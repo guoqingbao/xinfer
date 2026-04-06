@@ -323,6 +323,48 @@ xinfer --m mistralai/Ministral-3-3B --ui-server
 
 ---
 
+## 🔌 Guided decoding (Structured Outputs & Constraints)
+vLLM.rs now supports structured output and constraint-based generation via llguidance.
+
+### ⚠️ Security Notice
+
+**Client-provided constraints are BLOCKED by default.** To enable them, you must explicitly set the `--allow-constraint-api` flag.
+
+#### Enabling Client Constraints
+```bash
+# Enable client-submitted constraints via HTTP API
+vllm-rs --m Qwen/Qwen3.5-27B-FP8 --ui-server --prefix-cache --allow-constraint-api
+```
+
+#### Security Risks of Client Constraints
+Client-provided constraints can introduce serious security vulnerabilities:
+
+1. **Lark Grammar Injection**: Malicious clients can submit crafted Lark grammars that:
+   - Access special tokens beyond the user role boundary
+   - Inject arbitrary regex patterns that could cause ReDoS attacks
+   - Bypass the chat template's role separation
+
+2. **JSON Schema Escapes**: Clients can specify schemas that:
+   - Reference internal special tokens not intended for user control
+   - Create ambiguous token boundaries that leak system instructions
+   - Inject forbidden regex patterns matching system roles
+
+3. **Role Boundary Violations**: When constraints are enabled, clients can potentially:
+   - Escape the `user:` role boundary in chat templates
+   - Inject `system:` or `assistant:` role content
+   - Manipulate tool_call markers to inject fake tool responses
+   - Invent new ways to make poorly designed systems behave beyond intended scope
+
+#### Recommended Usage
+- **Production**: Set `--enable-tool-grammar` and/or `--allow-constraint-api` with trusted accessor systems/clients or when filtering inbound content through a tokenizer-aware WAF with grammar validation inline.
+
+```bash
+# Enable automatic tool grammar generation
+vllm-rs --m Qwen/Qwen3.5-27B-FP8 --ui-server --prefix-cache --enable-tool-grammar
+```
+
+See [**Structured Outputs Documentation →**](docs/llguidance-integration.md)
+
 ## 📘 Build from source code
 
 **Option 1 — Cargo**

@@ -1,9 +1,9 @@
 // src/server/server.rs
 use super::logger::ChatCompletionLogger;
+use super::GrammarRequest;
 use super::{
-    build_guided_decoding_grammar, build_messages_and_images, collect_openai_constraint_grammar,
-    normalize_reasoning_controls,
     streaming::{ChatResponse, Streamer},
+    build_messages_and_images, normalize_reasoning_controls,
     ChatResponder, DetokenizeRequest, DetokenizeResponse, EmbeddingRequest, EmbeddingResponse,
     EncodingFormat, TokenizeInput, TokenizeRequest, TokenizeResponse,
 };
@@ -20,12 +20,10 @@ use crate::tools::helpers::{
     resolve_tools, retain_tool_calls_forced_name, strict_tool_call_validation_enabled,
 };
 use crate::tools::{ToolChoice, ToolChoiceMode};
-use crate::utils::config::SamplingParams;
-use crate::utils::guidance::ReasoningEffort;
-use axum::{
-    extract::{Json, Query, State},
-    response::{sse::KeepAlive, Sse},
-};
+use crate::utils::config::{ReasoningEffort, SamplingParams};
+use crate::utils::guidance_grammar::{build_grammar_from_request, GrammarRequestDispatcher};
+use axum::extract::{Json, Query, State};
+use axum::response::{sse::KeepAlive, Sse};
 use base64::Engine;
 use std::collections::HashSet;
 use std::env;
@@ -376,20 +374,47 @@ pub async fn chat_completion(
         .max_tokens
         .unwrap_or(data.econfig.max_tokens.unwrap_or(16384));
 
+    // Get generation config from engine config for fallback
+    let generation_cfg = data.econfig.generation_cfg.as_ref();
+
     let mut params = SamplingParams::new_with_max_tokens(max_tokens);
-    params.temperature = request.temperature;
-    params.top_k = request.top_k;
-    params.top_p = request.top_p;
-    params.frequency_penalty = request.frequency_penalty;
-    params.presence_penalty = request.presence_penalty;
+    // Apply request values with fallback to generation config
+    params.temperature = request.temperature.or(generation_cfg.and_then(|gc| gc.temperature));
+    params.top_k = request.top_k.or(generation_cfg.and_then(|gc| gc.top_k));
+    params.top_p = request.top_p.or(generation_cfg.and_then(|gc| gc.top_p));
+    params.frequency_penalty = request.frequency_penalty.or(generation_cfg.and_then(|gc| gc.frequency_penalty));
+    params.presence_penalty = request.presence_penalty.or(generation_cfg.and_then(|gc| gc.presence_penalty));
+    // Set stop_token_ids from engine eos_token_id only (no request override)
+    params.stop_token_ids = generation_cfg
+        .and_then(|gc| gc.eos_token_id.clone())
+        .map(|eos| vec![eos.to_vec()]);
     params.session_id = request.session_id.clone();
     params.thinking = request.thinking.clone();
     params.stop_sequences = request.stop.clone();
-    params.reasoning_effort = request
-        .reasoning_effort
-        .clone()
-        .map(ReasoningEffort::from_str);
-    let (img_cfg, model_type, tool_config, engine_config, guidance_tokens) = {
+    #[cfg(not(feature = "python"))]
+    {
+        let effort_str = request
+            .reasoning_effort
+            .clone()
+            .unwrap_or_else(|| "none".to_string());
+        params.reasoning_effort = if effort_str != "none" {
+            Some(ReasoningEffort::from_str(effort_str))
+        } else {
+            None
+        };
+    }
+    #[cfg(feature = "python")]
+    {
+        // In Python builds, request.reasoning_effort is Option<String>
+        // Convert it to ReasoningEffort
+        let effort_str = request.reasoning_effort.clone().unwrap_or_else(|| "none".to_string());
+        params.reasoning_effort = if effort_str != "none" {
+            Some(ReasoningEffort::from_str(effort_str))
+        } else {
+            None
+        };
+    }
+    let (img_cfg, model_type, tool_config, engine_config, guidance_tokens, tokenizer) = {
         let e = data.engine.read();
         (
             e.img_cfg.clone(),
@@ -397,13 +422,48 @@ pub async fn chat_completion(
             e.tool_config.clone(),
             e.econfig.clone(),
             e.guidance_tokens.clone(),
+            e.tokenizer.clone(),
         )
     };
-    let constraint_grammar = match collect_openai_constraint_grammar(&request) {
-        Ok(grammar) => grammar,
-        Err(err) => return ChatResponder::ValidationError(err.to_string()),
+
+    // Generate complete grammar from request using unified single-call function
+    // This handles all permutations: tools, structured_outputs, response_format, constraint
+    let enforce_parser = engine_config.enforce_parser.clone();
+    let tool_parser_name = if let Some(ref enforced) = enforce_parser {
+        enforced.clone()
+    } else {
+        let parser_model_id =
+            super::resolve_engine_model_id(&engine_config).unwrap_or_else(|| model_id.clone());
+        StreamToolParser::parser_name_for_model(&model_type, &parser_model_id).to_string()
     };
-    if constraint_grammar.is_some() {
+    
+    // Get the chat template from the engine
+    let chat_template = {
+        let e = data.engine.read();
+        e.get_chat_template()
+    };
+
+    let mut grammar_request = request.clone();
+    if !grammar_request.max_tokens.is_some() {
+        grammar_request.max_tokens = Some(max_tokens);
+    }
+    
+    // Use new GrammarRequestDispatcher for grammar composition
+    let grammar = {
+        let dispatcher = GrammarRequestDispatcher::new(
+            &grammar_request,
+            &guidance_tokens,
+            &tool_config,
+            engine_config.enable_tool_grammar,
+            engine_config.allow_constraint_api,
+            tool_parser_name,
+            &tokenizer,
+            Some(chat_template),
+        );
+        dispatcher.build_grammar()
+    };
+
+    if grammar.is_some() {
         normalize_reasoning_controls(&mut params, &guidance_tokens);
     }
 
@@ -487,14 +547,9 @@ pub async fn chat_completion(
         .unwrap()
         .as_millis() as u64;
 
-    {
-        let engine = data.engine.read();
-        params.grammar = build_guided_decoding_grammar(
-            &engine.guidance_tokens,
-            constraint_grammar,
-            max_tokens,
-            params.reasoning_effort.clone(),
-        );
+    // Set grammar from unified generation
+    if let Some(g) = grammar {
+        params.grammar = Some(g);
     }
 
     if use_stream {
@@ -1896,4 +1951,50 @@ mod tests {
 
         assert!(validate_openai_tool_messages(&messages).is_ok());
     }
+}
+
+#[utoipa::path(
+    post,
+    tag = "vllm-rs",
+    path = "/v1/grammar",
+    request_body = GrammarRequest,
+    responses((status = 200, description = "Grammar-based completion"))
+)]
+pub async fn grammar_completion(
+    State(data): State<Arc<ServerData>>,
+    request: Json<GrammarRequest>,
+) -> ChatResponder {
+    // Only allow if constraint API is enabled via CLI
+    if !data.econfig.allow_constraint_api {
+        return ChatResponder::ValidationError(
+            "Grammar endpoint requires allow_constraint_api CLI flag".to_string(),
+        );
+    }
+
+    // Parse grammar using guidance.rs
+    let grammar =
+        match build_grammar_from_request(&request.grammar_type, &request.grammar)
+        {
+            Ok(g) => g,
+            Err(e) => return ChatResponder::ValidationError(e.to_string()),
+        };
+
+    // Build sampling params with grammar
+    let mut params = SamplingParams::new_with_max_tokens(
+        request
+            .max_tokens
+            .unwrap_or(data.econfig.max_tokens.unwrap_or(16384)),
+    );
+    params.temperature = request.temperature;
+    params.top_k = request.top_k;
+    params.top_p = request.top_p;
+    params.frequency_penalty = request.frequency_penalty;
+    params.presence_penalty = request.presence_penalty;
+    params.session_id = request.session_id.clone();
+    params.thinking = request.thinking;
+    params.stop_sequences = request.stop.clone();
+    params.grammar = Some(grammar);
+
+    // Delegate to existing streaming logic
+    ChatResponder::ValidationError("Grammar endpoint not fully implemented".to_string())
 }

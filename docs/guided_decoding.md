@@ -8,13 +8,23 @@ It focuses on:
 - how reasoning effort is applied
 - practical usage and validation commands
 
+## JSON Schema Reference
+
+For detailed JSON Schema constraint documentation with curl examples, see [`llguidance-json-schema.md`](llguidance-json-schema.md).
+
+This covers:
+- Schema type definitions (string, integer, number, boolean, object, array)
+- All supported API endpoints (OpenAI-compatible and Claude server)
+- Complete curl examples for each permutation
+- Schema sanitization behavior
+
 ## Current Model
 
 Guided decoding is request-scoped.
 
 The core engine does not invent grammars on its own. A request either:
 - supplies a constraint grammar
-- gets that constraint grammar composed with a reasoning prefix
+- gets a composed grammar containing both
 - or runs unconstrained when neither exists
 
 The final grammar is stored in `SamplingParams.grammar` and consumed by the runner.
@@ -44,7 +54,7 @@ The server composes:
 
 The result is a single `TopLevelGrammar` assigned to `SamplingParams.grammar`.
 
-If no client-supplied constraint grammar exists, `params.grammar` stays `None`.
+If no constraint grammar and no tool grammar exist, `params.grammar` stays `None`.
 
 ### 3. Sampling in runner
 
@@ -84,14 +94,17 @@ Legacy fields
 - `constraint`
 - `constraint_type = regex | lark | json_schema | json`
 
-If a request provides none of the above, guided decoding is not enabled.
+If a request provides none of the above, guided decoding is not enabled unless tool grammar synthesis adds one.
+
+The grammar composition logic is in `src/utils/guidance_grammar.rs`. The `GrammarRequestDispatcher` and `GrammarComposer` handle the composition of constraint grammars with reasoning grammars.
 
 ### Claude server
+
+Claude reuses the same tool-grammar builder path.
 
 Current state:
 - Claude does not expose the same client-supplied grammar request surface as the OpenAI endpoint
 - Claude reasoning is still driven by explicit thinking behavior, not by `reasoning_effort` grammar composition
-- Claude requests therefore do not currently enable guided decoding
 
 ## Reasoning Effort
 
@@ -99,7 +112,7 @@ Reasoning effort is separate from ordinary structured outputs.
 
 ### Current state
 
-The OpenAI path maps `reasoning_effort` into grammar composition when a request constraint exists.
+The OpenAI path maps `reasoning_effort` into grammar composition.
 
 Accepted values come from `ReasoningEffort::from_str`:
 - `none`
@@ -115,7 +128,7 @@ Non-Python builds also support:
 - `custom:<template>`
 
 Relevant code:
-- `src/utils/reasoning.rs`
+- `src/utils/guidance_grammar.rs`
 - `src/server/server.rs`
 - `src/utils/guidance.rs`
 
@@ -124,7 +137,6 @@ Relevant code:
 Reasoning effort:
 - does not enable chat-template thinking by itself
 - only affects grammar composition
-- is ignored when no request constraint grammar is present
 - only works when reasoning start/end tokens are available
 
 If the tokenizer does not expose reasoning markers, the system logs a warning and falls back to the base grammar.
@@ -160,7 +172,7 @@ xinfer --m Qwen/Qwen3.5-35B-A3B-FP8/ --ui-server --d 0
 | Enforce text pattern | `structured_outputs` or `constraint` | `regex` |
 | Enforce full object schema | `structured_outputs` or `response_format` | `json` / `json_schema` |
 | Enforce custom grammar | `structured_outputs` or `constraint` | `grammar` / `lark` |
-| Constrain tagged structured output payload | `structured_outputs` | `structural_tag` |
+| Constrain tool call payload | `structured_outputs` or automatic tool grammar | `structural_tag` / tool grammar |
 | Add a reasoning prefix | `reasoning_effort` | `low`, `medium`, `high`, etc. |
 
 ### 1. Constrain the answer to a fixed set
@@ -470,5 +482,5 @@ Check:
 
 - Guided decoding is only active when `SamplingParams.grammar` is present.
 - OpenAI currently has the richest client-facing grammar surface.
-- Claude does not currently expose request-level guided decoding.
+- Claude currently reuses tool grammar, but not the same direct constraint request API.
 - No request-level grammar means no guided decoding.
