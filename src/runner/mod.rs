@@ -230,6 +230,11 @@ pub enum MessageType {
     CheckPrefillStatus(usize),
     CheckPrefillStatusResponse(bool),
 
+    RunSpecDecode(Vec<Sequence>),
+    RunDraftAndVerify((Vec<Sequence>, Vec<u32>)),
+
+    RunSpecDecodeResponse(Vec<Vec<u32>>),
+
     KVCacheSwap((HashMap<usize, usize>, bool)),
 
     KVCacheSwapResponse(bool),

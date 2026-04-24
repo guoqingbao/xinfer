@@ -683,6 +683,38 @@ impl Scheduler {
         }
     }
 
+    pub fn postprocess_speculative_extra(&mut self, ids: &[usize], extras: &[Vec<u32>]) {
+        for (i, extra_tokens) in extras.iter().enumerate() {
+            if i >= ids.len() {
+                break;
+            }
+            let idx = ids[i];
+            if idx >= self.running.len() {
+                continue;
+            }
+            if self.running[idx].status == SequenceStatus::Finished {
+                continue;
+            }
+            let mut finished = false;
+            for &tok in extra_tokens {
+                if self.eos_token_id.contains(&tok) {
+                    self.running[idx].append_token(tok);
+                    self.running[idx].status = SequenceStatus::Finished;
+                    self.block_manager
+                        .capture_mamba_prefix_state(&self.running[idx], self.running[idx].len());
+                    self.block_manager.cache_sequence(&self.running[idx]);
+                    self.block_manager.deallocate(&mut self.running[idx]);
+                    finished = true;
+                    break;
+                }
+                self.running[idx].append_token(tok);
+            }
+            if !finished {
+                let _ = self.block_manager.ensure_allocate(&mut self.running[idx]);
+            }
+        }
+    }
+
     pub fn clear_finished(&mut self) {
         let is_pd_server = self.is_pd_server();
         let mut finished_counts = Vec::new();

@@ -835,6 +835,75 @@ impl Qwen3_5MoEForCausalLM {
         )
     }
 
+    pub fn forward_with_hidden_states(
+        &self,
+        input_ids: &Tensor,
+        positions: &Tensor,
+        kv_caches: Option<&Vec<(Tensor, Tensor)>>,
+        input_metadata: &InputMetadata,
+        embeded_inputs: bool,
+        target_layer_ids: &[usize],
+    ) -> Result<(Tensor, Vec<Tensor>)> {
+        let seqlens = input_metadata.seqlens.clone().unwrap_or_default();
+        let attention_mask = get_attention_causal_mask(
+            &self.device,
+            self.dtype,
+            positions,
+            seqlens.clone(),
+            self.config.sliding_window,
+            input_metadata.is_prefill,
+        );
+        let mut xs = if embeded_inputs {
+            input_ids.to_owned()
+        } else {
+            self.embed_forward(input_ids)?
+        };
+        let mut hidden_states_collector: Vec<Tensor> = Vec::new();
+        hidden_states_collector.push(xs.clone());
+        let mut kv_cache_idx = 0usize;
+        let seq_slots = self.resolve_seq_slots(input_metadata, xs.dim(0)?)?;
+        let mut mamba_cache = self.mamba_cache.write();
+        for (i, layer) in self.layers.iter().enumerate() {
+            let cache = if layer.is_full_attention() {
+                if let Some(kv_caches) = kv_caches {
+                    let c = &kv_caches[kv_cache_idx];
+                    kv_cache_idx += 1;
+                    Some((&c.0, &c.1))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            xs = layer.forward(
+                &xs,
+                attention_mask.as_ref(),
+                positions,
+                cache,
+                input_metadata,
+                &mut mamba_cache,
+                &seq_slots,
+            )?;
+            if target_layer_ids.contains(&i) {
+                hidden_states_collector.push(xs.clone());
+            }
+        }
+        if !seqlens.is_empty() {
+            let indices: Vec<_> = seqlens.iter().map(|x| x - 1 as u32).collect();
+            let batch = indices.len();
+            xs = xs.index_select(&Tensor::from_vec(indices, (batch,), xs.device())?, 0)?;
+        }
+        let xs = self.norm.forward(&xs)?;
+        let logits = if self.is_qvar_builder {
+            self.lm_head.forward(&xs)?
+        } else {
+            self.lm_head
+                .forward(&xs.to_dtype(self.dtype)?)?
+                .to_dtype(DType::F32)?
+        };
+        Ok((logits, hidden_states_collector))
+    }
+
     pub fn forward_with_deepstack(
         &self,
         input_ids: &Tensor,
@@ -855,6 +924,16 @@ impl Qwen3_5MoEForCausalLM {
             deepstack_visual_embeds,
             false,
         )
+    }
+
+    pub fn lm_head_forward(&self, hidden: &Tensor) -> Result<Tensor> {
+        if self.is_qvar_builder {
+            self.lm_head.forward(hidden)
+        } else {
+            self.lm_head
+                .forward(&hidden.to_dtype(self.dtype)?)?
+                .to_dtype(DType::F32)
+        }
     }
 
     pub fn get_vocab_size(&self) -> usize {
@@ -934,6 +1013,21 @@ impl Qwen3_5MoEForCausalLM {
 
     pub fn reset_mamba_cache(&self) -> Result<()> {
         self.mamba_cache.write().reset_all()
+    }
+
+    pub fn save_mamba_slot_state(&self, seq_id: usize) -> Result<(Vec<Tensor>, Vec<Tensor>)> {
+        self.mamba_cache.read().save_slot_state(seq_id)
+    }
+
+    pub fn restore_mamba_slot_state(
+        &self,
+        seq_id: usize,
+        conv_states: &[Tensor],
+        recurrent_states: &[Tensor],
+    ) -> Result<()> {
+        self.mamba_cache
+            .write()
+            .restore_slot_state(seq_id, conv_states, recurrent_states)
     }
 
     pub fn dtype(&self) -> DType {
