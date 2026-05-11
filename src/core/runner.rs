@@ -1197,15 +1197,21 @@ impl ModelRunner {
 
         let slot_mapping = Tensor::from_vec(slot_mapping, (s_len,), &self.device)?;
 
-        let block_tables_t = self.prepare_block_tables(seqs)?;
-        let context_lens_vec: Vec<u32> = seqs
-            .iter()
-            .zip(prefill_tokens.iter())
-            .map(|(seq, &num_tokens)| (seq.num_cached_tokens + num_tokens) as u32)
-            .collect();
-        let context_lens_t = Tensor::from_vec(context_lens_vec.clone(), seqs.len(), &self.device)?;
-        let block_tables = Some(block_tables_t);
-        let context_lens = Some(context_lens_t);
+        // Provide block_tables + context_lens when any sequence in the batch has
+        // prior cached KV (cu_seqlens_k > cu_seqlens_q). This enables the paged
+        // attention prefill kernel to attend to the full KV context.
+        let (block_tables, context_lens) = if cu_seqlens_k.last() > cu_seqlens_q.last() {
+            let block_tables_t = self.prepare_block_tables(seqs)?;
+            let context_lens: Vec<u32> = seqs
+                .iter()
+                .zip(prefill_tokens.iter())
+                .map(|(seq, &num_tokens)| (seq.num_cached_tokens + num_tokens) as u32)
+                .collect();
+            let context_lens = Tensor::from_vec(context_lens, seqs.len(), &self.device)?;
+            (Some(block_tables_t), Some(context_lens))
+        } else {
+            (None, None)
+        };
         let cu_seqlens_q_vec = cu_seqlens_q.clone();
         let cu_seqlens_q = Tensor::from_vec(cu_seqlens_q, (q_len,), &self.device)?;
         let cu_seqlens_k = Tensor::from_vec(cu_seqlens_k, (k_len,), &self.device)?;
