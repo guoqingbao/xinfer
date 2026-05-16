@@ -386,6 +386,7 @@ impl ModelRunner {
         llg_factory: Option<Arc<ParserFactory>>,
         stream: Option<LocalStream>,
     ) -> Result<Self> {
+        attention_rs::reset_paged_attention_layer_counter();
         let model = crate::build_model!(
             model_type,
             vb,

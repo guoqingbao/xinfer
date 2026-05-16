@@ -17,6 +17,7 @@ A blazing-fast ⚡, lightweight **Rust** 🦀 implementation of vLLM.
 * 💻 **Cross-Platform** – Supports **CUDA** (Linux/Windows) and **Metal** (macOS)
 * 🤖 **Built-in API Server and ChatGPT-like Web UI** – Native Rust server for both CUDA and Metal
 * 🔌 **MCP Integration** – Model Context Protocol for tool calling support
+* 🗜️ **TurboQuant KV Cache** – 2-4 bit KV cache compression for extended context
 * 📊 **Embedding & Tokenizer APIs** – Full text processing support
 * 🐍 **Lightweight Python Interface** – PyO3-powered bindings for chat completion
 
@@ -85,6 +86,8 @@ See [**Full Performance Benchmarks →**](docs/performance.md)
 Supports both **Safetensor** (including GPTQ, AWQ, MXFP4, NVFP4, and FP8-blockwise formats) and **GGUF** formats.
 
 All models support FP8 KV-cache acceleration (`--fp8-kvcache`). Works with all attention backends including `flashinfer` (SM80+), `flashattn`, and paged attention (V100/SM70+).
+
+All models also support **TurboQuant KV-cache compression** (`--kvcache-dtype turbo4` / `turbo3` / `turbo8`) for reduced memory usage. Uses the native flash attention backend with Walsh-Hadamard transform and per-head absmax quantization.
 
 ---
 ## 📚 Guides
@@ -362,6 +365,33 @@ vllm-rs --m AxionML/Qwen3.5-2B-NVFP4 --ui-server --prefix-cache
 
   </details>
 
+  <details open>
+    <summary>TurboQuant KV Cache (2-4 bit compression)</summary>
+
+  TurboQuant compresses the KV cache using Walsh-Hadamard transform rotation and per-head absmax quantization, significantly reducing KV cache memory. Uses the native flash attention backend (built with `flash` feature).
+
+  ```bash
+  # Build with native flash attention
+  ./build.sh --install --features cuda,nccl,flash,cutlass,graph
+
+  # turbo4: 4-bit K + 4-bit V (best balance of speed and memory)
+  vllm-rs --m Qwen/Qwen3.6-27B-FP8 --kvcache-dtype turbo4 --ui-server --prefix-cache
+
+  # turbo3: 3-bit K + 4-bit V (maximum compression)
+  vllm-rs --m Qwen/Qwen3.6-27B-FP8 --kvcache-dtype turbo3 --ui-server --prefix-cache
+
+  # turbo8: FP8 K + 4-bit V (highest quality, moderate compression)
+  vllm-rs --m Qwen/Qwen3.6-27B-FP8 --kvcache-dtype turbo8 --ui-server --prefix-cache
+  ```
+
+  | Mode | K precision | V precision | Memory savings | Quality |
+  |------|------------|------------|----------------|---------|
+  | `turbo8` | FP8 (8-bit) | 4-bit | ~40% | Highest |
+  | `turbo4` | 4-bit | 4-bit | ~75% | Good |
+  | `turbo3` | 3-bit | 4-bit | ~80% | Acceptable |
+
+  </details>
+
 ---
 
 ## 🔌 Guided decoding (Structured Outputs & Constraints)
@@ -549,6 +579,7 @@ pip install target/wheels/vllm_rs-*-cp38-abi3-*.whl --force-reinstall
 | `--server`       | Explicitly start API server (this is the default when no `--i`, `--prompts`, or `--batch` is given)        |
 | `--i`            | Interactive CLI chat mode                                        |
 | `--fp8-kvcache`       | Use FP8 KV Cache (works with all backends: flashinfer on SM80+, paged attention on V100+, Metal) |
+| `--kvcache-dtype`     | KV cache quantization: `fp8`, `turbo8` (FP8 K + 4-bit V), `turbo4` (4-bit K+V), `turbo3` (3-bit K + 4-bit V). TurboQuant modes use native flash attention. |
 | `--cpu-mem-fold`       | The percentage of CPU KVCache memory size compare to GPU (default 0.2, range from 0.1 to 10.0)              |
 | `--pd-server`       | When using PD Disaggregation, specify the current instance as the PD server (this server is only used for Prefill) |
 | `--pd-client`       | When using PD Disaggregation, specify the current instance as the PD client (this client sends long-context Prefill requests to the PD server for processing) |
@@ -590,6 +621,7 @@ pip install target/wheels/vllm_rs-*-cp38-abi3-*.whl --force-reinstall
 * [x] FP8 KV Cache (CUDA, all backends including FlashInfer on SM80+)
 * [x] FP8 KV Cache (Metal)
 * [x] FP8 KV Cache (with FlashInfer, SM80+)
+* [x] TurboQuant KV Cache (2-4 bit compression with WHT rotation)
 * [x] FP8 Models (CUDA: MoE, Dense; Metal: Dense)
 * [ ] Additional model support (Kimi K2, GLM 5.1 etc.)
 * [x] CPU KV Cache Offloading

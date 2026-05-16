@@ -11,6 +11,54 @@ use serde::{Deserialize, Serialize, Serializer};
 use std::collections::HashMap;
 use std::fmt;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum KvCacheDtype {
+    Auto,
+    Fp8,
+    Turbo8,
+    Turbo4,
+    Turbo3,
+}
+
+impl KvCacheDtype {
+    pub fn is_turboquant(&self) -> bool {
+        matches!(self, Self::Turbo8 | Self::Turbo4 | Self::Turbo3)
+    }
+
+    pub fn is_fp8_keys(&self) -> bool {
+        matches!(self, Self::Fp8 | Self::Turbo8)
+    }
+
+    pub fn from_str_opt(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "auto" | "bf16" | "bfloat16" => Some(Self::Auto),
+            "fp8" | "e4m3" => Some(Self::Fp8),
+            "turbo8" | "k8v4" => Some(Self::Turbo8),
+            "turbo4" | "4bit" => Some(Self::Turbo4),
+            "turbo3" | "k3v4" => Some(Self::Turbo3),
+            _ => None,
+        }
+    }
+}
+
+impl Default for KvCacheDtype {
+    fn default() -> Self {
+        Self::Auto
+    }
+}
+
+impl std::fmt::Display for KvCacheDtype {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Auto => write!(f, "auto"),
+            Self::Fp8 => write!(f, "fp8"),
+            Self::Turbo8 => write!(f, "turbo8"),
+            Self::Turbo4 => write!(f, "turbo4"),
+            Self::Turbo3 => write!(f, "turbo3"),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum EosTokenId {
     Single(u32),
@@ -249,6 +297,8 @@ pub struct Config {
     pub quant: Option<String>,
     pub moe_cfg: Option<MoEConfig>,
     pub fp8_kvcache: Option<bool>,
+    #[serde(default)]
+    pub kvcache_dtype: KvCacheDtype,
     pub quantization_config: Option<QuantConfig>,
     pub is_multi_model: Option<bool>,
     pub extra_config_json: Option<String>,
@@ -314,6 +364,8 @@ pub struct EngineConfig {
     pub prefix_cache: Option<bool>,
     pub prefix_cache_max_tokens: Option<usize>,
     pub fp8_kvcache: Option<bool>,
+    #[serde(default)]
+    pub kvcache_dtype: KvCacheDtype,
     pub server_mode: Option<bool>,
     pub pd_config: Option<PdConfig>,
     pub mcp_command: Option<String>,
@@ -386,6 +438,8 @@ pub struct EngineConfig {
     pub prefix_cache_max_tokens: Option<usize>,
     #[pyo3(get, set)]
     pub fp8_kvcache: Option<bool>,
+    #[serde(default)]
+    pub kvcache_dtype: KvCacheDtype,
     #[pyo3(get, set)]
     pub server_mode: Option<bool>,
     #[pyo3(get, set)]
@@ -477,6 +531,7 @@ impl EngineConfig {
             prefix_cache,
             prefix_cache_max_tokens,
             fp8_kvcache,
+            kvcache_dtype: KvCacheDtype::Auto,
             server_mode,
             pd_config,
             mcp_command,

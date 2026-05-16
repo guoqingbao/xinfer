@@ -86,6 +86,8 @@
 
 所有模型均支持FP8 KvCache加速（`--fp8-kvcache`），兼容所有注意力后端：`flashinfer`（SM80+）、`flashattn`、以及 Paged Attention（V100/SM70+）。
 
+所有模型还支持 **TurboQuant KV缓存压缩**（`--kvcache-dtype turbo4` / `turbo3` / `turbo8`），通过Walsh-Hadamard变换和逐头absmax量化实现2-4位KV缓存压缩，大幅降低显存占用。
+
 ---
 ## 📚 文档
 - [快速开始](docs/get_started.md)
@@ -486,6 +488,7 @@ pip install target/wheels/vllm_rs-*-cp38-abi3-*.whl --force-reinstall
 | `--server`       | 显式启动API服务（未指定 `--i`、`--prompts` 或 `--batch` 时，这是默认行为）        |
 | `--i`            | 交互式CLI对话模式                                        |
 | `--fp8-kvcache`       | 使用FP8 KV Cache（兼容所有后端：flashinfer SM80+、paged attention V100+、Metal）|
+| `--kvcache-dtype`     | KV缓存量化：`fp8`、`turbo8`（FP8 K + 4位V）、`turbo4`（4位K+V）、`turbo3`（3位K + 4位V）。TurboQuant模式使用原生flash attention。|
 | `--cpu-mem-fold`       | CPU KV Cache大小 (与GPU KV Cache的百分比，默认 0.2，取值0.1 - 10.0)              |
 | `--pd-server`       | 使用PD分离模式时，指定当前实例为PD服务器（此服务器仅用于Prefill）            |
 | `--pd-client`       | 使用PD分离模式时，指定当前实例为PD客户端（此客户端将长的上下文Prefill请求发送给PD服务器处理）|
@@ -526,6 +529,7 @@ pip install target/wheels/vllm_rs-*-cp38-abi3-*.whl --force-reinstall
 * [x] FP8 KV Cache (CUDA，所有后端，FlashInfer支持SM80+)
 * [x] FP8 KV Cache (Metal)
 * [x] FP8 KV Cache (FlashInfer，SM80+)
+* [x] TurboQuant KV Cache（2-4位压缩，WHT旋转量化）
 * [x] FP8 模型 (CUDA: MoE, Dense; Metal: Dense)
 * [ ] 支持更多模型类型（Kimi K2, GLM 5.1等）
 * [x] CPU KV Cache 卸载

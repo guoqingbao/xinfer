@@ -952,7 +952,10 @@ pub struct Args {
     pub port: Option<usize>,
 
     #[arg(long, default_value_t = false)]
-    pub fp8_kvcache: bool, //kv cache and attention with quantization
+    pub fp8_kvcache: bool,
+
+    #[arg(long, default_value = None)]
+    pub kvcache_dtype: Option<String>,
 
     // After model loading, the percentage of the remaining gpu memory for kvcache
     #[arg(long, default_value = None)]
