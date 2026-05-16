@@ -825,15 +825,20 @@ impl KVCacheAllocator {
                 cpu_cache.push((ckv_blocks, kpe_blocks));
             }
             Ok((gpu_cache, cpu_cache))
-        } else if cfg!(feature = "flashinfer") || cfg!(feature = "flashattn") {
+        } else if cfg!(feature = "flash")
+            || cfg!(feature = "flashinfer")
+            || cfg!(feature = "flashattn")
+        {
             let element_size = cache_dtype.size_in_bytes();
             let x = 16 / element_size;
+
+            let use_flash_native = cfg!(feature = "flash");
 
             let mut gpu_cache = Vec::new();
             let mut cpu_cache = Vec::new();
             for layer_idx in 0..self.num_kv_layers {
                 let (_, kv_heads, hd) = self.layer_flash_key_value_block_shape(layer_idx);
-                if hd > 256 {
+                if hd > 256 && !use_flash_native {
                     let key_blocks = Tensor::empty(
                         (num_gpu_blocks, kv_heads, hd / x, self.block_size, x),
                         cache_dtype,
@@ -865,7 +870,7 @@ impl KVCacheAllocator {
             }
             for layer_idx in 0..self.num_kv_layers {
                 let (_, kv_heads, hd) = self.layer_flash_key_value_block_shape(layer_idx);
-                if hd > 256 {
+                if hd > 256 && !use_flash_native {
                     let key_blocks = Tensor::zeros(
                         (num_cpu_blocks, kv_heads, hd / x, self.block_size, x),
                         cache_dtype,
