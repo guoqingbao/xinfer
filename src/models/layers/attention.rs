@@ -612,7 +612,7 @@ impl Attention {
                 sliding_window,
                 vb.device().clone(),
                 None,
-                config.fp8_kvcache.unwrap_or(false),
+                config.kvcache_dtype.is_fp8_keys(),
             )?,
             softcapping: config.attn_logit_softcapping,
             dtype,

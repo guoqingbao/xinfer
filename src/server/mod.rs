@@ -951,10 +951,7 @@ pub struct Args {
     #[arg(long)]
     pub port: Option<usize>,
 
-    #[arg(long, default_value_t = false)]
-    pub fp8_kvcache: bool,
-
-    #[arg(long, default_value = None)]
+    #[arg(long, default_value = None, help = "KV cache dtype: auto (default, uses model dtype), fp8, turbo8, turbo4, turbo3")]
     pub kvcache_dtype: Option<String>,
 
     // After model loading, the percentage of the remaining gpu memory for kvcache

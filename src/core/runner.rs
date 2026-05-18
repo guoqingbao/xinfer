@@ -1091,7 +1091,8 @@ impl ModelRunner {
             None
         };
 
-        let flashinfer_metadata = if cfg!(feature = "flashinfer") {
+        let skip_flashinfer = self.config.kvcache_dtype.is_turboquant();
+        let flashinfer_metadata = if cfg!(feature = "flashinfer") && !skip_flashinfer {
             let mut indptr = vec![0u32];
             let mut indices = Vec::new();
             let mut last_len = Vec::new();
@@ -1246,6 +1247,7 @@ impl ModelRunner {
         I: IntoIterator<Item = &'a S>,
         S: ToDecodeInput + 'a,
     {
+        let skip_flashinfer = self.config.kvcache_dtype.is_turboquant();
         let mut input_ids = Vec::new();
         let mut positions = Vec::new();
         let mut slot_mapping = Vec::new();
@@ -1275,7 +1277,7 @@ impl ModelRunner {
         let context_lens = Tensor::from_vec(context_lens, (c_len,), &self.device)?;
         let block_tables = self.prepare_block_tables(seq_refs.clone())?;
 
-        let flashinfer_metadata = if cfg!(feature = "flashinfer") {
+        let flashinfer_metadata = if cfg!(feature = "flashinfer") && !skip_flashinfer {
             #[cfg(all(feature = "cuda", feature = "graph"))]
             let use_cuda_graph = {
                 let require_exact_graph = match &self.model {

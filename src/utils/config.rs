@@ -296,7 +296,6 @@ pub struct Config {
     pub rope_scaling: Option<HashMap<String, RopeScalingValue>>,
     pub quant: Option<String>,
     pub moe_cfg: Option<MoEConfig>,
-    pub fp8_kvcache: Option<bool>,
     #[serde(default)]
     pub kvcache_dtype: KvCacheDtype,
     pub quantization_config: Option<QuantConfig>,
@@ -363,7 +362,6 @@ pub struct EngineConfig {
     pub seed: Option<u64>,
     pub prefix_cache: Option<bool>,
     pub prefix_cache_max_tokens: Option<usize>,
-    pub fp8_kvcache: Option<bool>,
     #[serde(default)]
     pub kvcache_dtype: KvCacheDtype,
     pub server_mode: Option<bool>,
@@ -436,8 +434,6 @@ pub struct EngineConfig {
     pub prefix_cache: Option<bool>,
     #[pyo3(get, set)]
     pub prefix_cache_max_tokens: Option<usize>,
-    #[pyo3(get, set)]
-    pub fp8_kvcache: Option<bool>,
     #[serde(default)]
     pub kvcache_dtype: KvCacheDtype,
     #[pyo3(get, set)]
@@ -482,7 +478,6 @@ impl EngineConfig {
         seed: Option<u64>,
         prefix_cache: Option<bool>,
         prefix_cache_max_tokens: Option<usize>,
-        fp8_kvcache: Option<bool>,
         server_mode: Option<bool>,
         cpu_mem_fold: Option<f32>,
         kv_fraction: Option<f32>,
@@ -530,7 +525,6 @@ impl EngineConfig {
             seed,
             prefix_cache,
             prefix_cache_max_tokens,
-            fp8_kvcache,
             kvcache_dtype: KvCacheDtype::Auto,
             server_mode,
             pd_config,

@@ -491,6 +491,8 @@ impl<M: CudaGraphModule> GraphCapturer<M> {
                 last_len,
             )
         };
+        #[cfg(feature = "flashinfer")]
+        let skip_flashinfer = attention_rs::get_turboquant_mode().is_some();
 
         let mut outputs = BTreeMap::<usize, Tensor>::new();
         for is_warmup in [true, false] {
@@ -504,7 +506,9 @@ impl<M: CudaGraphModule> GraphCapturer<M> {
                 let input_ids_bs = input_ids.narrow(0, 0, bs)?;
                 let positions_bs = positions.narrow(0, 0, bs)?;
                 #[cfg(feature = "flashinfer")]
-                let flashinfer_metadata = {
+                let flashinfer_metadata = if skip_flashinfer {
+                    None
+                } else {
                     let mut indptr_host = Vec::with_capacity(bs + 1);
                     indptr_host.push(0u32);
                     for i in 0..bs {
@@ -531,7 +535,7 @@ impl<M: CudaGraphModule> GraphCapturer<M> {
                                 &kv_len_arr_host_bs,
                                 bs,
                                 self.is_mla,
-                                true,
+                                !is_warmup,
                             )?;
                             (dp, mdp, Some(kv_len_arr_host_bs))
                         } else {
@@ -548,7 +552,7 @@ impl<M: CudaGraphModule> GraphCapturer<M> {
                         total_num_rows: None,
                         batch_indices: None,
                         positions: None,
-                        use_cuda_graph: true,
+                        use_cuda_graph: !is_warmup,
                         decode_plan_info,
                         prefill_plan_info: None,
                         mla_decode_plan_info,

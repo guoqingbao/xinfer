@@ -279,7 +279,7 @@ impl EngineConfig {
         max_num_seqs=Some(32), config_model_len=None, max_model_len=Some(1024), max_tokens=None,
         isq=None, num_shards=Some(1), device_ids=None,
         generation_cfg=None, seed=None, prefix_cache=None, prefix_cache_max_tokens=None,
-        fp8_kvcache=None, server_mode=None, cpu_mem_fold=None, kv_fraction=None, mamba_fraction=None, pd_config=None,
+        kvcache_dtype=None, server_mode=None, cpu_mem_fold=None, kv_fraction=None, mamba_fraction=None, pd_config=None,
         mcp_command=None, mcp_config=None, mcp_args=None,
         tool_prompt_template=None,
         pd_server_prefix_cache_ratio=None, pd_client_prefix_cache_ratio=None, yarn_scaling_factor=None,
@@ -302,7 +302,7 @@ impl EngineConfig {
         seed: Option<u64>,
         prefix_cache: Option<bool>,
         prefix_cache_max_tokens: Option<usize>,
-        fp8_kvcache: Option<bool>,
+        kvcache_dtype: Option<String>,
         server_mode: Option<bool>,
         cpu_mem_fold: Option<f32>,
         kv_fraction: Option<f32>,
@@ -350,7 +350,12 @@ impl EngineConfig {
             seed,
             prefix_cache,
             prefix_cache_max_tokens,
-            fp8_kvcache,
+            kvcache_dtype: if let Some(ref s) = kvcache_dtype {
+                crate::utils::config::KvCacheDtype::from_str_opt(s)
+                    .unwrap_or(crate::utils::config::KvCacheDtype::Auto)
+            } else {
+                crate::utils::config::KvCacheDtype::Auto
+            },
             server_mode,
             pd_config,
             mcp_command,

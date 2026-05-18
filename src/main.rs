@@ -178,13 +178,9 @@ async fn main() -> Result<()> {
                 dtype_str
             )
         })
-    } else if args.fp8_kvcache {
-        KvCacheDtype::Fp8
     } else {
         KvCacheDtype::Auto
     };
-    let fp8_kvcache_flag = matches!(kvcache_dtype, KvCacheDtype::Fp8 | KvCacheDtype::Turbo8);
-
     let mut econfig = EngineConfig::new(
         args.model_id,
         args.weight_path,
@@ -203,7 +199,6 @@ async fn main() -> Result<()> {
         args.seed,
         Some(prefix_cache),
         args.prefix_cache_max_tokens,
-        Some(fp8_kvcache_flag),
         Some(server || !interactive),
         args.cpu_mem_fold,
         args.kv_fraction,
