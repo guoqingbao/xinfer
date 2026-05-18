@@ -938,8 +938,9 @@ pub struct Args {
     #[arg(long)]
     pub tool_prompt: Option<String>,
 
+    /// Disable prefix caching (enabled by default)
     #[arg(long, default_value_t = false)]
-    pub prefix_cache: bool,
+    pub disable_prefix_cache: bool,
 
     /// Max cached prefix size in tokens (rounded down to block size).
     #[arg(long, default_value = None)]
@@ -997,6 +998,10 @@ pub struct Args {
     /// `thinking` / `enable_thinking`.
     #[arg(long, default_value_t = false)]
     pub disable_reasoning: bool,
+
+    /// Disable CUDA graph capture (enabled by default when compiled with cuda feature)
+    #[arg(long, default_value_t = false)]
+    pub disable_cuda_graph: bool,
 }
 
 /// Result of executing tool calls via MCP

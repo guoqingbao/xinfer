@@ -58,8 +58,8 @@ See [python/ReadMe.md](../python/ReadMe.md) for reproducible benchmark steps.
 
 ## Optimization Tips
 
-1. **Use FP8 KV Cache** (`--fp8-kvcache`) for memory efficiency with slight accuracy tradeoff
+1. **Use KV Cache Quantization** (`--kvcache-dtype fp8|turbo4|turbo3`) for memory efficiency — turbo4 gives 3.7x compression with good quality
 2. **Enable Flashinfer / Flash Attention** (`flashinfer` or `flashattn` feature) for maximum CUDA performance
-3. **Use Prefix Cache** (`--prefix-cache`) for multi-turn conversations
+3. **Prefix Cache** is enabled by default for multi-turn conversations
 4. **Tune `--kv-fraction`** to balance memory usage and batch size
 5. **Use PD Disaggregation** for long-context workloads to prevent decoding stalls

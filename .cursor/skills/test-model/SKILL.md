@@ -145,7 +145,7 @@ Build using `run.sh` which compiles both the main binary and the runner:
 
 ```bash
 cd <project_root>
-./run.sh --features cuda,nccl,flashinfer,cutlass,graph --release
+./run.sh --features cuda,nccl,flashinfer,cutlass --release
 ```
 
 Verify the build succeeds (exit code 0). The `Error: Must provide model_id or weight_path` message after build is expected — it means the binary compiled correctly.
@@ -197,9 +197,9 @@ Build the server command based on model type:
 
 | Model source | Command pattern |
 |-------------|-----------------|
-| Local safetensors | `./target/release/vllm-rs --w <path> --prefix-cache --ui-server --d <gpus> --port 7000` |
-| Local GGUF | `./target/release/vllm-rs --w <dir> --f <file.gguf> --prefix-cache --ui-server --d <gpus> --port 7000` |
-| HuggingFace ID | `./target/release/vllm-rs --m <hf_id> --prefix-cache --ui-server --d <gpus> --port 7000` |
+| Local safetensors | `./target/release/vllm-rs --w <path> --ui-server --d <gpus> --port 7000` |
+| Local GGUF | `./target/release/vllm-rs --w <dir> --f <file.gguf> --ui-server --d <gpus> --port 7000` |
+| HuggingFace ID | `./target/release/vllm-rs --m <hf_id> --ui-server --d <gpus> --port 7000` |
 
 Run the server in the background with `RUST_BACKTRACE=1` for debugging.
 
@@ -278,9 +278,9 @@ Include for each model:
 
 | Feature set | When to use |
 |-------------|-------------|
-| `cuda,nccl,flashinfer,cutlass,graph` | SM80+ (Ampere/Ada/Hopper), recommended |
-| `cuda,nccl,flashattn,cutlass,graph` | Alternative to flashinfer |
-| `cuda,nccl,graph` | V100 (SM70), no flash attention |
+| `cuda,nccl,flashinfer,cutlass` | SM80+ (Ampere/Ada/Hopper), recommended |
+| `cuda,nccl,flashattn,cutlass` | Alternative to flashinfer |
+| `cuda,nccl` | V100 (SM70), no flash attention |
 | `metal` | macOS Apple Silicon |
 
 ### Server flags
@@ -292,7 +292,7 @@ Include for each model:
 | `--m <hf_id>` | HuggingFace model ID (auto-downloads) |
 | `--d <ids>` | GPU device IDs (e.g. `0` or `0,1`) |
 | `--port <n>` | API server port |
-| `--prefix-cache` | Enable automatic prefix caching |
+| `--disable-prefix-cache` | Disable prefix caching (on by default) |
 | `--ui-server` | Enable built-in ChatGPT-like web UI |
 | `--isq <fmt>` | In-situ quantization (q2k, q3k, q4k, q5k, q6k, q8_0) |
-| `--fp8-kvcache` | Enable FP8 KV cache (all backends, flashinfer SM80+) |
+| `--kvcache-dtype <mode>` | KV cache quantization: fp8, turbo8, turbo4, turbo3 |

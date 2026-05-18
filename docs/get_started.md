@@ -4,14 +4,14 @@ This guide walks through building and running vLLM.rs across CUDA/Metal, differe
 
 ## Build & features
 - **Backends**: `--features cuda[,nccl,graph,flashinfer,cutlass]` or `--features metal`. CPU-only is supported but slow.
-- **Quant/accel toggles**: `--fp8-kvcache` (FP8 KV cache, works with all backends including flashinfer on SM80+), `flashattn` or `flashinfer` (Ampere+), `--prefix-cache` (prefix KV reuse).
+- **Quant/accel toggles**: `--kvcache-dtype fp8|turbo8|turbo4|turbo3` (KV cache quantization), `flashattn` or `flashinfer` (Ampere+), `--prefix-cache` (prefix KV reuse).
 - **Python bindings**: add feature `python` when building wheels (`./build.sh --features python`).
 
 ### Build (CUDA)
 ```shell
 # Remove `nccl` for single-gpu usage
 # Remove `flashattn`, `flashinfer` and `cutlass` for V100 or older hardware
-./build.sh --release --features cuda,nccl,graph,flashinfer,cutlass
+./build.sh --release --features cuda,nccl,flashinfer,cutlass
 ```
 
 ### Build (Metal)
@@ -30,7 +30,7 @@ cargo build --release --features metal
 - **CUDA text model (chat/server)**  
   ```bash
   target/release/vllm-rs --m Qwen/Qwen2.5-7B-Instruct --max-model-len 131072 \
-    --kv-fraction 0.6 --prefix-cache --ui-server
+    --kv-fraction 0.6 --ui-server
   ```
 - **Metal (Mac) text model**  
   ```bash
@@ -38,20 +38,17 @@ cargo build --release --features metal
   ```
 - **GGUF quantized**  
   ```bash
-  target/release/vllm-rs --f /path/model-Q4_K_M.gguf --max-model-len 65536 --prefix-cache
-  ```
+  target/release/vllm-rs --f /path/model-Q4_K_M.gguf --max-model-len 65536  ```
 - **Embeddings** (same server; OpenAI `/v1/embeddings`)  
   ```bash
-  target/release/vllm-rs --m Qwen/Qwen2.5-7B-Instruct --prefix-cache
-  # curl -d '{"input":"hello","embedding_type":"mean"}' http://localhost:8000/v1/embeddings
+  target/release/vllm-rs --m Qwen/Qwen2.5-7B-Instruct  # curl -d '{"input":"hello","embedding_type":"mean"}' http://localhost:8000/v1/embeddings
   ```
 - **Multimodal**  
   ```bash
   # Update image in the Chat UI
-  target/release/vllm-rs --m Qwen/Qwen3-VL-8B-Instruct --ui-server --prefix-cache
-  ```
+  target/release/vllm-rs --m Qwen/Qwen3-VL-8B-Instruct --ui-server  ```
 
-Common runtime knobs: `--max-model-len`, `--max-num-seqs`, `--kv-fraction` (CUDA KV share), `--cpu-mem-fold` (CPU swap ratio), `--port`, `--fp8-kvcache`, `--prefix-cache`, `--prefix-cache-max-tokens`, `--ui-server`, `--batch` (perf test).
+Common runtime knobs: `--max-model-len`, `--max-num-seqs`, `--kv-fraction` (CUDA KV share), `--cpu-mem-fold` (CPU swap ratio), `--port`, `--kvcache-dtype` (fp8/turbo8/turbo4/turbo3), `--prefix-cache`, `--prefix-cache-max-tokens`, `--ui-server`, `--batch` (perf test).
 
 Reasoning defaults to enabled when a request omits `thinking` / `enable_thinking`. Use `--disable-reasoning` on the Rust CLI to make the default be disabled instead; explicit request values still override the server default.
 
@@ -60,23 +57,21 @@ Reasoning defaults to enabled when a request omits `thinking` / `enable_thinking
   ```bash
   target/release/vllm-rs --m Qwen/Qwen3-30B-A3B-Instruct-2507 --d 0,1 --max-num-seqs 2 --kv-fraction 0.5
   ```
-- **Graph capture (Ampere+)**: add `--features graph,flashinfer` for fastest long-context prefill/decoding (compilation time increases).
+- **Graph capture**: CUDA graph is auto-enabled with `cuda` feature. Use `--disable-cuda-graph` at runtime to skip graph capture.
 
 ## 5) PD Disaggregation (prefill/decoding split)
 - **PD server (prefill host, usually memory-rich)**  
   ```bash
   target/release/vllm-rs --pd-server --port 8000 \
-    --m Qwen/Qwen3-30B-A3B-Instruct-2507 --prefix-cache
-  ```
+    --m Qwen/Qwen3-30B-A3B-Instruct-2507  ```
 - **PD client (decode host)**  
   ```bash
   target/release/vllm-rs --server --pd-client --pd-url 0.0.0.0:8000 \
-    --m Qwen/Qwen3-30B-A3B-Instruct-2507 --prefix-cache
-  ```
+    --m Qwen/Qwen3-30B-A3B-Instruct-2507  ```
 - Same weights/config on both ends; Local IPC used automatically on same node CUDA, TCP when `--pd-url` is set. Monitor logs for transfer and swap events.
 
 ## Prefix cache
-- Enable with `--prefix-cache` (CUDA/Metal). Prefix reuse is automatic; no `session_id` required.
+- Enabled by default (CUDA/Metal). Disable with `--disable-prefix-cache`. Prefix reuse is automatic; no `session_id` required.
 - Use `--prefix-cache-max-tokens` to cap the cache size (rounded down to block size).
 - Tune `--max-model-len`, `--kv-fraction`, `--cpu-mem-fold`; avoid overcommitting KV or cache will swap/evict.
 
@@ -89,7 +84,7 @@ Reasoning defaults to enabled when a request omits `thinking` / `enable_thinking
 ## Troubleshooting & tuning
 - Use `--log` to view loading/progress; watch for “swap” messages (KV pressure).
 - If OOM on Metal, lower `--max-model-len` and batch; on CUDA, reduce `--kv-fraction` or `--max-num-seqs`.
-- For GGUF/ISQ, keep `--max-num-seqs` moderate to avoid bandwidth bottlenecks; `--fp8-kvcache` is supported on all CUDA GPUs (SM70+) and Metal.
+- For GGUF/ISQ, keep `--max-num-seqs` moderate to avoid bandwidth bottlenecks; `--kvcache-dtype fp8` is supported on all CUDA GPUs (SM70+) and Metal.
 - Use the chat logger to monitor detailed interactions between client and vLLM.rs.
 
 ```shell

@@ -164,6 +164,7 @@ impl EngineBuilder {
             self.pd_client_prefix_cache_ratio,
             self.yarn_scaling_factor,
             false,
+            false,
         );
 
         if let Some(kv_dtype) = self.kvcache_dtype {

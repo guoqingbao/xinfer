@@ -149,7 +149,7 @@ Present guided decoding from the simplest use case to the most constrained one.
 
 ### Running the server
 ```shell
-./run.sh --features cuda,nccl,graph,flashinfer,cutlass --release --m Qwen/Qwen3.5-35B-A3B-FP8/ --ui-server --d 0 --prefix-cache
+./run.sh --features cuda,nccl,flashinfer,cutlass --release --m Qwen/Qwen3.5-35B-A3B-FP8/ --ui-server --d 0
 ```
 
 ### Quick map

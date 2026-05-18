@@ -67,14 +67,15 @@ class EngineConfig:
     device_id: Optional[int]
     generation_cfg: Optional[GenerationConfig]
     seed: Optional[int]
-    prefix_cache: Optional[bool]
+    disable_prefix_cache: Optional[bool]
     prefix_cache_max_tokens: Optional[int]
-    fp8_kvcache: Optional[bool]
+    kvcache_dtype: Optional[str]
     server_mode: Optional[bool]
     pd_config: Optional[PdConfig]
     mcp_config: Optional[str]
     mcp_command: Optional[str]
     mcp_args: Optional[str]
+    disable_cuda_graph: Optional[bool]
 
 @dataclass
 class SamplingParams:

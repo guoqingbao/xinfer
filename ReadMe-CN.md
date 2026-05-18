@@ -84,9 +84,16 @@
 
 支持 **Safetensor** (包含GPTQ, AWQ, MXFP4, NVFP4, FP8-blockwise 量化格式) 和 **GGUF** 格式。
 
-所有模型均支持FP8 KvCache加速（`--fp8-kvcache`），兼容所有注意力后端：`flashinfer`（SM80+）、`flashattn`、以及 Paged Attention（V100/SM70+）。
+所有模型均支持通过统一的 `--kvcache-dtype` 参数进行KV缓存量化：
 
-所有模型还支持 **TurboQuant KV缓存压缩**（`--kvcache-dtype turbo4` / `turbo3` / `turbo8`），通过Walsh-Hadamard变换和逐头absmax量化实现2-4位KV缓存压缩，大幅降低显存占用。
+| 模式 | Key精度 | Value精度 | 压缩比 | 后端 | 说明 |
+|------|---------|----------|--------|------|------|
+| `fp8` | FP8 | FP8 | 2x | FlashInfer / Paged / Metal | 所有GPU（SM70+）及Metal |
+| `turbo8` | FP8 | 4位 | 2.6x | 原生Flash | 最高质量TurboQuant |
+| `turbo4` | 4位 | 4位 | 3.7x | 原生Flash | 速度与显存最佳平衡 |
+| `turbo3` | 3位 | 4位 | 4.7x | 原生Flash | 最大压缩比 |
+
+TurboQuant模式（`turbo8`/`turbo4`/`turbo3`）使用Walsh-Hadamard变换旋转和逐头absmax量化实现KV缓存压缩。**注意：** MLA模型（GLM4.7 Flash、DeepSeek）使用压缩KV缓存布局，不兼容TurboQuant；这些模型支持 `fp8` 模式。
 
 ---
 ## 📚 文档
@@ -148,18 +155,15 @@ python3 -m pip install vllm_rs
 
   ```bash
   # CUDA
-  python3 -m vllm_rs.server --m unsloth/Qwen3.5-27B-GGUF --f Qwen3.5-27B-Q4_K_M.gguf --ui-server --prefix-cache
-  # Metal/MacOS (MacOS Tahoe之前的系统可能会存在生成过慢问题)
-  python3 -m vllm_rs.server --m unsloth/Qwen3.5-4B-GGUF --f Qwen3.5-4B-Q3_K_M.gguf --ui-server --prefix-cache
-   ```
+  python3 -m vllm_rs.server --m unsloth/Qwen3.5-27B-GGUF --f Qwen3.5-27B-Q4_K_M.gguf --ui-server  # Metal/MacOS (MacOS Tahoe之前的系统可能会存在生成过慢问题)
+  python3 -m vllm_rs.server --m unsloth/Qwen3.5-4B-GGUF --f Qwen3.5-4B-Q3_K_M.gguf --ui-server   ```
   </details>
 
    <details open>
     <summary>多卡 + 本地GGUF模型</summary>
 
    ```bash
-   python3 -m vllm_rs.server --f /path/Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf --d 0,1 --ui-server --prefix-cache
-   ```
+   python3 -m vllm_rs.server --f /path/Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf --d 0,1 --ui-server   ```
   </details>
 
   </details>
@@ -169,8 +173,7 @@ python3 -m pip install vllm_rs
 
    ```bash
    # 同时将权重量化为Q4K格式，启用最长上下文：
-   python3 -m vllm_rs.server --w /path/Qwen3.5-122B-A10B --isq q4k --d 0,1 --port 8000 --max-model-len 262144 --max-num-seqs 1 --ui-server --prefix-cache
-   ```
+   python3 -m vllm_rs.server --w /path/Qwen3.5-122B-A10B --isq q4k --d 0,1 --port 8000 --max-model-len 262144 --max-num-seqs 1 --ui-server   ```
   </details>
 
 
@@ -180,20 +183,17 @@ python3 -m pip install vllm_rs
 _FP8-Blockwise格式:_
 ```bash
 # CUDA (MoE, Dense) sm90+ 设备需打开`cutlass`特性以支持FP8硬件加速
-python3 -m vllm_rs.server --m Qwen/Qwen3.6-27B-FP8 --ui-server --prefix-cache --fp8-kvcache
+python3 -m vllm_rs.server --m Qwen/Qwen3.6-27B-FP8 --ui-server --kvcache-dtype fp8
 # MacOS/Metal (Dense)
-python3 -m vllm_rs.server --m Qwen/Qwen3-4B-Instruct-2507-FP8 --ui-server --prefix-cache
-```
+python3 -m vllm_rs.server --m Qwen/Qwen3-4B-Instruct-2507-FP8 --ui-server```
 
 _MXFP4 格式:_
 ```bash
-python3 -m vllm_rs.server --m olka-fi/Qwen3.5-4B-MXFP4 --ui-server --prefix-cache
-```
+python3 -m vllm_rs.server --m olka-fi/Qwen3.5-4B-MXFP4 --ui-server```
 
 _NVFP4 格式:_
 ```bash
-python3 -m vllm_rs.server --m unsloth/Qwen3.6-27B-NVFP4 --ui-server --prefix-cache
-```
+python3 -m vllm_rs.server --m unsloth/Qwen3.6-27B-NVFP4 --ui-server```
   </details>
 
 <details open>
@@ -201,8 +201,7 @@ python3 -m vllm_rs.server --m unsloth/Qwen3.6-27B-NVFP4 --ui-server --prefix-cac
 
 ```bash
 # 使用内置ChatUI上传或提及图片url (格式 '.bmp', '.gif', '.jpeg', '.png', '.tiff', or '.webp')
-python3 -m vllm_rs.server --m Qwen/Qwen3.5-35B-A3B-FP8 --ui-server --prefix-cache
-```
+python3 -m vllm_rs.server --m Qwen/Qwen3.5-35B-A3B-FP8 --ui-server```
 
   <details>
     <summary>运行GPTQ/AWQ Marlin兼容模型</summary>
@@ -226,10 +225,10 @@ python3 -m vllm_rs.server --w /home/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4-Marlin
 ```bash
 cd vllm.rs
 # 将 `sm_80` 更改至你当前的硬件特性，如 sm_75 (V100), sm_80 (A100), sm_86 (RTX4090), sm_90 (Hopper), sm_100/sm_120 (Blackwell); 将 CUDA 版本号 `12.9.0` 更改为与当前主机驱动匹配的版本; 将最后一个参数 `0` 更改为 `1` 启用Rust中国区镜像（适用于中国大陆）
-./build_docker.sh "cuda,nccl,graph,flashinfer,cutlass,python" sm_80 12.9.0 0
+./build_docker.sh "cuda,nccl,flashinfer,cutlass,python" sm_80 12.9.0 0
 
 # 还可以使用 `flash attention` 后端, 以及传入 `--prod` 以构建生产镜像
-./build_docker.sh --prod "cuda,nccl,graph,flashattn,cutlass,python" sm_90 13.0.0
+./build_docker.sh --prod "cuda,nccl,flashattn,cutlass,python" sm_90 13.0.0
 ```
    </details>
 
@@ -269,10 +268,10 @@ apt-get install -y libnccl2 libnccl-dev
 # V100及较老的机型(SM70)去掉 `flashattn/flashinfer` 和 `cutlass`特性
 # SM80+(A100, RTX4090, H100等)推荐使用flashinfer，支持FP8 KVCache
 # 默认安装进/usr/local/bin，使用`--dst`更改安装目录
-./build.sh --install --features cuda,nccl,graph,flashinfer,cutlass
+./build.sh --install --features cuda,nccl,flashinfer,cutlass
 
 # 使用Flash Attention后端
-./build.sh --install --features cuda,nccl,graph,flashattn,cutlass
+./build.sh --install --features cuda,nccl,flashattn,cutlass
 ```
   </details>
 
@@ -305,7 +304,7 @@ cargo install --features metal
     <summary>多卡未量化模型</summary>
 
    ```bash
-   vllm-rs --d 0,1 --w /path/Qwen3-30B-A3B-Instruct-2507 --ui-server --prefix-cache --fp8-kvcache
+   vllm-rs --d 0,1 --w /path/Qwen3-30B-A3B-Instruct-2507 --ui-server --kvcache-dtype fp8
    ```
   </details>
 
@@ -314,40 +313,35 @@ cargo install --features metal
 
   _FP8格式:_
    ```bash
-   vllm-rs --d 0,1 --w /path/Qwen3-Coder-30B-A3B-Instruct-FP8/ --ui-server --prefix-cache --fp8-kvcache
+   vllm-rs --d 0,1 --w /path/Qwen3-Coder-30B-A3B-Instruct-FP8/ --ui-server --kvcache-dtype fp8
     # Or Qwen3.6-27B-FP8 / Qwen3.6-35B-A3B-FP8
-   vllm-rs --m Qwen/Qwen3-Coder-Next-FP8 --ui-server --d 0,1 --prefix-cache
-   ```
+   vllm-rs --m Qwen/Qwen3-Coder-Next-FP8 --ui-server --d 0,1   ```
 
   _MXFP4格式 (CUDA):_
   ```bash
-  vllm-rs --m olka-fi/Qwen3.5-4B-MXFP4 --ui-server --prefix-cache
-  ```
+  vllm-rs --m olka-fi/Qwen3.5-4B-MXFP4 --ui-server  ```
 
   _NVFP4格式:_
   ```bash
-vllm-rs --m unsloth/Qwen3.6-27B-NVFP4 --ui-server --prefix-cache
-# MacOS/Metal
-vllm-rs --m AxionML/Qwen3.5-2B-NVFP4 --ui-server --prefix-cache
-  ```
+vllm-rs --m unsloth/Qwen3.6-27B-NVFP4 --ui-server# MacOS/Metal
+vllm-rs --m AxionML/Qwen3.5-2B-NVFP4 --ui-server  ```
   </details>
 
    <details open>
     <summary>多卡量化模型</summary>
 
    ```bash
-   vllm-rs --ui-server --d 0,1 --f /path/Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf --prefix-cache
-   ```
+   vllm-rs --ui-server --d 0,1 --f /path/Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf   ```
   </details>
 
    <details open>
-    <summary>未量化模型运行为Q4K量化模型，同时使用FP8 KVCache</summary>
+    <summary>未量化模型运行为Q4K量化模型，同时使用KV缓存量化</summary>
 
    ```bash
-   # 使用flashinfer后端（SM80+推荐）
-   vllm-rs --d 0,1 --w /path/Qwen3-30B-A3B-Instruct-2507 --isq q4k --server --port 8000 --fp8-kvcache
-   # V100/SM70+ 使用paged attention后端
-   # 编译时去除`flashinfer` 和 `flashattn`
+   # 使用flashinfer后端（SM80+推荐）+ FP8 KV缓存
+   vllm-rs --d 0,1 --w /path/Qwen3-30B-A3B-Instruct-2507 --isq q4k --server --port 8000 --kvcache-dtype fp8
+   # 使用TurboQuant KV缓存（turbo4: 3.7x压缩比）
+   vllm-rs --d 0,1 --w /path/Qwen3-30B-A3B-Instruct-2507 --isq q4k --server --port 8000 --kvcache-dtype turbo4
    ```
   </details>
 
@@ -367,7 +361,7 @@ vLLM.rs 现在支持通过 llguidance 库实现结构化输出和约束生成：
 通过Model Context Protocol让LLM调用外部工具。
 
 ```bash
-python3 -m vllm_rs.server --m unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF --f Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf --ui-server --prefix-cache --mcp-config ./mcp.json
+python3 -m vllm_rs.server --m unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF --f Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf --ui-server --mcp-config ./mcp.json
 ```
 查看 [**MCP文档 →**](docs/mcp_tool_calling.md)
 
@@ -443,16 +437,16 @@ pip install maturin[patchelf]  # Linux/Windows 平台
 
 ```bash
 # Naive CUDA (不带NCCL，只能用于单卡推理) 
-maturin build --release --features cuda,graph,python
+maturin build --release --features cuda,python
 
 # CUDA Paged Attention（V100/SM70+，支持FP8 KV Cache）
-./build.sh --release --features cuda,nccl,graph,python
+./build.sh --release --features cuda,nccl,python
 
 # CUDA FlashInfer后端（SM80+，支持FP8 KV Cache）
-./build.sh --release --features cuda,nccl,graph,flashinfer,cutlass,python
+./build.sh --release --features cuda,nccl,flashinfer,cutlass,python
 
 # CUDA Flash Attention后端
-./build.sh --release --features cuda,nccl,graph,flashattn,cutlass,python
+./build.sh --release --features cuda,nccl,flashattn,cutlass,python
 
 # macOS（Metal，支持FP8 KV Cache，但不支持多GPU推理）
 maturin build --release --features metal,python
@@ -487,16 +481,16 @@ pip install target/wheels/vllm_rs-*-cp38-abi3-*.whl --force-reinstall
 | `--frequency-penalty` | 频率惩罚，控制模型是否减少`高频重复词`的出现。<br> 数值范围 [-2, 2]，正值越大 → 重复次数越多的词惩罚越强；负值 → 越鼓励重复使用同一词 |
 | `--server`       | 显式启动API服务（未指定 `--i`、`--prompts` 或 `--batch` 时，这是默认行为）        |
 | `--i`            | 交互式CLI对话模式                                        |
-| `--fp8-kvcache`       | 使用FP8 KV Cache（兼容所有后端：flashinfer SM80+、paged attention V100+、Metal）|
-| `--kvcache-dtype`     | KV缓存量化：`fp8`、`turbo8`（FP8 K + 4位V）、`turbo4`（4位K+V）、`turbo3`（3位K + 4位V）。TurboQuant模式使用原生flash attention。|
+| `--kvcache-dtype`     | KV缓存量化：`fp8`（2x）、`turbo8`（FP8 K + 4位V，2.6x）、`turbo4`（4位K+V，3.7x）、`turbo3`（3位K + 4位V，4.7x）。FP8兼容所有后端；TurboQuant模式使用原生flash attention。|
 | `--cpu-mem-fold`       | CPU KV Cache大小 (与GPU KV Cache的百分比，默认 0.2，取值0.1 - 10.0)              |
 | `--pd-server`       | 使用PD分离模式时，指定当前实例为PD服务器（此服务器仅用于Prefill）            |
 | `--pd-client`       | 使用PD分离模式时，指定当前实例为PD客户端（此客户端将长的上下文Prefill请求发送给PD服务器处理）|
 | `--pd-url`       |  使用PD分离模式时，PD服务器实例如指定pd-url，则通过TCP/IP通信（适用于PD服务器与客户端在不同服务器） |
 | `--ui-server`       |  服务模式: 启动API服务，同时启动ChatGPT风格的内置对话网页服务 |
 | `--kv-fraction`       |  用于控制KVCache使用量 (模型加载后剩余可用GPU显存的百分比) |
-| `--prefix-cache`   | 启用前缀缓存，用于多轮对话 |
+| `--disable-prefix-cache`   | 禁用前缀缓存（默认启用） |
 | `--prefix-cache-max-tokens`   | 限制前缀缓存大小（按 block size 向下取整） |
+| `--disable-cuda-graph`   | 禁用CUDA图捕获（CUDA模式下默认启用） |
 | `--yarn-scaling-factor`       | YARN RoPE缩放因子，用于扩展上下文窗口（例如：`4.0` 扩展4倍上下文） |
 
 ### MCP配置参数

@@ -85,9 +85,16 @@ See [**Full Performance Benchmarks →**](docs/performance.md)
 
 Supports both **Safetensor** (including GPTQ, AWQ, MXFP4, NVFP4, and FP8-blockwise formats) and **GGUF** formats.
 
-All models support FP8 KV-cache acceleration (`--fp8-kvcache`). Works with all attention backends including `flashinfer` (SM80+), `flashattn`, and paged attention (V100/SM70+).
+All models support KV cache quantization via the unified `--kvcache-dtype` flag:
 
-All models also support **TurboQuant KV-cache compression** (`--kvcache-dtype turbo4` / `turbo3` / `turbo8`) for reduced memory usage. Uses the native flash attention backend with Walsh-Hadamard transform and per-head absmax quantization.
+| Mode | Keys | Values | Compression | Backend | Notes |
+|------|------|--------|-------------|---------|-------|
+| `fp8` | FP8 | FP8 | 2x | FlashInfer / Paged / Metal | All GPUs (SM70+) and Metal |
+| `turbo8` | FP8 | 4-bit | 2.6x | Native Flash | Highest quality TurboQuant |
+| `turbo4` | 4-bit | 4-bit | 3.7x | Native Flash | Best speed-memory balance |
+| `turbo3` | 3-bit | 4-bit | 4.7x | Native Flash | Maximum compression |
+
+TurboQuant modes (`turbo8`/`turbo4`/`turbo3`) use Walsh-Hadamard transform rotation and per-head absmax quantization for KV cache compression. **Note:** MLA models (GLM4.7 Flash, DeepSeek) use a compressed KV cache layout incompatible with TurboQuant; `fp8` is supported for these models.
 
 ---
 ## 📚 Guides
@@ -150,10 +157,8 @@ Download the wheel from the [Release Assets](https://github.com/guoqingbao/vllm.
 
 ```bash
 # CUDA
-python3 -m vllm_rs.server --m unsloth/Qwen3.5-27B-GGUF --f Qwen3.5-27B-Q4_K_M.gguf --ui-server --prefix-cache
-# Metal/MacOS (response can be seriously degradated on MacOS pre-Tahoe, use a smaller `--max-model-len` or `--kv-fraction` parameter)
-python3 -m vllm_rs.server --m unsloth/Qwen3.5-4B-GGUF --f Qwen3.5-4B-Q3_K_M.gguf --ui-server --prefix-cache
-```
+python3 -m vllm_rs.server --m unsloth/Qwen3.5-27B-GGUF --f Qwen3.5-27B-Q4_K_M.gguf --ui-server# Metal/MacOS (response can be seriously degradated on MacOS pre-Tahoe, use a smaller `--max-model-len` or `--kv-fraction` parameter)
+python3 -m vllm_rs.server --m unsloth/Qwen3.5-4B-GGUF --f Qwen3.5-4B-Q3_K_M.gguf --ui-server```
 
   </details>
 
@@ -161,7 +166,7 @@ python3 -m vllm_rs.server --m unsloth/Qwen3.5-4B-GGUF --f Qwen3.5-4B-Q3_K_M.gguf
     <summary>Multi-GPU + Safetensors model</summary>
 
 ```bash
-python3 -m vllm_rs.server --m Qwen/Qwen3.5-122B-A10B --d 0,1 --ui-server --prefix-cache --fp8-kvcache
+python3 -m vllm_rs.server --m Qwen/Qwen3.5-122B-A10B --d 0,1 --ui-server --kvcache-dtype fp8
 ```
 
   </details>
@@ -171,8 +176,7 @@ python3 -m vllm_rs.server --m Qwen/Qwen3.5-122B-A10B --d 0,1 --ui-server --prefi
 
 ```bash
 # Load as Q4K format, other options (q2k, q3k, q5k, q6k, q8_0):
-python3 -m vllm_rs.server --w /path/Qwen3.6-35B-A3B --isq q4k --d 0 --ui-server --prefix-cache
-```
+python3 -m vllm_rs.server --w /path/Qwen3.6-35B-A3B --isq q4k --d 0 --ui-server```
 
   </details>
 
@@ -181,19 +185,16 @@ python3 -m vllm_rs.server --w /path/Qwen3.6-35B-A3B --isq q4k --d 0 --ui-server 
 
 _FP8-Blockwise format:_
 ```bash
-python3 -m vllm_rs.server --m Qwen/Qwen3.6-27B-FP8 --ui-server --prefix-cache
-```
+python3 -m vllm_rs.server --m Qwen/Qwen3.6-27B-FP8 --ui-server```
 
 _MXFP4 format:_
 
 ```bash
-python3 -m vllm_rs.server --m olka-fi/Qwen3.5-4B-MXFP4 --ui-server --prefix-cache
-```
+python3 -m vllm_rs.server --m olka-fi/Qwen3.5-4B-MXFP4 --ui-server```
 
 _NVFP4 format:_
 ```bash
-python3 -m vllm_rs.server --m unsloth/Qwen3.6-27B-NVFP4 --ui-server --prefix-cache
-```
+python3 -m vllm_rs.server --m unsloth/Qwen3.6-27B-NVFP4 --ui-server```
 
   </details>
 
@@ -202,8 +203,7 @@ python3 -m vllm_rs.server --m unsloth/Qwen3.6-27B-NVFP4 --ui-server --prefix-cac
 
 ```bash
 # Use the built-in ChatUI to upload images or refer image url (ended with '.bmp', '.gif', '.jpeg', '.png', '.tiff', or '.webp')
-python3 -m vllm_rs.server --m Qwen/Qwen3.6-35B-A3B-FP8 --ui-server --prefix-cache
-```
+python3 -m vllm_rs.server --m Qwen/Qwen3.6-35B-A3B-FP8 --ui-server```
 
   </details>
 
@@ -227,10 +227,10 @@ See [**More Python Examples →**](python/ReadMe.md)
 ```bash
 cd vllm.rs
 # change `sm_80` to your hardware spec, e.g., sm_75 (V100), sm_80 (A100), sm_86 (RTX4096), sm_90 (Hopper), sm_100/sm_120 (Blackwell); change CUDA version `12.9.0` to match your host driver; change last parameter `0` to `1` to enable rust crate mirror (Chinese Mainland)
-./build_docker.sh "cuda,nccl,graph,flashinfer,cutlass,python" sm_80 12.9.0 0
+./build_docker.sh "cuda,nccl,flashinfer,cutlass,python" sm_80 12.9.0 0
 
 # You can also use `flash attention` backend, use `--prod` to build the production image 
-./build_docker.sh --prod "cuda,nccl,graph,flashattn,cutlass,python" sm_90 13.0.0
+./build_docker.sh --prod "cuda,nccl,flashattn,cutlass,python" sm_90 13.0.0
 
 ```
   </details>
@@ -272,10 +272,10 @@ Install vLLM.rs
 # Remove `nccl` for single-gpu usage
 # Add `cutlass` for sm90+ (fp8 models)
 # Use `--dst` to change installation folder
-./build.sh --install --features cuda,nccl,graph,flashinfer,cutlass
+./build.sh --install --features cuda,nccl,flashinfer,cutlass
 
 # Use Flash Attention backend
-./build.sh --install --features cuda,nccl,graph,flashattn,cutlass
+./build.sh --install --features cuda,nccl,flashattn,cutlass
 
 # Remove `flashinfer` or `flashattn` for V100 or older hardware
 ```
@@ -301,17 +301,15 @@ By default, vllm-rs starts in **API server mode** on port 8000. Use `--i` for in
 
   ```bash
   # CUDA
-  vllm-rs --m unsloth/Qwen3.5-27B-GGUF --f Qwen3.5-27B-Q4_K_M.gguf --ui-server --prefix-cache
-  # Metal/MacOS
-  vllm-rs --m unsloth/Qwen3.5-4B-GGUF --f Qwen3.5-4B-Q3_K_M.gguf --ui-server --prefix-cache
-  ```
+  vllm-rs --m unsloth/Qwen3.5-27B-GGUF --f Qwen3.5-27B-Q4_K_M.gguf --ui-server  # Metal/MacOS
+  vllm-rs --m unsloth/Qwen3.5-4B-GGUF --f Qwen3.5-4B-Q3_K_M.gguf --ui-server  ```
 
   <details open>
     <summary>Multi-GPU + Unquantized Model</summary>
 
   ```bash
   # Replace "--ui-server" with "--server" will only start API server
-  vllm-rs --d 0,1 --m Qwen/Qwen3-30B-A3B-Instruct-2507 --ui-server --prefix-cache --fp8-kvcache
+  vllm-rs --d 0,1 --m Qwen/Qwen3-30B-A3B-Instruct-2507 --ui-server --kvcache-dtype fp8
   ```
 
   </details>
@@ -320,8 +318,7 @@ By default, vllm-rs starts in **API server mode** on port 8000. Use `--i` for in
     <summary>Multi-GPU + GGUF Model</summary>
 
   ```bash
-  vllm-rs --d 0,1 --f /path/Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf --ui-server --prefix-cache
-  ```
+  vllm-rs --d 0,1 --f /path/Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf --ui-server  ```
 
   </details>
 
@@ -331,34 +328,29 @@ By default, vllm-rs starts in **API server mode** on port 8000. Use `--i` for in
 _FP8-Blockwise format:_
 ```bash
 # CUDA (MoE, Dense), be sure to enable `cutlass` feature on sm90+
-vllm-rs --m Qwen/Qwen3.6-27B-FP8 --ui-server --prefix-cache
-# Or Qwen3-Next 80B
-vllm-rs --m Qwen/Qwen3-Coder-Next-FP8 --ui-server --d 0,1 --prefix-cache --fp8-kvcache
+vllm-rs --m Qwen/Qwen3.6-27B-FP8 --ui-server# Or Qwen3-Next 80B
+vllm-rs --m Qwen/Qwen3-Coder-Next-FP8 --ui-server --d 0,1 --kvcache-dtype fp8
 # MacOS/Metal
-vllm-rs --m Qwen/Qwen3.5-4B-FP8 --ui-server --prefix-cache
-```
+vllm-rs --m Qwen/Qwen3.5-4B-FP8 --ui-server```
 
 _MXFP4 format (CUDA):_
 ```bash
-vllm-rs --m olka-fi/Qwen3.5-4B-MXFP4 --ui-server --prefix-cache
-```
+vllm-rs --m olka-fi/Qwen3.5-4B-MXFP4 --ui-server```
 
 _NVFP4 format:_
 ```bash
-vllm-rs --m unsloth/Qwen3.6-27B-NVFP4 --ui-server --prefix-cache
-# MacOS/Metal
-vllm-rs --m AxionML/Qwen3.5-2B-NVFP4 --ui-server --prefix-cache
-```
+vllm-rs --m unsloth/Qwen3.6-27B-NVFP4 --ui-server# MacOS/Metal
+vllm-rs --m AxionML/Qwen3.5-2B-NVFP4 --ui-server```
   </details>
 
   <details open>
-    <summary>ISQ model + FP8 KvCache</summary>
+    <summary>ISQ model + FP8/TurboQuant KvCache</summary>
 
   ```bash
-  # CUDA with flashinfer (SM80+, recommended)
-  ./run.sh --release --features cuda,nccl,graph,flashinfer,cutlass --d 0 --m Qwen/Qwen3.6-35B-A3B --isq q4k --fp8-kvcache
-  # CUDA without flashinfer (V100/SM70+, uses paged attention)
-  ./run.sh --release --features cuda,nccl,graph,cutlass --d 0 --m Qwen/Qwen3.6-35B-A3B --isq q4k --fp8-kvcache
+  # CUDA with flashinfer (SM80+, recommended) + FP8 KV cache
+  ./run.sh --release --features cuda,nccl,flashinfer,cutlass --d 0 --m Qwen/Qwen3.6-35B-A3B --isq q4k --kvcache-dtype fp8
+  # CUDA with TurboQuant KV cache (turbo4: 3.7x compression)
+  ./run.sh --release --features cuda,nccl,flashinfer,cutlass --d 0 --m Qwen/Qwen3.6-35B-A3B --isq q4k --kvcache-dtype turbo4
   # MacOS/Metal
   vllm-rs --ui-server --w /path/Qwen3-4B --isq q6k
   ```
@@ -368,27 +360,21 @@ vllm-rs --m AxionML/Qwen3.5-2B-NVFP4 --ui-server --prefix-cache
   <details open>
     <summary>TurboQuant KV Cache (2-4 bit compression)</summary>
 
-  TurboQuant compresses the KV cache using Walsh-Hadamard transform rotation and per-head absmax quantization, significantly reducing KV cache memory. Uses the native flash attention backend (built with `flash` feature).
+  TurboQuant compresses the KV cache using Walsh-Hadamard transform rotation and per-head absmax quantization, significantly reducing KV cache memory. Uses the native flash attention backend (requires `flash` feature, automatically included when building with `graph`).
 
   ```bash
-  # Build with native flash attention
-  ./build.sh --install --features cuda,nccl,flash,cutlass,graph
+  # turbo4: 4-bit K + 4-bit V — best balance of speed and memory (3.7x compression)
+  vllm-rs --m Qwen/Qwen3.6-27B-FP8 --kvcache-dtype turbo4 --ui-server
+  # turbo3: 3-bit K + 4-bit V — maximum compression (4.7x)
+  vllm-rs --m Qwen/Qwen3.6-27B-FP8 --kvcache-dtype turbo3 --ui-server
+  # turbo8: FP8 K + 4-bit V — highest quality, moderate compression (2.6x)
+  vllm-rs --m Qwen/Qwen3.6-27B-FP8 --kvcache-dtype turbo8 --ui-server  ```
 
-  # turbo4: 4-bit K + 4-bit V (best balance of speed and memory)
-  vllm-rs --m Qwen/Qwen3.6-27B-FP8 --kvcache-dtype turbo4 --ui-server --prefix-cache
-
-  # turbo3: 3-bit K + 4-bit V (maximum compression)
-  vllm-rs --m Qwen/Qwen3.6-27B-FP8 --kvcache-dtype turbo3 --ui-server --prefix-cache
-
-  # turbo8: FP8 K + 4-bit V (highest quality, moderate compression)
-  vllm-rs --m Qwen/Qwen3.6-27B-FP8 --kvcache-dtype turbo8 --ui-server --prefix-cache
-  ```
-
-  | Mode | K precision | V precision | Memory savings | Quality |
-  |------|------------|------------|----------------|---------|
-  | `turbo8` | FP8 (8-bit) | 4-bit | ~40% | Highest |
-  | `turbo4` | 4-bit | 4-bit | ~75% | Good |
-  | `turbo3` | 3-bit | 4-bit | ~80% | Acceptable |
+  | Mode | K precision | V precision | Compression ratio | Quality |
+  |------|------------|------------|-------------------|---------|
+  | `turbo8` | FP8 (8-bit) | 4-bit | 2.6x | Highest |
+  | `turbo4` | 4-bit | 4-bit | 3.7x | Good |
+  | `turbo3` | 3-bit | 4-bit | 4.7x | Acceptable |
 
   </details>
 
@@ -409,7 +395,7 @@ Enable LLMs to call external tools via Model Context Protocol.
 
 ```bash
 # Start with multiple mcp servers
-python3 -m vllm_rs.server --m unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF --f Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf --ui-server --prefix-cache --mcp-config ./mcp.json
+python3 -m vllm_rs.server --m unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF --f Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf --ui-server --mcp-config ./mcp.json
 ```
 
 See [**MCP Documentation →**](docs/mcp_tool_calling.md)
@@ -537,13 +523,13 @@ pip install maturin[patchelf]  # For Linux/Windows
 maturin build --release --features cuda,python
 
 # CUDA with Paged Attention (V100/SM70+, FP8 KV Cache supported)
-./build.sh --release --features cuda,nccl,graph,python
+./build.sh --release --features cuda,nccl,python
 
 # CUDA with Flash Attention backend
-./build.sh --release --features cuda,nccl,graph,flashattn,cutlass,python
+./build.sh --release --features cuda,nccl,flashattn,cutlass,python
 
 # CUDA with FlashInfer backend (SM80+, FP8 KV Cache supported)
-./build.sh --release --features cuda,nccl,graph,flashinfer,cutlass,python
+./build.sh --release --features cuda,nccl,flashinfer,cutlass,python
 
 # macOS (Metal, single GPU only, FP8 KV Cache supported)
 maturin build --release --features metal,python
@@ -578,16 +564,16 @@ pip install target/wheels/vllm_rs-*-cp38-abi3-*.whl --force-reinstall
 | `--frequency-penalty` | Frequency penalty, controls whether the model reduces the probability of `tokens that appear too often`. <br> Range [-2, 2]. Higher positive values → stronger penalty for frequently repeated tokens; negative values → encourages more repetition |
 | `--server`       | Explicitly start API server (this is the default when no `--i`, `--prompts`, or `--batch` is given)        |
 | `--i`            | Interactive CLI chat mode                                        |
-| `--fp8-kvcache`       | Use FP8 KV Cache (works with all backends: flashinfer on SM80+, paged attention on V100+, Metal) |
-| `--kvcache-dtype`     | KV cache quantization: `fp8`, `turbo8` (FP8 K + 4-bit V), `turbo4` (4-bit K+V), `turbo3` (3-bit K + 4-bit V). TurboQuant modes use native flash attention. |
+| `--kvcache-dtype`     | KV cache quantization: `fp8` (2x), `turbo8` (FP8 K + 4-bit V, 2.6x), `turbo4` (4-bit K+V, 3.7x), `turbo3` (3-bit K + 4-bit V, 4.7x). FP8 works with all backends; TurboQuant modes use native flash attention. |
 | `--cpu-mem-fold`       | The percentage of CPU KVCache memory size compare to GPU (default 0.2, range from 0.1 to 10.0)              |
 | `--pd-server`       | When using PD Disaggregation, specify the current instance as the PD server (this server is only used for Prefill) |
 | `--pd-client`       | When using PD Disaggregation, specify the current instance as the PD client (this client sends long-context Prefill requests to the PD server for processing) |
 | `--pd-url`          | PD communication URL: `tcp://host:port` or `http://host:port` for remote TCP, `file:///path` for filesystem socket (containers), or omit for local IPC |
 | `--ui-server`       |  server mode: start the API server and also start the ChatGPT-like web server |
 | `--kv-fraction`       |  control kvcache usage (percentage of remaining gpu memory after model loading) |
-| `--prefix-cache`   | Enable prefix caching for multi-turn conversations |
+| `--disable-prefix-cache`   | Disable prefix caching (enabled by default) |
 | `--prefix-cache-max-tokens`   | Cap prefix cache size in tokens (rounded down to block size) |
+| `--disable-cuda-graph`   | Disable CUDA graph capture (enabled by default with CUDA) |
 | `--yarn-scaling-factor`       | YARN RoPE scaling factor for context extension (e.g., `4.0` extends 4x context) |
 
 ### MCP Configuration

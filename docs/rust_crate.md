@@ -115,5 +115,5 @@ fn main() -> candle_core::Result<()> {
 
 ```shell
 # add `nccl` feature for multirank inference (and copy `runner` (which is built with build.sh) to your target path)
-cargo run --release --features cuda,graph
+cargo run --release --features cuda
 ```

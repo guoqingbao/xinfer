@@ -9,10 +9,10 @@ This repository provides a Docker image for **vLLM-rs**, a high-performance infe
 The image is built with the following features enabled by default:
 
 ```text
-cuda,nccl,graph,python,flashinfer,cutlass
+cuda,nccl,python,flashinfer,cutlass
 ```
 
-Graph capture is enabled by default; remove `graph` if you don't want it (or if your GPU does not support it).
+CUDA graph capture is auto-enabled with `cuda`; use `--disable-cuda-graph` at runtime to skip it.
 `flashinfer` or `flashattn` increases build time but improves long-context prefill/decoding performance.
 
 For V100, remove `flashattn` or `flashinfer`, and `cutlass`.
@@ -32,7 +32,7 @@ To build this Docker image locally, choose the feature list, compute capability 
 Build from script:
 
 ```bash
-./build_docker.sh "cuda,nccl,graph,flashinfer,python" sm_80 12.9.0
+./build_docker.sh "cuda,nccl,flashinfer,python" sm_80 12.9.0
 ```
 
 Build from command line:
@@ -42,7 +42,7 @@ docker build --network=host -f "Dockerfile" -t "vllm-rs:latest" \
   --build-arg CUDA_VERSION="12.9.0" \
   --build-arg UBUNTU_VERSION="22.04" \
   --build-arg CUDA_FLAVOR="cudnn-devel" \
-  --build-arg WITH_FEATURES="cuda,nccl,graph,flashinfer,python" \
+  --build-arg WITH_FEATURES="cuda,nccl,flashinfer,cutlass,python" \
   --build-arg CUDA_COMPUTE_CAP="sm_80" \
   # --build-arg CHINA_MIRROR="0" \ Use Rust crate mirror in Chinese mainland
   .

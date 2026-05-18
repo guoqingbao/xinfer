@@ -9,16 +9,15 @@ xbot -> vLLM.rs (OpenAI-compatible)
 ## 1) Start vLLM.rs (at port 8000)
 
 ```bash
-./run --release --features cuda,nccl,graph,flashinfer,cutlass \
-  --m Qwen/Qwen3.6-27B-FP8 \
-  --prefix-cache
+./run --release --features cuda,nccl,flashinfer,cutlass \
+  --m Qwen/Qwen3.6-27B-FP8
 ```
 
 or
 
 ```shell
 # Python
-python3 -m vllm_rs.server --m Qwen/Qwen3.6-27B-FP8 --prefix-cache
+python3 -m vllm_rs.server --m Qwen/Qwen3.6-27B-FP8
 ```
 
 ## 2) Discover the served model name

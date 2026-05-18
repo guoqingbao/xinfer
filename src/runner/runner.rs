@@ -208,13 +208,13 @@ fn main() -> anyhow::Result<()> {
                 init_req.econfig.pd_config
             );
 
-            // Optional warmup
             if !is_pd_server {
-                //No need graph capture for PD server
                 #[cfg(all(feature = "cuda", feature = "graph"))]
                 let arch = init_req.config.architectures.as_ref().unwrap()[0].clone();
                 #[cfg(all(feature = "cuda", feature = "graph"))]
-                if vllm_rs::utils::is_no_cuda_graph_supprt(arch.clone()) {
+                if init_req.econfig.disable_cuda_graph {
+                    vllm_rs::log_info!("CUDA graph capture disabled by --disable-cuda-graph");
+                } else if vllm_rs::utils::is_no_cuda_graph_supprt(arch.clone()) {
                     vllm_rs::log_info!("{arch} does not supprt CUDA graph");
                 } else {
                     match runner.warmup_capture() {

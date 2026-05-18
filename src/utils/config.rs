@@ -375,6 +375,8 @@ pub struct EngineConfig {
     pub yarn_scaling_factor: Option<f64>,
     #[serde(default)]
     pub disable_reasoning: bool,
+    #[serde(default)]
+    pub disable_cuda_graph: bool,
 }
 
 #[cfg(feature = "python")]
@@ -456,6 +458,8 @@ pub struct EngineConfig {
     pub yarn_scaling_factor: Option<f64>,
     #[pyo3(get, set)]
     pub disable_reasoning: bool,
+    #[pyo3(get, set)]
+    pub disable_cuda_graph: bool,
 }
 
 #[cfg(not(feature = "python"))]
@@ -491,6 +495,7 @@ impl EngineConfig {
         pd_client_prefix_cache_ratio: Option<f32>,
         yarn_scaling_factor: Option<f64>,
         disable_reasoning: bool,
+        disable_cuda_graph: bool,
     ) -> Self {
         let mut device_ids = device_ids.unwrap_or_default();
         if device_ids.is_empty() {
@@ -536,6 +541,7 @@ impl EngineConfig {
             pd_client_prefix_cache_ratio,
             yarn_scaling_factor,
             disable_reasoning,
+            disable_cuda_graph,
         }
     }
 }

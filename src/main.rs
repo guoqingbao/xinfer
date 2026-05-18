@@ -153,12 +153,7 @@ async fn main() -> Result<()> {
         None
     };
 
-    let mut prefix_cache = args.prefix_cache;
-
-    if interactive && !args.server && !args.pd_server {
-        // force to use prefix cache in chat mode
-        prefix_cache = true;
-    }
+    let prefix_cache = !args.disable_prefix_cache;
     let tool_prompt_template = if let Some(ref path) = args.tool_prompt {
         let content = std::fs::read_to_string(path).map_err(candle_core::Error::wrap)?;
         let json: serde_json::Value =
@@ -212,6 +207,7 @@ async fn main() -> Result<()> {
         None, // pd_client_prefix_cache_ratio
         args.yarn_scaling_factor,
         args.disable_reasoning,
+        args.disable_cuda_graph,
     );
     econfig.kvcache_dtype = kvcache_dtype;
 

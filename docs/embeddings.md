@@ -5,7 +5,7 @@ This repository now exposes OpenAI-style embeddings for text-only models (Qwen3,
 ## Start the server (embeddings enabled)
 - CUDA example (Qwen3 text):  
   ```bash
-  target/release/vllm-rs --server --m Qwen/Qwen2.5-7B-Instruct --prefix-cache
+  target/release/vllm-rs --server --m Qwen/Qwen2.5-7B-Instruct
   ```
 - Metal example (LLaMa3 text):  
   ```bash

@@ -281,6 +281,19 @@ impl KVCacheAllocator {
             }
         };
 
+        let kvcache_dtype = if is_mla && econfig.kvcache_dtype.is_turboquant() {
+            crate::log_warn!(
+                "TurboQuant ({:?}) is not supported for MLA models (kv_lora_rank={}). \
+                 MLA uses compressed KV cache layout incompatible with TurboQuant. \
+                 Falling back to auto KV cache dtype.",
+                econfig.kvcache_dtype,
+                mla_kv_lora_rank,
+            );
+            crate::utils::config::KvCacheDtype::Auto
+        } else {
+            econfig.kvcache_dtype
+        };
+
         let per_layer_cache_config = match gemma4_per_layer_cache_config(config) {
             Some(configs) if configs.len() == num_kv_layers => Some(configs),
             Some(_) => {
@@ -312,7 +325,7 @@ impl KVCacheAllocator {
             } else {
                 kv_fraction
             },
-            kvcache_dtype: econfig.kvcache_dtype,
+            kvcache_dtype,
             cpu_mem_fold: econfig.cpu_mem_fold.unwrap_or(0.2),
             dtype_size,
             model_dtype_size,
@@ -323,6 +336,10 @@ impl KVCacheAllocator {
             mla_qk_rope_head_dim,
             per_layer_cache_config,
         }
+    }
+
+    pub fn resolved_kvcache_dtype(&self) -> crate::utils::config::KvCacheDtype {
+        self.kvcache_dtype
     }
 
     /// Set per-layer KV cache configuration for models with heterogeneous head dims

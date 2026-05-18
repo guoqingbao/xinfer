@@ -10,9 +10,9 @@ Goose -> vLLM.rs (OpenAI-compatible)
 
 ```bash
 # Rust
-./run.sh --features cuda,nccl,graph,flashinfer,cutlass,graph --release --m Qwen/Qwen3-Coder-Next-FP8 --server --d 0,1 --prefix-cache
+./run.sh --features cuda,nccl,flashinfer,cutlass --release --m Qwen/Qwen3-Coder-Next-FP8 --server --d 0,1
 # Python
-python3 -m vllm_rs.server --m Qwen/Qwen3-30B-A3B-Instruct-2507 --d 0,1 --server --prefix-cache
+python3 -m vllm_rs.server --m Qwen/Qwen3-30B-A3B-Instruct-2507 --d 0,1 --server
 ```
 
 ## 2) Configure Goose

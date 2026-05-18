@@ -278,12 +278,12 @@ impl EngineConfig {
         hf_token=None, hf_token_path=None, enforce_parser=None,
         max_num_seqs=Some(32), config_model_len=None, max_model_len=Some(1024), max_tokens=None,
         isq=None, num_shards=Some(1), device_ids=None,
-        generation_cfg=None, seed=None, prefix_cache=None, prefix_cache_max_tokens=None,
+        generation_cfg=None, seed=None, disable_prefix_cache=false, prefix_cache_max_tokens=None,
         kvcache_dtype=None, server_mode=None, cpu_mem_fold=None, kv_fraction=None, mamba_fraction=None, pd_config=None,
         mcp_command=None, mcp_config=None, mcp_args=None,
         tool_prompt_template=None,
         pd_server_prefix_cache_ratio=None, pd_client_prefix_cache_ratio=None, yarn_scaling_factor=None,
-        disable_reasoning=false,))]
+        disable_reasoning=false, disable_cuda_graph=false,))]
     pub fn new(
         model_id: Option<String>,
         weight_path: Option<String>,
@@ -300,7 +300,7 @@ impl EngineConfig {
         device_ids: Option<Vec<usize>>,
         generation_cfg: Option<GenerationConfig>,
         seed: Option<u64>,
-        prefix_cache: Option<bool>,
+        disable_prefix_cache: bool,
         prefix_cache_max_tokens: Option<usize>,
         kvcache_dtype: Option<String>,
         server_mode: Option<bool>,
@@ -316,6 +316,7 @@ impl EngineConfig {
         pd_client_prefix_cache_ratio: Option<f32>,
         yarn_scaling_factor: Option<f64>,
         disable_reasoning: bool,
+        disable_cuda_graph: bool,
     ) -> Self {
         let mut device_ids = device_ids.unwrap_or_default();
         if device_ids.is_empty() {
@@ -348,7 +349,7 @@ impl EngineConfig {
             device_ids: Some(device_ids),
             generation_cfg,
             seed,
-            prefix_cache,
+            prefix_cache: Some(!disable_prefix_cache),
             prefix_cache_max_tokens,
             kvcache_dtype: if let Some(ref s) = kvcache_dtype {
                 crate::utils::config::KvCacheDtype::from_str_opt(s)
@@ -366,6 +367,7 @@ impl EngineConfig {
             pd_client_prefix_cache_ratio,
             yarn_scaling_factor,
             disable_reasoning,
+            disable_cuda_graph,
         }
     }
 }
