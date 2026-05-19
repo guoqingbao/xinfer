@@ -539,7 +539,7 @@ impl<M: CudaGraphModule> GraphCapturer<M> {
                                 &kv_len_arr_host_bs,
                                 bs,
                                 self.is_mla,
-                                !is_warmup,
+                                true, //must be true for graph capture
                             )?;
                             (dp, mdp, Some(kv_len_arr_host_bs))
                         } else {
@@ -556,7 +556,7 @@ impl<M: CudaGraphModule> GraphCapturer<M> {
                         total_num_rows: None,
                         batch_indices: None,
                         positions: None,
-                        use_cuda_graph: !is_warmup,
+                        use_cuda_graph: true,
                         decode_plan_info,
                         prefill_plan_info: None,
                         mla_decode_plan_info,

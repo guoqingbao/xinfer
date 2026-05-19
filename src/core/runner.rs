@@ -594,7 +594,11 @@ impl ModelRunner {
             econfig.seed.unwrap()
         };
         #[cfg(feature = "flashinfer")]
-        let flashinfer_kv_params = if config.kvcache_dtype.is_turboquant() {
+        let skip_flashinfer_init = config.kvcache_dtype.is_turboquant()
+            || (config.kvcache_dtype.is_fp8_keys()
+                && !attention_rs::has_flashinfer_fp8_kvcache());
+        #[cfg(feature = "flashinfer")]
+        let flashinfer_kv_params = if skip_flashinfer_init {
             None
         } else {
             let mut params = None;
@@ -616,9 +620,9 @@ impl ModelRunner {
             params
         };
         #[cfg(feature = "flashinfer")]
-        if config.kvcache_dtype.is_turboquant() {
+        if skip_flashinfer_init {
             crate::log_info!(
-                "Use native flash backend (TurboQuant {:?} enabled, flashinfer disabled)",
+                "Use native flash backend ({:?} kvcache, flashinfer disabled)",
                 config.kvcache_dtype
             );
         } else {
@@ -1095,7 +1099,9 @@ impl ModelRunner {
             None
         };
 
-        let skip_flashinfer = self.config.kvcache_dtype.is_turboquant();
+        let skip_flashinfer = self.config.kvcache_dtype.is_turboquant()
+            || (self.config.kvcache_dtype.is_fp8_keys()
+                && !attention_rs::has_flashinfer_fp8_kvcache());
         let flashinfer_metadata = if cfg!(feature = "flashinfer") && !skip_flashinfer {
             let mut indptr = vec![0u32];
             let mut indices = Vec::new();
@@ -1251,7 +1257,9 @@ impl ModelRunner {
         I: IntoIterator<Item = &'a S>,
         S: ToDecodeInput + 'a,
     {
-        let skip_flashinfer = self.config.kvcache_dtype.is_turboquant();
+        let skip_flashinfer = self.config.kvcache_dtype.is_turboquant()
+            || (self.config.kvcache_dtype.is_fp8_keys()
+                && !attention_rs::has_flashinfer_fp8_kvcache());
         let mut input_ids = Vec::new();
         let mut positions = Vec::new();
         let mut slot_mapping = Vec::new();
