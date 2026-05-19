@@ -493,6 +493,10 @@ impl<M: CudaGraphModule> GraphCapturer<M> {
         };
         #[cfg(feature = "flashinfer")]
         let skip_flashinfer = attention_rs::get_turboquant_mode().is_some();
+        #[cfg(feature = "flashinfer")]
+        let capture_in_warmup = !skip_flashinfer;
+        #[cfg(not(feature = "flashinfer"))]
+        let capture_in_warmup = false;
 
         let mut outputs = BTreeMap::<usize, Tensor>::new();
         for is_warmup in [true, false] {
@@ -580,7 +584,9 @@ impl<M: CudaGraphModule> GraphCapturer<M> {
                     flashinfer_metadata,
                 };
 
-                self.model.start_capture(bs)?;
+                if !is_warmup || capture_in_warmup {
+                    self.model.start_capture(bs)?;
+                }
                 if is_warmup {
                     let _ = self.model.forward(
                         &input_ids_bs,
@@ -599,7 +605,9 @@ impl<M: CudaGraphModule> GraphCapturer<M> {
                     )?;
                     outputs.insert(bs, out);
                 }
-                self.model.end_capture(!is_warmup)?;
+                if !is_warmup || capture_in_warmup {
+                    self.model.end_capture(!is_warmup)?;
+                }
             }
         }
         let _ = self.model.report_graph_pool_usage();
