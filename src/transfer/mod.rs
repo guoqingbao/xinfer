@@ -278,7 +278,8 @@ impl Transfer {
 
                     let tq_full = matches!(
                         attention_rs::get_turboquant_mode(),
-                        Some(attention_rs::TurboquantMode::Turbo4) | Some(attention_rs::TurboquantMode::Turbo3)
+                        Some(attention_rs::TurboquantMode::Turbo4)
+                            | Some(attention_rs::TurboquantMode::Turbo3)
                     );
                     #[cfg(feature = "cuda")]
                     if !tq_full {
@@ -305,21 +306,42 @@ impl Transfer {
                     if let Some(tq_handles) = tq_layer_handles {
                         for (layer_idx, tq_h) in tq_handles.iter().enumerate() {
                             attention_rs::with_turboquant_layer(layer_idx, |tq, _| -> Result<()> {
-                                let remote_va = cuda_remote::open_ipc_handle_any(&tq_h.v_absmax, local_device)?;
-                                let remote_vq = cuda_remote::open_ipc_handle_any(&tq_h.v_quant, local_device)?;
-                                attention_rs::cache::swap_blocks(&remote_va, &tq.v_absmax, &mapping)?;
-                                attention_rs::cache::swap_blocks(&remote_vq, &tq.v_quant, &mapping)?;
+                                let remote_va =
+                                    cuda_remote::open_ipc_handle_any(&tq_h.v_absmax, local_device)?;
+                                let remote_vq =
+                                    cuda_remote::open_ipc_handle_any(&tq_h.v_quant, local_device)?;
+                                attention_rs::cache::swap_blocks(
+                                    &remote_va,
+                                    &tq.v_absmax,
+                                    &mapping,
+                                )?;
+                                attention_rs::cache::swap_blocks(
+                                    &remote_vq,
+                                    &tq.v_quant,
+                                    &mapping,
+                                )?;
 
-                                if let (Some(ka_handle), Some(local_ka)) = (&tq_h.k_absmax, &tq.k_absmax) {
-                                    let remote_ka = cuda_remote::open_ipc_handle_any(ka_handle, local_device)?;
-                                    attention_rs::cache::swap_blocks(&remote_ka, local_ka, &mapping)?;
+                                if let (Some(ka_handle), Some(local_ka)) =
+                                    (&tq_h.k_absmax, &tq.k_absmax)
+                                {
+                                    let remote_ka =
+                                        cuda_remote::open_ipc_handle_any(ka_handle, local_device)?;
+                                    attention_rs::cache::swap_blocks(
+                                        &remote_ka, local_ka, &mapping,
+                                    )?;
                                 }
-                                if let (Some(kq_handle), Some(local_kq)) = (&tq_h.k_quant, &tq.k_quant) {
-                                    let remote_kq = cuda_remote::open_ipc_handle_any(kq_handle, local_device)?;
-                                    attention_rs::cache::swap_blocks(&remote_kq, local_kq, &mapping)?;
+                                if let (Some(kq_handle), Some(local_kq)) =
+                                    (&tq_h.k_quant, &tq.k_quant)
+                                {
+                                    let remote_kq =
+                                        cuda_remote::open_ipc_handle_any(kq_handle, local_device)?;
+                                    attention_rs::cache::swap_blocks(
+                                        &remote_kq, local_kq, &mapping,
+                                    )?;
                                 }
                                 Ok(())
-                            }).transpose()?;
+                            })
+                            .transpose()?;
                         }
                     }
                 }
@@ -339,7 +361,8 @@ impl Transfer {
 
                     let tq_full = matches!(
                         attention_rs::get_turboquant_mode(),
-                        Some(attention_rs::TurboquantMode::Turbo4) | Some(attention_rs::TurboquantMode::Turbo3)
+                        Some(attention_rs::TurboquantMode::Turbo4)
+                            | Some(attention_rs::TurboquantMode::Turbo3)
                     );
                     if !tq_full {
                         for (i, (k_bytes, v_bytes)) in layer_data.into_iter().enumerate() {
@@ -373,24 +396,41 @@ impl Transfer {
                         for (layer_idx, tq_d) in tq_data.iter().enumerate() {
                             attention_rs::with_turboquant_layer(layer_idx, |tq, _| -> Result<()> {
                                 let va_cpu = super::transfer::bytes_to_tq_cpu_tensor(
-                                    &tq_d.v_absmax, *num_blocks, &tq.v_absmax)?;
+                                    &tq_d.v_absmax,
+                                    *num_blocks,
+                                    &tq.v_absmax,
+                                )?;
                                 let vq_cpu = super::transfer::bytes_to_tq_cpu_tensor(
-                                    &tq_d.v_quant, *num_blocks, &tq.v_quant)?;
+                                    &tq_d.v_quant,
+                                    *num_blocks,
+                                    &tq.v_quant,
+                                )?;
                                 attention_rs::cache::swap_blocks(&va_cpu, &tq.v_absmax, &mapping)?;
                                 attention_rs::cache::swap_blocks(&vq_cpu, &tq.v_quant, &mapping)?;
 
-                                if let (Some(ka_bytes), Some(local_ka)) = (&tq_d.k_absmax, &tq.k_absmax) {
+                                if let (Some(ka_bytes), Some(local_ka)) =
+                                    (&tq_d.k_absmax, &tq.k_absmax)
+                                {
                                     let ka_cpu = super::transfer::bytes_to_tq_cpu_tensor(
-                                        ka_bytes, *num_blocks, local_ka)?;
+                                        ka_bytes,
+                                        *num_blocks,
+                                        local_ka,
+                                    )?;
                                     attention_rs::cache::swap_blocks(&ka_cpu, local_ka, &mapping)?;
                                 }
-                                if let (Some(kq_bytes), Some(local_kq)) = (&tq_d.k_quant, &tq.k_quant) {
+                                if let (Some(kq_bytes), Some(local_kq)) =
+                                    (&tq_d.k_quant, &tq.k_quant)
+                                {
                                     let kq_cpu = super::transfer::bytes_to_tq_cpu_tensor(
-                                        kq_bytes, *num_blocks, local_kq)?;
+                                        kq_bytes,
+                                        *num_blocks,
+                                        local_kq,
+                                    )?;
                                     attention_rs::cache::swap_blocks(&kq_cpu, local_kq, &mapping)?;
                                 }
                                 Ok(())
-                            }).transpose()?;
+                            })
+                            .transpose()?;
                         }
                     }
                 }
@@ -477,24 +517,35 @@ impl Transfer {
                         let mut tq_handles = Vec::with_capacity(num_layers);
                         #[cfg(feature = "cuda")]
                         for layer_idx in 0..num_layers {
-                            let h = attention_rs::with_turboquant_layer(layer_idx, |tq, _mode| -> Result<TqLayerIpcHandles> {
-                                let va_handle = cuda_remote::get_ipc_handle_any(&tq.v_absmax)?;
-                                let vq_handle = cuda_remote::get_ipc_handle_any(&tq.v_quant)?;
-                                let ka_handle = tq.k_absmax.as_ref()
-                                    .map(|t| cuda_remote::get_ipc_handle_any(t))
-                                    .transpose()?;
-                                let kq_handle = tq.k_quant.as_ref()
-                                    .map(|t| cuda_remote::get_ipc_handle_any(t))
-                                    .transpose()?;
-                                Ok(TqLayerIpcHandles {
-                                    k_absmax: ka_handle,
-                                    k_quant: kq_handle,
-                                    v_absmax: va_handle,
-                                    v_quant: vq_handle,
-                                })
-                            }).ok_or_else(|| candle_core::Error::Msg(
-                                format!("TQ layer {} not found on server", layer_idx)
-                            ))??;
+                            let h = attention_rs::with_turboquant_layer(
+                                layer_idx,
+                                |tq, _mode| -> Result<TqLayerIpcHandles> {
+                                    let va_handle = cuda_remote::get_ipc_handle_any(&tq.v_absmax)?;
+                                    let vq_handle = cuda_remote::get_ipc_handle_any(&tq.v_quant)?;
+                                    let ka_handle = tq
+                                        .k_absmax
+                                        .as_ref()
+                                        .map(|t| cuda_remote::get_ipc_handle_any(t))
+                                        .transpose()?;
+                                    let kq_handle = tq
+                                        .k_quant
+                                        .as_ref()
+                                        .map(|t| cuda_remote::get_ipc_handle_any(t))
+                                        .transpose()?;
+                                    Ok(TqLayerIpcHandles {
+                                        k_absmax: ka_handle,
+                                        k_quant: kq_handle,
+                                        v_absmax: va_handle,
+                                        v_quant: vq_handle,
+                                    })
+                                },
+                            )
+                            .ok_or_else(|| {
+                                candle_core::Error::Msg(format!(
+                                    "TQ layer {} not found on server",
+                                    layer_idx
+                                ))
+                            })??;
                             tq_handles.push(h);
                         }
                         Some(tq_handles)
@@ -519,7 +570,8 @@ impl Transfer {
 
                     let tq_full = matches!(
                         tq_mode,
-                        Some(attention_rs::TurboquantMode::Turbo4) | Some(attention_rs::TurboquantMode::Turbo3)
+                        Some(attention_rs::TurboquantMode::Turbo4)
+                            | Some(attention_rs::TurboquantMode::Turbo3)
                     );
 
                     let mut layer_data = Vec::new();
@@ -546,26 +598,61 @@ impl Transfer {
                     let tq_layer_data = if tq_mode.is_some() {
                         let mut tq_data = Vec::with_capacity(num_layers);
                         for layer_idx in 0..num_layers {
-                            let d = attention_rs::with_turboquant_layer(layer_idx, |tq, _mode| -> Result<TqLayerTcpData> {
-                                let va_cpu = super::transfer::copy_blocks_to_cpu(
-                                    &tq.v_absmax, &mapping, server_block_ids.len())?;
-                                let vq_cpu = super::transfer::copy_blocks_to_cpu(
-                                    &tq.v_quant, &mapping, server_block_ids.len())?;
-                                let ka_cpu = tq.k_absmax.as_ref()
-                                    .map(|t| super::transfer::copy_blocks_to_cpu(t, &mapping, server_block_ids.len()))
-                                    .transpose()?;
-                                let kq_cpu = tq.k_quant.as_ref()
-                                    .map(|t| super::transfer::copy_blocks_to_cpu(t, &mapping, server_block_ids.len()))
-                                    .transpose()?;
-                                Ok(TqLayerTcpData {
-                                    k_absmax: ka_cpu.map(|t| super::transfer::cpu_tensor_to_bytes_any(&t)).transpose()?,
-                                    k_quant: kq_cpu.map(|t| super::transfer::cpu_tensor_to_bytes_any(&t)).transpose()?,
-                                    v_absmax: super::transfer::cpu_tensor_to_bytes_any(&va_cpu)?,
-                                    v_quant: super::transfer::cpu_tensor_to_bytes_any(&vq_cpu)?,
-                                })
-                            }).ok_or_else(|| candle_core::Error::Msg(
-                                format!("TQ layer {} not found on server", layer_idx)
-                            ))??;
+                            let d = attention_rs::with_turboquant_layer(
+                                layer_idx,
+                                |tq, _mode| -> Result<TqLayerTcpData> {
+                                    let va_cpu = super::transfer::copy_blocks_to_cpu(
+                                        &tq.v_absmax,
+                                        &mapping,
+                                        server_block_ids.len(),
+                                    )?;
+                                    let vq_cpu = super::transfer::copy_blocks_to_cpu(
+                                        &tq.v_quant,
+                                        &mapping,
+                                        server_block_ids.len(),
+                                    )?;
+                                    let ka_cpu = tq
+                                        .k_absmax
+                                        .as_ref()
+                                        .map(|t| {
+                                            super::transfer::copy_blocks_to_cpu(
+                                                t,
+                                                &mapping,
+                                                server_block_ids.len(),
+                                            )
+                                        })
+                                        .transpose()?;
+                                    let kq_cpu = tq
+                                        .k_quant
+                                        .as_ref()
+                                        .map(|t| {
+                                            super::transfer::copy_blocks_to_cpu(
+                                                t,
+                                                &mapping,
+                                                server_block_ids.len(),
+                                            )
+                                        })
+                                        .transpose()?;
+                                    Ok(TqLayerTcpData {
+                                        k_absmax: ka_cpu
+                                            .map(|t| super::transfer::cpu_tensor_to_bytes_any(&t))
+                                            .transpose()?,
+                                        k_quant: kq_cpu
+                                            .map(|t| super::transfer::cpu_tensor_to_bytes_any(&t))
+                                            .transpose()?,
+                                        v_absmax: super::transfer::cpu_tensor_to_bytes_any(
+                                            &va_cpu,
+                                        )?,
+                                        v_quant: super::transfer::cpu_tensor_to_bytes_any(&vq_cpu)?,
+                                    })
+                                },
+                            )
+                            .ok_or_else(|| {
+                                candle_core::Error::Msg(format!(
+                                    "TQ layer {} not found on server",
+                                    layer_idx
+                                ))
+                            })??;
                             tq_data.push(d);
                         }
                         Some(tq_data)

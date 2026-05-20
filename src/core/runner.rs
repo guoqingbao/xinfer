@@ -1654,8 +1654,7 @@ impl ModelRunner {
         let tq_mode = attention_rs::get_turboquant_mode();
         let tq_full = matches!(
             tq_mode,
-            Some(attention_rs::TurboquantMode::Turbo4)
-                | Some(attention_rs::TurboquantMode::Turbo3)
+            Some(attention_rs::TurboquantMode::Turbo4) | Some(attention_rs::TurboquantMode::Turbo3)
         );
 
         if !tq_full {
@@ -1681,7 +1680,10 @@ impl ModelRunner {
             if swap_in {
                 crate::log_info!("{:.2} MB CPU KV cached blocks swapped in GPU!", total_mb);
             } else {
-                crate::log_info!("{:.2} MB GPU KV cached blocks swapped out to CPU!", total_mb);
+                crate::log_info!(
+                    "{:.2} MB GPU KV cached blocks swapped out to CPU!",
+                    total_mb
+                );
             }
         }
 
@@ -1693,24 +1695,33 @@ impl ModelRunner {
                     if swap_in {
                         cache::swap_blocks(&cpu_layer.v_absmax, &gpu_layer.v_absmax, &mappings)?;
                         cache::swap_blocks(&cpu_layer.v_quant, &gpu_layer.v_quant, &mappings)?;
-                        if let (Some(cpu_ka), Some(gpu_ka)) = (&cpu_layer.k_absmax, &gpu_layer.k_absmax) {
+                        if let (Some(cpu_ka), Some(gpu_ka)) =
+                            (&cpu_layer.k_absmax, &gpu_layer.k_absmax)
+                        {
                             cache::swap_blocks(cpu_ka, gpu_ka, &mappings)?;
                         }
-                        if let (Some(cpu_kq), Some(gpu_kq)) = (&cpu_layer.k_quant, &gpu_layer.k_quant) {
+                        if let (Some(cpu_kq), Some(gpu_kq)) =
+                            (&cpu_layer.k_quant, &gpu_layer.k_quant)
+                        {
                             cache::swap_blocks(cpu_kq, gpu_kq, &mappings)?;
                         }
                     } else {
                         cache::swap_blocks(&gpu_layer.v_absmax, &cpu_layer.v_absmax, &mappings)?;
                         cache::swap_blocks(&gpu_layer.v_quant, &cpu_layer.v_quant, &mappings)?;
-                        if let (Some(gpu_ka), Some(cpu_ka)) = (&gpu_layer.k_absmax, &cpu_layer.k_absmax) {
+                        if let (Some(gpu_ka), Some(cpu_ka)) =
+                            (&gpu_layer.k_absmax, &cpu_layer.k_absmax)
+                        {
                             cache::swap_blocks(gpu_ka, cpu_ka, &mappings)?;
                         }
-                        if let (Some(gpu_kq), Some(cpu_kq)) = (&gpu_layer.k_quant, &cpu_layer.k_quant) {
+                        if let (Some(gpu_kq), Some(cpu_kq)) =
+                            (&gpu_layer.k_quant, &cpu_layer.k_quant)
+                        {
                             cache::swap_blocks(gpu_kq, cpu_kq, &mappings)?;
                         }
                     }
                     Ok(())
-                }).transpose()?;
+                })
+                .transpose()?;
             }
             crate::log_info!(
                 "TQ buffers {} ({} layers, {} blocks)",

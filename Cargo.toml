@@ -6,7 +6,8 @@ default-run = "vllm-rs"
 description = "A minimal, high-performance large language model (LLM) inference engine implementing vLLM in Rust."
 repository = "https://github.com/guoqingbao/vllm.rs"
 homepage = "https://github.com/guoqingbao/vllm.rs"
-keywords = ["llm", "inference", "candle", "qwen", "moe", "rust", "vllm"]
+readme = "ReadMe.md"
+keywords = ["llm", "inference", "rust", "candle", "vllm"]
 categories = ["algorithms", "hardware-support", "science"]
 license = "MIT"
 
