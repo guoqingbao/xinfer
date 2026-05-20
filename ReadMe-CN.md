@@ -73,25 +73,24 @@ python3 -m vllm_rs.server --m Qwen/Qwen3.6-27B-FP8 --ui-server
 
 ## 📈 性能
 
-> **A100-40G** 及 **Hopper-80G**
+> **A100-40G**, **Hopper-80G** 及 **RTX 5090**
 
 | 模型 | 格式 | 大小 | 输出速度 |
 |---|---|---|---|
-| Ministral-3-3B (Multimodal) | BF16 | 3B | **118.49** tokens/s |
-| Ministral-3-3B (Multimodal) | ISQ (BF16→Q4K) | 3B | **171.92** tokens/s |
-| Qwen3-VL-8B-Instruct（**多模态**） | Q8_0 | 8B | **105.31** tokens/s |
+| Ministral-3-3B (**多模态**) | ISQ (BF16→Q4K) | 3B | **171.92** tokens/s |
+| Qwen3-VL-8B-Instruct (**多模态**) | Q8_0 | 8B | **105.31** tokens/s |
 | Llama-3.1-8B | ISQ (BF16→Q4K) | 8B | **120.74** tokens/s |
 | DeepSeek-R1-0528-Qwen3-8B | Q4_K_M | 8B | **124.87** tokens/s |
 | GLM-4-9B-0414 | Q4_K_M | 9B | **70.38** tokens/s |
 | QwQ-32B | Q4_K_M | 32B | **41.36** tokens/s |
-| **Qwen3-30B-A3B** | Q4_K_M | **30B (MoE)** | **97.16** tokens/s |
-| **Qwen3.5-27B** | Q4_K_M | **27B (Dense)** | **45.20** tokens/s |
-| **Qwen3.5-27B/Qwen3.6-27B** | FP8 | **27B (Dense)** | **42** tokens/s（**Hopper**） |
-| **Qwen3.5-35B-A3B** | FP8 | **35B (MoE)** | **97** tokens/s（**Hopper**） |
-| **GLM4.7 Flash** | NVFP4 | **30B (MoE)** | **79** tokens/s（**Hopper**） |
-| **Gemma4-31B** | ISQ (BF16→Q4K) | **31B (Dense)** | **41** tokens/s（**Hopper**） |
-| **Gemma4-26B-A4B** | NVFP4 | **26B (MoE)** | **82** tokens/s（**Hopper**） |
-| **MiniMax-M2.5** | NVFP4 | **229B (MoE)** | **62** tokens/s（**Hopper, TP=2**） |
+| **Qwen3-30B-A3B** | NVFP4 | **30B (MoE)** | **175.30** tokens/s (**RTX 5090**) |
+| **Qwen3.5-27B** (**多模态**) | Q4_K_M | **27B (Dense)** | **45.20** tokens/s |
+| **Qwen3.5-27B/Qwen3.6-27B** | FP8 | **27B (Dense)** | **42** tokens/s (**Hopper**) |
+| **Qwen3.6-35B-A3B** (**多模态**) | FP8 | **35B (MoE)** | **102** tokens/s (**Hopper**) |
+| **GLM4.7 Flash** | NVFP4 | **30B (MoE)** | **79** tokens/s (**Hopper, Software FP4**) |
+| **Gemma4-31B** | ISQ (BF16→Q4K) | **31B (Dense)** | **41** tokens/s (**Hopper**) |
+| **Gemma4-26B-A4B** | NVFP4 | **26B (MoE)** | **131** tokens/s (**RTX 5090**) |
+| **MiniMax-M2.5** | NVFP4 | **229B (MoE)** | **62** tokens/s (**Hopper, Software FP4, TP=2**) |
 
 <details>
 <summary>Apple Silicon (M4)</summary>
