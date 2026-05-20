@@ -492,7 +492,11 @@ impl<M: CudaGraphModule> GraphCapturer<M> {
             )
         };
         #[cfg(feature = "flashinfer")]
-        let skip_flashinfer = attention_rs::get_turboquant_mode().is_some();
+        let skip_flashinfer = attention_rs::get_turboquant_mode().is_some()
+            || (self.flashinfer_kv_params.is_none()
+                && kv_caches
+                    .and_then(|c| c.first())
+                    .map_or(false, |(k, _)| k.dtype() == DType::U8));
         #[cfg(feature = "flashinfer")]
         let capture_in_warmup = !skip_flashinfer;
         #[cfg(not(feature = "flashinfer"))]
