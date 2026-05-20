@@ -36,6 +36,7 @@ use crate::{
     utils::kvcache_allocator::KVCacheAllocator,
 };
 use attention_rs::cache;
+#[cfg(feature = "flashinfer")]
 use attention_rs::FlashInferMetadata;
 use attention_rs::InputMetadata;
 use candle_core::{DType, Device, Result, Tensor, D};
@@ -605,9 +606,15 @@ impl ModelRunner {
         } else {
             econfig.seed.unwrap()
         };
+
+        #[cfg(feature = "flashinfer")]
+        let has_heterogeneous_head_dim =
+            matches!(model_type, ModelType::Gemma3) || matches!(model_type, ModelType::Gemma4);
+
         #[cfg(feature = "flashinfer")]
         let skip_flashinfer_init = config.kvcache_dtype.is_turboquant()
-            || (config.kvcache_dtype.is_fp8_keys() && !attention_rs::has_flashinfer_fp8_e4m3());
+            || (config.kvcache_dtype.is_fp8_keys() && !attention_rs::has_flashinfer_fp8_e4m3())
+            || has_heterogeneous_head_dim;
         #[cfg(feature = "flashinfer")]
         let flashinfer_kv_params = if skip_flashinfer_init {
             None
@@ -1105,16 +1112,8 @@ impl ModelRunner {
         let cu_seqlens_q = Tensor::from_vec(cu_seqlens_q, (q_len,), &self.device)?;
         let cu_seqlens_k = Tensor::from_vec(cu_seqlens_k, (k_len,), &self.device)?;
 
-        let disable_flash_attn = if matches!(self.model_type, ModelType::Gemma3) {
-            Some(true)
-        } else {
-            None
-        };
-
-        let skip_flashinfer = self.config.kvcache_dtype.is_turboquant()
-            || (self.config.kvcache_dtype.is_fp8_keys()
-                && !attention_rs::has_flashinfer_fp8_e4m3());
-        let flashinfer_metadata = if cfg!(feature = "flashinfer") && !skip_flashinfer {
+        #[cfg(feature = "flashinfer")]
+        let flashinfer_metadata = if self.flashinfer_kv_params.is_some() {
             let mut indptr = vec![0u32];
             let mut indices = Vec::new();
             let mut last_len = Vec::new();
@@ -1175,14 +1174,12 @@ impl ModelRunner {
                 Tensor::from_vec(batch_indices_vec, (batch_indices_len,), &self.device)?;
             let positions = Tensor::from_vec(positions_vec, (positions_len,), &self.device)?;
 
-            #[cfg(feature = "flashinfer")]
             let cu_seqlens_q_host_u32: Vec<u32> =
                 cu_seqlens_q_vec.iter().map(|&x| x as u32).collect();
 
             let mut prefill_plan_info: Option<Vec<i64>> = None;
             let mut mla_prefill_plan_info: Option<Vec<i64>> = None;
 
-            #[cfg(feature = "flashinfer")]
             if self.is_mla_model() {
                 if let Some(params) = self.flashinfer_kv_params {
                     mla_prefill_plan_info = Some(attention_rs::mla::mla_prefill_plan(
@@ -1198,7 +1195,6 @@ impl ModelRunner {
                 }
             };
 
-            #[cfg(feature = "flashinfer")]
             if !self.is_mla_model() {
                 if let Some(params) = self.flashinfer_kv_params {
                     prefill_plan_info = Some(attention_rs::flashinfer::prefill_plan(
@@ -1239,6 +1235,9 @@ impl ModelRunner {
             None
         };
 
+        #[cfg(not(feature = "flashinfer"))]
+        let flashinfer_metadata = None;
+
         let sequence_ids_vec = seqs.iter().map(|s| s.id()).collect::<Vec<_>>();
         let mamba_slot_mapping = self.prepare_mamba_slot_mapping(&sequence_ids_vec, true)?;
         let sequence_ids = Some(sequence_ids_vec);
@@ -1256,7 +1255,6 @@ impl ModelRunner {
             max_seqlen_q,
             max_seqlen_k,
             max_context_len,
-            disable_flash_attn,
             seqlens: Some(cu_seqlens_q_vec[1..].to_vec()),
             flashinfer_metadata,
         };
@@ -1269,9 +1267,6 @@ impl ModelRunner {
         I: IntoIterator<Item = &'a S>,
         S: ToDecodeInput + 'a,
     {
-        let skip_flashinfer = self.config.kvcache_dtype.is_turboquant()
-            || (self.config.kvcache_dtype.is_fp8_keys()
-                && !attention_rs::has_flashinfer_fp8_e4m3());
         let mut input_ids = Vec::new();
         let mut positions = Vec::new();
         let mut slot_mapping = Vec::new();
@@ -1301,7 +1296,8 @@ impl ModelRunner {
         let context_lens = Tensor::from_vec(context_lens, (c_len,), &self.device)?;
         let block_tables = self.prepare_block_tables(seq_refs.clone())?;
 
-        let flashinfer_metadata = if cfg!(feature = "flashinfer") && !skip_flashinfer {
+        #[cfg(feature = "flashinfer")]
+        let flashinfer_metadata = if self.flashinfer_kv_params.is_some() {
             #[cfg(all(feature = "cuda", feature = "graph"))]
             let use_cuda_graph = {
                 let require_exact_graph = match &self.model {
@@ -1384,6 +1380,8 @@ impl ModelRunner {
         } else {
             None
         };
+        #[cfg(not(feature = "flashinfer"))]
+        let flashinfer_metadata = None;
 
         let sequence_ids = Some(seq_refs.iter().map(|s| s.id()).collect::<Vec<_>>());
         let mamba_slot_mapping = self.prepare_mamba_slot_mapping(
@@ -1406,7 +1404,6 @@ impl ModelRunner {
             max_seqlen_q: 0,
             max_seqlen_k: 0,
             max_context_len,
-            disable_flash_attn: None,
             seqlens: None,
             flashinfer_metadata,
         };

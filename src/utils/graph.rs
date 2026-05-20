@@ -492,13 +492,7 @@ impl<M: CudaGraphModule> GraphCapturer<M> {
             )
         };
         #[cfg(feature = "flashinfer")]
-        let skip_flashinfer = attention_rs::get_turboquant_mode().is_some()
-            || (self.flashinfer_kv_params.is_none()
-                && kv_caches
-                    .and_then(|c| c.first())
-                    .map_or(false, |(k, _)| k.dtype() == DType::U8));
-        #[cfg(feature = "flashinfer")]
-        let capture_in_warmup = !skip_flashinfer;
+        let capture_in_warmup = self.flashinfer_kv_params.is_some();
         #[cfg(not(feature = "flashinfer"))]
         let capture_in_warmup = false;
 
@@ -514,7 +508,7 @@ impl<M: CudaGraphModule> GraphCapturer<M> {
                 let input_ids_bs = input_ids.narrow(0, 0, bs)?;
                 let positions_bs = positions.narrow(0, 0, bs)?;
                 #[cfg(feature = "flashinfer")]
-                let flashinfer_metadata = if skip_flashinfer {
+                let flashinfer_metadata = if self.flashinfer_kv_params.is_none() {
                     None
                 } else {
                     let mut indptr_host = Vec::with_capacity(bs + 1);
@@ -583,7 +577,6 @@ impl<M: CudaGraphModule> GraphCapturer<M> {
                     max_seqlen_q: 0,
                     max_seqlen_k: 0,
                     max_context_len: self.max_model_len,
-                    disable_flash_attn: None,
                     seqlens: None,
                     flashinfer_metadata,
                 };
