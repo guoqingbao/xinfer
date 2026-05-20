@@ -101,10 +101,18 @@ pub enum RunnerType {
     Process(Vec<LocalStream>),
 }
 
+pub struct CpuTqLayerCache {
+    pub k_absmax: Option<Tensor>,
+    pub k_quant: Option<Tensor>,
+    pub v_absmax: Tensor,
+    pub v_quant: Tensor,
+}
+
 pub struct ModelRunner {
     model: Model,
     gpu_kv_cache: Arc<Mutex<Vec<(Tensor, Tensor)>>>,
     cpu_kv_cache: Arc<Mutex<Vec<(Tensor, Tensor)>>>,
+    cpu_tq_cache: Option<Vec<CpuTqLayerCache>>,
     device: Device,
     config: EngineConfig,
     #[cfg(all(feature = "cuda", feature = "graph"))]
@@ -578,6 +586,10 @@ impl ModelRunner {
         let (gpu_kv_cache, cpu_kv_cache) =
             allocator.init_kv_cache(&allocation, dtype, &device, econfig.pd_config.as_ref())?;
 
+        let num_cpu_blocks =
+            (econfig.cpu_mem_fold.unwrap_or(0.2f32) * econfig.num_blocks as f32) as usize;
+        let cpu_tq_cache = allocator.init_cpu_tq_cache(num_cpu_blocks)?;
+
         let (temperature, top_k, top_p) = if econfig.generation_cfg.is_some() {
             (
                 econfig.generation_cfg.as_ref().unwrap().temperature.clone(),
@@ -642,6 +654,7 @@ impl ModelRunner {
             model,
             gpu_kv_cache: Arc::new(Mutex::new(gpu_kv_cache)),
             cpu_kv_cache: Arc::new(Mutex::new(cpu_kv_cache)),
+            cpu_tq_cache,
             device,
             config: econfig.clone(),
             #[cfg(all(feature = "cuda", feature = "graph"))]
@@ -1638,12 +1651,16 @@ impl ModelRunner {
     }
 
     pub fn swap_kvcache(&self, mappings: HashMap<usize, usize>, swap_in: bool) -> Result<bool> {
-        fn cache_swap(
-            gpu_cache: &Vec<(Tensor, Tensor)>,
-            cpu_cache: &Vec<(Tensor, Tensor)>,
-            mappings: &HashMap<usize, usize>,
-            swap_in: bool,
-        ) -> Result<bool> {
+        let tq_mode = attention_rs::get_turboquant_mode();
+        let tq_full = matches!(
+            tq_mode,
+            Some(attention_rs::TurboquantMode::Turbo4)
+                | Some(attention_rs::TurboquantMode::Turbo3)
+        );
+
+        if !tq_full {
+            let gpu_cache = self.get_kv_cache();
+            let cpu_cache = self.get_cpu_kv_cache();
             assert!(
                 gpu_cache.len() > 0 && cpu_cache.len() > 0,
                 "Invalid kvcache tensors!"
@@ -1652,34 +1669,58 @@ impl ModelRunner {
                 * cpu_cache[0].0.dtype().size_in_bytes();
             for i in 0..gpu_cache.len() {
                 if swap_in {
-                    cache::swap_blocks(&cpu_cache[i].0, &gpu_cache[i].0, mappings)?;
-                    cache::swap_blocks(&cpu_cache[i].1, &gpu_cache[i].1, mappings)?;
+                    cache::swap_blocks(&cpu_cache[i].0, &gpu_cache[i].0, &mappings)?;
+                    cache::swap_blocks(&cpu_cache[i].1, &gpu_cache[i].1, &mappings)?;
                 } else {
-                    cache::swap_blocks(&gpu_cache[i].0, &cpu_cache[i].0, mappings)?;
-                    cache::swap_blocks(&gpu_cache[i].1, &cpu_cache[i].1, mappings)?;
+                    cache::swap_blocks(&gpu_cache[i].0, &cpu_cache[i].0, &mappings)?;
+                    cache::swap_blocks(&gpu_cache[i].1, &cpu_cache[i].1, &mappings)?;
                 }
             }
-            let total_mb_bytes_swapped =
+            let total_mb =
                 (block_size_bytes * mappings.len() * gpu_cache.len() * 2) as f32 / 1024.0 / 1024.0;
             if swap_in {
-                crate::log_info!(
-                    "{:.2} MB CPU KV cached blocks swapped in GPU!",
-                    total_mb_bytes_swapped
-                );
+                crate::log_info!("{:.2} MB CPU KV cached blocks swapped in GPU!", total_mb);
             } else {
-                crate::log_info!(
-                    "{:.2} MB GPU KV cached blocks swapped out to CPU!",
-                    total_mb_bytes_swapped
-                );
+                crate::log_info!("{:.2} MB GPU KV cached blocks swapped out to CPU!", total_mb);
             }
-            Ok(true)
         }
-        cache_swap(
-            &*self.get_kv_cache(),
-            &*self.get_cpu_kv_cache(),
-            &mappings,
-            swap_in,
-        )
+
+        if let Some(cpu_tq) = &self.cpu_tq_cache {
+            let num_layers = cpu_tq.len();
+            for layer_idx in 0..num_layers {
+                let cpu_layer = &cpu_tq[layer_idx];
+                attention_rs::with_turboquant_layer(layer_idx, |gpu_layer, _| -> Result<()> {
+                    if swap_in {
+                        cache::swap_blocks(&cpu_layer.v_absmax, &gpu_layer.v_absmax, &mappings)?;
+                        cache::swap_blocks(&cpu_layer.v_quant, &gpu_layer.v_quant, &mappings)?;
+                        if let (Some(cpu_ka), Some(gpu_ka)) = (&cpu_layer.k_absmax, &gpu_layer.k_absmax) {
+                            cache::swap_blocks(cpu_ka, gpu_ka, &mappings)?;
+                        }
+                        if let (Some(cpu_kq), Some(gpu_kq)) = (&cpu_layer.k_quant, &gpu_layer.k_quant) {
+                            cache::swap_blocks(cpu_kq, gpu_kq, &mappings)?;
+                        }
+                    } else {
+                        cache::swap_blocks(&gpu_layer.v_absmax, &cpu_layer.v_absmax, &mappings)?;
+                        cache::swap_blocks(&gpu_layer.v_quant, &cpu_layer.v_quant, &mappings)?;
+                        if let (Some(gpu_ka), Some(cpu_ka)) = (&gpu_layer.k_absmax, &cpu_layer.k_absmax) {
+                            cache::swap_blocks(gpu_ka, cpu_ka, &mappings)?;
+                        }
+                        if let (Some(gpu_kq), Some(cpu_kq)) = (&gpu_layer.k_quant, &cpu_layer.k_quant) {
+                            cache::swap_blocks(gpu_kq, cpu_kq, &mappings)?;
+                        }
+                    }
+                    Ok(())
+                }).transpose()?;
+            }
+            crate::log_info!(
+                "TQ buffers {} ({} layers, {} blocks)",
+                if swap_in { "swapped in" } else { "swapped out" },
+                num_layers,
+                mappings.len()
+            );
+        }
+
+        Ok(true)
     }
 
     pub fn transfer_prefill(&self, seq: &Sequence) -> Result<bool> {

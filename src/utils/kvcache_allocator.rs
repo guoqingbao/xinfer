@@ -1092,4 +1092,85 @@ impl KVCacheAllocator {
         attention_rs::init_turboquant_cache(tq_mode, tq_layers, self.block_size);
         Ok(())
     }
+
+    /// Allocate CPU-side TQ buffers for swap. Returns None if not TQ mode.
+    pub fn init_cpu_tq_cache(
+        &self,
+        num_cpu_blocks: usize,
+    ) -> candle_core::Result<Option<Vec<crate::core::runner::CpuTqLayerCache>>> {
+        use crate::utils::config::KvCacheDtype;
+        let tq_mode = match self.kvcache_dtype {
+            KvCacheDtype::Turbo8 => attention_rs::TurboquantMode::Turbo8,
+            KvCacheDtype::Turbo4 => attention_rs::TurboquantMode::Turbo4,
+            KvCacheDtype::Turbo3 => attention_rs::TurboquantMode::Turbo3,
+            _ => return Ok(None),
+        };
+
+        if num_cpu_blocks == 0 {
+            return Ok(None);
+        }
+
+        let mut cpu_tq = Vec::new();
+        for layer_idx in 0..self.num_kv_layers {
+            let (_, kv_heads, hd) = self.layer_flash_key_value_block_shape(layer_idx);
+            let bs = self.block_size;
+
+            let v_absmax = Tensor::zeros(
+                (num_cpu_blocks, bs, kv_heads),
+                candle_core::DType::F32,
+                &Device::Cpu,
+            )?;
+            let v_quant = Tensor::zeros(
+                (num_cpu_blocks, bs, kv_heads, hd / 2),
+                candle_core::DType::U8,
+                &Device::Cpu,
+            )?;
+
+            let (k_absmax, k_quant) = match tq_mode {
+                attention_rs::TurboquantMode::Turbo4 => {
+                    let ka = Tensor::zeros(
+                        (num_cpu_blocks, bs, kv_heads),
+                        candle_core::DType::F32,
+                        &Device::Cpu,
+                    )?;
+                    let kq = Tensor::zeros(
+                        (num_cpu_blocks, bs, kv_heads, hd / 2),
+                        candle_core::DType::U8,
+                        &Device::Cpu,
+                    )?;
+                    (Some(ka), Some(kq))
+                }
+                attention_rs::TurboquantMode::Turbo3 => {
+                    let ka = Tensor::zeros(
+                        (num_cpu_blocks, bs, kv_heads),
+                        candle_core::DType::F32,
+                        &Device::Cpu,
+                    )?;
+                    let k_bytes_per_head = (hd * 3 + 7) / 8;
+                    let kq = Tensor::zeros(
+                        (num_cpu_blocks, bs, kv_heads, k_bytes_per_head),
+                        candle_core::DType::U8,
+                        &Device::Cpu,
+                    )?;
+                    (Some(ka), Some(kq))
+                }
+                _ => (None, None),
+            };
+
+            cpu_tq.push(crate::core::runner::CpuTqLayerCache {
+                k_absmax,
+                k_quant,
+                v_absmax,
+                v_quant,
+            });
+        }
+
+        crate::log_warn!(
+            "Initialized CPU TurboQuant {} swap cache: {} layers, {} blocks",
+            self.kvcache_dtype,
+            self.num_kv_layers,
+            num_cpu_blocks,
+        );
+        Ok(Some(cpu_tq))
+    }
 }
