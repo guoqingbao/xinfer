@@ -715,6 +715,14 @@ impl Scheduler {
             seq.status = SequenceStatus::Finished;
             self.block_manager.deallocate(&seq);
         }
+        if let Some(pos) = self.transferred.iter().position(|seq| seq.id == seq_id) {
+            let seq = self.transferred.remove(pos).unwrap();
+            crate::log_warn!(
+                "Seq {} - cancel requested while awaiting PD transfer",
+                seq.id
+            );
+            let _ = self.block_manager.try_release_remote_kvcache(seq.id);
+        }
         self.release_cache(seq_id);
         self.running.retain(|seq| seq.id != seq_id);
     }

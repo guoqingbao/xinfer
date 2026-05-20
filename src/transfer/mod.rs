@@ -232,7 +232,12 @@ impl Transfer {
 
     /// (Client) Checks if a specific prefill has finished.
     pub fn check_prefill_finished(&self, seq_id: usize) -> Result<bool> {
-        Ok(self.finished_data.write().contains_key(&seq_id))
+        Ok(self.finished_data.read().contains_key(&seq_id))
+    }
+
+    /// (Client) Remove finished data for a seq after successful receive to avoid unbounded memory.
+    pub fn cleanup_finished_data(&self, seq_id: usize) {
+        self.finished_data.write().remove(&seq_id);
     }
 
     /// (Client) Receives the KV cache data and copies it into local GPU blocks.
@@ -394,12 +399,14 @@ impl Transfer {
         }
 
         let dtype = local_gpu_cache[0].0.dtype();
-        match dtype {
+        let result = match dtype {
             DType::F16 => read_data::<half::f16>(&self, seq, local_gpu_cache),
             DType::BF16 => read_data::<half::bf16>(&self, seq, local_gpu_cache),
             DType::U8 => read_data::<u8>(&self, seq, local_gpu_cache),
             _ => candle_core::bail!("Invalid kvcache dtype!"),
-        }
+        };
+        self.cleanup_finished_data(seq.id);
+        result
     }
 
     /// (Client) Notify the server to release kvcache
