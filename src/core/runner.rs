@@ -595,8 +595,7 @@ impl ModelRunner {
         };
         #[cfg(feature = "flashinfer")]
         let skip_flashinfer_init = config.kvcache_dtype.is_turboquant()
-            || (config.kvcache_dtype.is_fp8_keys()
-                && !attention_rs::has_flashinfer_fp8_kvcache());
+            || (config.kvcache_dtype.is_fp8_keys() && !attention_rs::has_flashinfer_fp8_e4m3());
         #[cfg(feature = "flashinfer")]
         let flashinfer_kv_params = if skip_flashinfer_init {
             None
@@ -1101,7 +1100,7 @@ impl ModelRunner {
 
         let skip_flashinfer = self.config.kvcache_dtype.is_turboquant()
             || (self.config.kvcache_dtype.is_fp8_keys()
-                && !attention_rs::has_flashinfer_fp8_kvcache());
+                && !attention_rs::has_flashinfer_fp8_e4m3());
         let flashinfer_metadata = if cfg!(feature = "flashinfer") && !skip_flashinfer {
             let mut indptr = vec![0u32];
             let mut indices = Vec::new();
@@ -1259,7 +1258,7 @@ impl ModelRunner {
     {
         let skip_flashinfer = self.config.kvcache_dtype.is_turboquant()
             || (self.config.kvcache_dtype.is_fp8_keys()
-                && !attention_rs::has_flashinfer_fp8_kvcache());
+                && !attention_rs::has_flashinfer_fp8_e4m3());
         let mut input_ids = Vec::new();
         let mut positions = Vec::new();
         let mut slot_mapping = Vec::new();
