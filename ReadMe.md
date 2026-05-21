@@ -26,14 +26,14 @@
 ### Option A — 🚀 Rust (recommended)
 
 ```bash
-# Prerequisites: Rust compiler and CUDA Toolkit (if not installed)
+# Prerequisites: Rust compiler, CUDA Toolkit (optional) or Metal XCode commandline tool
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 sudo apt-get install -y git build-essential libssl-dev pkg-config
 
 # Repo for install
 export VLLM_RS_REPO="https://github.com/guoqingbao/vllm.rs"
 
-# 1. Install (one-time, remove `flashinfer` and `cutlass` features on SM_70/SM_75, e.g., V100)
+# 1. Install (one-time, replace features to `metal` on Mac, remove `flashinfer` and `cutlass` features on SM_70/SM_75, e.g., V100)
 cargo install --git $VLLM_RS_REPO vllm-rs --features cuda,nccl,flashinfer,cutlass
 
 # or, git clone and install from local source code
@@ -57,9 +57,9 @@ Optionally add `--kvcache-dtype` to compress KV cache and extend context:
 | Flag (`--kvcache-dtype`) | Compression | Quality | GPU Requirement |
 |---|---|---|---|
 | _(default)_ | 1× (BF16) | Baseline | All |
-| `fp8` | **2×** | Near-lossless | SM70+ / Metal |
-| `turbo8` | **2.6×** | 79–100% throughput | SM70+ |
-| `turbo4` | **3.7×** | Best balance | SM70+ |
+| `fp8` | **2×** | Near-lossless | SM70+ / Apple M1 |
+| `turbo8` | **2.6×** | 79–100% throughput | SM70+ / Apple M1|
+| `turbo4` | **3.7×** | Best balance | SM70+ / Apple M1|
 | `turbo3` | **4.7×** | Max compression | SM70+ |
 
 ### Option B — 📦 Python (`pip install`)

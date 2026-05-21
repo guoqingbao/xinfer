@@ -26,14 +26,14 @@
 ### 方式 A — 🚀 Rust（推荐）
 
 ```bash
-# 依赖项: Rust 编译器、CUDA 工具链（可选）
+# 依赖项: Rust 编译器、CUDA 工具链（可选）、Metal需安装Xcode 命令行工具（可选）
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 sudo apt-get install -y git build-essential libssl-dev pkg-config
 
 # 安装Repo地址
 export VLLM_RS_REPO="https://github.com/guoqingbao/vllm.rs"
 
-# 1. 安装（一次性，SM_70/SM_75，例如V100平台需去掉 `flashinfer,cutlass`编译选项 ）
+# 1. 安装（一次性，Metal平台将特性替换为`--features metal`, SM_70/SM_75，例如V100平台需去掉 `flashinfer,cutlass`编译选项 ）
 cargo install --git $VLLM_RS_REPO vllm-rs --features cuda,nccl,flashinfer,cutlass
 
 # 或者，Git clone 后从本地源码安装
@@ -57,9 +57,9 @@ cargo install xbot # 配置使用本地 Base URL
 | 参数（`--kvcache-dtype`） | 压缩比 | 质量 | GPU 要求 (V100及以上显卡) |
 |---|---|---|---|
 | _（默认）_ | 1×（BF16） | 基线 | 全部 |
-| `fp8` | **2×** | 近无损 | SM70+ / Metal |
-| `turbo8` | **2.6×** | 79–100% 基线吞吐 | SM70+ |
-| `turbo4` | **3.7×** | 最佳平衡 | SM70+ |
+| `fp8` | **2×** | 近无损 | SM70+ / Apple M1 |
+| `turbo8` | **2.6×** | 79–100% 基线吞吐 | SM70+ / Apple M1|
+| `turbo4` | **3.7×** | 最佳平衡 | SM70+ / Apple M1|
 | `turbo3` | **4.7×** | 最大压缩 | SM70+ |
 
 ### 方式 B — 📦 Python（`pip install`）

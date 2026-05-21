@@ -919,6 +919,7 @@ impl KVCacheAllocator {
         } else if cfg!(feature = "flash")
             || cfg!(feature = "flashinfer")
             || cfg!(feature = "flashattn")
+            || cfg!(feature = "metal")
         {
             // For turbo4/turbo3, the standard K/V cache is unused — all data lives
             // in TQ buffers. Allocate 1-block dummies so Option<Tensor> remains Some
