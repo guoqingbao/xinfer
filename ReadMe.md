@@ -30,15 +30,21 @@
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 sudo apt-get install -y git build-essential libssl-dev pkg-config
 
-# 1. Install (one-time, remove `flashinfer` and `cutlass` features on SM_70/SM_75, e.g., V100)
-cargo install --git https://github.com/guoqingbao/vllm.rs \
-  vllm-rs runner --features cuda,nccl,flashinfer,cutlass
+# Repo for install
+export VLLM_RS_REPO="https://github.com/guoqingbao/vllm.rs"
 
-# or, Git clone and install from local source code
+# 1. Install (one-time, remove `flashinfer` and `cutlass` features on SM_70/SM_75, e.g., V100)
+cargo install --git $VLLM_RS_REPO vllm-rs --features cuda,nccl,flashinfer,cutlass
+
+# or, git clone and install from local source code
+# git clone $VLLM_RS_REPO && cd vllm.rs
 # ./build.sh --install --features cuda,nccl,flashinfer,cutlass
 
 # 2. Run
 vllm-rs --m Qwen/Qwen3.6-27B-FP8 --kvcache-dtype turbo4 --ui-server
+
+# local model
+# vllm-rs --w /home/Qwen3.6-35B-A3B --d 0,1 --ui-server
 
 # 3. Vibe Coding Client (optinal)
 cargo install xbot # config to use local Base URL

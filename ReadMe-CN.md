@@ -30,15 +30,21 @@
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 sudo apt-get install -y git build-essential libssl-dev pkg-config
 
+# 安装Repo地址
+export VLLM_RS_REPO="https://github.com/guoqingbao/vllm.rs"
+
 # 1. 安装（一次性，SM_70/SM_75，例如V100平台需去掉 `flashinfer,cutlass`编译选项 ）
-cargo install --git https://github.com/guoqingbao/vllm.rs \
-  vllm-rs runner --features cuda,nccl,flashinfer,cutlass
+cargo install --git $VLLM_RS_REPO vllm-rs --features cuda,nccl,flashinfer,cutlass
 
 # 或者，Git clone 后从本地源码安装
+# git clone $VLLM_RS_REPO && cd vllm.rs
 # ./build.sh --install --features cuda,nccl,flashinfer,cutlass
 
 # 2. 运行
 vllm-rs --m Qwen/Qwen3.6-27B-FP8 --kvcache-dtype turbo4 --ui-server
+
+# 运行本地模型
+# vllm-rs --w /home/Qwen3.6-35B-A3B --d 0,1 --ui-server
 
 # 3. Vibe Coding 客户端（可选）
 cargo install xbot # 配置使用本地 Base URL
