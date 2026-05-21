@@ -26,8 +26,13 @@
 ### 方式 A — 🚀 Rust（推荐）
 
 ```bash
-# 1. 安装（一次性），需要 Rust 编译器和 CUDA 工具链
+# 依赖项: Rust 编译器、CUDA 工具链（可选）
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+sudo apt-get install -y git build-essential libssl-dev pkg-config
+
+# 1. 安装（一次性，SM_70/SM_75，例如V100平台需去掉 `flashinfer,cutlass`编译选项 ）
 cargo install --git https://github.com/guoqingbao/vllm.rs vllm-rs runner --features cuda,nccl,flashinfer,cutlass
+
 # 或者，Git clone 后从本地源码安装
 # ./build.sh --install --features cuda,nccl,flashinfer,cutlass
 
@@ -46,9 +51,9 @@ cargo install xbot # 配置使用本地 Base URL
 |---|---|---|---|
 | _（默认）_ | 1×（BF16） | 基线 | 全部 |
 | `fp8` | **2×** | 近无损 | SM70+ / Metal |
-| `turbo8` | **2.6×** | 79–100% 基线吞吐 | SM80+ |
-| `turbo4` | **3.7×** | 最佳平衡 | SM80+ |
-| `turbo3` | **4.7×** | 最大压缩 | SM80+ |
+| `turbo8` | **2.6×** | 79–100% 基线吞吐 | SM70+ |
+| `turbo4` | **3.7×** | 最佳平衡 | SM70+ |
+| `turbo3` | **4.7×** | 最大压缩 | SM70+ |
 
 ### 方式 B — 📦 Python（`pip install`）
 - 💡Hopper (SM90) / Blackwell (SM100+)：从 `GitHub Releases` 下载对应 wheel；
@@ -60,8 +65,7 @@ python3 -m vllm_rs.server --m Qwen/Qwen3.6-27B-FP8 --ui-server
 ```
 
 ### 方式 C — Docker 安装
-- 💡将 `sm_xx` 改为 sm_70/sm_75 (Turing)、sm_80/sm_89 (Ampere)、sm_90 (Hopper)、sm_100/sm_120 (Blackwell)
-- 💡将 CUDA 版本改为 `12.9.0`（sm_70/sm_75）或 `13.0.0`（SM_80+）
+- 💡将 `sm_xx` 改为 sm_70/sm_75 (Turing，去掉 `flashinfer,cutlass`编译选项)、sm_80/sm_89 (Ampere)、sm_90 (Hopper)、sm_100/sm_120 (Blackwell)
 ```bash
 # 示例：Hopper (SM_90, CUDA 13.0.0)，最后一个参数传 1 启用中国大陆 Docker 镜像
 ./build_docker.sh "cuda,nccl,flashinfer,cutlass" sm_90 13.0.0 0

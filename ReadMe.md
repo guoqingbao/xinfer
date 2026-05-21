@@ -26,8 +26,13 @@
 ### Option A — 🚀 Rust (recommended)
 
 ```bash
-# 1. Install (one-time), Rust compiler and CUDA toolkit required
+# Prerequisites: Rust compiler and CUDA Toolkit
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+sudo apt-get install -y git build-essential libssl-dev pkg-config
+
+# 1. Install (one-time, remove `flashinfer` and `cutlass` features on SM_70/SM_75, e.g., V100)
 cargo install --git https://github.com/guoqingbao/vllm.rs vllm-rs runner --features cuda,nccl,flashinfer,cutlass
+
 # or, Git clone and install from local source code
 # ./build.sh --install --features cuda,nccl,flashinfer,cutlass
 
@@ -46,9 +51,9 @@ Optionally add `--kvcache-dtype` to compress KV cache and extend context:
 |---|---|---|---|
 | _(default)_ | 1× (BF16) | Baseline | All |
 | `fp8` | **2×** | Near-lossless | SM70+ / Metal |
-| `turbo8` | **2.6×** | 79–100% throughput | SM80+ |
-| `turbo4` | **3.7×** | Best balance | SM80+ |
-| `turbo3` | **4.7×** | Max compression | SM80+ |
+| `turbo8` | **2.6×** | 79–100% throughput | SM70+ |
+| `turbo4` | **3.7×** | Best balance | SM70+ |
+| `turbo3` | **4.7×** | Max compression | SM70+ |
 
 ### Option B — 📦 Python (`pip install`)
 - 💡Hopper (SM90) / Blackwell (SM100+): download wheel from `GitHub Releases`; 
@@ -60,8 +65,7 @@ python3 -m vllm_rs.server --m Qwen/Qwen3.6-27B-FP8 --ui-server
 ```
 
 ### Option C — Install with Docker
-- 💡Change `sm_xx` to sm_70/sm_75 (Turing), sm_80/sm_89 (Ampere), sm_90 (Hopper), sm_100/sm_120 (Blackwell)
-- 💡Change CUDA version to `12.9.0` for sm_70/sm_75 and `13.0.0` for SM_80+ 
+- 💡Change `sm_xx` to sm_70/sm_75 (Turing, remove `flashinfer` and `cutlass` features), sm_80/sm_89 (Ampere), sm_90 (Hopper), sm_100/sm_120 (Blackwell)
 ```bash
 # Example: Hopper (SM_90, CUDA 13.0.0), pass last arguemnt 1 for China docker mirror
 ./build_docker.sh "cuda,nccl,flashinfer,cutlass" sm_90 13.0.0 0
