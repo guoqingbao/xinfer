@@ -6,7 +6,7 @@ set -euo pipefail
 #   --help / -h    Show usage
 #
 # Positional args (unchanged):
-#   1: WITH_FEATURES   (default: cuda,nccl,graph,python,flashinfer)
+#   1: WITH_FEATURES   (default: cuda,nccl,python,flashinfer)
 #   2: SM_ARG          (default: sm_80)  accepts sm_XX, XX, or comma list sm_80,sm_86
 #   3: CUDA_VERSION    (default: 12.9.0) accepts X.Y.Z, X.Y, or shorthand like 129/124
 #   4: CHINA_MIRROR    (default: 0)      0=off, 1=on
@@ -59,7 +59,7 @@ while [[ $# -gt 0 ]]; do
 done
 set -- "${POSITIONAL[@]}"
 
-WITH_FEATURES="${1:-cuda,nccl,graph,python,flashinfer}"
+WITH_FEATURES="${1:-cuda,nccl,python,flashinfer}"
 SM_ARG="${2:-sm_80}"
 CUDA_VERSION_ARG="${3:-12.9.0}"
 CHINA_MIRROR="${4:-0}"

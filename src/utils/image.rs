@@ -675,7 +675,7 @@ mod tests {
             rope_scaling: None,
             quant: None,
             moe_cfg: None,
-            fp8_kvcache: None,
+            kvcache_dtype: crate::utils::config::KvCacheDtype::Auto,
             quantization_config: None,
             is_multi_model: None,
             extra_config_json,

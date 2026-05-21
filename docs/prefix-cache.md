@@ -15,7 +15,7 @@ fully cached at block boundaries, the last block is recomputed to ensure a
 non-empty prefill step for correct sampling.
 
 ## Flags
-- `--prefix-cache`: enable prefix cache.
+- Prefix cache is **enabled by default**. Use `--disable-prefix-cache` to turn it off.
 - `--prefix-cache-max-tokens <N>`: cap cache size in tokens (rounded down to block size).
 
 If `--prefix-cache-max-tokens` is not set, defaults are:

@@ -249,8 +249,8 @@ Add mappings in order:
 |----------|---------|
 | **macOS (Metal)** | `cargo build --release --features metal` |
 | **CUDA (basic)** | `cargo build --release --features "cuda,flashinfer"` |
-| **CUDA (full)** | `cargo build --release --features "cuda,flashinfer,graph,nccl"` |
-| **CUDA (sm90+)** | Add `cutlass` feature: `--features "cuda,flashinfer,graph,nccl,cutlass"` |
+| **CUDA (full)** | `cargo build --release --features "cuda,flashinfer,nccl"` |
+| **CUDA (sm90+)** | Add `cutlass` feature: `--features "cuda,flashinfer,nccl,cutlass"` |
 
 If permission errors occur on `target/`, use: `CARGO_TARGET_DIR=/tmp/vllm-rs-check cargo check --features metal`
 
@@ -277,13 +277,13 @@ Fix all errors and warnings before proceeding.
 cargo run --release --features metal -- --m <model_id_or_path> --port 8080 # or use --w to specify local model path
 
 # CUDA
-cargo run --release --features "cuda,flashinfer,cutlass,graph" -- --m <model_id_or_path> --port 8080
+cargo run --release --features "cuda,flashinfer,cutlass" -- --m <model_id_or_path> --port 8080
 ```
 
 **Multi-GPU (CUDA, use run.sh):**
 ```bash
 # This builds both the runner binary and the main server, --d used to specifify device ids
-./run.sh --release --features "cuda,flashinfer,cutlass,graph,nccl" -- \
+./run.sh --release --features "cuda,flashinfer,cutlass,nccl" -- \
     --model <model_id_or_path> --port 8080 --d 0,1
 ```
 
@@ -363,5 +363,5 @@ Compare outputs against the Python reference:
 | `src/utils/mod.rs` | Config parsing (HF + GGUF), architecture registration, chat templates |
 | `src/core/runner.rs` | Model enum, build_model!, model_call!, graph_wrapper! macros |
 | `src/server/parser.rs` | Tool parsing, structured output per model type |
-| `Cargo.toml` | Feature flags: metal, cuda, flashinfer, graph, nccl, cutlass |
+| `Cargo.toml` | Feature flags: metal, cuda, flashinfer, nccl, cutlass |
 | `run.sh` | Multi-rank build + run script |

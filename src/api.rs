@@ -28,7 +28,7 @@ pub struct EngineBuilder {
     isq: Option<String>,
     dtype: Option<DType>,
     flash_attn: Option<bool>,
-    fp8_kvcache: Option<bool>,
+    kvcache_dtype: Option<crate::utils::config::KvCacheDtype>,
     mamba_fraction: Option<f32>,
     prefix_cache: Option<bool>,
     prefix_cache_max_tokens: Option<usize>,
@@ -45,7 +45,7 @@ impl EngineBuilder {
             isq: None,
             dtype: None,
             flash_attn: None,
-            fp8_kvcache: None,
+            kvcache_dtype: None,
             mamba_fraction: None,
             prefix_cache: None,
             prefix_cache_max_tokens: None,
@@ -72,7 +72,12 @@ impl EngineBuilder {
     }
 
     pub fn with_fp8_kvcache(mut self) -> Self {
-        self.fp8_kvcache = Some(true);
+        self.kvcache_dtype = Some(crate::utils::config::KvCacheDtype::Fp8);
+        self
+    }
+
+    pub fn with_kvcache_dtype(mut self, dtype: crate::utils::config::KvCacheDtype) -> Self {
+        self.kvcache_dtype = Some(dtype);
         self
     }
 
@@ -128,7 +133,7 @@ impl EngineBuilder {
             }
         };
 
-        let econfig = EngineConfig::new(
+        let mut econfig = EngineConfig::new(
             model_id,
             weight_path,
             weight_file,
@@ -144,9 +149,9 @@ impl EngineBuilder {
             self.device_ids.clone(),
             None,
             None,
-            self.prefix_cache,
+            !self.prefix_cache.unwrap_or(true),
             self.prefix_cache_max_tokens,
-            self.fp8_kvcache,
+            None,
             None,
             None,
             None,
@@ -160,7 +165,12 @@ impl EngineBuilder {
             self.pd_client_prefix_cache_ratio,
             self.yarn_scaling_factor,
             false,
+            false,
         );
+
+        if let Some(kv_dtype) = self.kvcache_dtype {
+            econfig.kvcache_dtype = kv_dtype;
+        }
 
         let dtype = self.dtype.clone().map(dtype_to_str);
         let dtype = get_dtype(dtype);

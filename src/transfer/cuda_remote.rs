@@ -31,6 +31,32 @@ pub(super) fn get_ipc_handle<T: WithDType + candle_core::cuda_backend::CudaDType
     ))
 }
 
+/// Dtype-dispatching version of get_ipc_handle — picks the right T at runtime.
+pub(super) fn get_ipc_handle_any(tensor: &Tensor) -> Result<CudaIpcMemHandle> {
+    match tensor.dtype() {
+        candle_core::DType::U8 => get_ipc_handle::<u8>(tensor),
+        candle_core::DType::F32 => get_ipc_handle::<f32>(tensor),
+        candle_core::DType::F16 => get_ipc_handle::<half::f16>(tensor),
+        candle_core::DType::BF16 => get_ipc_handle::<half::bf16>(tensor),
+        dt => candle_core::bail!("Unsupported dtype for IPC handle: {:?}", dt),
+    }
+}
+
+/// Dtype-dispatching version of open_ipc_handle — picks the right T at runtime.
+pub(super) fn open_ipc_handle_any(
+    handle: &CudaIpcMemHandle,
+    device: &Device,
+) -> Result<ManuallyDrop<Tensor>> {
+    let dt: candle_core::DType = handle.2.clone().into();
+    match dt {
+        candle_core::DType::U8 => open_ipc_handle::<u8>(handle, device),
+        candle_core::DType::F32 => open_ipc_handle::<f32>(handle, device),
+        candle_core::DType::F16 => open_ipc_handle::<half::f16>(handle, device),
+        candle_core::DType::BF16 => open_ipc_handle::<half::bf16>(handle, device),
+        dt => candle_core::bail!("Unsupported dtype for IPC open: {:?}", dt),
+    }
+}
+
 /// (Client) Opens an IPC handle to get a local tensor pointing to remote GPU memory.
 pub(super) fn open_ipc_handle<T: WithDType + candle_core::cuda_backend::CudaDType>(
     handle: &CudaIpcMemHandle,

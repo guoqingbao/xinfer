@@ -324,7 +324,7 @@ impl Phi4Attention {
                 cfg.sliding_window,
                 vb.device().clone(),
                 None,
-                cfg.fp8_kvcache.unwrap_or(false),
+                cfg.kvcache_dtype.is_fp8_keys(),
             )?,
             is_quantized: is_qvar_builder || cfg.quant.is_some(),
             dtype,

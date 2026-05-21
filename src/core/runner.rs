@@ -36,6 +36,7 @@ use crate::{
     utils::kvcache_allocator::KVCacheAllocator,
 };
 use attention_rs::cache;
+#[cfg(feature = "flashinfer")]
 use attention_rs::FlashInferMetadata;
 use attention_rs::InputMetadata;
 use candle_core::{DType, Device, Result, Tensor, D};
@@ -101,10 +102,18 @@ pub enum RunnerType {
     Process(Vec<LocalStream>),
 }
 
+pub struct CpuTqLayerCache {
+    pub k_absmax: Option<Tensor>,
+    pub k_quant: Option<Tensor>,
+    pub v_absmax: Tensor,
+    pub v_quant: Tensor,
+}
+
 pub struct ModelRunner {
     model: Model,
     gpu_kv_cache: Arc<Mutex<Vec<(Tensor, Tensor)>>>,
     cpu_kv_cache: Arc<Mutex<Vec<(Tensor, Tensor)>>>,
+    cpu_tq_cache: Option<Vec<CpuTqLayerCache>>,
     device: Device,
     config: EngineConfig,
     #[cfg(all(feature = "cuda", feature = "graph"))]
@@ -386,6 +395,7 @@ impl ModelRunner {
         llg_factory: Option<Arc<ParserFactory>>,
         stream: Option<LocalStream>,
     ) -> Result<Self> {
+        attention_rs::reset_paged_attention_layer_counter();
         let model = crate::build_model!(
             model_type,
             vb,
@@ -454,6 +464,7 @@ impl ModelRunner {
             KVCacheAllocator::new(econfig, config, dtype)
         } else {
             let allocator = KVCacheAllocator::new(&econfig, &config, dtype);
+            econfig.kvcache_dtype = allocator.resolved_kvcache_dtype();
             let device_ids = econfig.device_ids.clone().unwrap_or(vec![0]);
             match allocator.plan(&device_ids, econfig) {
                 Ok(_) => {
@@ -576,6 +587,10 @@ impl ModelRunner {
         let (gpu_kv_cache, cpu_kv_cache) =
             allocator.init_kv_cache(&allocation, dtype, &device, econfig.pd_config.as_ref())?;
 
+        let num_cpu_blocks =
+            (econfig.cpu_mem_fold.unwrap_or(0.2f32) * econfig.num_blocks as f32) as usize;
+        let cpu_tq_cache = allocator.init_cpu_tq_cache(num_cpu_blocks)?;
+
         let (temperature, top_k, top_p) = if econfig.generation_cfg.is_some() {
             (
                 econfig.generation_cfg.as_ref().unwrap().temperature.clone(),
@@ -591,8 +606,19 @@ impl ModelRunner {
         } else {
             econfig.seed.unwrap()
         };
+
         #[cfg(feature = "flashinfer")]
-        let flashinfer_kv_params = {
+        let has_heterogeneous_head_dim =
+            matches!(model_type, ModelType::Gemma3) || matches!(model_type, ModelType::Gemma4);
+
+        #[cfg(feature = "flashinfer")]
+        let skip_flashinfer_init = config.kvcache_dtype.is_turboquant()
+            || (config.kvcache_dtype.is_fp8_keys() && !attention_rs::has_flashinfer_fp8_e4m3())
+            || has_heterogeneous_head_dim;
+        #[cfg(feature = "flashinfer")]
+        let flashinfer_kv_params = if skip_flashinfer_init {
+            None
+        } else {
             let mut params = None;
             for (k_cache, _) in &gpu_kv_cache {
                 if k_cache.rank() != 4 {
@@ -612,7 +638,39 @@ impl ModelRunner {
             params
         };
         #[cfg(feature = "flashinfer")]
-        crate::log_info!("Use flashinfer backend {:?}", flashinfer_kv_params);
+        if skip_flashinfer_init {
+            crate::log_info!(
+                "Use native flash backend ({:?} kvcache, flashinfer disabled)",
+                config.kvcache_dtype
+            );
+        } else {
+            crate::log_info!("Use flashinfer backend {:?}", flashinfer_kv_params);
+        }
+
+        #[cfg(all(feature = "flashattn", not(feature = "flashinfer")))]
+        {
+            let flashattn_usable = if config.kvcache_dtype.is_turboquant() {
+                false
+            } else if config.kvcache_dtype.is_fp8_keys() {
+                let sm = device
+                    .as_cuda_device()
+                    .ok()
+                    .and_then(|d| attention_rs::cuda_utils::sm_version(d))
+                    .unwrap_or(0);
+                sm == 90 // FP8 requires SM90
+            } else {
+                true
+            };
+
+            if flashattn_usable {
+                crate::log_info!("Use flashattn backend ({:?} kvcache)", config.kvcache_dtype);
+            } else {
+                crate::log_info!(
+                    "Use native flash backend ({:?} kvcache, flashattn not suitable)",
+                    config.kvcache_dtype
+                );
+            }
+        }
 
         if mamba_prefix_capacity > 0
             && comm.rank() == 0
@@ -628,6 +686,7 @@ impl ModelRunner {
             model,
             gpu_kv_cache: Arc::new(Mutex::new(gpu_kv_cache)),
             cpu_kv_cache: Arc::new(Mutex::new(cpu_kv_cache)),
+            cpu_tq_cache,
             device,
             config: econfig.clone(),
             #[cfg(all(feature = "cuda", feature = "graph"))]
@@ -1065,32 +1124,21 @@ impl ModelRunner {
 
         let slot_mapping = Tensor::from_vec(slot_mapping, (s_len,), &self.device)?;
 
-        // Provide block_tables + context_lens when any sequence in the batch has
-        // prior cached KV (cu_seqlens_k > cu_seqlens_q). This enables the paged
-        // attention prefill kernel to attend to the full KV context.
-        let (block_tables, context_lens) = if cu_seqlens_k.last() > cu_seqlens_q.last() {
-            let block_tables_t = self.prepare_block_tables(seqs)?;
-            let context_lens: Vec<u32> = seqs
-                .iter()
-                .zip(prefill_tokens.iter())
-                .map(|(seq, &num_tokens)| (seq.num_cached_tokens + num_tokens) as u32)
-                .collect();
-            let context_lens = Tensor::from_vec(context_lens, seqs.len(), &self.device)?;
-            (Some(block_tables_t), Some(context_lens))
-        } else {
-            (None, None)
-        };
+        let block_tables_t = self.prepare_block_tables(seqs)?;
+        let context_lens_vec: Vec<u32> = seqs
+            .iter()
+            .zip(prefill_tokens.iter())
+            .map(|(seq, &num_tokens)| (seq.num_cached_tokens + num_tokens) as u32)
+            .collect();
+        let context_lens_t = Tensor::from_vec(context_lens_vec, seqs.len(), &self.device)?;
+        let block_tables = Some(block_tables_t);
+        let context_lens = Some(context_lens_t);
         let cu_seqlens_q_vec = cu_seqlens_q.clone();
         let cu_seqlens_q = Tensor::from_vec(cu_seqlens_q, (q_len,), &self.device)?;
         let cu_seqlens_k = Tensor::from_vec(cu_seqlens_k, (k_len,), &self.device)?;
 
-        let disable_flash_attn = if matches!(self.model_type, ModelType::Gemma3) {
-            Some(true)
-        } else {
-            None
-        };
-
-        let flashinfer_metadata = if cfg!(feature = "flashinfer") {
+        #[cfg(feature = "flashinfer")]
+        let flashinfer_metadata = if self.flashinfer_kv_params.is_some() {
             let mut indptr = vec![0u32];
             let mut indices = Vec::new();
             let mut last_len = Vec::new();
@@ -1151,14 +1199,12 @@ impl ModelRunner {
                 Tensor::from_vec(batch_indices_vec, (batch_indices_len,), &self.device)?;
             let positions = Tensor::from_vec(positions_vec, (positions_len,), &self.device)?;
 
-            #[cfg(feature = "flashinfer")]
             let cu_seqlens_q_host_u32: Vec<u32> =
                 cu_seqlens_q_vec.iter().map(|&x| x as u32).collect();
 
             let mut prefill_plan_info: Option<Vec<i64>> = None;
             let mut mla_prefill_plan_info: Option<Vec<i64>> = None;
 
-            #[cfg(feature = "flashinfer")]
             if self.is_mla_model() {
                 if let Some(params) = self.flashinfer_kv_params {
                     mla_prefill_plan_info = Some(attention_rs::mla::mla_prefill_plan(
@@ -1174,7 +1220,6 @@ impl ModelRunner {
                 }
             };
 
-            #[cfg(feature = "flashinfer")]
             if !self.is_mla_model() {
                 if let Some(params) = self.flashinfer_kv_params {
                     prefill_plan_info = Some(attention_rs::flashinfer::prefill_plan(
@@ -1215,6 +1260,9 @@ impl ModelRunner {
             None
         };
 
+        #[cfg(not(feature = "flashinfer"))]
+        let flashinfer_metadata = None;
+
         let sequence_ids_vec = seqs.iter().map(|s| s.id()).collect::<Vec<_>>();
         let mamba_slot_mapping = self.prepare_mamba_slot_mapping(&sequence_ids_vec, true)?;
         let sequence_ids = Some(sequence_ids_vec);
@@ -1232,7 +1280,6 @@ impl ModelRunner {
             max_seqlen_q,
             max_seqlen_k,
             max_context_len,
-            disable_flash_attn,
             seqlens: Some(cu_seqlens_q_vec[1..].to_vec()),
             flashinfer_metadata,
         };
@@ -1274,7 +1321,8 @@ impl ModelRunner {
         let context_lens = Tensor::from_vec(context_lens, (c_len,), &self.device)?;
         let block_tables = self.prepare_block_tables(seq_refs.clone())?;
 
-        let flashinfer_metadata = if cfg!(feature = "flashinfer") {
+        #[cfg(feature = "flashinfer")]
+        let flashinfer_metadata = if self.flashinfer_kv_params.is_some() {
             #[cfg(all(feature = "cuda", feature = "graph"))]
             let use_cuda_graph = {
                 let require_exact_graph = match &self.model {
@@ -1357,6 +1405,8 @@ impl ModelRunner {
         } else {
             None
         };
+        #[cfg(not(feature = "flashinfer"))]
+        let flashinfer_metadata = None;
 
         let sequence_ids = Some(seq_refs.iter().map(|s| s.id()).collect::<Vec<_>>());
         let mamba_slot_mapping = self.prepare_mamba_slot_mapping(
@@ -1379,7 +1429,6 @@ impl ModelRunner {
             max_seqlen_q: 0,
             max_seqlen_k: 0,
             max_context_len,
-            disable_flash_attn: None,
             seqlens: None,
             flashinfer_metadata,
         };
@@ -1624,12 +1673,15 @@ impl ModelRunner {
     }
 
     pub fn swap_kvcache(&self, mappings: HashMap<usize, usize>, swap_in: bool) -> Result<bool> {
-        fn cache_swap(
-            gpu_cache: &Vec<(Tensor, Tensor)>,
-            cpu_cache: &Vec<(Tensor, Tensor)>,
-            mappings: &HashMap<usize, usize>,
-            swap_in: bool,
-        ) -> Result<bool> {
+        let tq_mode = attention_rs::get_turboquant_mode();
+        let tq_full = matches!(
+            tq_mode,
+            Some(attention_rs::TurboquantMode::Turbo4) | Some(attention_rs::TurboquantMode::Turbo3)
+        );
+
+        if !tq_full {
+            let gpu_cache = self.get_kv_cache();
+            let cpu_cache = self.get_cpu_kv_cache();
             assert!(
                 gpu_cache.len() > 0 && cpu_cache.len() > 0,
                 "Invalid kvcache tensors!"
@@ -1638,34 +1690,70 @@ impl ModelRunner {
                 * cpu_cache[0].0.dtype().size_in_bytes();
             for i in 0..gpu_cache.len() {
                 if swap_in {
-                    cache::swap_blocks(&cpu_cache[i].0, &gpu_cache[i].0, mappings)?;
-                    cache::swap_blocks(&cpu_cache[i].1, &gpu_cache[i].1, mappings)?;
+                    cache::swap_blocks(&cpu_cache[i].0, &gpu_cache[i].0, &mappings)?;
+                    cache::swap_blocks(&cpu_cache[i].1, &gpu_cache[i].1, &mappings)?;
                 } else {
-                    cache::swap_blocks(&gpu_cache[i].0, &cpu_cache[i].0, mappings)?;
-                    cache::swap_blocks(&gpu_cache[i].1, &cpu_cache[i].1, mappings)?;
+                    cache::swap_blocks(&gpu_cache[i].0, &cpu_cache[i].0, &mappings)?;
+                    cache::swap_blocks(&gpu_cache[i].1, &cpu_cache[i].1, &mappings)?;
                 }
             }
-            let total_mb_bytes_swapped =
+            let total_mb =
                 (block_size_bytes * mappings.len() * gpu_cache.len() * 2) as f32 / 1024.0 / 1024.0;
             if swap_in {
-                crate::log_info!(
-                    "{:.2} MB CPU KV cached blocks swapped in GPU!",
-                    total_mb_bytes_swapped
-                );
+                crate::log_info!("{:.2} MB CPU KV cached blocks swapped in GPU!", total_mb);
             } else {
                 crate::log_info!(
                     "{:.2} MB GPU KV cached blocks swapped out to CPU!",
-                    total_mb_bytes_swapped
+                    total_mb
                 );
             }
-            Ok(true)
         }
-        cache_swap(
-            &*self.get_kv_cache(),
-            &*self.get_cpu_kv_cache(),
-            &mappings,
-            swap_in,
-        )
+
+        if let Some(cpu_tq) = &self.cpu_tq_cache {
+            let num_layers = cpu_tq.len();
+            for layer_idx in 0..num_layers {
+                let cpu_layer = &cpu_tq[layer_idx];
+                attention_rs::with_turboquant_layer(layer_idx, |gpu_layer, _| -> Result<()> {
+                    if swap_in {
+                        cache::swap_blocks(&cpu_layer.v_absmax, &gpu_layer.v_absmax, &mappings)?;
+                        cache::swap_blocks(&cpu_layer.v_quant, &gpu_layer.v_quant, &mappings)?;
+                        if let (Some(cpu_ka), Some(gpu_ka)) =
+                            (&cpu_layer.k_absmax, &gpu_layer.k_absmax)
+                        {
+                            cache::swap_blocks(cpu_ka, gpu_ka, &mappings)?;
+                        }
+                        if let (Some(cpu_kq), Some(gpu_kq)) =
+                            (&cpu_layer.k_quant, &gpu_layer.k_quant)
+                        {
+                            cache::swap_blocks(cpu_kq, gpu_kq, &mappings)?;
+                        }
+                    } else {
+                        cache::swap_blocks(&gpu_layer.v_absmax, &cpu_layer.v_absmax, &mappings)?;
+                        cache::swap_blocks(&gpu_layer.v_quant, &cpu_layer.v_quant, &mappings)?;
+                        if let (Some(gpu_ka), Some(cpu_ka)) =
+                            (&gpu_layer.k_absmax, &cpu_layer.k_absmax)
+                        {
+                            cache::swap_blocks(gpu_ka, cpu_ka, &mappings)?;
+                        }
+                        if let (Some(gpu_kq), Some(cpu_kq)) =
+                            (&gpu_layer.k_quant, &cpu_layer.k_quant)
+                        {
+                            cache::swap_blocks(gpu_kq, cpu_kq, &mappings)?;
+                        }
+                    }
+                    Ok(())
+                })
+                .transpose()?;
+            }
+            crate::log_info!(
+                "TQ buffers {} ({} layers, {} blocks)",
+                if swap_in { "swapped in" } else { "swapped out" },
+                num_layers,
+                mappings.len()
+            );
+        }
+
+        Ok(true)
     }
 
     pub fn transfer_prefill(&self, seq: &Sequence) -> Result<bool> {

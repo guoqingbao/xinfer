@@ -17,7 +17,7 @@ The skill lives at .cursor/skills/test-model/SKILL.md and is **automatically act
 |-------|-------------|
 | **0 - Gather models** | Collects model list from a local folder scan or user-provided HuggingFace IDs. Auto-detects supported architectures and quantization formats. |
 | **1 - Estimate resources** | Queries nvidia-smi for available GPUs and free memory. Estimates per-model memory requirements and assigns GPUs accordingly. |
-| **2 - Build** | Compiles the project with run.sh --features cuda,nccl,flashinfer,cutlass,graph --release (builds both vllm-rs and the runner binary). |
+| **2 - Build** | Compiles the project with run.sh --features cuda,nccl,flashinfer,cutlass --release (builds both vllm-rs and the runner binary). |
 | **3 - Create test script** | Writes test_model.py, an OpenAI-compatible API test that sends 1k+ input tokens, requests 1k+ output tokens, and measures throughput and quality. |
 | **4 - Test each model** | Iteratively starts the server, waits for readiness, runs the test script (with and without reasoning/thinking), records results, kills the server, and moves to the next model. |
 | **5 - Summarize** | Produces a markdown table with per-model results: format, GPUs, throughput, and quality verdict. |

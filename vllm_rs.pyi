@@ -53,28 +53,68 @@ class EngineConfig:
     hf_token: Optional[str]
     hf_token_path: Optional[str]
     enforce_parser: Optional[str]
-    tokenizer: Optional[str]
-    tokenizer_config: Optional[str]
-    num_blocks: Optional[int]
-    kv_fraction: Optional[float]
-    cpu_mem_fold: Optional[float]
     max_num_seqs: Optional[int]
+    config_model_len: Optional[int]
     max_model_len: Optional[int]
     max_tokens: Optional[int]
-    max_num_batched_tokens: Optional[int]
     isq: Optional[str]
     num_shards: Optional[int]
-    device_id: Optional[int]
+    device_ids: Optional[List[int]]
     generation_cfg: Optional[GenerationConfig]
     seed: Optional[int]
-    prefix_cache: Optional[bool]
+    disable_prefix_cache: bool
     prefix_cache_max_tokens: Optional[int]
-    fp8_kvcache: Optional[bool]
+    kvcache_dtype: Optional[str]
     server_mode: Optional[bool]
+    cpu_mem_fold: Optional[float]
+    kv_fraction: Optional[float]
+    mamba_fraction: Optional[float]
     pd_config: Optional[PdConfig]
-    mcp_config: Optional[str]
     mcp_command: Optional[str]
-    mcp_args: Optional[str]
+    mcp_config: Optional[str]
+    mcp_args: Optional[List[str]]
+    tool_prompt_template: Optional[str]
+    pd_server_prefix_cache_ratio: Optional[float]
+    pd_client_prefix_cache_ratio: Optional[float]
+    yarn_scaling_factor: Optional[float]
+    disable_reasoning: bool
+    disable_cuda_graph: bool
+
+    def __init__(
+        self,
+        model_id: Optional[str] = None,
+        weight_path: Optional[str] = None,
+        weight_file: Optional[str] = None,
+        hf_token: Optional[str] = None,
+        hf_token_path: Optional[str] = None,
+        enforce_parser: Optional[str] = None,
+        max_num_seqs: Optional[int] = 32,
+        config_model_len: Optional[int] = None,
+        max_model_len: Optional[int] = 1024,
+        max_tokens: Optional[int] = None,
+        isq: Optional[str] = None,
+        num_shards: Optional[int] = 1,
+        device_ids: Optional[List[int]] = None,
+        generation_cfg: Optional[GenerationConfig] = None,
+        seed: Optional[int] = None,
+        disable_prefix_cache: bool = False,
+        prefix_cache_max_tokens: Optional[int] = None,
+        kvcache_dtype: Optional[str] = None,
+        server_mode: Optional[bool] = None,
+        cpu_mem_fold: Optional[float] = None,
+        kv_fraction: Optional[float] = None,
+        mamba_fraction: Optional[float] = None,
+        pd_config: Optional[PdConfig] = None,
+        mcp_command: Optional[str] = None,
+        mcp_config: Optional[str] = None,
+        mcp_args: Optional[List[str]] = None,
+        tool_prompt_template: Optional[str] = None,
+        pd_server_prefix_cache_ratio: Optional[float] = None,
+        pd_client_prefix_cache_ratio: Optional[float] = None,
+        yarn_scaling_factor: Optional[float] = None,
+        disable_reasoning: bool = False,
+        disable_cuda_graph: bool = False,
+    ) -> None: ...
 
 @dataclass
 class SamplingParams:

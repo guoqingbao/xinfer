@@ -76,6 +76,24 @@ pub struct CudaIpcMemHandle(Vec<u8>, Vec<usize>, SerializableDType); // Simplifi
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CudaIpcMemHandle(Vec<i8>, Vec<usize>, SerializableDType); // Simplified as bytes. See cuda.rs for real impl.
 
+/// TurboQuant buffer handles for a single layer (IPC path).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TqLayerIpcHandles {
+    pub k_absmax: Option<CudaIpcMemHandle>,
+    pub k_quant: Option<CudaIpcMemHandle>,
+    pub v_absmax: CudaIpcMemHandle,
+    pub v_quant: CudaIpcMemHandle,
+}
+
+/// TurboQuant buffer data for a single layer (TCP path).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TqLayerTcpData {
+    pub k_absmax: Option<Vec<u8>>,
+    pub k_quant: Option<Vec<u8>>,
+    pub v_absmax: Vec<u8>,
+    pub v_quant: Vec<u8>,
+}
+
 /// A handle abstracting *how* to get the KV cache data.
 /// This is serialized and sent from the PDServer to the Client.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -87,6 +105,8 @@ pub enum KVTransferHandle {
         layer_handles: Vec<(CudaIpcMemHandle, CudaIpcMemHandle)>,
         /// The *server's* GPU block IDs that contain the data for this sequence.
         server_block_ids: Vec<u32>,
+        /// TurboQuant buffer IPC handles (one per layer). Present when TQ is active.
+        tq_layer_handles: Option<Vec<TqLayerIpcHandles>>,
     },
     /// For remote HtoD copy. Contains the raw KV cache data.
     RemoteTcp {
@@ -96,6 +116,8 @@ pub enum KVTransferHandle {
         layer_data: Vec<(Vec<u8>, Vec<u8>)>,
         /// The number of blocks (tokens) in the sequence.
         num_blocks: usize,
+        /// TurboQuant buffer data (one per layer). Present when TQ is active.
+        tq_layer_data: Option<Vec<TqLayerTcpData>>,
     },
 }
 
@@ -210,7 +232,12 @@ impl Transfer {
 
     /// (Client) Checks if a specific prefill has finished.
     pub fn check_prefill_finished(&self, seq_id: usize) -> Result<bool> {
-        Ok(self.finished_data.write().contains_key(&seq_id))
+        Ok(self.finished_data.read().contains_key(&seq_id))
+    }
+
+    /// (Client) Remove finished data for a seq after successful receive to avoid unbounded memory.
+    pub fn cleanup_finished_data(&self, seq_id: usize) {
+        self.finished_data.write().remove(&seq_id);
     }
 
     /// (Client) Receives the KV cache data and copies it into local GPU blocks.
@@ -241,78 +268,170 @@ impl Transfer {
                 KVTransferHandle::LocalIpc {
                     layer_handles,
                     server_block_ids,
+                    tq_layer_handles,
                 } => {
-                    // This mapping copies from the server's block N to the client's block N.
                     let mapping: HashMap<usize, usize> = server_block_ids
                         .iter()
                         .zip(local_gpu_ids)
                         .map(|(server_id, local_id)| (*server_id as usize, local_id as usize))
                         .collect();
 
+                    let tq_full = matches!(
+                        attention_rs::get_turboquant_mode(),
+                        Some(attention_rs::TurboquantMode::Turbo4)
+                            | Some(attention_rs::TurboquantMode::Turbo3)
+                    );
                     #[cfg(feature = "cuda")]
-                    for (i, (k_handle, v_handle)) in layer_handles.iter().enumerate() {
-                        // Open the remote IPC handles to get local pointers to remote memory
-                        let remote_k_tensor =
-                            cuda_remote::open_ipc_handle::<T>(k_handle, local_device)?;
-                        let remote_v_tensor =
-                            cuda_remote::open_ipc_handle::<T>(v_handle, local_device)?;
+                    if !tq_full {
+                        for (i, (k_handle, v_handle)) in layer_handles.iter().enumerate() {
+                            let remote_k_tensor =
+                                cuda_remote::open_ipc_handle::<T>(k_handle, local_device)?;
+                            let remote_v_tensor =
+                                cuda_remote::open_ipc_handle::<T>(v_handle, local_device)?;
 
-                        // Use swap_blocks to perform a D2D (peer) copy
-                        // Copy from: remote_k_tensor, To: local_gpu_cache
-                        attention_rs::cache::swap_blocks(
-                            &remote_k_tensor,
-                            &local_gpu_cache[i].0,
-                            &mapping,
-                        )?;
-                        attention_rs::cache::swap_blocks(
-                            &remote_v_tensor,
-                            &local_gpu_cache[i].1,
-                            &mapping,
-                        )?;
+                            attention_rs::cache::swap_blocks(
+                                &remote_k_tensor,
+                                &local_gpu_cache[i].0,
+                                &mapping,
+                            )?;
+                            attention_rs::cache::swap_blocks(
+                                &remote_v_tensor,
+                                &local_gpu_cache[i].1,
+                                &mapping,
+                            )?;
+                        }
+                    }
+
+                    #[cfg(feature = "cuda")]
+                    if let Some(tq_handles) = tq_layer_handles {
+                        for (layer_idx, tq_h) in tq_handles.iter().enumerate() {
+                            attention_rs::with_turboquant_layer(layer_idx, |tq, _| -> Result<()> {
+                                let remote_va =
+                                    cuda_remote::open_ipc_handle_any(&tq_h.v_absmax, local_device)?;
+                                let remote_vq =
+                                    cuda_remote::open_ipc_handle_any(&tq_h.v_quant, local_device)?;
+                                attention_rs::cache::swap_blocks(
+                                    &remote_va,
+                                    &tq.v_absmax,
+                                    &mapping,
+                                )?;
+                                attention_rs::cache::swap_blocks(
+                                    &remote_vq,
+                                    &tq.v_quant,
+                                    &mapping,
+                                )?;
+
+                                if let (Some(ka_handle), Some(local_ka)) =
+                                    (&tq_h.k_absmax, &tq.k_absmax)
+                                {
+                                    let remote_ka =
+                                        cuda_remote::open_ipc_handle_any(ka_handle, local_device)?;
+                                    attention_rs::cache::swap_blocks(
+                                        &remote_ka, local_ka, &mapping,
+                                    )?;
+                                }
+                                if let (Some(kq_handle), Some(local_kq)) =
+                                    (&tq_h.k_quant, &tq.k_quant)
+                                {
+                                    let remote_kq =
+                                        cuda_remote::open_ipc_handle_any(kq_handle, local_device)?;
+                                    attention_rs::cache::swap_blocks(
+                                        &remote_kq, local_kq, &mapping,
+                                    )?;
+                                }
+                                Ok(())
+                            })
+                            .transpose()?;
+                        }
                     }
                 }
                 KVTransferHandle::RemoteTcp {
                     layer_data,
                     num_blocks,
+                    tq_layer_data,
                 } => {
                     if local_gpu_ids.len() < *num_blocks {
                         candle_core::bail!("Not enough blocks allocated to receive KV cache");
                     }
 
-                    // This mapping copies from the *N-th* block in the received data
-                    // to the client's *N-th* allocated block.
                     let mapping: HashMap<usize, usize> = (0..*num_blocks)
                         .zip(local_gpu_ids)
                         .map(|(i, local_id)| (i, local_id as usize))
                         .collect();
 
-                    for (i, (k_bytes, v_bytes)) in layer_data.into_iter().enumerate() {
-                        // Reconstruct CPU tensors from raw bytes
-                        let (local_k_cache, local_v_cache) = &local_gpu_cache[i];
+                    let tq_full = matches!(
+                        attention_rs::get_turboquant_mode(),
+                        Some(attention_rs::TurboquantMode::Turbo4)
+                            | Some(attention_rs::TurboquantMode::Turbo3)
+                    );
+                    if !tq_full {
+                        for (i, (k_bytes, v_bytes)) in layer_data.into_iter().enumerate() {
+                            let (local_k_cache, local_v_cache) = &local_gpu_cache[i];
 
-                        let remote_k_tensor = super::transfer::bytes_to_cpu_tensor(
-                            k_bytes,
-                            *num_blocks,
-                            local_k_cache,
-                        )?;
-                        let remote_v_tensor = super::transfer::bytes_to_cpu_tensor(
-                            v_bytes,
-                            *num_blocks,
-                            local_v_cache,
-                        )?;
+                            let remote_k_tensor = super::transfer::bytes_to_cpu_tensor(
+                                k_bytes,
+                                *num_blocks,
+                                local_k_cache,
+                            )?;
+                            let remote_v_tensor = super::transfer::bytes_to_cpu_tensor(
+                                v_bytes,
+                                *num_blocks,
+                                local_v_cache,
+                            )?;
 
-                        // Use swap_blocks to perform an HtoD copy
-                        // Copy from: remote_k_tensor (CPU), To: local_k_cache (GPU)
-                        attention_rs::cache::swap_blocks(
-                            &remote_k_tensor,
-                            &local_k_cache,
-                            &mapping,
-                        )?;
-                        attention_rs::cache::swap_blocks(
-                            &remote_v_tensor,
-                            &local_v_cache,
-                            &mapping,
-                        )?;
+                            attention_rs::cache::swap_blocks(
+                                &remote_k_tensor,
+                                &local_k_cache,
+                                &mapping,
+                            )?;
+                            attention_rs::cache::swap_blocks(
+                                &remote_v_tensor,
+                                &local_v_cache,
+                                &mapping,
+                            )?;
+                        }
+                    }
+
+                    if let Some(tq_data) = tq_layer_data {
+                        for (layer_idx, tq_d) in tq_data.iter().enumerate() {
+                            attention_rs::with_turboquant_layer(layer_idx, |tq, _| -> Result<()> {
+                                let va_cpu = super::transfer::bytes_to_tq_cpu_tensor(
+                                    &tq_d.v_absmax,
+                                    *num_blocks,
+                                    &tq.v_absmax,
+                                )?;
+                                let vq_cpu = super::transfer::bytes_to_tq_cpu_tensor(
+                                    &tq_d.v_quant,
+                                    *num_blocks,
+                                    &tq.v_quant,
+                                )?;
+                                attention_rs::cache::swap_blocks(&va_cpu, &tq.v_absmax, &mapping)?;
+                                attention_rs::cache::swap_blocks(&vq_cpu, &tq.v_quant, &mapping)?;
+
+                                if let (Some(ka_bytes), Some(local_ka)) =
+                                    (&tq_d.k_absmax, &tq.k_absmax)
+                                {
+                                    let ka_cpu = super::transfer::bytes_to_tq_cpu_tensor(
+                                        ka_bytes,
+                                        *num_blocks,
+                                        local_ka,
+                                    )?;
+                                    attention_rs::cache::swap_blocks(&ka_cpu, local_ka, &mapping)?;
+                                }
+                                if let (Some(kq_bytes), Some(local_kq)) =
+                                    (&tq_d.k_quant, &tq.k_quant)
+                                {
+                                    let kq_cpu = super::transfer::bytes_to_tq_cpu_tensor(
+                                        kq_bytes,
+                                        *num_blocks,
+                                        local_kq,
+                                    )?;
+                                    attention_rs::cache::swap_blocks(&kq_cpu, local_kq, &mapping)?;
+                                }
+                                Ok(())
+                            })
+                            .transpose()?;
+                        }
                     }
                 }
             }
@@ -320,12 +439,14 @@ impl Transfer {
         }
 
         let dtype = local_gpu_cache[0].0.dtype();
-        match dtype {
+        let result = match dtype {
             DType::F16 => read_data::<half::f16>(&self, seq, local_gpu_cache),
             DType::BF16 => read_data::<half::bf16>(&self, seq, local_gpu_cache),
             DType::U8 => read_data::<u8>(&self, seq, local_gpu_cache),
             _ => candle_core::bail!("Invalid kvcache dtype!"),
-        }
+        };
+        self.cleanup_finished_data(seq.id);
+        result
     }
 
     /// (Client) Notify the server to release kvcache
@@ -379,55 +500,170 @@ impl Transfer {
                 .duration_since(UNIX_EPOCH)
                 .expect("Time went backwards")
                 .as_millis() as usize;
+            let tq_mode = attention_rs::get_turboquant_mode();
+            let num_layers = server_gpu_cache.len();
+
             let transfer_handle = match config.method {
                 PdMethod::LocalIpc => {
                     let mut layer_handles = Vec::new();
                     #[cfg(feature = "cuda")]
                     for (k_tensor, v_tensor) in server_gpu_cache.iter() {
-                        // Get IPC handles for the *entire* layer tensors
                         let k_handle = cuda_remote::get_ipc_handle::<T>(k_tensor)?;
                         let v_handle = cuda_remote::get_ipc_handle::<T>(v_tensor)?;
                         layer_handles.push((k_handle, v_handle));
                     }
+
+                    let tq_layer_handles = if tq_mode.is_some() {
+                        let mut tq_handles = Vec::with_capacity(num_layers);
+                        #[cfg(feature = "cuda")]
+                        for layer_idx in 0..num_layers {
+                            let h = attention_rs::with_turboquant_layer(
+                                layer_idx,
+                                |tq, _mode| -> Result<TqLayerIpcHandles> {
+                                    let va_handle = cuda_remote::get_ipc_handle_any(&tq.v_absmax)?;
+                                    let vq_handle = cuda_remote::get_ipc_handle_any(&tq.v_quant)?;
+                                    let ka_handle = tq
+                                        .k_absmax
+                                        .as_ref()
+                                        .map(|t| cuda_remote::get_ipc_handle_any(t))
+                                        .transpose()?;
+                                    let kq_handle = tq
+                                        .k_quant
+                                        .as_ref()
+                                        .map(|t| cuda_remote::get_ipc_handle_any(t))
+                                        .transpose()?;
+                                    Ok(TqLayerIpcHandles {
+                                        k_absmax: ka_handle,
+                                        k_quant: kq_handle,
+                                        v_absmax: va_handle,
+                                        v_quant: vq_handle,
+                                    })
+                                },
+                            )
+                            .ok_or_else(|| {
+                                candle_core::Error::Msg(format!(
+                                    "TQ layer {} not found on server",
+                                    layer_idx
+                                ))
+                            })??;
+                            tq_handles.push(h);
+                        }
+                        Some(tq_handles)
+                    } else {
+                        None
+                    };
+
                     KVTransferHandle::LocalIpc {
                         layer_handles,
                         server_block_ids: seq.block_table.clone(),
+                        tq_layer_handles,
                     }
                 }
                 PdMethod::RemoteTcp => {
-                    let mut layer_data = Vec::new();
                     let server_block_ids = &seq.block_table;
 
-                    // This mapping copies *from* the server's block IDs *to*
-                    // a contiguous index (0, 1, 2...) in a *new CPU tensor*.
                     let mapping: HashMap<usize, usize> = server_block_ids
                         .iter()
                         .enumerate()
                         .map(|(i, &server_id)| (server_id as usize, i))
                         .collect();
 
-                    for (k_tensor, v_tensor) in server_gpu_cache.iter() {
-                        // Copy blocks from GPU to a new contiguous CPU tensor
-                        let k_cpu_tensor = super::transfer::copy_blocks_to_cpu(
-                            k_tensor,
-                            &mapping,
-                            server_block_ids.len(),
-                        )?;
-                        let v_cpu_tensor = super::transfer::copy_blocks_to_cpu(
-                            v_tensor,
-                            &mapping,
-                            server_block_ids.len(),
-                        )?;
+                    let tq_full = matches!(
+                        tq_mode,
+                        Some(attention_rs::TurboquantMode::Turbo4)
+                            | Some(attention_rs::TurboquantMode::Turbo3)
+                    );
 
-                        // Get raw bytes from the CPU tensors
-                        layer_data.push((
-                            super::transfer::cpu_tensor_to_bytes::<T>(&k_cpu_tensor)?,
-                            super::transfer::cpu_tensor_to_bytes::<T>(&v_cpu_tensor)?,
-                        ));
+                    let mut layer_data = Vec::new();
+                    if !tq_full {
+                        for (k_tensor, v_tensor) in server_gpu_cache.iter() {
+                            let k_cpu_tensor = super::transfer::copy_blocks_to_cpu(
+                                k_tensor,
+                                &mapping,
+                                server_block_ids.len(),
+                            )?;
+                            let v_cpu_tensor = super::transfer::copy_blocks_to_cpu(
+                                v_tensor,
+                                &mapping,
+                                server_block_ids.len(),
+                            )?;
+
+                            layer_data.push((
+                                super::transfer::cpu_tensor_to_bytes::<T>(&k_cpu_tensor)?,
+                                super::transfer::cpu_tensor_to_bytes::<T>(&v_cpu_tensor)?,
+                            ));
+                        }
                     }
+
+                    let tq_layer_data = if tq_mode.is_some() {
+                        let mut tq_data = Vec::with_capacity(num_layers);
+                        for layer_idx in 0..num_layers {
+                            let d = attention_rs::with_turboquant_layer(
+                                layer_idx,
+                                |tq, _mode| -> Result<TqLayerTcpData> {
+                                    let va_cpu = super::transfer::copy_blocks_to_cpu(
+                                        &tq.v_absmax,
+                                        &mapping,
+                                        server_block_ids.len(),
+                                    )?;
+                                    let vq_cpu = super::transfer::copy_blocks_to_cpu(
+                                        &tq.v_quant,
+                                        &mapping,
+                                        server_block_ids.len(),
+                                    )?;
+                                    let ka_cpu = tq
+                                        .k_absmax
+                                        .as_ref()
+                                        .map(|t| {
+                                            super::transfer::copy_blocks_to_cpu(
+                                                t,
+                                                &mapping,
+                                                server_block_ids.len(),
+                                            )
+                                        })
+                                        .transpose()?;
+                                    let kq_cpu = tq
+                                        .k_quant
+                                        .as_ref()
+                                        .map(|t| {
+                                            super::transfer::copy_blocks_to_cpu(
+                                                t,
+                                                &mapping,
+                                                server_block_ids.len(),
+                                            )
+                                        })
+                                        .transpose()?;
+                                    Ok(TqLayerTcpData {
+                                        k_absmax: ka_cpu
+                                            .map(|t| super::transfer::cpu_tensor_to_bytes_any(&t))
+                                            .transpose()?,
+                                        k_quant: kq_cpu
+                                            .map(|t| super::transfer::cpu_tensor_to_bytes_any(&t))
+                                            .transpose()?,
+                                        v_absmax: super::transfer::cpu_tensor_to_bytes_any(
+                                            &va_cpu,
+                                        )?,
+                                        v_quant: super::transfer::cpu_tensor_to_bytes_any(&vq_cpu)?,
+                                    })
+                                },
+                            )
+                            .ok_or_else(|| {
+                                candle_core::Error::Msg(format!(
+                                    "TQ layer {} not found on server",
+                                    layer_idx
+                                ))
+                            })??;
+                            tq_data.push(d);
+                        }
+                        Some(tq_data)
+                    } else {
+                        None
+                    };
+
                     KVTransferHandle::RemoteTcp {
                         layer_data,
                         num_blocks: seq.block_table.len(),
+                        tq_layer_data,
                     }
                 }
             };
@@ -439,7 +675,6 @@ impl Transfer {
                 sending_time,
                 num_cached_tokens: seq.num_cached_tokens,
             });
-            // Send the finished data back to the client
             sf.communicator.send(&msg)
         }
 
@@ -475,6 +710,19 @@ impl Drop for Transfer {
     }
 }
 
+/// (Client) Converts raw TQ bytes back into a CPU tensor for HtoD copy.
+/// Uses the GPU tensor's shape with dim(0) replaced by `num_blocks`.
+pub fn bytes_to_tq_cpu_tensor(
+    bytes: &Vec<u8>,
+    num_blocks: usize,
+    gpu_tensor_template: &Tensor,
+) -> Result<Tensor> {
+    let dtype = gpu_tensor_template.dtype();
+    let mut cpu_shape = gpu_tensor_template.shape().dims().to_vec();
+    cpu_shape[0] = num_blocks;
+    Tensor::from_raw_buffer(bytes, dtype, &cpu_shape, &candle_core::Device::Cpu)
+}
+
 /// (Client) Converts raw bytes back into a CPU tensor for HtoD copy.
 pub fn bytes_to_cpu_tensor(
     bytes: &Vec<u8>,
@@ -507,6 +755,17 @@ pub fn cpu_tensor_to_bytes<T: WithDType>(cpu_tensor: &Tensor) -> Result<Vec<u8>>
         )
     };
     Ok(bytes.to_vec())
+}
+
+/// Dtype-dispatching version of cpu_tensor_to_bytes.
+pub fn cpu_tensor_to_bytes_any(cpu_tensor: &Tensor) -> Result<Vec<u8>> {
+    match cpu_tensor.dtype() {
+        DType::U8 => cpu_tensor_to_bytes::<u8>(cpu_tensor),
+        DType::F32 => cpu_tensor_to_bytes::<f32>(cpu_tensor),
+        DType::F16 => cpu_tensor_to_bytes::<half::f16>(cpu_tensor),
+        DType::BF16 => cpu_tensor_to_bytes::<half::bf16>(cpu_tensor),
+        dt => candle_core::bail!("Unsupported dtype for tensor bytes: {:?}", dt),
+    }
 }
 
 /// (Server) Copies specific blocks from a GPU tensor to a new, contiguous CPU tensor.

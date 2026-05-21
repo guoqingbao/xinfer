@@ -62,7 +62,7 @@ The skill accepts multiple input forms — provide whichever is convenient:
 For models that require multi-GPU inference, the agent uses `run.sh` which builds the `runner` binary alongside the main server:
 
 ```bash
-./run.sh --release --features "cuda,flashinfer,cutlass,graph,nccl" -- \
+./run.sh --release --features "cuda,flashinfer,cutlass,nccl" -- \
     --model <model_id> --port 8000 --tensor-parallel <num_gpus>
 ```
 

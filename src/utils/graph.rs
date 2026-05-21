@@ -491,6 +491,10 @@ impl<M: CudaGraphModule> GraphCapturer<M> {
                 last_len,
             )
         };
+        #[cfg(feature = "flashinfer")]
+        let capture_in_warmup = self.flashinfer_kv_params.is_some();
+        #[cfg(not(feature = "flashinfer"))]
+        let capture_in_warmup = false;
 
         let mut outputs = BTreeMap::<usize, Tensor>::new();
         for is_warmup in [true, false] {
@@ -504,7 +508,9 @@ impl<M: CudaGraphModule> GraphCapturer<M> {
                 let input_ids_bs = input_ids.narrow(0, 0, bs)?;
                 let positions_bs = positions.narrow(0, 0, bs)?;
                 #[cfg(feature = "flashinfer")]
-                let flashinfer_metadata = {
+                let flashinfer_metadata = if self.flashinfer_kv_params.is_none() {
+                    None
+                } else {
                     let mut indptr_host = Vec::with_capacity(bs + 1);
                     indptr_host.push(0u32);
                     for i in 0..bs {
@@ -531,7 +537,7 @@ impl<M: CudaGraphModule> GraphCapturer<M> {
                                 &kv_len_arr_host_bs,
                                 bs,
                                 self.is_mla,
-                                true,
+                                true, //must be true for graph capture
                             )?;
                             (dp, mdp, Some(kv_len_arr_host_bs))
                         } else {
@@ -571,12 +577,13 @@ impl<M: CudaGraphModule> GraphCapturer<M> {
                     max_seqlen_q: 0,
                     max_seqlen_k: 0,
                     max_context_len: self.max_model_len,
-                    disable_flash_attn: None,
                     seqlens: None,
                     flashinfer_metadata,
                 };
 
-                self.model.start_capture(bs)?;
+                if !is_warmup || capture_in_warmup {
+                    self.model.start_capture(bs)?;
+                }
                 if is_warmup {
                     let _ = self.model.forward(
                         &input_ids_bs,
@@ -595,7 +602,9 @@ impl<M: CudaGraphModule> GraphCapturer<M> {
                     )?;
                     outputs.insert(bs, out);
                 }
-                self.model.end_capture(!is_warmup)?;
+                if !is_warmup || capture_in_warmup {
+                    self.model.end_capture(!is_warmup)?;
+                }
             }
         }
         let _ = self.model.report_graph_pool_usage();

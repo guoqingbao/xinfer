@@ -350,9 +350,13 @@ impl Scheduler {
         } else {
             std::cmp::max(self.cfg.max_num_seqs, MIN_NUM_SCHEDULED_REQS)
         };
+        let mut pd_finished_ids: Vec<usize> = Vec::new();
         for (idx, seq) in self.running.iter_mut().enumerate() {
             if decode_ids.len() >= decode_max_seqs {
                 break;
+            }
+            if seq.status == SequenceStatus::Finished {
+                continue;
             }
             if !self.block_manager.can_append(&seq) {
                 // filter out seq that unable to acquire resources
@@ -361,18 +365,19 @@ impl Scheduler {
             if is_pd_server && seq.status == SequenceStatus::Cached {
                 if let Ok(success) = self.block_manager.try_check_kvcache_release(seq.id) {
                     if success {
-                        // Client received kvcache - release blocks but keep prefix cache entries
-                        // Prefix cache entries will be evicted via LRU when memory is needed
                         crate::log_warn!("PD Server: release prefilled kvcache for Seq {} (prefix cache retained)", seq.id);
                         seq.status = SequenceStatus::Finished;
                         self.block_manager.deallocate(seq);
+                        pd_finished_ids.push(seq.id);
                     }
                 }
-                // in PD server mode, we do not decode, filter out seq have been prefilled
                 continue;
             }
             self.block_manager.may_append(seq)?;
             decode_ids.push(idx);
+        }
+        if !pd_finished_ids.is_empty() {
+            self.running.retain(|s| !pd_finished_ids.contains(&s.id));
         }
 
         self.is_last_prefill = false;
@@ -709,6 +714,14 @@ impl Scheduler {
             }
             seq.status = SequenceStatus::Finished;
             self.block_manager.deallocate(&seq);
+        }
+        if let Some(pos) = self.transferred.iter().position(|seq| seq.id == seq_id) {
+            let seq = self.transferred.remove(pos).unwrap();
+            crate::log_warn!(
+                "Seq {} - cancel requested while awaiting PD transfer",
+                seq.id
+            );
+            let _ = self.block_manager.try_release_remote_kvcache(seq.id);
         }
         self.release_cache(seq_id);
         self.running.retain(|seq| seq.id != seq_id);

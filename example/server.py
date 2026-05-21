@@ -24,9 +24,9 @@ def parse_args():
     parser.add_argument("--top-k", type=int, default=None)
     parser.add_argument("--frequency-penalty", type=float, default=None)
     parser.add_argument("--presence-penalty", type=float, default=None)
-    parser.add_argument("--prefix-cache", action="store_true")
+    parser.add_argument("--disable-prefix-cache", action="store_true")
     parser.add_argument("--prefix-cache-max-tokens", type=int, default=None)
-    parser.add_argument("--fp8-kvcache", action="store_true")
+    parser.add_argument("--kvcache-dtype", type=str, default=None, help="KV cache quantization: fp8, turbo8, turbo4, turbo3")
     parser.add_argument("--cpu-mem-fold", type=float, default=None)
     parser.add_argument("--kv-fraction", type=float, default=None)
     parser.add_argument("--pd-server", action="store_true")
@@ -40,6 +40,8 @@ def parse_args():
     parser.add_argument("--enforce-parser", type=str, default=None)
     parser.add_argument("--pd-server-prefix-cache-ratio", type=float, default=None)
     parser.add_argument("--pd-client-prefix-cache-ratio", type=float, default=None)
+    parser.add_argument("--disable-reasoning", action="store_true")
+    parser.add_argument("--disable-cuda-graph", action="store_true")
 
     args = parser.parse_args()
     if args.pd_server and args.ui_server:
@@ -107,9 +109,9 @@ def run_server(args):
         isq=args.isq,
         device_ids=[int(d) for d in args.d.split(",")],
         generation_cfg=generation_cfg,
-        prefix_cache=args.prefix_cache,
+        disable_prefix_cache=args.disable_prefix_cache,
         prefix_cache_max_tokens=args.prefix_cache_max_tokens,
-        fp8_kvcache=args.fp8_kvcache,
+        kvcache_dtype=args.kvcache_dtype,
         server_mode=True,
         cpu_mem_fold=args.cpu_mem_fold,
         kv_fraction=args.kv_fraction,
@@ -119,6 +121,8 @@ def run_server(args):
         mcp_args=args.mcp_args,
         pd_server_prefix_cache_ratio=args.pd_server_prefix_cache_ratio,
         pd_client_prefix_cache_ratio=args.pd_client_prefix_cache_ratio,
+        disable_reasoning=args.disable_reasoning,
+        disable_cuda_graph=args.disable_cuda_graph,
     )
 
     engine = Engine(cfg, args.dtype)

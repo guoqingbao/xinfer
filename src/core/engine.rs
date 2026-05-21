@@ -120,7 +120,7 @@ impl LLMEngine {
         let model_loaded = Arc::new(AtomicBool::new(false));
         let (mut econfig, use_runner) =
             prepare_engine_config(econfig, &config, &config_tokenizer, &mut generation_cfg);
-        config.fp8_kvcache = econfig.fp8_kvcache;
+        config.kvcache_dtype = econfig.kvcache_dtype;
 
         // In case config file missing bos and eos configuration
         config.apply_generation_cfg(generation_cfg.as_ref());
@@ -239,9 +239,10 @@ impl LLMEngine {
             };
 
             if !is_pd_server {
-                //No graph capture for PD server
                 #[cfg(all(feature = "cuda", feature = "graph"))]
-                if crate::utils::is_no_cuda_graph_supprt(arch.clone()) {
+                if econfig.disable_cuda_graph {
+                    log_info!("CUDA graph capture disabled by --disable-cuda-graph");
+                } else if crate::utils::is_no_cuda_graph_supprt(arch.clone()) {
                     log_info!("{arch} does not supprt CUDA graph");
                 } else {
                     match model_runner.warmup_capture() {
@@ -357,6 +358,7 @@ impl LLMEngine {
                         let mut econfig = econfig.clone();
                         // Use new KVCacheAllocator for multi-rank negotiation
                         let allocator = KVCacheAllocator::new(&econfig, &config, dtype);
+                        econfig.kvcache_dtype = allocator.resolved_kvcache_dtype();
                         let device_ids = econfig.device_ids.clone().unwrap_or(vec![0]);
                         match allocator.plan(&device_ids, &mut econfig) {
                             Ok(_) => {

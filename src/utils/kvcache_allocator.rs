@@ -108,8 +108,7 @@ pub struct KVCacheAllocator {
     user_max_num_seqs: Option<usize>,
     config_model_len: usize,
     kv_fraction: f64,
-    // Flags
-    fp8_kvcache: bool,
+    kvcache_dtype: crate::utils::config::KvCacheDtype,
     cpu_mem_fold: f32,
     dtype_size: usize,
     model_dtype_size: usize,
@@ -185,7 +184,7 @@ impl KVCacheAllocator {
             .head_dim
             .unwrap_or(config.hidden_size / config.num_attention_heads);
 
-        let fp8_kvcache = econfig.fp8_kvcache.unwrap_or(false);
+        let fp8_kvcache = econfig.kvcache_dtype.is_fp8_keys();
         let dtype_size = if fp8_kvcache {
             1
         } else {
@@ -282,6 +281,19 @@ impl KVCacheAllocator {
             }
         };
 
+        let kvcache_dtype = if is_mla && econfig.kvcache_dtype.is_turboquant() {
+            crate::log_warn!(
+                "TurboQuant ({:?}) is not supported for MLA models (kv_lora_rank={}). \
+                 MLA uses compressed KV cache layout incompatible with TurboQuant. \
+                 Falling back to auto KV cache dtype.",
+                econfig.kvcache_dtype,
+                mla_kv_lora_rank,
+            );
+            crate::utils::config::KvCacheDtype::Auto
+        } else {
+            econfig.kvcache_dtype
+        };
+
         let per_layer_cache_config = match gemma4_per_layer_cache_config(config) {
             Some(configs) if configs.len() == num_kv_layers => Some(configs),
             Some(_) => {
@@ -313,7 +325,7 @@ impl KVCacheAllocator {
             } else {
                 kv_fraction
             },
-            fp8_kvcache,
+            kvcache_dtype,
             cpu_mem_fold: econfig.cpu_mem_fold.unwrap_or(0.2),
             dtype_size,
             model_dtype_size,
@@ -324,6 +336,10 @@ impl KVCacheAllocator {
             mla_qk_rope_head_dim,
             per_layer_cache_config,
         }
+    }
+
+    pub fn resolved_kvcache_dtype(&self) -> crate::utils::config::KvCacheDtype {
+        self.kvcache_dtype
     }
 
     /// Set per-layer KV cache configuration for models with heterogeneous head dims
@@ -443,9 +459,21 @@ impl KVCacheAllocator {
 
         Ok(())
     }
-    /// Calculate per-block memory size in bytes
+    /// Calculate per-block memory size in bytes.
+    /// For turbo4/turbo3, only TQ buffers are counted (standard cache is a 1-block dummy).
+    /// For turbo8, standard FP8 cache + TQ V buffers.
     pub fn per_block_bytes(&self) -> usize {
-        if self.is_mla {
+        use crate::utils::config::KvCacheDtype;
+
+        let tq_full = matches!(
+            self.kvcache_dtype,
+            KvCacheDtype::Turbo4 | KvCacheDtype::Turbo3
+        );
+
+        let base = if tq_full {
+            // turbo4/turbo3: standard K/V cache is NOT allocated per-block
+            0
+        } else if self.is_mla {
             self.block_size
                 * (self.mla_kv_lora_rank + self.mla_qk_rope_head_dim)
                 * self.dtype_size
@@ -464,7 +492,57 @@ impl KVCacheAllocator {
                 * self.dtype_size
                 * 2 // K and V
                 * self.num_kv_layers
-        }
+        };
+
+        let tq_extra = match self.kvcache_dtype {
+            KvCacheDtype::Turbo8 => {
+                let per_layer = |heads: usize, hd: usize| {
+                    self.block_size * heads * 4          // v_absmax: f32 per head per token
+                    + self.block_size * heads * (hd / 2) // v_quant: packed 4-bit
+                };
+                if let Some(ref configs) = self.per_layer_cache_config {
+                    configs
+                        .iter()
+                        .map(|&(kv_heads, hd)| per_layer(self.kv_heads_per_shard_for(kv_heads), hd))
+                        .sum()
+                } else {
+                    per_layer(self.kv_heads_per_shard(), self.head_dim) * self.num_kv_layers
+                }
+            }
+            KvCacheDtype::Turbo4 => {
+                // K and V each: absmax (f32 per head) + quant (hd/2 packed u8)
+                let per_layer = |heads: usize, hd: usize| {
+                    self.block_size * heads * 4 * 2          // k_absmax + v_absmax
+                    + self.block_size * heads * (hd / 2) * 2 // k_quant + v_quant
+                };
+                if let Some(ref configs) = self.per_layer_cache_config {
+                    configs
+                        .iter()
+                        .map(|&(kv_heads, hd)| per_layer(self.kv_heads_per_shard_for(kv_heads), hd))
+                        .sum()
+                } else {
+                    per_layer(self.kv_heads_per_shard(), self.head_dim) * self.num_kv_layers
+                }
+            }
+            KvCacheDtype::Turbo3 => {
+                let per_layer = |heads: usize, hd: usize| {
+                    self.block_size * heads * 4 * 2              // k_absmax + v_absmax
+                    + self.block_size * heads * ((hd * 3 + 7) / 8) // k_quant (3-bit packed)
+                    + self.block_size * heads * (hd / 2) // v_quant (4-bit packed)
+                };
+                if let Some(ref configs) = self.per_layer_cache_config {
+                    configs
+                        .iter()
+                        .map(|&(kv_heads, hd)| per_layer(self.kv_heads_per_shard_for(kv_heads), hd))
+                        .sum()
+                } else {
+                    per_layer(self.kv_heads_per_shard(), self.head_dim) * self.num_kv_layers
+                }
+            }
+            _ => 0,
+        };
+
+        base + tq_extra
     }
 
     /// Calculate required memory for given parameters
@@ -759,26 +837,39 @@ impl KVCacheAllocator {
         let _ = pd_config;
 
         #[cfg(all(feature = "flashattn", not(feature = "flashinfer"), feature = "cuda"))]
-        if self.fp8_kvcache {
+        if self.kvcache_dtype.is_fp8_keys() {
             let sm = device
                 .as_cuda_device()
                 .ok()
                 .and_then(|d| attention_rs::cuda_utils::sm_version(d))
                 .unwrap_or(0);
-            if sm == 90 {
-                candle_core::bail!(
+            if sm != 90 {
+                tracing::warn!(
                     "FP8 KV cache with FlashAttention requires SM90 (Hopper), \
-                     but detected SM{sm}. Use FlashInfer backend for FP8 KV cache on current GPU."
+                     detected SM{sm}. Will fall back to native flash kernels.",
+                    sm = sm,
                 );
             }
         }
 
-        let cache_dtype = if self.fp8_kvcache { DType::U8 } else { dtype };
-        crate::log_warn!(
-            "Using FP8 KV Cache? {}, cache dtype {:?}",
-            self.fp8_kvcache,
-            cache_dtype
-        );
+        let cache_dtype = if self.kvcache_dtype.is_fp8_keys() {
+            DType::U8
+        } else {
+            dtype
+        };
+        if self.kvcache_dtype.is_turboquant() {
+            crate::log_warn!(
+                "TurboQuant mode: {:?}, standard cache dtype {:?} (dummy for turbo4/turbo3)",
+                self.kvcache_dtype,
+                cache_dtype
+            );
+        } else {
+            crate::log_warn!(
+                "KV cache dtype: {:?}, cache dtype {:?}",
+                self.kvcache_dtype,
+                cache_dtype
+            );
+        }
 
         if self.is_mla {
             // MLA cache: (ckv_cache, kpe_cache) per layer
@@ -825,72 +916,58 @@ impl KVCacheAllocator {
                 cpu_cache.push((ckv_blocks, kpe_blocks));
             }
             Ok((gpu_cache, cpu_cache))
-        } else if cfg!(feature = "flashinfer") || cfg!(feature = "flashattn") {
-            let element_size = cache_dtype.size_in_bytes();
-            let x = 16 / element_size;
+        } else if cfg!(feature = "flash")
+            || cfg!(feature = "flashinfer")
+            || cfg!(feature = "flashattn")
+        {
+            // For turbo4/turbo3, the standard K/V cache is unused — all data lives
+            // in TQ buffers. Allocate 1-block dummies so Option<Tensor> remains Some
+            // (the forward path checks is_some to trigger store dispatch).
+            let tq_full = matches!(
+                self.kvcache_dtype,
+                crate::utils::config::KvCacheDtype::Turbo4
+                    | crate::utils::config::KvCacheDtype::Turbo3
+            );
+            let std_gpu_blocks = if tq_full { 1 } else { num_gpu_blocks };
+            let std_cpu_blocks = if tq_full { 1 } else { num_cpu_blocks };
 
             let mut gpu_cache = Vec::new();
             let mut cpu_cache = Vec::new();
             for layer_idx in 0..self.num_kv_layers {
                 let (_, kv_heads, hd) = self.layer_flash_key_value_block_shape(layer_idx);
-                if hd > 256 {
-                    let key_blocks = Tensor::empty(
-                        (num_gpu_blocks, kv_heads, hd / x, self.block_size, x),
-                        cache_dtype,
-                        device,
-                        Some(sync_alloc),
-                    )?;
-                    let value_blocks = Tensor::empty(
-                        (num_gpu_blocks, kv_heads, hd, self.block_size),
-                        cache_dtype,
-                        device,
-                        Some(sync_alloc),
-                    )?;
-                    gpu_cache.push((key_blocks, value_blocks));
-                } else {
-                    let key_blocks = Tensor::empty(
-                        (num_gpu_blocks, self.block_size, kv_heads, hd),
-                        cache_dtype,
-                        device,
-                        Some(sync_alloc),
-                    )?;
-                    let value_blocks = Tensor::empty(
-                        (num_gpu_blocks, self.block_size, kv_heads, hd),
-                        cache_dtype,
-                        device,
-                        Some(sync_alloc),
-                    )?;
-                    gpu_cache.push((key_blocks, value_blocks));
-                }
+                let key_blocks = Tensor::empty(
+                    (std_gpu_blocks, self.block_size, kv_heads, hd),
+                    cache_dtype,
+                    device,
+                    Some(sync_alloc),
+                )?;
+                let value_blocks = Tensor::empty(
+                    (std_gpu_blocks, self.block_size, kv_heads, hd),
+                    cache_dtype,
+                    device,
+                    Some(sync_alloc),
+                )?;
+                gpu_cache.push((key_blocks, value_blocks));
             }
             for layer_idx in 0..self.num_kv_layers {
                 let (_, kv_heads, hd) = self.layer_flash_key_value_block_shape(layer_idx);
-                if hd > 256 {
-                    let key_blocks = Tensor::zeros(
-                        (num_cpu_blocks, kv_heads, hd / x, self.block_size, x),
-                        cache_dtype,
-                        &Device::Cpu,
-                    )?;
-                    let value_blocks = Tensor::zeros(
-                        (num_cpu_blocks, kv_heads, hd, self.block_size),
-                        cache_dtype,
-                        &Device::Cpu,
-                    )?;
-                    cpu_cache.push((key_blocks, value_blocks));
-                } else {
-                    let key_blocks = Tensor::zeros(
-                        (num_cpu_blocks, self.block_size, kv_heads, hd),
-                        cache_dtype,
-                        &Device::Cpu,
-                    )?;
-                    let value_blocks = Tensor::zeros(
-                        (num_cpu_blocks, self.block_size, kv_heads, hd),
-                        cache_dtype,
-                        &Device::Cpu,
-                    )?;
-                    cpu_cache.push((key_blocks, value_blocks));
-                }
+                let key_blocks = Tensor::zeros(
+                    (std_cpu_blocks, self.block_size, kv_heads, hd),
+                    cache_dtype,
+                    &Device::Cpu,
+                )?;
+                let value_blocks = Tensor::zeros(
+                    (std_cpu_blocks, self.block_size, kv_heads, hd),
+                    cache_dtype,
+                    &Device::Cpu,
+                )?;
+                cpu_cache.push((key_blocks, value_blocks));
             }
+
+            if self.kvcache_dtype.is_turboquant() {
+                self.init_turboquant_cache(num_gpu_blocks, device, sync_alloc)?;
+            }
+
             Ok((gpu_cache, cpu_cache))
         } else {
             let mut gpu_cache = Vec::new();
@@ -929,5 +1006,172 @@ impl KVCacheAllocator {
             }
             Ok((gpu_cache, cpu_cache))
         }
+    }
+
+    fn init_turboquant_cache(
+        &self,
+        num_gpu_blocks: usize,
+        device: &Device,
+        sync_alloc: bool,
+    ) -> candle_core::Result<()> {
+        use crate::utils::config::KvCacheDtype;
+
+        let tq_mode = match self.kvcache_dtype {
+            KvCacheDtype::Turbo8 => attention_rs::TurboquantMode::Turbo8,
+            KvCacheDtype::Turbo4 => attention_rs::TurboquantMode::Turbo4,
+            KvCacheDtype::Turbo3 => attention_rs::TurboquantMode::Turbo3,
+            _ => return Ok(()),
+        };
+
+        let mut tq_layers = Vec::new();
+        for layer_idx in 0..self.num_kv_layers {
+            let (_, kv_heads, hd) = self.layer_flash_key_value_block_shape(layer_idx);
+            let bs = self.block_size;
+
+            let v_absmax = Tensor::empty(
+                (num_gpu_blocks, bs, kv_heads),
+                candle_core::DType::F32,
+                device,
+                Some(sync_alloc),
+            )?;
+            let v_quant = Tensor::empty(
+                (num_gpu_blocks, bs, kv_heads, hd / 2),
+                candle_core::DType::U8,
+                device,
+                Some(sync_alloc),
+            )?;
+
+            let (k_absmax, k_quant) = match tq_mode {
+                attention_rs::TurboquantMode::Turbo4 => {
+                    let ka = Tensor::empty(
+                        (num_gpu_blocks, bs, kv_heads),
+                        candle_core::DType::F32,
+                        device,
+                        Some(sync_alloc),
+                    )?;
+                    let kq = Tensor::empty(
+                        (num_gpu_blocks, bs, kv_heads, hd / 2),
+                        candle_core::DType::U8,
+                        device,
+                        Some(sync_alloc),
+                    )?;
+                    (Some(ka), Some(kq))
+                }
+                attention_rs::TurboquantMode::Turbo3 => {
+                    let ka = Tensor::empty(
+                        (num_gpu_blocks, bs, kv_heads),
+                        candle_core::DType::F32,
+                        device,
+                        Some(sync_alloc),
+                    )?;
+                    let k_bytes_per_head = (hd * 3 + 7) / 8;
+                    let kq = Tensor::empty(
+                        (num_gpu_blocks, bs, kv_heads, k_bytes_per_head),
+                        candle_core::DType::U8,
+                        device,
+                        Some(sync_alloc),
+                    )?;
+                    (Some(ka), Some(kq))
+                }
+                _ => (None, None),
+            };
+
+            tq_layers.push(attention_rs::TurboquantLayerCache {
+                k_absmax,
+                k_quant,
+                v_absmax,
+                v_quant,
+            });
+        }
+
+        crate::log_warn!(
+            "Initialized TurboQuant {} cache: {} layers, {} blocks",
+            self.kvcache_dtype,
+            self.num_kv_layers,
+            num_gpu_blocks,
+        );
+        attention_rs::init_turboquant_cache(tq_mode, tq_layers, self.block_size);
+        Ok(())
+    }
+
+    /// Allocate CPU-side TQ buffers for swap. Returns None if not TQ mode.
+    pub fn init_cpu_tq_cache(
+        &self,
+        num_cpu_blocks: usize,
+    ) -> candle_core::Result<Option<Vec<crate::core::runner::CpuTqLayerCache>>> {
+        use crate::utils::config::KvCacheDtype;
+        let tq_mode = match self.kvcache_dtype {
+            KvCacheDtype::Turbo8 => attention_rs::TurboquantMode::Turbo8,
+            KvCacheDtype::Turbo4 => attention_rs::TurboquantMode::Turbo4,
+            KvCacheDtype::Turbo3 => attention_rs::TurboquantMode::Turbo3,
+            _ => return Ok(None),
+        };
+
+        if num_cpu_blocks == 0 {
+            return Ok(None);
+        }
+
+        let mut cpu_tq = Vec::new();
+        for layer_idx in 0..self.num_kv_layers {
+            let (_, kv_heads, hd) = self.layer_flash_key_value_block_shape(layer_idx);
+            let bs = self.block_size;
+
+            let v_absmax = Tensor::zeros(
+                (num_cpu_blocks, bs, kv_heads),
+                candle_core::DType::F32,
+                &Device::Cpu,
+            )?;
+            let v_quant = Tensor::zeros(
+                (num_cpu_blocks, bs, kv_heads, hd / 2),
+                candle_core::DType::U8,
+                &Device::Cpu,
+            )?;
+
+            let (k_absmax, k_quant) = match tq_mode {
+                attention_rs::TurboquantMode::Turbo4 => {
+                    let ka = Tensor::zeros(
+                        (num_cpu_blocks, bs, kv_heads),
+                        candle_core::DType::F32,
+                        &Device::Cpu,
+                    )?;
+                    let kq = Tensor::zeros(
+                        (num_cpu_blocks, bs, kv_heads, hd / 2),
+                        candle_core::DType::U8,
+                        &Device::Cpu,
+                    )?;
+                    (Some(ka), Some(kq))
+                }
+                attention_rs::TurboquantMode::Turbo3 => {
+                    let ka = Tensor::zeros(
+                        (num_cpu_blocks, bs, kv_heads),
+                        candle_core::DType::F32,
+                        &Device::Cpu,
+                    )?;
+                    let k_bytes_per_head = (hd * 3 + 7) / 8;
+                    let kq = Tensor::zeros(
+                        (num_cpu_blocks, bs, kv_heads, k_bytes_per_head),
+                        candle_core::DType::U8,
+                        &Device::Cpu,
+                    )?;
+                    (Some(ka), Some(kq))
+                }
+                _ => (None, None),
+            };
+
+            cpu_tq.push(crate::core::runner::CpuTqLayerCache {
+                k_absmax,
+                k_quant,
+                v_absmax,
+                v_quant,
+            });
+        }
+
+        crate::log_warn!(
+            "Initialized CPU TurboQuant {} swap cache: {} layers, {} blocks",
+            self.kvcache_dtype,
+            self.num_kv_layers,
+            num_cpu_blocks,
+        );
+        Ok(Some(cpu_tq))
     }
 }
