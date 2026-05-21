@@ -38,17 +38,17 @@ cargo install --git https://github.com/guoqingbao/vllm.rs \
 # ./build.sh --install --features cuda,nccl,flashinfer,cutlass
 
 # 2. 运行
-vllm-rs --m Qwen/Qwen3.6-27B-FP8 --ui-server
+vllm-rs --m Qwen/Qwen3.6-27B-FP8 --kvcache-dtype turbo4 --ui-server
 
 # 3. Vibe Coding 客户端（可选）
 cargo install xbot # 配置使用本地 Base URL
 ```
 
-浏览器打开 `http://IP:8001` 即可使用内置对话界面，或使用 `http://IP:8000/v1/` 作为 API 服务 Base URL。
+浏览器打开 `http://IP:8001` 即可使用内置对话界面，或使用 `http://IP:8000/v1/` 作为 API 服务 `Base URL`。
 
 可选添加 `--kvcache-dtype` 压缩 KV 缓存以扩展上下文：
 
-| 参数（`--kvcache-dtype`） | 压缩比 | 质量 | GPU 要求 |
+| 参数（`--kvcache-dtype`） | 压缩比 | 质量 | GPU 要求 (V100及以上显卡) |
 |---|---|---|---|
 | _（默认）_ | 1×（BF16） | 基线 | 全部 |
 | `fp8` | **2×** | 近无损 | SM70+ / Metal |
@@ -57,18 +57,18 @@ cargo install xbot # 配置使用本地 Base URL
 | `turbo3` | **4.7×** | 最大压缩 | SM70+ |
 
 ### 方式 B — 📦 Python（`pip install`）
-- 💡Turing/V100 (SM70/SM75), Hopper (SM90) / Blackwell (SM100+)：从 `GitHub Releases` 下载对应 wheel；
+- 💡Turing/V100 (SM70/SM75)，Hopper (SM90)，Blackwell (SM100+)：请从 `GitHub Releases`页面下载对应 wheel包；
 ```bash
 # Metal (macOS) / Ampere (SM80, A100)
 pip install vllm_rs
-python3 -m vllm_rs.server --m Qwen/Qwen3.6-27B-FP8 --ui-server
+python3 -m vllm_rs.server --m Qwen/Qwen3.6-27B-FP8 --kvcache-dtype turbo4 --ui-server
 ```
 
 ### 方式 C — Docker 安装
 - 💡将 `sm_xx` 改为 sm_70/sm_75 (Turing，去掉 `flashinfer,cutlass`编译选项)、sm_80/sm_89 (Ampere)、sm_90 (Hopper)、sm_100/sm_120/sm_121 (Blackwell)
 ```bash
-# 示例：Hopper (SM_90, CUDA 13.0.0)，最后一个参数传 1 启用中国大陆 Docker 镜像
-./build_docker.sh "cuda,nccl,flashinfer,cutlass" sm_90 13.0.0 0
+# 示例：Hopper (SM_90, CUDA 13.0.0)，增加额外参数 1 启用中国大陆 Rust crate 镜像
+./build_docker.sh "cuda,nccl,flashinfer,cutlass" sm_90 13.0.0
 ```
 
 参考 [Docker 指南 →](docs/docker.md)
@@ -142,7 +142,7 @@ TurboQuant 通过 Walsh-Hadamard 变换旋转 + 逐头 absmax 量化，将 KV �
 
 | 模型 | KV 预算 | BF16 | turbo4 | 提升 |
 |---|---|---|---|---|
-| **Qwen3.6-35B-A3B**（NVFP4/FP8） | 7 GB（24 GB GPU） | 70 万 | **270 万** | **3.9×** |
+| **Qwen3.6-35B-A3B**（NVFP4 | 7 GB（24 GB GPU） | 70 万 | **270 万** | **3.9×** |
 | | 15 GB（32 GB GPU） | 150 万 | **580 万** | **3.9×** |
 | **Qwen3.6-27B**（FP8） | 7 GB | 11.2 万 | **43.4 万** | **3.9×** |
 | | 15 GB | 24 万 | **93 万** | **3.9×** |
@@ -151,7 +151,7 @@ TurboQuant 通过 Walsh-Hadamard 变换旋转 + 逐头 absmax 量化，将 KV �
 | **Gemma4-26B-A4B**（NVFP4） | 7 GB | 3.2 万 | **12.5 万** | **3.9×** |
 | | 15 GB | 7 万 | **27.1 万** | **3.9×** |
 
-> 混合架构模型（Qwen3.6）全注意力层数远少于总层数，TurboQuant 压缩效果尤为显著。MLA 模型（DeepSeek、GLM4.7 Flash）请搭配 `fp8` 使用。表中 KV 预算为理论最大值，实际可用量仅为 KV 预算的 90%（`--kv-fraction 0.9`），需为运行时和批处理预留缓冲空间。
+> 混合架构模型（Qwen3.6）全注意力层数远少于总层数，TurboQuant 压缩效果尤为显著。MLA 模型（DeepSeek、GLM4.7 Flash）请搭配 `fp8` 使用。表中 KV 预算为理论最大值，实际可用量最高为 KV 预算的 90%（`--kv-fraction 0.9`），需为运行时和批处理预留缓冲空间。
 
 ```bash
 # 35B MoE 单卡 24/32 GB 即可运行
@@ -403,7 +403,7 @@ pip install target/wheels/vllm_rs-*.whl --force-reinstall
 
 ## 🔀 Prefill-Decode 分离（PD 分离）
 
-将预填充（prompt 处理）和解码（token 生成）拆分到不同 GPU 或机器。消除长上下文预填充时的解码卡顿。
+将预填充（prompt 处理）和解码（token 生成）拆分到不同 GPU 或机器。消除长上下文预填充时的解码卡顿。PD 服务器 与 PD 客户端必须使用相同KvCache数据类型(`--kvcache-dtype`)，对话请求需发送至PD客户端，PD服务端只处理PD客户端发来的预填充请求.
 
 | 模式 | 配置 | 适用场景 |
 |---|---|---|
@@ -411,14 +411,26 @@ pip install target/wheels/vllm_rs-*.whl --force-reinstall
 | 文件 IPC | `--pd-url file:///path` | Docker 容器，共享卷 |
 | 远程 TCP | `--pd-url tcp://host:port` | 不同机器 |
 
+**单机多卡部署**（无需指定pd-url，默认使用CUDA IPC）
+
 ```bash
-# PD 服务器（预填充 GPU）
+# PD 服务器（预填充 GPU，默认端口7000）
 vllm-rs --d 0,1 --m Qwen/Qwen3-30B-A3B-Instruct-2507 --pd-server
 
 # PD 客户端（解码 GPU + API 服务）
 vllm-rs --d 2,3 --w /path/Qwen3-30B-A3B-Instruct-2507 --isq q4k --ui-server --port 8000 --pd-client
 ```
 
+**多机部署**（tcp模式）
+
+```bash
+# 服务器机器（192.168.1.100）
+target/release/vllm-rs --d 0,1 --m Qwen/... --pd-server --pd-url tcp://0.0.0.0:8100
+
+# 客户端机器
+target/release/vllm-rs --d 0,1 --w /path/... --pd-client --pd-url tcp://192.168.1.100:8100 --ui-server --port 8000
+```
+> Metal/macOS 不支持 Local IPC，必须指定 `--pd-url`。
 <details>
 <summary>多容器部署（file:// 模式）</summary>
 
@@ -436,22 +448,6 @@ target/release/vllm-rs --d 0,1 --w /path/... --pd-client --pd-url file:///socket
 
 </details>
 
-<details>
-<summary>多机部署（tcp:// 模式）</summary>
-
-```bash
-# 服务器机器（192.168.1.100）
-target/release/vllm-rs --d 0,1 --m Qwen/... --pd-server --pd-url tcp://0.0.0.0:8100
-
-# 客户端机器
-target/release/vllm-rs --d 0,1 --w /path/... --pd-client --pd-url tcp://192.168.1.100:8100 --ui-server --port 8000
-```
-
-> Metal/macOS 不支持 LocalIPC，必须指定 `--pd-url`。
-
-</details>
-
----
 
 ## 🔌 MCP 工具调用
 

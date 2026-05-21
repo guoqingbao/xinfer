@@ -26,7 +26,7 @@
 ### Option A — 🚀 Rust (recommended)
 
 ```bash
-# Prerequisites: Rust compiler and CUDA Toolkit
+# Prerequisites: Rust compiler and CUDA Toolkit (if not installed)
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 sudo apt-get install -y git build-essential libssl-dev pkg-config
 
@@ -38,13 +38,13 @@ cargo install --git https://github.com/guoqingbao/vllm.rs \
 # ./build.sh --install --features cuda,nccl,flashinfer,cutlass
 
 # 2. Run
-vllm-rs --m Qwen/Qwen3.6-27B-FP8 --ui-server
+vllm-rs --m Qwen/Qwen3.6-27B-FP8 --kvcache-dtype turbo4 --ui-server
 
 # 3. Vibe Coding Client (optinal)
 cargo install xbot # config to use local Base URL
 ```
 
-Open `http://IP:8001` for the built-in chat UI, or use `http://IP:8000/v1/` as API server Base URL.
+Open `http://IP:8001` for the built-in chat UI, or use `http://IP:8000/v1/` as API server `Base URL`.
 
 Optionally add `--kvcache-dtype` to compress KV cache and extend context:
 
@@ -61,14 +61,14 @@ Optionally add `--kvcache-dtype` to compress KV cache and extend context:
 ```bash
 # Metal (macOS) / Ampere (SM80, A100)
 pip install vllm_rs
-python3 -m vllm_rs.server --m Qwen/Qwen3.6-27B-FP8 --ui-server
+python3 -m vllm_rs.server --m Qwen/Qwen3.6-27B-FP8 --kvcache-dtype turbo4 --ui-server
 ```
 
 ### Option C — Install with Docker
 - 💡Change `sm_xx` to sm_70/sm_75 (Turing/V100, remove `flashinfer` and `cutlass` features), sm_80/sm_89 (Ampere), sm_90 (Hopper), sm_100/sm_120 (Blackwell)
 ```bash
-# Example: Hopper (SM_90, CUDA 13.0.0), pass last arguemnt 1 for China docker mirror
-./build_docker.sh "cuda,nccl,flashinfer,cutlass" sm_90 13.0.0 0
+# Example: Hopper (SM_90, CUDA 13.0.0), append extra argument 1 for rust crate mirror (Chinese Mainland)
+./build_docker.sh "cuda,nccl,flashinfer,cutlass" sm_90 13.0.0
 ```
 
 See [Docker guide →](docs/docker.md)
@@ -389,7 +389,7 @@ pip install target/wheels/vllm_rs-*.whl --force-reinstall
 
 ## 🔀 Prefill-Decode Disaggregation
 
-Split prefill (prompt processing) and decode (token generation) across GPUs or machines. Eliminates decode stalls during long-context prefilling.
+Split prefill (prompt processing) and decode (token generation) across GPUs or machines. Eliminates decode stalls during long-context prefilling. PD Server and PD Client must use **same** KvCache type (`--kvcache-dtype`). API request(s) must send to PD Client and the PD Server only process internal prefill requests sent from PD Client.
 
 | Mode | Config | Use Case |
 |---|---|---|
@@ -397,33 +397,16 @@ Split prefill (prompt processing) and decode (token generation) across GPUs or m
 | File IPC | `--pd-url file:///path` | Docker containers, shared volume |
 | Remote TCP | `--pd-url tcp://host:port` | Different machines |
 
+**Local IPC** (multirank)
 ```bash
-# PD Server (prefill GPU)
+# PD Server (prefill GPU, default port 7000)
 vllm-rs --d 0,1 --m Qwen/Qwen3-30B-A3B-Instruct-2507 --pd-server
 
 # PD Client (decode GPU + API)
 vllm-rs --d 2,3 --w /path/Qwen3-30B-A3B-Instruct-2507 --isq q4k --ui-server --port 8000 --pd-client
 ```
 
-<details>
-<summary>Multi-container (file:// mode)</summary>
-
-```bash
-mkdir -p /tmp/pd-sockets
-
-# Server container
-docker run --gpus '"device=0,1"' -v /tmp/pd-sockets:/sockets ...
-target/release/vllm-rs --d 0,1 --m Qwen/... --pd-server --pd-url file:///sockets
-
-# Client container
-docker run --gpus '"device=2,3"' -v /tmp/pd-sockets:/sockets ...
-target/release/vllm-rs --d 0,1 --w /path/... --pd-client --pd-url file:///sockets --ui-server --port 8000
-```
-
-</details>
-
-<details>
-<summary>Multi-machine (tcp:// mode)</summary>
+**Multinode** (tcp mode)
 
 ```bash
 # Server machine (192.168.1.100)
@@ -435,9 +418,20 @@ target/release/vllm-rs --d 0,1 --w /path/... --pd-client --pd-url tcp://192.168.
 
 > Metal/macOS requires `--pd-url` (no LocalIPC support).
 
-</details>
+<details>
+<summary>Multi-container (file:// mode)</summary>
+```bash
+mkdir -p /tmp/pd-sockets
 
----
+# Server container
+docker run --gpus '"device=0,1"' -v /tmp/pd-sockets:/sockets ...
+target/release/vllm-rs --d 0,1 --m Qwen/... --pd-server --pd-url file:///sockets
+
+# Client container
+docker run --gpus '"device=2,3"' -v /tmp/pd-sockets:/sockets ...
+target/release/vllm-rs --d 0,1 --w /path/... --pd-client --pd-url file:///sockets --ui-server --port 8000
+```
+</details>
 
 ## 🔌 MCP Tool Calling
 
