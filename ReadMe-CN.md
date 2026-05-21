@@ -77,7 +77,7 @@ python3 -m vllm_rs.server --m Qwen/Qwen3.6-27B-FP8 --kvcache-dtype turbo4 --ui-s
 
 ## 📈 性能
 
-> **A100-40G**, **Hopper-80G** 及 **RTX 5090**
+> **V100-32G**, **A100-40G**, **Hopper-80G** 及 **RTX 5090**
 
 | 模型 | 格式 | 大小 | 输出速度 |
 |---|---|---|---|
@@ -88,6 +88,7 @@ python3 -m vllm_rs.server --m Qwen/Qwen3.6-27B-FP8 --kvcache-dtype turbo4 --ui-s
 | GLM-4-9B-0414 | Q4_K_M | 9B | **70.38** tokens/s |
 | QwQ-32B | Q4_K_M | 32B | **41.36** tokens/s |
 | **Qwen3-30B-A3B** | NVFP4 | **30B (MoE)** | **175.30** tokens/s (**RTX 5090**) |
+| **Qwen3-30B-A3B** | NVFP4 | **30B (MoE)** | **67.10** tokens/s (**V100, Software FP4**) |
 | **Qwen3.5-27B** (**多模态**) | Q4_K_M | **27B (Dense)** | **45.20** tokens/s |
 | **Qwen3.5-27B/Qwen3.6-27B** | FP8 | **27B (Dense)** | **42** tokens/s (**Hopper**) |
 | **Qwen3.6-35B-A3B** (**多模态**) | FP8 | **35B (MoE)** | **102** tokens/s (**Hopper**) |
