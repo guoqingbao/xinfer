@@ -31,7 +31,8 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 sudo apt-get install -y git build-essential libssl-dev pkg-config
 
 # 1. 安装（一次性，SM_70/SM_75，例如V100平台需去掉 `flashinfer,cutlass`编译选项 ）
-cargo install --git https://github.com/guoqingbao/vllm.rs vllm-rs runner --features cuda,nccl,flashinfer,cutlass
+cargo install --git https://github.com/guoqingbao/vllm.rs \
+  vllm-rs runner --features cuda,nccl,flashinfer,cutlass
 
 # 或者，Git clone 后从本地源码安装
 # ./build.sh --install --features cuda,nccl,flashinfer,cutlass
@@ -56,8 +57,7 @@ cargo install xbot # 配置使用本地 Base URL
 | `turbo3` | **4.7×** | 最大压缩 | SM70+ |
 
 ### 方式 B — 📦 Python（`pip install`）
-- 💡Hopper (SM90) / Blackwell (SM100+)：从 `GitHub Releases` 下载对应 wheel；
-- 💡SM80 以下（V100 等）：需手动编译（见使用方法部分）
+- 💡Turing/V100 (SM70/SM75), Hopper (SM90) / Blackwell (SM100+)：从 `GitHub Releases` 下载对应 wheel；
 ```bash
 # Metal (macOS) / Ampere (SM80, A100)
 pip install vllm_rs
@@ -65,7 +65,7 @@ python3 -m vllm_rs.server --m Qwen/Qwen3.6-27B-FP8 --ui-server
 ```
 
 ### 方式 C — Docker 安装
-- 💡将 `sm_xx` 改为 sm_70/sm_75 (Turing，去掉 `flashinfer,cutlass`编译选项)、sm_80/sm_89 (Ampere)、sm_90 (Hopper)、sm_100/sm_120 (Blackwell)
+- 💡将 `sm_xx` 改为 sm_70/sm_75 (Turing，去掉 `flashinfer,cutlass`编译选项)、sm_80/sm_89 (Ampere)、sm_90 (Hopper)、sm_100/sm_120/sm_121 (Blackwell)
 ```bash
 # 示例：Hopper (SM_90, CUDA 13.0.0)，最后一个参数传 1 启用中国大陆 Docker 镜像
 ./build_docker.sh "cuda,nccl,flashinfer,cutlass" sm_90 13.0.0 0

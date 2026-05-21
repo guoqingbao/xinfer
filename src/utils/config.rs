@@ -480,8 +480,9 @@ impl EngineConfig {
         device_ids: Option<Vec<usize>>,
         generation_cfg: Option<GenerationConfig>,
         seed: Option<u64>,
-        prefix_cache: Option<bool>,
+        disable_prefix_cache: bool,
         prefix_cache_max_tokens: Option<usize>,
+        kvcache_dtype: Option<String>,
         server_mode: Option<bool>,
         cpu_mem_fold: Option<f32>,
         kv_fraction: Option<f32>,
@@ -528,9 +529,13 @@ impl EngineConfig {
             device_ids: Some(device_ids),
             generation_cfg,
             seed,
-            prefix_cache,
+            prefix_cache: Some(!disable_prefix_cache),
             prefix_cache_max_tokens,
-            kvcache_dtype: KvCacheDtype::Auto,
+            kvcache_dtype: if let Some(ref s) = kvcache_dtype {
+                KvCacheDtype::from_str_opt(s).unwrap_or(KvCacheDtype::Auto)
+            } else {
+                KvCacheDtype::Auto
+            },
             server_mode,
             pd_config,
             mcp_command,

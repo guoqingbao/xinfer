@@ -843,10 +843,11 @@ impl KVCacheAllocator {
                 .ok()
                 .and_then(|d| attention_rs::cuda_utils::sm_version(d))
                 .unwrap_or(0);
-            if sm == 90 {
-                candle_core::bail!(
+            if sm != 90 {
+                tracing::warn!(
                     "FP8 KV cache with FlashAttention requires SM90 (Hopper), \
-                     but detected SM{sm}. Use FlashInfer backend for FP8 KV cache on current GPU."
+                     detected SM{sm}. Will fall back to native flash kernels.",
+                    sm = sm,
                 );
             }
         }

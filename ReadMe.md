@@ -31,7 +31,8 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 sudo apt-get install -y git build-essential libssl-dev pkg-config
 
 # 1. Install (one-time, remove `flashinfer` and `cutlass` features on SM_70/SM_75, e.g., V100)
-cargo install --git https://github.com/guoqingbao/vllm.rs vllm-rs runner --features cuda,nccl,flashinfer,cutlass
+cargo install --git https://github.com/guoqingbao/vllm.rs \
+  vllm-rs runner --features cuda,nccl,flashinfer,cutlass
 
 # or, Git clone and install from local source code
 # ./build.sh --install --features cuda,nccl,flashinfer,cutlass
@@ -56,8 +57,7 @@ Optionally add `--kvcache-dtype` to compress KV cache and extend context:
 | `turbo3` | **4.7×** | Max compression | SM70+ |
 
 ### Option B — 📦 Python (`pip install`)
-- 💡Hopper (SM90) / Blackwell (SM100+): download wheel from `GitHub Releases`; 
-- 💡Below SM80 (V100 etc.): manual build required (see Usage section)
+- 💡Turing/V100 (SM70/SM75), Hopper (SM90) / Blackwell (SM100+): download wheel from `GitHub Releases`; 
 ```bash
 # Metal (macOS) / Ampere (SM80, A100)
 pip install vllm_rs
@@ -65,7 +65,7 @@ python3 -m vllm_rs.server --m Qwen/Qwen3.6-27B-FP8 --ui-server
 ```
 
 ### Option C — Install with Docker
-- 💡Change `sm_xx` to sm_70/sm_75 (Turing, remove `flashinfer` and `cutlass` features), sm_80/sm_89 (Ampere), sm_90 (Hopper), sm_100/sm_120 (Blackwell)
+- 💡Change `sm_xx` to sm_70/sm_75 (Turing/V100, remove `flashinfer` and `cutlass` features), sm_80/sm_89 (Ampere), sm_90 (Hopper), sm_100/sm_120 (Blackwell)
 ```bash
 # Example: Hopper (SM_90, CUDA 13.0.0), pass last arguemnt 1 for China docker mirror
 ./build_docker.sh "cuda,nccl,flashinfer,cutlass" sm_90 13.0.0 0

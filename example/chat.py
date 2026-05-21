@@ -37,6 +37,8 @@ def parse_args():
     parser.add_argument("--kvcache-dtype", type=str, default=None, help="KV cache quantization: fp8, turbo8, turbo4, turbo3")
     parser.add_argument("--cpu-mem-fold", type=float, default=None)
     parser.add_argument("--kv-fraction", type=float, default=None)
+    parser.add_argument("--disable-reasoning", action="store_true")
+    parser.add_argument("--disable-cuda-graph", action="store_true")
 
     return parser.parse_args()
 
@@ -68,6 +70,8 @@ def build_engine_config(args, num_of_prompts, disable_prefix_cache):
         server_mode=False,
         cpu_mem_fold=args.cpu_mem_fold,
         kv_fraction=args.kv_fraction,
+        disable_reasoning=args.disable_reasoning,
+        disable_cuda_graph=args.disable_cuda_graph,
     )
 
 def show_tokens_left(tokens_left: int, total_tokens: int):

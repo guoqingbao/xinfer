@@ -59,6 +59,8 @@ def run(args):
         server_mode=False,
         cpu_mem_fold=args.cpu_mem_fold,
         kv_fraction=args.kv_fraction,
+        disable_reasoning=args.disable_reasoning,
+        disable_cuda_graph=args.disable_cuda_graph,
     )
 
 
@@ -128,6 +130,8 @@ if __name__ == "__main__":
     parser.add_argument("--kvcache-dtype", type=str, default=None, help="KV cache quantization: fp8, turbo8, turbo4, turbo3")
     parser.add_argument("--cpu-mem-fold", type=float, default=None)
     parser.add_argument("--kv-fraction", type=float, default=None)
+    parser.add_argument("--disable-reasoning", action="store_true")
+    parser.add_argument("--disable-cuda-graph", action="store_true")
 
     args = parser.parse_args()
     if not os.path.exists(args.w):

@@ -647,6 +647,31 @@ impl ModelRunner {
             crate::log_info!("Use flashinfer backend {:?}", flashinfer_kv_params);
         }
 
+        #[cfg(all(feature = "flashattn", not(feature = "flashinfer")))]
+        {
+            let flashattn_usable = if config.kvcache_dtype.is_turboquant() {
+                false
+            } else if config.kvcache_dtype.is_fp8_keys() {
+                let sm = device
+                    .as_cuda_device()
+                    .ok()
+                    .and_then(|d| attention_rs::cuda_utils::sm_version(d))
+                    .unwrap_or(0);
+                sm == 90 // FP8 requires SM90
+            } else {
+                true
+            };
+
+            if flashattn_usable {
+                crate::log_info!("Use flashattn backend ({:?} kvcache)", config.kvcache_dtype);
+            } else {
+                crate::log_info!(
+                    "Use native flash backend ({:?} kvcache, flashattn not suitable)",
+                    config.kvcache_dtype
+                );
+            }
+        }
+
         if mamba_prefix_capacity > 0
             && comm.rank() == 0
             && matches!(model, Model::Qwen3_5(_) | Model::Qwen3_5MoE(_))

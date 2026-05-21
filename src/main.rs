@@ -165,18 +165,16 @@ async fn main() -> Result<()> {
         None
     };
 
-    use vllm_rs::utils::config::KvCacheDtype;
-    let kvcache_dtype = if let Some(ref dtype_str) = args.kvcache_dtype {
+    if let Some(ref dtype_str) = args.kvcache_dtype {
+        use vllm_rs::utils::config::KvCacheDtype;
         KvCacheDtype::from_str_opt(dtype_str).unwrap_or_else(|| {
             panic!(
                 "Invalid --kvcache-dtype value: {}. Use auto/fp8/turbo8/turbo4/turbo3.",
                 dtype_str
             )
-        })
-    } else {
-        KvCacheDtype::Auto
-    };
-    let mut econfig = EngineConfig::new(
+        });
+    }
+    let econfig = EngineConfig::new(
         args.model_id,
         args.weight_path,
         args.weight_file,
@@ -192,8 +190,9 @@ async fn main() -> Result<()> {
         args.device_ids.clone(),
         generation_cfg,
         args.seed,
-        Some(prefix_cache),
+        !prefix_cache,
         args.prefix_cache_max_tokens,
+        args.kvcache_dtype.clone(),
         Some(server || !interactive),
         args.cpu_mem_fold,
         args.kv_fraction,
@@ -209,7 +208,6 @@ async fn main() -> Result<()> {
         args.disable_reasoning,
         args.disable_cuda_graph,
     );
-    econfig.kvcache_dtype = kvcache_dtype;
 
     let server_port = if server {
         let port = args
