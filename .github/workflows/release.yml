@@ -109,30 +109,30 @@ jobs:
       - name: Install Rust
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-          echo "/root/.cargo/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - name: Install maturin and cargo-deb
         run: |
-          . /root/.cargo/env
+          . "$HOME/.cargo/env"
           pip3 install --no-cache-dir maturin patchelf cffi
           cargo install cargo-deb
 
       # Build the xinfer binary (without python feature)
       - name: Build xinfer binary
         run: |
-          . /root/.cargo/env
+          . "$HOME/.cargo/env"
           cargo build --release --bin xinfer --features "${{ matrix.features }}"
 
       # Build the Python wheel (with python feature, stripping flashinfer/flashattn)
       - name: Build Python wheel
         run: |
-          . /root/.cargo/env
+          . "$HOME/.cargo/env"
           ./build.sh --release --features "${{ matrix.python_features }}"
 
       # Package deb
       - name: Package deb
         run: |
-          . /root/.cargo/env
+          . "$HOME/.cargo/env"
           cargo deb --no-build --output "dist/xinfer-linux-x64-${{ matrix.sm_name }}.deb"
 
       # Package tar.gz for npm
