@@ -153,10 +153,6 @@ jobs:
             sm_name: sm90
             features: "cuda,nccl,flashinfer,cutlass"
             python_features: "cuda,nccl,flashinfer,cutlass,python"
-          - sm: "100"
-            sm_name: sm100
-            features: "cuda,nccl,flashinfer,cutlass"
-            python_features: "cuda,nccl,flashinfer,cutlass,python"
           - sm: "120"
             sm_name: sm120
             features: "cuda,nccl,flashinfer,cutlass"
