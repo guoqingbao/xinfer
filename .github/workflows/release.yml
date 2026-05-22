@@ -272,6 +272,8 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # Publish Python wheels to PyPI
+  # PyPI package name is "xinfer-ai" (import name stays "xinfer").
+  # For one-off / retry publishes, use the publish-pypi.yml workflow instead.
   # ---------------------------------------------------------------------------
   publish-pypi:
     name: publish-pypi
@@ -290,16 +292,19 @@ jobs:
           path: dist
           merge-multiple: true
 
-      - name: Install maturin
+      - name: Install twine
         if: env.MATURIN_PYPI_TOKEN != ''
-        run: pip3 install maturin
+        run: pip3 install twine
 
       - name: Upload wheels to PyPI
         if: env.MATURIN_PYPI_TOKEN != ''
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
         run: |
           for whl in dist/wheels/*.whl; do
             echo "Uploading $whl"
-            maturin upload --skip-existing "$whl"
+            twine upload --skip-existing "$whl"
           done
 
   # ---------------------------------------------------------------------------

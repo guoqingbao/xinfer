@@ -1,0 +1,165 @@
+name: publish-pypi
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.12.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Build wheels on self-hosted (SM80+) — sequential to share the machine
+  # ---------------------------------------------------------------------------
+  build-wheels-cuda:
+    name: wheel-${{ matrix.sm_name }}
+    runs-on: self-hosted
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        include:
+          - sm: "80"
+            sm_name: sm80
+            python_features: "cuda,nccl,flashinfer,cutlass,python"
+          - sm: "89"
+            sm_name: sm89
+            python_features: "cuda,nccl,flashinfer,cutlass,python"
+          - sm: "90"
+            sm_name: sm90
+            python_features: "cuda,nccl,flashinfer,cutlass,python"
+          - sm: "100"
+            sm_name: sm100
+            python_features: "cuda,nccl,flashinfer,cutlass,python"
+          - sm: "120"
+            sm_name: sm120
+            python_features: "cuda,nccl,flashinfer,cutlass,python"
+    env:
+      CUDA_COMPUTE_CAP: ${{ matrix.sm }}
+      RAYON_NUM_THREADS: "128"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+
+      - name: Clean previous build
+        run: cargo clean 2>/dev/null || true
+
+      - name: Build Python wheel
+        run: ./build.sh --release --features "${{ matrix.python_features }}"
+
+      - name: Collect wheel
+        run: |
+          mkdir -p dist/wheels
+          cp target/wheels/*.whl "dist/wheels/" 2>/dev/null || true
+          ls -la dist/wheels/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.sm_name }}
+          path: dist/wheels/*.whl
+
+  # ---------------------------------------------------------------------------
+  # Build wheels on GitHub-hosted (SM70/SM75) — CUDA 12.9 container
+  # ---------------------------------------------------------------------------
+  build-wheels-legacy:
+    name: wheel-${{ matrix.sm_name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - sm: "70"
+            sm_name: sm70
+            cuda_version: "12.9.0"
+            python_features: "cuda,nccl,python"
+          - sm: "75"
+            sm_name: sm75
+            cuda_version: "12.9.0"
+            python_features: "cuda,nccl,python"
+    container:
+      image: docker.io/nvidia/cuda:${{ matrix.cuda_version }}-cudnn-devel-ubuntu22.04
+    env:
+      CUDA_COMPUTE_CAP: ${{ matrix.sm }}
+      DEBIAN_FRONTEND: noninteractive
+      RAYON_NUM_THREADS: "16"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+
+      - name: Install system dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends --allow-change-held-packages \
+            libnccl-dev libnccl2 \
+            curl git ca-certificates \
+            libssl-dev pkg-config \
+            clang libclang-dev \
+            python3-pip patchelf dpkg-dev
+          rm -rf /var/lib/apt/lists/*
+
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Install maturin
+        run: |
+          . "$HOME/.cargo/env"
+          pip3 install --no-cache-dir maturin patchelf cffi
+
+      - name: Build Python wheel
+        run: |
+          . "$HOME/.cargo/env"
+          ./build.sh --release --features "${{ matrix.python_features }}"
+
+      - name: Collect wheel
+        run: |
+          mkdir -p dist/wheels
+          cp target/wheels/*.whl "dist/wheels/" 2>/dev/null || true
+          ls -la dist/wheels/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.sm_name }}
+          path: dist/wheels/*.whl
+
+  # ---------------------------------------------------------------------------
+  # Publish all wheels to PyPI
+  # ---------------------------------------------------------------------------
+  publish:
+    name: publish-to-pypi
+    runs-on: ubuntu-latest
+    needs: [build-wheels-cuda, build-wheels-legacy]
+    env:
+      MATURIN_PYPI_TOKEN: ${{ secrets.PYPI_TOKEN }}
+    steps:
+      - name: Check PYPI_TOKEN
+        if: env.MATURIN_PYPI_TOKEN == ''
+        run: |
+          echo "::error::PYPI_TOKEN secret is not configured"
+          exit 1
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Install maturin
+        run: pip3 install maturin
+
+      - name: List wheels
+        run: find dist -name "*.whl" -type f | sort
+
+      - name: Upload wheels to PyPI
+        run: |
+          for whl in dist/*.whl; do
+            echo "Uploading $whl"
+            maturin upload --skip-existing "$whl"
+          done

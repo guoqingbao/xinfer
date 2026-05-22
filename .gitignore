@@ -13,3 +13,5 @@ CLAUDE.md
 test_model.py
 .xbot/
 XBOT.md
+patent_*
+release.sh
