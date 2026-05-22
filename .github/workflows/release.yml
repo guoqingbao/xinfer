@@ -41,9 +41,10 @@ jobs:
           echo "version=${cargo_version}" >> "$GITHUB_OUTPUT"
 
   # ---------------------------------------------------------------------------
-  # CUDA builds: one job per SM variant, using nvidia/cuda Docker images
+  # CUDA legacy builds: SM70/SM75 on GitHub-hosted runners (CUDA 12.9 image)
+  # These older archs don't need flashinfer/cutlass and work on free runners.
   # ---------------------------------------------------------------------------
-  cuda:
+  cuda-legacy:
     name: cuda-${{ matrix.sm_name }}
     runs-on: ubuntu-latest
     needs: validate
@@ -51,7 +52,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # SM70 / SM75 — CUDA 12.9.0 (Volta/Turing, no flashinfer/cutlass)
           - sm: "70"
             sm_name: sm70
             cuda_version: "12.9.0"
@@ -62,32 +62,8 @@ jobs:
             cuda_version: "12.9.0"
             features: "cuda,nccl"
             python_features: "cuda,nccl,python"
-          # SM89 — CUDA 12.9.0 (Ada Lovelace)
-          - sm: "89"
-            sm_name: sm89
-            cuda_version: "12.9.0"
-            features: "cuda,nccl,flashinfer,cutlass"
-            python_features: "cuda,nccl,python,cutlass"
-          # SM90 — CUDA 13.0.0 (Hopper)
-          - sm: "90"
-            sm_name: sm90
-            cuda_version: "13.0.0"
-            features: "cuda,nccl,flashinfer,cutlass"
-            python_features: "cuda,nccl,python,cutlass"
-          # SM100 — CUDA 13.0.0 (Blackwell)
-          - sm: "100"
-            sm_name: sm100
-            cuda_version: "13.0.0"
-            features: "cuda,nccl,flashinfer,cutlass"
-            python_features: "cuda,nccl,python,cutlass"
-          # SM120/SM121 — CUDA 13.0.0 (next-gen)
-          - sm: "120"
-            sm_name: sm120
-            cuda_version: "13.0.0"
-            features: "cuda,nccl,flashinfer,cutlass"
-            python_features: "cuda,nccl,python,cutlass"
     container:
-      image: docker.io/nvidia/cuda:${{ matrix.cuda_version }}-${{ matrix.cuda_version >= '13' && 'devel' || 'cudnn-devel' }}-ubuntu22.04
+      image: docker.io/nvidia/cuda:${{ matrix.cuda_version }}-cudnn-devel-ubuntu22.04
     env:
       CUDA_COMPUTE_CAP: ${{ matrix.sm }}
       DEBIAN_FRONTEND: noninteractive
@@ -117,25 +93,21 @@ jobs:
           pip3 install --no-cache-dir maturin patchelf cffi
           cargo install cargo-deb
 
-      # Build the xinfer binary (without python feature)
       - name: Build xinfer binary
         run: |
           . "$HOME/.cargo/env"
           cargo build --release --bin xinfer --features "${{ matrix.features }}"
 
-      # Build the Python wheel (with python feature, stripping flashinfer/flashattn)
       - name: Build Python wheel
         run: |
           . "$HOME/.cargo/env"
           ./build.sh --release --features "${{ matrix.python_features }}"
 
-      # Package deb
       - name: Package deb
         run: |
           . "$HOME/.cargo/env"
           cargo deb --no-build --output "dist/xinfer-linux-x64-${{ matrix.sm_name }}.deb"
 
-      # Package tar.gz for npm
       - name: Package tar.gz
         run: |
           mkdir -p dist/xinfer
@@ -143,7 +115,6 @@ jobs:
           tar -C dist/xinfer -czf "dist/xinfer-${{ needs.validate.outputs.version }}-linux-x64-${{ matrix.sm_name }}.tar.gz" xinfer
           rm -rf dist/xinfer
 
-      # Copy wheel to dist
       - name: Collect wheel
         run: |
           mkdir -p dist/wheels
@@ -158,7 +129,78 @@ jobs:
             dist/wheels/*.whl
 
   # ---------------------------------------------------------------------------
-  # Metal build (macOS)
+  # CUDA builds: SM80+ on self-hosted runner (CUDA 13.0 already installed)
+  # Builds run sequentially (max-parallel: 1) switching CUDA_COMPUTE_CAP.
+  # ---------------------------------------------------------------------------
+  cuda:
+    name: cuda-${{ matrix.sm_name }}
+    runs-on: self-hosted
+    needs: validate
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        include:
+          - sm: "80"
+            sm_name: sm80
+            features: "cuda,nccl,flashinfer,cutlass"
+            python_features: "cuda,nccl,python,cutlass"
+          - sm: "89"
+            sm_name: sm89
+            features: "cuda,nccl,flashinfer,cutlass"
+            python_features: "cuda,nccl,python,cutlass"
+          - sm: "90"
+            sm_name: sm90
+            features: "cuda,nccl,flashinfer,cutlass"
+            python_features: "cuda,nccl,python,cutlass"
+          - sm: "100"
+            sm_name: sm100
+            features: "cuda,nccl,flashinfer,cutlass"
+            python_features: "cuda,nccl,python,cutlass"
+          - sm: "120"
+            sm_name: sm120
+            features: "cuda,nccl,flashinfer,cutlass"
+            python_features: "cuda,nccl,python,cutlass"
+    env:
+      CUDA_COMPUTE_CAP: ${{ matrix.sm }}
+      RAYON_NUM_THREADS: "128"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Clean previous build artifacts
+        run: cargo clean 2>/dev/null || true
+
+      - name: Build xinfer binary
+        run: cargo build --release --bin xinfer --features "${{ matrix.features }}"
+
+      - name: Build Python wheel
+        run: ./build.sh --release --features "${{ matrix.python_features }}"
+
+      - name: Package deb
+        run: cargo deb --no-build --output "dist/xinfer-linux-x64-${{ matrix.sm_name }}.deb"
+
+      - name: Package tar.gz
+        run: |
+          mkdir -p dist/xinfer
+          cp target/release/xinfer dist/xinfer/xinfer
+          tar -C dist/xinfer -czf "dist/xinfer-${{ needs.validate.outputs.version }}-linux-x64-${{ matrix.sm_name }}.tar.gz" xinfer
+          rm -rf dist/xinfer
+
+      - name: Collect wheel
+        run: |
+          mkdir -p dist/wheels
+          cp target/wheels/*.whl "dist/wheels/" 2>/dev/null || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xinfer-cuda-${{ matrix.sm_name }}
+          path: |
+            dist/*.tar.gz
+            dist/*.deb
+            dist/wheels/*.whl
+
+  # ---------------------------------------------------------------------------
+  # Metal build (macOS) — GitHub-hosted runner
   # ---------------------------------------------------------------------------
   metal:
     name: metal-${{ matrix.npm_target }}
@@ -197,7 +239,7 @@ jobs:
   checksums:
     name: checksums
     runs-on: ubuntu-latest
-    needs: [validate, cuda, metal]
+    needs: [validate, cuda-legacy, cuda, metal]
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -207,7 +249,7 @@ jobs:
       - name: Generate SHA256SUMS
         run: |
           cd dist
-          find . -maxdepth 1 -type f \( -name "*.tar.gz" -o -name "*.deb" -o -name "*.whl" \) \
+          find . -type f \( -name "*.tar.gz" -o -name "*.deb" -o -name "*.whl" \) \
             -exec sha256sum {} + > SHA256SUMS
           cat SHA256SUMS
 
