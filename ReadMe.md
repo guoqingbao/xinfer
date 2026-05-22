@@ -29,7 +29,7 @@
 
 **Option 1 — npm (easiest)**
 ```bash
-npm install -g @trusted-ai/xinfer
+npm install -g xinfer-ai
 xinfer --m Qwen/Qwen3.6-27B-FP8 --kvcache-dtype turbo4 --ui-server
 ```
 
@@ -48,7 +48,7 @@ cargo install --git $XINFER_REPO xinfer --features cuda,nccl,flashinfer,cutlass
 **Option 3 — pip (Python)**
 ```bash
 # Turing/V100 (SM70/SM75), Hopper (SM90) / Blackwell (SM100+): download wheel from `GitHub Releases`
-pip install xinfer # Metal (macOS) / Ampere (SM80, A100)
+pip install xinfer-ai # Metal (macOS) / Ampere (SM80, A100)
 ```
 
 **Option 4 — Docker**
@@ -405,7 +405,7 @@ pip install maturin maturin[patchelf]
 maturin build --release --features metal,python
 
 # Install
-pip install target/wheels/xinfer-*.whl --force-reinstall
+pip install target/wheels/xinfer*.whl --force-reinstall
 ```
 
 </details>
