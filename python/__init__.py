@@ -1,5 +1,5 @@
-from .vllm_rs import *
+from .xinfer import *
 
-__doc__ = vllm_rs.__doc__
-if hasattr(vllm_rs, "__all__"):
-    __all__ = vllm_rs.__all__
+__doc__ = xinfer.__doc__
+if hasattr(xinfer, "__all__"):
+    __all__ = xinfer.__all__

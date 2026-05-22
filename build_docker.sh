@@ -5,12 +5,12 @@ set -euo pipefail
 #   --prod / -p    Use Dockerfile.prod (default: Dockerfile)
 #   --help / -h    Show usage
 #
-# Positional args (unchanged):
+# Positional args:
 #   1: WITH_FEATURES   (default: cuda,nccl,python,flashinfer)
 #   2: SM_ARG          (default: sm_80)  accepts sm_XX, XX, or comma list sm_80,sm_86
 #   3: CUDA_VERSION    (default: 12.9.0) accepts X.Y.Z, X.Y, or shorthand like 129/124
 #   4: CHINA_MIRROR    (default: 0)      0=off, 1=on
-#   5: IMAGE_TAG       (default: vllm-rs:latest)
+#   5: IMAGE_TAG       (default: xinfer:latest)
 
 usage() {
   cat <<'EOF'
@@ -20,13 +20,12 @@ Usage:
 Examples:
   ./build_docker.sh
   ./build_docker.sh --prod
-  ./build_docker.sh --prod "cuda,nccl,python" sm_90 12.4 0 vllm-rs:prod
+  ./build_docker.sh --prod "cuda,nccl,python" sm_90 12.4 0 xinfer:prod
 EOF
 }
 
 DOCKERFILE="Dockerfile"
 
-# Parse flags first (do not break positional args)
 POSITIONAL=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -40,7 +39,6 @@ while [[ $# -gt 0 ]]; do
       ;;
     --)
       shift
-      # Remainder are positional
       while [[ $# -gt 0 ]]; do
         POSITIONAL+=("$1")
         shift
@@ -63,14 +61,10 @@ WITH_FEATURES="${1:-cuda,nccl,python,flashinfer}"
 SM_ARG="${2:-sm_80}"
 CUDA_VERSION_ARG="${3:-12.9.0}"
 CHINA_MIRROR="${4:-0}"
-IMAGE_TAG="${5:-vllm-rs:latest}"
+IMAGE_TAG="${5:-xinfer:latest}"
 
-# Optional environment override (kept as env rather than positional to avoid breaking callers)
 UBUNTU_VERSION="${UBUNTU_VERSION:-22.04}"
 
-# Accept: sm_80 -> 80
-# Also accept: 80 -> 80
-# Optionally accept list: sm_80,sm_86 -> 80,86
 normalize_sm_list() {
   local in="$1"
   local out=""
@@ -81,7 +75,7 @@ normalize_sm_list() {
     if [[ "$part" =~ ^sm_([0-9]+)$ ]]; then
       part="${BASH_REMATCH[1]}"
     elif [[ "$part" =~ ^[0-9]+$ ]]; then
-      : # already numeric
+      :
     else
       echo "ERROR: Invalid compute cap '$part'. Use sm_XX (e.g., sm_80) or XX (e.g., 80)." >&2
       exit 1
@@ -92,11 +86,6 @@ normalize_sm_list() {
   echo "$out"
 }
 
-# Accept CUDA version in forms:
-# - X.Y.Z (pass through)
-# - X.Y   -> X.Y.0
-# - 129   -> 12.9.0
-# - 124   -> 12.4.0
 normalize_cuda_version() {
   local v="$1"
 
@@ -124,10 +113,6 @@ cuda_major() {
   echo "${v%%.*}"
 }
 
-# IMPORTANT:
-# Dockerfile cannot do shell evaluation inside FROM. We precompute a flavor string and pass it as a build arg.
-#   - CUDA major >= 13 => "devel"
-#   - else             => "cudnn-devel"
 cuda_flavor_for_version() {
   local v="$1"
   local major
@@ -180,17 +165,17 @@ China mirror mode: ${CHINA_MIRROR}
 
 Commands:
 
-1) vLLM.rs Help:
-   docker run --rm -it --gpus all --network host ${IMAGE_TAG} vllm-rs --help
+1) xInfer Help:
+   docker run --rm -it --gpus all --network host ${IMAGE_TAG} xinfer --help
 
-2) Run API server (make sure `--network host`):
-   docker run --rm -it --gpus all --network host ${IMAGE_TAG} vllm-rs --m Qwen/Qwen3-0.6B --server
+2) Run API server (make sure --network host):
+   docker run --rm -it --gpus all --network host ${IMAGE_TAG} xinfer --m Qwen/Qwen3-0.6B --server
 
 3) Run UI + API Server:
     a) Run interactively:
       docker run --rm -it --gpus all --network host -v /home:/home -v /data:/data ${IMAGE_TAG} bash
     b) Start the UI + API server
-      vllm-rs-server --w /home/path/Qwen3-Coder-30B-A3B-Instruct-FP8 --ui-server
+      xinfer-server --w /home/path/Qwen3-Coder-30B-A3B-Instruct-FP8 --ui-server
 ============================================================
 
 EOF

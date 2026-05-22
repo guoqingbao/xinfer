@@ -61,7 +61,7 @@ const CLAUDE_REASONING_MARKERS: &[(&str, &str)] = &[
     ("<thought>", "</thought>"),
     ("<|channel>", "<channel|>"),
 ];
-const SYNTHETIC_THINKING_SIGNATURE_PREFIX: &str = "vllm-rs-thinking-v1:";
+const SYNTHETIC_THINKING_SIGNATURE_PREFIX: &str = "xinfer-thinking-v1:";
 
 fn strip_nested_reasoning_markers(text: &str) -> String {
     let mut result = text.to_string();
@@ -1993,7 +1993,7 @@ pub async fn messages(
     State(data): State<Arc<ServerData>>,
     request: Json<ClaudeMessageRequest>,
 ) -> ClaudeResponder {
-    // Create logger for this request (None if VLLM_RS_CHAT_LOGGER not set to true)
+    // Create logger for this request (None if XINFER_CHAT_LOGGER not set to true)
     let logger = ChatCompletionLogger::new_claude();
     if let Some(ref l) = logger {
         l.log_raw_request(&*request);
@@ -2033,7 +2033,7 @@ pub async fn messages(
         .unwrap_or(data.econfig.max_tokens.unwrap_or(16384));
     let use_stream = request.stream.unwrap_or(false);
     let tool_buffer_timeout = Duration::from_secs(
-        env::var("VLLM_RS_TOOL_BUFFER_TIMEOUT_SECS")
+        env::var("XINFER_TOOL_BUFFER_TIMEOUT_SECS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(600),

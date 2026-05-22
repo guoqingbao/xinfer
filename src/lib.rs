@@ -24,7 +24,7 @@ use crate::utils::config::{EngineConfig, GenerationConfig, SamplingParams};
 /// A Python module implemented in Rust.
 #[cfg(feature = "python")]
 #[pymodule]
-fn vllm_rs(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn xinfer(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Engine>()?;
     m.add_class::<EngineConfig>()?;
     m.add_class::<SamplingParams>()?;

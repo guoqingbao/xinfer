@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Tokenize/Detokenize API Demo for vLLM.rs
+Tokenize/Detokenize API Demo for xInfer
 
 This script demonstrates how to use the /tokenize and /detokenize API endpoints.
-Make sure the vllm.rs server is running before executing this script.
+Make sure the xInfer server is running before executing this script.
 
 Usage:
     python tokenize.py [--url URL]
@@ -19,7 +19,7 @@ def tokenize_text(base_url: str, text: str, add_special_tokens: bool = True) -> 
     Tokenize plain text using the /tokenize endpoint.
     
     Args:
-        base_url: Base URL of the vllm.rs server
+        base_url: Base URL of the xInfer server
         text: Text to tokenize
         add_special_tokens: Whether to add special tokens (default: True)
     
@@ -43,7 +43,7 @@ def tokenize_messages(base_url: str, messages: list, add_special_tokens: bool = 
     This applies the model's chat template before tokenization.
     
     Args:
-        base_url: Base URL of the vllm.rs server
+        base_url: Base URL of the xInfer server
         messages: List of message dicts with 'role' and 'content' keys
         add_special_tokens: Whether to add special tokens (default: True)
     
@@ -66,7 +66,7 @@ def detokenize(base_url: str, tokens: list, skip_special_tokens: bool = True) ->
     Convert token IDs back to text using the /detokenize endpoint.
     
     Args:
-        base_url: Base URL of the vllm.rs server
+        base_url: Base URL of the xInfer server
         tokens: List of token IDs to decode
         skip_special_tokens: Whether to skip special tokens in output (default: True)
     
@@ -86,7 +86,7 @@ def detokenize(base_url: str, tokens: list, skip_special_tokens: bool = True) ->
 
 def main():
     parser = argparse.ArgumentParser(description="Tokenize/Detokenize API Demo")
-    parser.add_argument("--url", default="http://localhost:8000", help="vllm.rs server URL")
+    parser.add_argument("--url", default="http://localhost:8000", help="xInfer server URL")
     args = parser.parse_args()
     
     base_url = args.url
@@ -106,7 +106,7 @@ def main():
             print(f"Max model length: {result['max_model_len']}")
     except requests.exceptions.RequestException as e:
         print(f"Error: {e}")
-        print("Make sure the vllm.rs server is running!")
+        print("Make sure the xInfer server is running!")
         return
     
     print()

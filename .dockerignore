@@ -22,3 +22,7 @@ target/
 tmp/
 /Cargo.lock
 *.lock
+
+# npm
+npm/vendor/
+npm/node_modules/

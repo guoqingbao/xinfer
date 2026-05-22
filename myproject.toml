@@ -3,8 +3,8 @@ requires = ["maturin>=0.14,<0.15"]
 build-backend = "maturin"
 
 [project]
-name = "vllm-rs"
-description = "A blazing-fast ⚡, lightweight Rust 🦀 implementation of vLLM."
+name = "xinfer"
+description = "xInfer — a high-performance LLM inference engine in Rust."
 requires-python = ">=3.8"
 classifiers = [
     "Programming Language :: Rust",
@@ -14,5 +14,5 @@ classifiers = [
 
 [tool.maturin]
 python-source = "python"
-include = ["vllm_rs/runner", "vllm_rs/__init__.py", "vllm_rs/__init__.pyi", "py.typed"]
+include = ["xinfer/xinfer", "xinfer/__init__.py", "xinfer/__init__.pyi", "py.typed"]
 sdist-include = ["ReadMe.md"]

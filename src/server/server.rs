@@ -47,7 +47,7 @@ struct StreamingContext {
 /// Routes streaming tokens to either `content` or `reasoning_content` in SSE
 /// chunks based on reasoning marker state from the tool parser.
 ///
-/// When `VLLM_RS_STREAM_AS_REASONING_CONTENT` is enabled (default), reasoning
+/// When `XINFER_STREAM_AS_REASONING_CONTENT` is enabled (default), reasoning
 /// markers (`<think>`, `</think>`, etc.) are stripped from the stream and the
 /// inner text is emitted as `delta.reasoning_content` instead of `delta.content`.
 ///
@@ -343,7 +343,7 @@ impl StreamingContext {
 
 #[utoipa::path(
     post,
-    tag = "vllm-rs",
+    tag = "xinfer",
     path = "/v1/chat/completions",
     request_body = ChatCompletionRequest,
     responses((status = 200, description = "Chat completions"))
@@ -352,7 +352,7 @@ pub async fn chat_completion(
     State(data): State<Arc<ServerData>>,
     request: Json<ChatCompletionRequest>,
 ) -> ChatResponder {
-    // Create logger for this request (None if VLLM_RS_CHAT_LOGGER not set to true)
+    // Create logger for this request (None if XINFER_CHAT_LOGGER not set to true)
     let logger = ChatCompletionLogger::new();
     if let Some(ref l) = logger {
         l.log_request(&request);
@@ -365,7 +365,7 @@ pub async fn chat_completion(
         .map(|options| options.include_usage)
         .unwrap_or(true);
     let tool_buffer_timeout = Duration::from_secs(
-        env::var("VLLM_RS_TOOL_BUFFER_TIMEOUT_SECS")
+        env::var("XINFER_TOOL_BUFFER_TIMEOUT_SECS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(600),
@@ -1394,7 +1394,7 @@ pub async fn chat_completion(
 
 #[utoipa::path(
     post,
-    tag = "vllm-rs",
+    tag = "xinfer",
     path = "/v1/embeddings",
     request_body = EmbeddingRequest,
     responses((status = 200, description = "Embeddings"))
@@ -1459,7 +1459,7 @@ pub async fn create_embeddings(
 
 #[utoipa::path(
     get,
-    tag = "vllm-rs",
+    tag = "xinfer",
     path = "/v1/usage",
     request_body = UsageQuery,
     responses((status = 200, description = "Token Usage Request"))
@@ -1489,7 +1489,7 @@ pub async fn get_usage(
 
 #[utoipa::path(
     post,
-    tag = "vllm-rs",
+    tag = "xinfer",
     path = "/tokenize",
     request_body = TokenizeRequest,
     responses((status = 200, description = "Tokenize text or messages"))
@@ -1572,7 +1572,7 @@ pub async fn tokenize(
 
 #[utoipa::path(
     post,
-    tag = "vllm-rs",
+    tag = "xinfer",
     path = "/detokenize",
     request_body = DetokenizeRequest,
     responses((status = 200, description = "Detokenize tokens to text"))

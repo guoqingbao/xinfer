@@ -4,7 +4,7 @@ import os
 import signal
 import sys
 import warnings
-from vllm_rs import Engine, EngineConfig, GenerationConfig, PdConfig, PdMethod, PdRole
+from xinfer import Engine, EngineConfig, GenerationConfig, PdConfig, PdMethod, PdRole
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Run Chat Server")

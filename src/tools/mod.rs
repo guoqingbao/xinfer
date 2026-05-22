@@ -1,5 +1,5 @@
 // src/tools/mod.rs
-//! Tool calling support for vLLM.rs
+//! Tool calling support for xInfer
 //!
 //! This module provides OpenAI-compatible tool calling functionality,
 //! allowing LLMs to invoke external functions and tools.

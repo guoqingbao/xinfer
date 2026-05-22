@@ -1,4 +1,4 @@
-# 🚀 vLLM.rs
+# xInfer
 
 **纯 Rust 实现的极速 LLM 推理引擎。** 无需 PyTorch，无需 Python 运行时，开箱即用。
 
@@ -9,71 +9,55 @@
 
 ---
 
-## ✨ 为什么选择 vLLM.rs？
+## ✨ 为什么选择 xInfer？
 
-- **零 Python 依赖** — 纯 Rust 后端，不需要 PyTorch 或 CUDA Python 绑定。
-- **极致性能** — `原生 Flash Attention`、FlashInfer、CUDA Graphs、持续批处理、前缀缓存、PD 分离。消费级 GPU 上 `30B+` 模型解码速度高达 **175 tok/s**。
-- **极简内核** — 核心调度 + 注意力逻辑仅 **< 5000 行** Rust 代码。
-- **跨平台** — CUDA（Linux/Windows）、Metal（macOS），统一二进制，统一 API。
-- **生产就绪** — OpenAI/Anthropic 兼容 API、内置 `ChatGPT 风格` Web UI、MCP 工具调用、结构化输出、Embedding + 分词器端点。
-- **极致 KV 压缩** — TurboQuant（`2–4 位` KV 缓存）以极小的质量损失将上下文扩展至 **4.3 倍**。单卡 24/32 GB GPU 即可运行 `30B+` MoE 模型并支持**百万级上下文**。
-- **轻量 Python 绑定** — 需要 Python 入口时可选 PyO3 wheel 包。
+| | 特性 | 详情 |
+|---|---|---|
+| **0️⃣** | 零 Python 依赖 | 纯 Rust 后端 — 不需要 PyTorch 或 CUDA Python 绑定 |
+| **⚡** | 极致性能 | 原生 Flash Attention、FlashInfer、CUDA Graphs、持续批处理、前缀缓存、PD 分离。消费级 GPU 上 `30B+` 模型解码速度高达 **175 tok/s** |
+| **🪶** | 极简内核 | 核心调度 + 注意力逻辑仅 **< 5000 行** Rust 代码 |
+| **🌍** | 跨平台 | CUDA（Linux/Windows）、Metal（macOS），统一二进制，统一 API |
+| **🏭** | 生产就绪 | OpenAI/Anthropic 兼容 API、内置 ChatGPT 风格 Web UI、MCP 工具调用、结构化输出、Embedding + 分词器端点 |
+| **🗜️** | 极致 KV 压缩 | TurboQuant（`2–4 位` KV 缓存）以极小的质量损失将上下文扩展至 **4.3 倍**。单卡 24/32 GB GPU 即可运行 `30B+` MoE 模型并支持**百万级上下文** |
+| **🐍** | 轻量 Python 绑定 | 需要 Python 入口时可选 PyO3 wheel 包 |
 
 ---
 
-## 快速开始
+## 🚀 快速开始
 
-### 方式 A — 🚀 Rust（推荐）
+### 📦 安装
 
+**方式 1 — npm（最简单）**
 ```bash
-# 依赖项: Rust 编译器、CUDA 工具链（可选）、Metal需安装Xcode 命令行工具（可选）
+npm install -g @trusted-ai/xinfer
+xinfer --m Qwen/Qwen3.6-27B-FP8 --kvcache-dtype turbo4 --ui-server
+```
+
+npm 包会自动检测 GPU 的 CUDA 计算能力并下载对应的预编译二进制文件。
+
+**方式 2 — Cargo（从源码安装）**
+```bash
+# 依赖项: Rust 编译器、CUDA 工具链（可选）、Metal 需安装 Xcode 命令行工具（可选）
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 sudo apt-get install -y git build-essential libssl-dev pkg-config
 
-# 安装Repo地址
-export VLLM_RS_REPO="https://github.com/guoqingbao/vllm.rs"
-
-# 1. 安装（一次性，Metal平台将特性替换为`--features metal`, SM_70/SM_75，例如V100平台需去掉 `flashinfer,cutlass`编译选项 ）
-cargo install --git $VLLM_RS_REPO vllm-rs --features cuda,nccl,flashinfer,cutlass
-
-# 或者，Git clone 后从本地源码安装
-# git clone $VLLM_RS_REPO && cd vllm.rs
-# ./build.sh --install --features cuda,nccl,flashinfer,cutlass
-
-# 2. 运行
-vllm-rs --m Qwen/Qwen3.6-27B-FP8 --kvcache-dtype turbo4 --ui-server
-
-# 运行本地模型
-# vllm-rs --w /home/Qwen3.6-35B-A3B --d 0,1 --ui-server
-
-# 3. Vibe Coding 客户端（可选）
-cargo install xbot # 配置使用本地 Base URL
+export XINFER_REPO="https://github.com/guoqingbao/xinfer"
+# macOS/Metal：将特性替换为 `--features metal`
+# SM_70/SM_75（如 V100）：去掉 `flashinfer` 和 `cutlass` 编译选项
+cargo install --git $XINFER_REPO xinfer --features cuda,nccl,flashinfer,cutlass
 ```
 
-浏览器打开 `http://IP:8001` 即可使用内置对话界面，或使用 `http://IP:8000/v1/` 作为 API 服务 `Base URL`。
-
-可选添加 `--kvcache-dtype` 压缩 KV 缓存以扩展上下文：
-
-| 参数（`--kvcache-dtype`） | 压缩比 | 质量 | GPU 要求 (V100及以上显卡) |
-|---|---|---|---|
-| _（默认）_ | 1×（BF16） | 基线 | 全部 |
-| `fp8` | **2×** | 近无损 | SM70+ / Apple M1 |
-| `turbo8` | **2.6×** | 79–100% 基线吞吐 | SM70+ / Apple M1|
-| `turbo4` | **3.7×** | 最佳平衡 | SM70+ / Apple M1|
-| `turbo3` | **4.7×** | 最大压缩 | SM70+ |
-
-### 方式 B — 📦 Python（`pip install`）
-- 💡Turing/V100 (SM70/SM75)，Hopper (SM90)，Blackwell (SM100+)：请从 `GitHub Releases`页面下载对应 wheel包；
+**方式 3 — pip（Python）**
 ```bash
-# Metal (macOS) / Ampere (SM80, A100)
-pip install vllm_rs
-python3 -m vllm_rs.server --m Qwen/Qwen3.6-27B-FP8 --kvcache-dtype turbo4 --ui-server
+# Turing/V100 (SM70/SM75)、Hopper (SM90)、Blackwell (SM100+)：请从 GitHub Releases 下载对应 wheel
+pip install xinfer # Metal (macOS) / Ampere (SM80, A100)
 ```
 
-### 方式 C — Docker 安装
-- 💡将 `sm_xx` 改为 sm_70/sm_75 (Turing，去掉 `flashinfer,cutlass`编译选项)、sm_80/sm_89 (Ampere)、sm_90 (Hopper)、sm_100/sm_120/sm_121 (Blackwell)
+**方式 4 — Docker**
 ```bash
-# 示例：Hopper (SM_90, CUDA 13.0.0)，增加额外参数 1 启用中国大陆 Rust crate 镜像
+# 修改 sm 版本，示例：Hopper (sm_90, CUDA 13.0.0)，sm_100/sm_120 (Blackwell)
+# Turing/V100 (sm_70/sm_75)：去掉 `flashinfer` 和 `cutlass` 编译选项
+# 增加额外参数 1 启用中国大陆 Rust crate 镜像
 ./build_docker.sh "cuda,nccl,flashinfer,cutlass" sm_90 13.0.0
 ```
 
@@ -81,9 +65,44 @@ python3 -m vllm_rs.server --m Qwen/Qwen3.6-27B-FP8 --kvcache-dtype turbo4 --ui-s
 
 ---
 
+### ▶️ 运行
+
+**使用 HuggingFace 模型 ID：**
+```bash
+xinfer --m Qwen/Qwen3.6-27B-FP8 --kvcache-dtype turbo4 --ui-server
+```
+
+**使用本地模型路径：**
+```bash
+xinfer --w /home/Qwen3.6-35B-A3B --d 0,1 --ui-server
+```
+
+**Python 使用方式：**
+```bash
+python3 -m xinfer.server --m Qwen/Qwen3.6-27B-FP8 --kvcache-dtype turbo4 --ui-server
+```
+
+> **提示：** 浏览器打开 `http://IP:8001` 即可使用内置对话界面，或使用 `http://IP:8000/v1/` 作为 API 服务 `Base URL`。
+
+---
+
+### 🗜️ KV 缓存压缩
+
+添加 `--kvcache-dtype` 参数压缩 KV 缓存，扩展上下文长度：
+
+| 参数（`--kvcache-dtype`） | 压缩比 | 质量 | GPU 要求 |
+|---|---|---|---|
+| _（默认）_ | 1×（BF16） | 基线 | 全部 |
+| `fp8` | **2×** | 近无损 | SM70+ / Apple M1 |
+| `turbo8` | **2.6×** | 79–100% 基线吞吐 | SM70+ / Apple M1|
+| `turbo4` | **3.7×** | 最佳平衡 | SM70+ / Apple M1|
+| `turbo3` | **4.7×** | 最大压缩 | SM70+ |
+
+---
+
 ## 📈 性能
 
-> **V100-32G**, **A100-40G**, **Hopper-80G** 及 **RTX 5090**
+> 测试平台：**V100-32G**、**A100-40G**、**Hopper-80G** 及 **RTX 5090**
 
 | 模型 | 格式 | 大小 | 输出速度 |
 |---|---|---|---|
@@ -104,9 +123,9 @@ python3 -m vllm_rs.server --m Qwen/Qwen3.6-27B-FP8 --kvcache-dtype turbo4 --ui-s
 | **MiniMax-M2.5** | NVFP4 | **229B (MoE)** | **62** tokens/s (**Hopper, Software FP4, TP=2**) |
 
 <details>
-<summary>Apple Silicon (M4)</summary>
+<summary><b>Apple Silicon (M4)</b></summary>
 
-| 模型 | 并发数 | 输出Tokens | 耗时 (s) | 吞吐量 (tokens/s) |
+| 模型 | 并发数 | 输出 Tokens | 耗时 (s) | 吞吐量 (tokens/s) |
 |---|---|---|---|---|
 | Qwen3-0.6B (BF16) | 128 | 63488 | 83.13s | 763.73 |
 | Qwen3-0.6B (BF16) | 32 | 15872 | 23.53s | 674.43 |
@@ -143,13 +162,15 @@ python3 -m vllm_rs.server --m Qwen/Qwen3.6-27B-FP8 --kvcache-dtype turbo4 --ui-s
 
 **格式：** Safetensors（BF16、`FP8-blockwise`、GPTQ、AWQ、MXFP4、`NVFP4`）| GGUF（所有量化类型）| `ISQ`（即时量化）
 
+---
+
 ### TurboQuant KV 缓存 — 消费级 GPU 运行 30B+ 模型
 
 TurboQuant 通过 Walsh-Hadamard 变换旋转 + 逐头 absmax 量化，将 KV 缓存压缩至 2–4 位。使用 `turbo4` 的最大上下文容量：
 
 | 模型 | KV 预算 | BF16 | turbo4 | 提升 |
 |---|---|---|---|---|
-| **Qwen3.6-35B-A3B**（NVFP4 | 7 GB（24 GB GPU） | 70 万 | **270 万** | **3.9×** |
+| **Qwen3.6-35B-A3B**（NVFP4） | 7 GB（24 GB GPU） | 70 万 | **270 万** | **3.9×** |
 | | 15 GB（32 GB GPU） | 150 万 | **580 万** | **3.9×** |
 | **Qwen3.6-27B**（FP8） | 7 GB | 11.2 万 | **43.4 万** | **3.9×** |
 | | 15 GB | 24 万 | **93 万** | **3.9×** |
@@ -162,16 +183,16 @@ TurboQuant 通过 Walsh-Hadamard 变换旋转 + 逐头 absmax 量化，将 KV �
 
 ```bash
 # 35B MoE 单卡 24/32 GB 即可运行
-vllm-rs --m unsloth/Qwen3.6-35B-A3B-NVFP4 --kvcache-dtype turbo4
+xinfer --m unsloth/Qwen3.6-35B-A3B-NVFP4 --kvcache-dtype turbo4
 
-# FP8 + turboquant最高精度
-vllm-rs --m Qwen/Qwen3.6-35B-A3B-FP8 --kvcache-dtype turbo8
+# FP8 精度
+xinfer --m Qwen/Qwen3.6-35B-A3B-FP8 --kvcache-dtype fp8
 
 # 27B Dense + turbo4
-vllm-rs --m Qwen/Qwen3.6-27B-FP8 --kvcache-dtype turbo4
+xinfer --m Qwen/Qwen3.6-27B-FP8 --kvcache-dtype turbo4
 
 # 30B MoE GGUF + turbo4
-vllm-rs --m unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF \
+xinfer --m unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF \
   --f Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf --kvcache-dtype turbo4
 ```
 
@@ -194,11 +215,11 @@ sudo apt-get install -y cuda-nvcc-12-9 cuda-nvrtc-dev-12-9 libcublas-dev-12-9 li
 sudo apt-get install -y libnccl2 libnccl-dev
 
 # 编译安装
-./build.sh --install --features cuda,nccl,flashinfer,cutlass
+cargo --install --features cuda,nccl,flashinfer,cutlass
 # Flash Attention 后端：
-./build.sh --install --features cuda,nccl,flashattn,cutlass
+cargo --install --features cuda,nccl,flashattn,cutlass
 # V100 / 较老硬件（无 flash 后端）：
-./build.sh --install --features cuda,nccl
+cargo --install --features cuda,nccl
 ```
 
 </details>
@@ -230,40 +251,40 @@ cargo install --features metal
 
 ### 运行模型
 
-- 💡默认启动 OpenAI 兼容 API 服务（`http://localhost:8000`）。添加 `--ui-server` 可同时启动内置 ChatGPT 风格 Web UI（`http://localhost:8001`）。
-
-- 💡Docker 内构建请参考 [**在 Docker 中运行 vLLM.rs →**](docs/docker.md)
+> **提示：** 默认启动 OpenAI 兼容 API 服务（`http://localhost:8000`）。添加 `--ui-server` 可同时启动内置 ChatGPT 风格 Web UI（`http://localhost:8001`）。
+>
+> Docker 内构建请参考 [**在 Docker 中运行 xInfer →**](docs/docker.md)
 
 ```bash
 # FP8 模型（sm90+ 需启用 cutlass）+ Web UI
-vllm-rs --m Qwen/Qwen3.6-27B-FP8 --ui-server
+xinfer --m Qwen/Qwen3.6-27B-FP8 --ui-server
 
 # 未量化 Safetensors（多卡）
-vllm-rs --d 0,1 --m Qwen/Qwen3-30B-A3B-Instruct-2507 --kvcache-dtype fp8
+xinfer --d 0,1 --m Qwen/Qwen3-30B-A3B-Instruct-2507 --kvcache-dtype fp8
 
 # ISQ 即时量化
-vllm-rs --m Qwen/Qwen3.6-35B-A3B --isq q4k
+xinfer --m Qwen/Qwen3.6-35B-A3B --isq q4k
 
 # NVFP4 模型
-vllm-rs --m unsloth/Qwen3.6-27B-NVFP4
+xinfer --m unsloth/Qwen3.6-27B-NVFP4
 
 # MXFP4
-vllm-rs --m olka-fi/Qwen3.5-4B-MXFP4
+xinfer --m olka-fi/Qwen3.5-4B-MXFP4
 
 # GGUF 模型（4 位 KV 缓存）
-vllm-rs --m unsloth/Qwen3.5-27B-GGUF --f Qwen3.5-27B-Q4_K_M.gguf --kvcache-dtype turbo4
+xinfer --m unsloth/Qwen3.5-27B-GGUF --f Qwen3.5-27B-Q4_K_M.gguf --kvcache-dtype turbo4
 
 # FP8 Metal
-vllm-rs --m Qwen/Qwen3.5-4B-FP8
+xinfer --m Qwen/Qwen3.5-4B-FP8
 
 # Gemma4 26B（NVFP4）
-vllm-rs --m unsloth/gemma-4-26b-a4b-it-NVFP4
+xinfer --m unsloth/gemma-4-26b-a4b-it-NVFP4
 
 # MLA 模型（GLM4.7 Flash）
-vllm-rs --m GadflyII/GLM-4.7-Flash-NVFP4
+xinfer --m GadflyII/GLM-4.7-Flash-NVFP4
 
 # 交互式 CLI 对话
-vllm-rs --i --m unsloth/Qwen3.5-27B-GGUF --f Qwen3.5-27B-Q4_K_M.gguf
+xinfer --i --m unsloth/Qwen3.5-27B-GGUF --f Qwen3.5-27B-Q4_K_M.gguf
 ```
 
 <details>
@@ -271,13 +292,13 @@ vllm-rs --i --m unsloth/Qwen3.5-27B-GGUF --f Qwen3.5-27B-Q4_K_M.gguf
 
 ```bash
 # ISQ Q4K + FP8 KV 缓存
-vllm-rs --m Qwen/Qwen3.6-35B-A3B --isq q4k --kvcache-dtype fp8
+xinfer --m Qwen/Qwen3.6-35B-A3B --isq q4k --kvcache-dtype fp8
 
 # ISQ Q4K + TurboQuant KV 缓存
-vllm-rs --m Qwen/Qwen3.6-35B-A3B --isq q4k --kvcache-dtype turbo4
+xinfer --m Qwen/Qwen3.6-35B-A3B --isq q4k --kvcache-dtype turbo4
 
 # Metal ISQ
-vllm-rs --w /path/Qwen3-4B --isq q6k
+xinfer --w /path/Qwen3-4B --isq q6k
 ```
 
 </details>
@@ -287,10 +308,10 @@ vllm-rs --w /path/Qwen3-4B --isq q6k
 
 ```bash
 # 单卡 — GGUF
-vllm-rs --m unsloth/Qwen3.5-27B-GGUF --f Qwen3.5-27B-Q4_K_M.gguf
+xinfer --m unsloth/Qwen3.5-27B-GGUF --f Qwen3.5-27B-Q4_K_M.gguf
 
 # 多卡 — GGUF
-vllm-rs --d 0,1 --f /path/Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf
+xinfer --d 0,1 --f /path/Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf
 ```
 
 </details>
@@ -300,19 +321,19 @@ vllm-rs --d 0,1 --f /path/Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf
 
 ```bash
 # turbo4: 4位 K+V — 3.7× 压缩，最佳平衡
-vllm-rs --m Qwen/Qwen3.6-27B-FP8 --kvcache-dtype turbo4
+xinfer --m Qwen/Qwen3.6-27B-FP8 --kvcache-dtype turbo4
 
 # turbo3: 3位 K + 4位 V — 4.7× 压缩
-vllm-rs --m Qwen/Qwen3.6-27B-FP8 --kvcache-dtype turbo3
+xinfer --m Qwen/Qwen3.6-27B-FP8 --kvcache-dtype turbo3
 
 # turbo8: FP8 K + 4位 V — 2.6× 压缩，最高质量
-vllm-rs --m Qwen/Qwen3.6-27B-FP8 --kvcache-dtype turbo8
+xinfer --m Qwen/Qwen3.6-27B-FP8 --kvcache-dtype turbo8
 
 # 35B MoE（NVFP4 + turbo4）— 24 GB 单卡即可运行
-vllm-rs --m unsloth/Qwen3.6-35B-A3B-NVFP4 --kvcache-dtype turbo4
+xinfer --m unsloth/Qwen3.6-35B-A3B-NVFP4 --kvcache-dtype turbo4
 
 # 30B MoE（GGUF Q4_K_M + turbo4）— 消费级 GPU
-vllm-rs --m unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF \
+xinfer --m unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF \
   --f Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf --kvcache-dtype turbo4
 ```
 
@@ -325,16 +346,16 @@ vllm-rs --m unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF \
 # 通过内置 Chat UI 上传图片或在 API 请求中传入 image_url
 
 # Qwen3.6 35B MoE（FP8，多模态）
-vllm-rs --m Qwen/Qwen3.6-35B-A3B-FP8 --ui-server
+xinfer --m Qwen/Qwen3.6-35B-A3B-FP8 --ui-server
 
 # Qwen3-VL 8B（GGUF）
-vllm-rs --m unsloth/Qwen3-VL-8B-Instruct-GGUF --f Qwen3-VL-8B-Instruct-Q8_0.gguf --ui-server
+xinfer --m unsloth/Qwen3-VL-8B-Instruct-GGUF --f Qwen3-VL-8B-Instruct-Q8_0.gguf --ui-server
 
 # Gemma4 26B MoE（NVFP4，多模态）
-vllm-rs --m unsloth/gemma-4-26b-a4b-it-NVFP4 --ui-server
+xinfer --m unsloth/gemma-4-26b-a4b-it-NVFP4 --ui-server
 
 # Mistral-3 VL 3B（BF16，多模态）
-vllm-rs --m mistralai/Ministral-3-3B --ui-server
+xinfer --m mistralai/Ministral-3-3B --ui-server
 ```
 
 </details>
@@ -343,44 +364,31 @@ vllm-rs --m mistralai/Ministral-3-3B --ui-server
 
 ## 📘 使用方法（Python）
 
-### 安装
-
-```bash
-# macOS
-pip install vllm_rs
-
-# Linux（SM80+）
-apt-get install -y libnccl2 libnccl-dev   # 可选
-pip install vllm_rs
-
-# Hopper / Blackwell：从 GitHub Releases 下载对应 wheel
-```
-
 ### 运行模型
 
 ```bash
 # FP8 模型 + Web UI
-python3 -m vllm_rs.server --m Qwen/Qwen3.6-27B-FP8 --ui-server
+python3 -m xinfer.server --m Qwen/Qwen3.6-27B-FP8 --ui-server
 
 # 未量化 Safetensors（多卡）
-python3 -m vllm_rs.server --m Qwen/Qwen3.5-122B-A10B --d 0,1 --kvcache-dtype fp8
+python3 -m xinfer.server --m Qwen/Qwen3.5-122B-A10B --d 0,1 --kvcache-dtype fp8
 
 # ISQ 即时量化
-python3 -m vllm_rs.server --w /path/Qwen3.6-35B-A3B --isq q4k --d 0 --kvcache-dtype turbo8
+python3 -m xinfer.server --w /path/Qwen3.6-35B-A3B --isq q4k --d 0 --kvcache-dtype turbo8
 
 # NVFP4 / MXFP4
-python3 -m vllm_rs.server --m unsloth/Qwen3.6-27B-NVFP4
-python3 -m vllm_rs.server --m olka-fi/Qwen3.5-4B-MXFP4
-python3 -m vllm_rs.server --m GadflyII/GLM-4.7-Flash-NVFP4
+python3 -m xinfer.server --m unsloth/Qwen3.6-27B-NVFP4
+python3 -m xinfer.server --m olka-fi/Qwen3.5-4B-MXFP4
+python3 -m xinfer.server --m GadflyII/GLM-4.7-Flash-NVFP4
 
 # GGUF
-python3 -m vllm_rs.server --m unsloth/Qwen3.5-27B-GGUF --f Qwen3.5-27B-Q4_K_M.gguf
+python3 -m xinfer.server --m unsloth/Qwen3.5-27B-GGUF --f Qwen3.5-27B-Q4_K_M.gguf
 
 # 多模态
-python3 -m vllm_rs.server --m Qwen/Qwen3.6-35B-A3B-FP8 --kvcache-dtype fp8
+python3 -m xinfer.server --m Qwen/Qwen3.6-35B-A3B-FP8 --kvcache-dtype fp8
 
 # GPTQ / AWQ
-python3 -m vllm_rs.server --w /home/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4-Marlin
+python3 -m xinfer.server --w /home/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4-Marlin
 ```
 
 查看 [更多 Python 示例 →](python/ReadMe.md)
@@ -401,7 +409,7 @@ pip install maturin maturin[patchelf]
 maturin build --release --features metal,python
 
 # 安装
-pip install target/wheels/vllm_rs-*.whl --force-reinstall
+pip install target/wheels/xinfer-*.whl --force-reinstall
 ```
 
 </details>
@@ -410,7 +418,7 @@ pip install target/wheels/vllm_rs-*.whl --force-reinstall
 
 ## 🔀 Prefill-Decode 分离（PD 分离）
 
-将预填充（prompt 处理）和解码（token 生成）拆分到不同 GPU 或机器。消除长上下文预填充时的解码卡顿。PD 服务器 与 PD 客户端必须使用相同KvCache数据类型(`--kvcache-dtype`)，对话请求需发送至PD客户端，PD服务端只处理PD客户端发来的预填充请求.
+将预填充（prompt 处理）和解码（token 生成）拆分到不同 GPU 或机器。消除长上下文预填充时的解码卡顿。PD 服务器与 PD 客户端必须使用相同 KvCache 数据类型（`--kvcache-dtype`）。对话请求需发送至 PD 客户端，PD 服务端只处理 PD 客户端发来的预填充请求。
 
 | 模式 | 配置 | 适用场景 |
 |---|---|---|
@@ -418,48 +426,49 @@ pip install target/wheels/vllm_rs-*.whl --force-reinstall
 | 文件 IPC | `--pd-url file:///path` | Docker 容器，共享卷 |
 | 远程 TCP | `--pd-url tcp://host:port` | 不同机器 |
 
-**单机多卡部署**（无需指定pd-url，默认使用CUDA IPC）
-
+**单机多卡部署**（无需指定 pd-url，默认使用 CUDA IPC）
 ```bash
-# PD 服务器（预填充 GPU，默认端口7000）
-vllm-rs --d 0,1 --m Qwen/Qwen3-30B-A3B-Instruct-2507 --pd-server
+# PD 服务器（预填充 GPU，默认端口 7000）
+xinfer --d 0,1 --m Qwen/Qwen3-30B-A3B-Instruct-2507 --pd-server
 
 # PD 客户端（解码 GPU + API 服务）
-vllm-rs --d 2,3 --w /path/Qwen3-30B-A3B-Instruct-2507 --isq q4k --ui-server --port 8000 --pd-client
+xinfer --d 2,3 --w /path/Qwen3-30B-A3B-Instruct-2507 --isq q4k --ui-server --port 8000 --pd-client
 ```
 
-**多机部署**（tcp模式）
-
+**多机部署**（tcp 模式）
 ```bash
 # 服务器机器（192.168.1.100）
-target/release/vllm-rs --d 0,1 --m Qwen/... --pd-server --pd-url tcp://0.0.0.0:8100
+target/release/xinfer --d 0,1 --m Qwen/... --pd-server --pd-url tcp://0.0.0.0:8100
 
 # 客户端机器
-target/release/vllm-rs --d 0,1 --w /path/... --pd-client --pd-url tcp://192.168.1.100:8100 --ui-server --port 8000
+target/release/xinfer --d 0,1 --w /path/... --pd-client --pd-url tcp://192.168.1.100:8100 --ui-server --port 8000
 ```
+
 > Metal/macOS 不支持 Local IPC，必须指定 `--pd-url`。
+
 <details>
-<summary>多容器部署（file:// 模式）</summary>
+<summary><b>多容器部署（file:// 模式）</b></summary>
 
 ```bash
 mkdir -p /tmp/pd-sockets
 
 # 服务器容器
 docker run --gpus '"device=0,1"' -v /tmp/pd-sockets:/sockets ...
-target/release/vllm-rs --d 0,1 --m Qwen/... --pd-server --pd-url file:///sockets
+target/release/xinfer --d 0,1 --m Qwen/... --pd-server --pd-url file:///sockets
 
 # 客户端容器
 docker run --gpus '"device=2,3"' -v /tmp/pd-sockets:/sockets ...
-target/release/vllm-rs --d 0,1 --w /path/... --pd-client --pd-url file:///sockets --ui-server --port 8000
+target/release/xinfer --d 0,1 --w /path/... --pd-client --pd-url file:///sockets --ui-server --port 8000
 ```
 
 </details>
 
+---
 
 ## 🔌 MCP 工具调用
 
 ```bash
-vllm-rs --m unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF \
+xinfer --m unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF \
   --f Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf --ui-server --mcp-config ./mcp.json
 ```
 
@@ -493,7 +502,7 @@ vllm-rs --m unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF \
 | [添加模型](docs/add_model.md) | 移植新架构（AI 辅助） |
 | [测试模型](docs/test_model.md) | 验证模型质量（AI 辅助） |
 
-**在 vLLM.rs 后端下使用 Agent：** [xbot](docs/xbot.md) · [OpenCode](docs/opencode.md) · [Kilo Code](docs/kilocode.md) · [Claude Code](docs/claude_code.md) · [Goose](docs/goose.md)
+**在 xInfer 后端下使用 Agent：** [xbot](docs/xbot.md) · [OpenCode](docs/opencode.md) · [Kilo Code](docs/kilocode.md) · [Claude Code](docs/claude_code.md) · [Goose](docs/goose.md)
 
 ---
 
@@ -536,7 +545,7 @@ vllm-rs --m unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF \
 
 ---
 
-## 🛠️ 开发计划（TODO）
+## 🛠️ 开发计划
 
 * [x] Metal 平台支持批量推理
 * [x] 支持 GGUF 格式
@@ -544,33 +553,33 @@ vllm-rs --m unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF \
 * [x] CUDA Graph
 * [x] OpenAI API 兼容服务器（支持流式输出）
 * [x] 持续批处理
-* [x] 多卡并行推理（Safetensors模型、GPTQ/AWQ及GGUF量化模型）
-* [x] Metal/macOS平台Prompt处理加速
+* [x] 多卡并行推理（Safetensors 模型、GPTQ/AWQ 及 GGUF 量化模型）
+* [x] Metal/macOS 平台 Prompt 处理加速
 * [x] 分块预填充（Chunked Prefill）
-* [x] 前缀缓存 (使用`prefix-cache`参数)
-* [x] 从Hugginface Hub下载并加载模型
-* [ ] 从ModelScope下载并加载 (中国大陆地区)
-* [x] Metal/macOS平台前缀缓存
-* [x] FP8 KV Cache (CUDA，所有后端，FlashInfer支持SM80+)
-* [x] FP8 KV Cache (Metal)
-* [x] FP8 KV Cache (FlashInfer，SM80+)
-* [x] TurboQuant KV Cache（2-4位压缩，WHT旋转量化）
-* [x] FP8 模型 (CUDA: MoE, Dense; Metal: Dense)
-* [ ] 支持更多模型类型（Kimi K2, GLM 5.1等）
+* [x] 前缀缓存（使用 `prefix-cache` 参数）
+* [x] 从 HuggingFace Hub 下载并加载模型
+* [ ] 从 ModelScope 下载并加载（中国大陆地区）
+* [x] Metal/macOS 平台前缀缓存
+* [x] FP8 KV Cache（CUDA，所有后端，FlashInfer 支持 SM80+）
+* [x] FP8 KV Cache（Metal）
+* [x] FP8 KV Cache（FlashInfer，SM80+）
+* [x] TurboQuant KV Cache（2-4 位压缩，WHT 旋转量化）
+* [x] FP8 模型（CUDA: MoE, Dense; Metal: Dense）
+* [ ] 支持更多模型类型（Kimi K2、GLM 5.1 等）
 * [x] CPU KV Cache 卸载
 * [x] PD（Prefill/Decode）分离（CUDA）
 * [x] PD（Prefill/Decode）分离（Metal）
-* [x] 内置 ChatGPT风格 Web 网页服务
+* [x] 内置 ChatGPT 风格 Web 网页服务
 * [x] Embedding API
 * [x] Tokenize/Detokenize API
-* [x] MCP集成与工具调用
+* [x] MCP 集成与工具调用
 * [x] 公共前缀缓存
 * [x] Claude/Anthropic API 兼容服务器
-* [x] 支持CUDA 13
-* [x] **支持FlashInfer后端**
-* [x] **支持DeepGEMM后端 (Hopper)**
-* [x] **MXFP4/NVFP4模型支持**
-* [x] **支持Turboquant（4位、3位）KvCache**
+* [x] 支持 CUDA 13
+* [x] **支持 FlashInfer 后端**
+* [x] **支持 DeepGEMM 后端（Hopper）**
+* [x] **MXFP4/NVFP4 模型支持**
+* [x] **支持 Turboquant（4 位、3 位）KvCache**
 * [ ] TentorRT-LLM
 
 ---
@@ -582,11 +591,11 @@ vllm-rs --m unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF \
 
 ## Star History
 
-<a href="https://www.star-history.com/?repos=guoqingbao%2Fvllm.rs&type=date&legend=top-left">
+<a href="https://www.star-history.com/?repos=guoqingbao%2Fxinfer&type=date&legend=top-left">
  <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=guoqingbao/vllm.rs&type=date&theme=dark&legend=top-left" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=guoqingbao/vllm.rs&type=date&legend=top-left" />
-   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=guoqingbao/vllm.rs&type=date&legend=top-left" />
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=guoqingbao/xinfer&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=guoqingbao/xinfer&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=guoqingbao/xinfer&type=date&legend=top-left" />
  </picture>
 </a>
 

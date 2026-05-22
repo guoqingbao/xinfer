@@ -1,6 +1,6 @@
 # Guided Decoding
 
-This document describes the current guided decoding implementation in `vllm.rs`.
+This document describes the current guided decoding implementation in `xinfer`.
 
 It focuses on:
 - the live request-to-sampling workflow
@@ -149,7 +149,7 @@ Present guided decoding from the simplest use case to the most constrained one.
 
 ### Running the server
 ```shell
-./run.sh --features cuda,nccl,flashinfer,cutlass --release --m Qwen/Qwen3.5-35B-A3B-FP8/ --ui-server --d 0
+xinfer --m Qwen/Qwen3.5-35B-A3B-FP8/ --ui-server --d 0
 ```
 
 ### Quick map

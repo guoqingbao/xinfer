@@ -1,0 +1,49 @@
+{
+  "name": "@trusted-ai/xinfer",
+  "version": "0.12.0",
+  "description": "xInfer — a high-performance LLM inference engine in Rust with CUDA/Metal acceleration",
+  "license": "MIT",
+  "homepage": "https://github.com/guoqingbao/xinfer#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/guoqingbao/xinfer.git"
+  },
+  "bugs": {
+    "url": "https://github.com/guoqingbao/xinfer/issues"
+  },
+  "bin": {
+    "xinfer": "bin/xinfer.js"
+  },
+  "scripts": {
+    "prepack": "node scripts/prepare-package.js",
+    "postpack": "node scripts/clean-package.js",
+    "postinstall": "node scripts/install.js"
+  },
+  "files": [
+    "bin/xinfer.js",
+    "scripts/install.js",
+    "docs",
+    "README.md",
+    "LICENSE.txt"
+  ],
+  "keywords": [
+    "llm",
+    "inference",
+    "cuda",
+    "metal",
+    "gpu",
+    "xinfer",
+    "rust"
+  ],
+  "os": [
+    "darwin",
+    "linux"
+  ],
+  "cpu": [
+    "arm64",
+    "x64"
+  ],
+  "engines": {
+    "node": ">=18"
+  }
+}

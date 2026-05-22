@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Default build options
 RELEASE=""
 PROFILE="release"
 FEATURES=""
@@ -19,12 +18,11 @@ Options:
   --release          Build release profile (default)
   --features <...>   Cargo/Maturin feature list (string)
   publish            Publish to PyPI via maturin publish
-  --install          Force --release build and copy runner + vllm-rs into --dst (default: /usr/local/bin)
+  --install          Force --release build and copy xinfer into --dst (default: /usr/local/bin)
   --dst <dir>        Destination directory for --install (default: /usr/local/bin)
 EOF
 }
 
-# Helper to compute binary names cross-platform
 bin_name() {
   local name="$1"
   if [[ "${OSTYPE:-}" == "msys" || "${OSTYPE:-}" == "win32" || "${OSTYPE:-}" == "cygwin" ]]; then
@@ -34,7 +32,6 @@ bin_name() {
   fi
 }
 
-# Parse arguments
 while [[ "$#" -gt 0 ]]; do
   case "$1" in
     --debug)
@@ -82,14 +79,12 @@ while [[ "$#" -gt 0 ]]; do
   shift
 done
 
-# If install, force release build (binary installs should be release)
 if [[ "$INSTALL" == true ]]; then
   RELEASE="--release"
   PROFILE="release"
 fi
 
-RUNNER_BIN="$(bin_name runner)"
-VLLM_RS_BIN="$(bin_name vllm-rs)"
+XINFER_BIN="$(bin_name xinfer)"
 
 HAS_PYTHON=false
 if [[ "$FEATURES" == *"python"* ]]; then
@@ -101,60 +96,40 @@ if [[ "$FEATURES" == *"metal"* ]]; then
   IS_METAL=true
 fi
 
-# Echo config
 echo "Building with profile: $PROFILE"
 echo "Features: $FEATURES"
 echo "Install: $INSTALL"
 
 # -------------------------------------------------------------------
-# INSTALL PATH: build both binaries in one command, install to --dst
+# INSTALL PATH: build xinfer binary, install to --dst
 # -------------------------------------------------------------------
 if [[ "$INSTALL" == true ]]; then
   echo "Binary-only install requested; skipping maturin and python package staging."
 
-  if [[ "$IS_METAL" == true ]]; then
-    echo "Metal feature detected. Building vllm-rs only..."
-    cargo build $RELEASE --bin vllm-rs --features "$FEATURES"
-  else
-    FEATURES_NO_PY=$(echo "$FEATURES" | sed -E 's/\bpython\b//g' | xargs)
-    echo "Building vllm-rs and runner binaries..."
-    cargo build $RELEASE --bin vllm-rs --bin runner --features "$FEATURES_NO_PY"
-  fi
+  FEATURES_NO_PY=$(echo "$FEATURES" | sed -E 's/\bpython\b//g' | xargs)
+  echo "Building xinfer binary..."
+  cargo build $RELEASE --bin xinfer --features "$FEATURES_NO_PY"
 
-  echo "Installing binaries to: $DST"
+  echo "Installing binary to: $DST"
   mkdir -p "$DST"
 
-  VLLM_RS_PATH="target/$PROFILE/$VLLM_RS_BIN"
-  if [[ ! -f "$VLLM_RS_PATH" ]]; then
-    echo "Error: vllm-rs binary not found at $VLLM_RS_PATH"
+  XINFER_PATH="target/$PROFILE/$XINFER_BIN"
+  if [[ ! -f "$XINFER_PATH" ]]; then
+    echo "Error: xinfer binary not found at $XINFER_PATH"
     exit 1
   fi
-  install -m 755 "$VLLM_RS_PATH" "$DST/vllm-rs"
-
-  if [[ "$IS_METAL" != true ]]; then
-    RUNNER_PATH="target/$PROFILE/$RUNNER_BIN"
-    if [[ ! -f "$RUNNER_PATH" ]]; then
-      echo "Error: runner binary not found at $RUNNER_PATH"
-      exit 1
-    fi
-    install -m 755 "$RUNNER_PATH" "$DST/runner"
-  fi
+  install -m 755 "$XINFER_PATH" "$DST/xinfer"
 
   echo "Build and install complete."
   exit 0
 fi
 
 # -------------------------------------------------------------------
-# NO PYTHON: build both binaries in one cargo command, done
+# NO PYTHON: build xinfer binary, done
 # -------------------------------------------------------------------
 if [[ "$HAS_PYTHON" != true ]]; then
-  if [[ "$IS_METAL" == true ]]; then
-    echo "Metal feature detected. Building vllm-rs only..."
-    cargo build $RELEASE --bin vllm-rs --features "$FEATURES"
-  else
-    echo "Building vllm-rs and runner binaries..."
-    cargo build $RELEASE --bin vllm-rs --bin runner --features "$FEATURES"
-  fi
+  echo "Building xinfer binary..."
+  cargo build $RELEASE --bin xinfer --features "$FEATURES"
   echo "Build complete."
   exit 0
 fi
@@ -162,30 +137,29 @@ fi
 # -------------------------------------------------------------------
 # PYTHON PATH: python package staging + maturin build/publish
 # -------------------------------------------------------------------
-DEST_DIR="vllm_rs"
+DEST_DIR="xinfer"
 mkdir -p "$DEST_DIR"
 
 if [[ "$IS_METAL" == true ]]; then
-  echo "Metal feature detected. Skipping runner build and copy."
+  echo "Metal feature detected. Skipping xinfer binary copy for python package."
 else
-  FEATURES_RUNNER=$(echo "$FEATURES" | sed -E 's/\bpython\b//g' | xargs)
-  echo "Building runner binary..."
-  cargo build $RELEASE --bin runner --features "$FEATURES_RUNNER"
+  FEATURES_BIN=$(echo "$FEATURES" | sed -E 's/\bpython\b//g' | xargs)
+  echo "Building xinfer binary..."
+  cargo build $RELEASE --bin xinfer --features "$FEATURES_BIN"
 
-  echo "Copying runner binary into $DEST_DIR/ ..."
-  RUNNER_BINARY="target/$PROFILE/$RUNNER_BIN"
-  cp "$RUNNER_BINARY" "$DEST_DIR/runner"
-  chmod 755 "$DEST_DIR/runner"
+  echo "Copying xinfer binary into $DEST_DIR/ ..."
+  XINFER_BINARY="target/$PROFILE/$XINFER_BIN"
+  cp "$XINFER_BINARY" "$DEST_DIR/xinfer"
+  chmod 755 "$DEST_DIR/xinfer"
   if command -v patchelf >/dev/null 2>&1; then
-    echo "Patching runner rpath for bundled libs..."
-    patchelf --set-rpath '$ORIGIN:$ORIGIN/../vllm_rs.libs' "$DEST_DIR/runner"
+    echo "Patching xinfer rpath for bundled libs..."
+    patchelf --set-rpath '$ORIGIN:$ORIGIN/../xinfer.libs' "$DEST_DIR/xinfer"
   else
-    echo "Warning: patchelf not found; runner may need LD_LIBRARY_PATH to find bundled libs."
+    echo "Warning: patchelf not found; xinfer may need LD_LIBRARY_PATH to find bundled libs."
   fi
 fi
 
-# Staging files for python package
-cp "vllm_rs.pyi" "$DEST_DIR/__init__.pyi"
+cp "xinfer.pyi" "$DEST_DIR/__init__.pyi"
 chmod 755 "$DEST_DIR/__init__.pyi"
 touch "$DEST_DIR/py.typed"
 chmod 755 "$DEST_DIR/py.typed"
@@ -200,7 +174,6 @@ chmod 755 "$DEST_DIR/chat.py"
 cp "example/completion.py" "$DEST_DIR/completion.py"
 chmod 755 "$DEST_DIR/completion.py"
 
-# Build or publish Python package with maturin
 echo "Building Python extension with maturin..."
 
 FEATURES_MATURIN=$(echo "$FEATURES" | sed -E 's/\bflashattn\b//g' | xargs)
@@ -215,10 +188,9 @@ else
   maturin build $RELEASE --features "$FEATURES_MATURIN"
 fi
 
-# Clean up staging directory
 echo "Cleaning up temporary files..."
 if [[ "$IS_METAL" != true ]]; then
-  rm -f "$DEST_DIR/runner"
+  rm -f "$DEST_DIR/xinfer"
 fi
 rm -f "$DEST_DIR/__init__.py" \
       "$DEST_DIR/__init__.pyi" \

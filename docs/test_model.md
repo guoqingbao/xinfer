@@ -1,11 +1,11 @@
 # Model Testing (AI-Assisted)
 
-vLLM.rs ships with a **Cursor Agent Skill** that automates the process of testing LLM models for correctness, output quality, and inference performance. It handles GPU detection, model loading, API testing, and result summarization.
+xInfer ships with a **Cursor Agent Skill** that automates the process of testing LLM models for correctness, output quality, and inference performance. It handles GPU detection, model loading, API testing, and result summarization.
 
 ## Prerequisites
 
 - [Cursor IDE](https://cursor.sh/) with Agent mode enabled (for other Agents, mention the skill file manually)
-- The vLLM.rs repository cloned locally
+- The xInfer repository cloned locally
 - One or more NVIDIA GPUs with sufficient memory for the target models
 - Python 3 with the requests library installed
 
@@ -17,7 +17,7 @@ The skill lives at .cursor/skills/test-model/SKILL.md and is **automatically act
 |-------|-------------|
 | **0 - Gather models** | Collects model list from a local folder scan or user-provided HuggingFace IDs. Auto-detects supported architectures and quantization formats. |
 | **1 - Estimate resources** | Queries nvidia-smi for available GPUs and free memory. Estimates per-model memory requirements and assigns GPUs accordingly. |
-| **2 - Build** | Compiles the project with run.sh --features cuda,nccl,flashinfer,cutlass --release (builds both vllm-rs and the runner binary). |
+| **2 - Build** | Compiles the project with `./build.sh --install --features cuda,nccl,flashinfer,cutlass`. |
 | **3 - Create test script** | Writes test_model.py, an OpenAI-compatible API test that sends 1k+ input tokens, requests 1k+ output tokens, and measures throughput and quality. |
 | **4 - Test each model** | Iteratively starts the server, waits for readiness, runs the test script (with and without reasoning/thinking), records results, kills the server, and moves to the next model. |
 | **5 - Summarize** | Produces a markdown table with per-model results: format, GPUs, throughput, and quality verdict. |
@@ -99,6 +99,6 @@ If a model fails to load or produce output, the skill guides the agent through:
 |------|------|
 | .cursor/skills/test-model/SKILL.md | The skill definition (read by the AI agent) |
 | test_model.py | OpenAI API test script (created by the skill) |
-| run.sh | Build script for both vllm-rs and runner binaries |
+| build.sh | Build script for the xinfer binary |
 | src/core/engine.rs | Engine loop, guard.step() location for debug |
 | src/models/layers/deltanet.rs | DeltaNet layer with per-weight quantization detection |

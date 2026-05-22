@@ -1,6 +1,6 @@
-use vllm_rs::api::{EngineBuilder, ModelRepo};
-use vllm_rs::server::{ChatMessage, MessageContentType};
-use vllm_rs::utils::{config::SamplingParams, log_throughput};
+use xinfer::api::{EngineBuilder, ModelRepo};
+use xinfer::server::{ChatMessage, MessageContentType};
+use xinfer::utils::{config::SamplingParams, log_throughput};
 
 fn main() -> anyhow::Result<()> {
     let mut engine = EngineBuilder::new(ModelRepo::ModelID(("Qwen/Qwen3-0.6B", None))).build()?;

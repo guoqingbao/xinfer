@@ -5,20 +5,30 @@ use reedline::{DefaultPrompt, DefaultPromptSegment, Reedline, Signal};
 use serde_json;
 use std::sync::Arc;
 use tool_parser::ParserFactory;
-use vllm_rs::core::engine::StreamItem;
-use vllm_rs::core::engine::GLOBAL_RT;
-use vllm_rs::core::{engine::LLMEngine, GenerationOutput};
-use vllm_rs::log_error;
-use vllm_rs::server::run_server;
-use vllm_rs::server::Args;
-use vllm_rs::transfer::{PdConfig, PdMethod, PdRole};
-use vllm_rs::utils::chat_template::Message;
-use vllm_rs::utils::config::GenerationConfig;
-use vllm_rs::utils::config::{EngineConfig, SamplingParams};
-use vllm_rs::utils::get_dtype;
+use xinfer::core::engine::StreamItem;
+use xinfer::core::engine::GLOBAL_RT;
+use xinfer::core::{engine::LLMEngine, GenerationOutput};
+use xinfer::log_error;
+use xinfer::server::run_server;
+use xinfer::server::Args;
+use xinfer::transfer::{PdConfig, PdMethod, PdRole};
+use xinfer::utils::chat_template::Message;
+use xinfer::utils::config::GenerationConfig;
+use xinfer::utils::config::{EngineConfig, SamplingParams};
+use xinfer::utils::get_dtype;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // When invoked as `xinfer runner --sock ... --uuid ...`, run the GPU worker subprocess.
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() > 1 && args[1] == "runner" {
+        let runner_args: Vec<String> = std::iter::once(args[0].clone())
+            .chain(args[2..].iter().cloned())
+            .collect();
+        xinfer::runner::run_runner_process(runner_args)
+            .map_err(|e| candle_core::Error::Msg(format!("{e}")))?;
+        return Ok(());
+    }
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::INFO)
         .init();
@@ -166,7 +176,7 @@ async fn main() -> Result<()> {
     };
 
     if let Some(ref dtype_str) = args.kvcache_dtype {
-        use vllm_rs::utils::config::KvCacheDtype;
+        use xinfer::utils::config::KvCacheDtype;
         KvCacheDtype::from_str_opt(dtype_str).unwrap_or_else(|| {
             panic!(
                 "Invalid --kvcache-dtype value: {}. Use auto/fp8/turbo8/turbo4/turbo3.",
@@ -213,7 +223,7 @@ async fn main() -> Result<()> {
         let port = args
             .port
             .unwrap_or(if args.pd_server { 7000 } else { 8000 });
-        vllm_rs::utils::ensure_port_free("0.0.0.0", port as u16);
+        xinfer::utils::ensure_port_free("0.0.0.0", port as u16);
         Some(port)
     } else {
         None
@@ -425,7 +435,7 @@ async fn main() -> Result<()> {
                     stop_sequence: None,
                 }]
             } else {
-                vllm_rs::log_warn!("Starting the inference...");
+                xinfer::log_warn!("Starting the inference...");
 
                 let (receivers, tokenizer) = {
                     let mut e = engine.write();
@@ -482,7 +492,7 @@ async fn main() -> Result<()> {
         }
 
         let decode_time_taken = all_decode_time_taken / outputs.len() as f32;
-        vllm_rs::log_info!("--- Performance Metrics ---");
+        xinfer::log_info!("--- Performance Metrics ---");
 
         tracing::info!(
             "⏱️ Prompt tokens: {} in {:.2}s ({:.2} tokens/s)",

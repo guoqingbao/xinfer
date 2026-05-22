@@ -1436,7 +1436,7 @@ pub async fn run_server(
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .unwrap()
                                 .as_millis() as i64,
-                            "owned_by": "vllm.rs",
+                            "owned_by": "xinfer",
                             "permission": [],
                             "modalities": m,
                             "max_model_len": exposed_max_model_len,

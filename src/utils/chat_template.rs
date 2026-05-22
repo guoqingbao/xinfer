@@ -78,7 +78,7 @@ fn escape_special_tokens_in_text(
         if token.is_empty() || !protected.contains(token) {
             continue;
         }
-        let sentinel = format!("__VLLM_RS_PRESERVE_TOKEN_{}__", idx);
+        let sentinel = format!("__XINFER_PRESERVE_TOKEN_{}__", idx);
         protected = protected.replace(token, &sentinel);
         sentinels.push((sentinel, token.clone()));
     }
@@ -433,10 +433,10 @@ impl ChatTemplate {
             template = template.replace("{%- set meta = message.get(\"metadata\", \"\") %}", "");
             template = template.replace("{{ meta }}", "");
         }
-        env.add_template("vllm.rs", template.as_str())
+        env.add_template("xinfer", template.as_str())
             .map_err(ApplyChatTemplateError::AddTemplateError)?;
         let template = env
-            .get_template("vllm.rs")
+            .get_template("xinfer")
             .map_err(ApplyChatTemplateError::GetTemplateError)?;
 
         let render_messages = self.escaped_messages_for_render();

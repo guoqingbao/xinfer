@@ -192,8 +192,7 @@ impl Communicator {
                         }
                         "file" => {
                             // --- Local (File-based IPC) Mode ---
-                            let sock_name =
-                                format!("{}@vllm-rs-transfer-{}", url.path(), self.rank);
+                            let sock_name = format!("{}@xinfer-transfer-{}", url.path(), self.rank);
                             self.connect_local_ipc(&sock_name)?
                         }
                         _ => {
@@ -207,7 +206,7 @@ impl Communicator {
             }
             None => {
                 // --- Local (File-based IPC) Mode with default path ---
-                let sock_name = format!("@vllm-rs-transfer-{}", self.rank);
+                let sock_name = format!("@xinfer-transfer-{}", self.rank);
                 self.connect_local_ipc(&sock_name)?
             }
         };

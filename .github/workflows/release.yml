@@ -1,0 +1,286 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+  id-token: write
+  packages: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Validate that all package versions match the tag
+  # ---------------------------------------------------------------------------
+  validate:
+    name: validate-version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate package versions
+        id: version
+        run: |
+          cargo_version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
+          npm_version="$(node -p "require('./npm/package.json').version")"
+          if [ "$cargo_version" != "$npm_version" ]; then
+            echo "Cargo.toml version ($cargo_version) must match npm/package.json version ($npm_version)" >&2
+            exit 1
+          fi
+          expected_tag="v${cargo_version}"
+          if [ "${{ github.ref_name }}" != "$expected_tag" ]; then
+            echo "Tag ${{ github.ref_name }} must match package version $expected_tag" >&2
+            exit 1
+          fi
+          echo "version=${cargo_version}" >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------------
+  # CUDA builds: one job per SM variant, using nvidia/cuda Docker images
+  # ---------------------------------------------------------------------------
+  cuda:
+    name: cuda-${{ matrix.sm_name }}
+    runs-on: ubuntu-latest
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # SM70 / SM75 — CUDA 12.9.0 (Volta/Turing, no flashinfer/cutlass)
+          - sm: "70"
+            sm_name: sm70
+            cuda_version: "12.9.0"
+            features: "cuda,nccl"
+            python_features: "cuda,nccl,python"
+          - sm: "75"
+            sm_name: sm75
+            cuda_version: "12.9.0"
+            features: "cuda,nccl"
+            python_features: "cuda,nccl,python"
+          # SM89 — CUDA 12.9.0 (Ada Lovelace)
+          - sm: "89"
+            sm_name: sm89
+            cuda_version: "12.9.0"
+            features: "cuda,nccl,flashinfer,cutlass"
+            python_features: "cuda,nccl,python,cutlass"
+          # SM90 — CUDA 13.0.0 (Hopper)
+          - sm: "90"
+            sm_name: sm90
+            cuda_version: "13.0.0"
+            features: "cuda,nccl,flashinfer,cutlass"
+            python_features: "cuda,nccl,python,cutlass"
+          # SM100 — CUDA 13.0.0 (Blackwell)
+          - sm: "100"
+            sm_name: sm100
+            cuda_version: "13.0.0"
+            features: "cuda,nccl,flashinfer,cutlass"
+            python_features: "cuda,nccl,python,cutlass"
+          # SM120/SM121 — CUDA 13.0.0 (next-gen)
+          - sm: "120"
+            sm_name: sm120
+            cuda_version: "13.0.0"
+            features: "cuda,nccl,flashinfer,cutlass"
+            python_features: "cuda,nccl,python,cutlass"
+    container:
+      image: docker.io/nvidia/cuda:${{ matrix.cuda_version }}-${{ matrix.cuda_version >= '13' && 'devel' || 'cudnn-devel' }}-ubuntu22.04
+      options: --network host
+    env:
+      CUDA_COMPUTE_CAP: ${{ matrix.sm }}
+      DEBIAN_FRONTEND: noninteractive
+      RAYON_NUM_THREADS: "16"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends --allow-change-held-packages \
+            libnccl-dev libnccl2 \
+            curl git ca-certificates \
+            libssl-dev pkg-config \
+            clang libclang-dev \
+            python3-pip patchelf dpkg-dev
+          rm -rf /var/lib/apt/lists/*
+
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+          echo "/root/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Install maturin and cargo-deb
+        run: |
+          . /root/.cargo/env
+          pip3 install --no-cache-dir maturin patchelf cffi
+          cargo install cargo-deb
+
+      # Build the xinfer binary (without python feature)
+      - name: Build xinfer binary
+        run: |
+          . /root/.cargo/env
+          cargo build --release --bin xinfer --features "${{ matrix.features }}"
+
+      # Build the Python wheel (with python feature, stripping flashinfer/flashattn)
+      - name: Build Python wheel
+        run: |
+          . /root/.cargo/env
+          ./build.sh --release --features "${{ matrix.python_features }}"
+
+      # Package deb
+      - name: Package deb
+        run: |
+          . /root/.cargo/env
+          cargo deb --no-build --output "dist/xinfer-linux-x64-${{ matrix.sm_name }}.deb"
+
+      # Package tar.gz for npm
+      - name: Package tar.gz
+        run: |
+          mkdir -p dist/xinfer
+          cp target/release/xinfer dist/xinfer/xinfer
+          tar -C dist/xinfer -czf "dist/xinfer-${{ needs.validate.outputs.version }}-linux-x64-${{ matrix.sm_name }}.tar.gz" xinfer
+          rm -rf dist/xinfer
+
+      # Copy wheel to dist
+      - name: Collect wheel
+        run: |
+          mkdir -p dist/wheels
+          cp target/wheels/*.whl "dist/wheels/" 2>/dev/null || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xinfer-cuda-${{ matrix.sm_name }}
+          path: |
+            dist/*.tar.gz
+            dist/*.deb
+            dist/wheels/*.whl
+
+  # ---------------------------------------------------------------------------
+  # Metal build (macOS)
+  # ---------------------------------------------------------------------------
+  metal:
+    name: metal-${{ matrix.npm_target }}
+    runs-on: macos-latest
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - rust_target: aarch64-apple-darwin
+            npm_target: darwin-arm64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
+
+      - name: Build xinfer binary
+        run: cargo build --release --target ${{ matrix.rust_target }} --bin xinfer --features "metal"
+
+      - name: Package tar.gz
+        run: |
+          mkdir -p "dist/xinfer"
+          cp "target/${{ matrix.rust_target }}/release/xinfer" "dist/xinfer/xinfer"
+          tar -C dist/xinfer -czf "dist/xinfer-${{ needs.validate.outputs.version }}-${{ matrix.npm_target }}-metal.tar.gz" xinfer
+          rm -rf dist/xinfer
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xinfer-${{ matrix.npm_target }}-metal
+          path: dist/*.tar.gz
+
+  # ---------------------------------------------------------------------------
+  # Checksums + GitHub Release
+  # ---------------------------------------------------------------------------
+  checksums:
+    name: checksums
+    runs-on: ubuntu-latest
+    needs: [validate, cuda, metal]
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS
+        run: |
+          cd dist
+          find . -maxdepth 1 -type f \( -name "*.tar.gz" -o -name "*.deb" -o -name "*.whl" \) \
+            -exec sha256sum {} + > SHA256SUMS
+          cat SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xinfer-release-artifacts
+          path: dist/*
+
+      - name: Upload artifacts to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: xInfer v${{ needs.validate.outputs.version }}
+          generate_release_notes: true
+          files: |
+            dist/*.tar.gz
+            dist/*.deb
+            dist/wheels/*.whl
+            dist/SHA256SUMS
+
+  # ---------------------------------------------------------------------------
+  # Publish Python wheels to PyPI
+  # ---------------------------------------------------------------------------
+  publish-pypi:
+    name: publish-pypi
+    runs-on: ubuntu-latest
+    needs: [validate, checksums]
+    env:
+      MATURIN_PYPI_TOKEN: ${{ secrets.PYPI_TOKEN }}
+    steps:
+      - name: Skip when PYPI_TOKEN is not configured
+        if: env.MATURIN_PYPI_TOKEN == ''
+        run: echo "PYPI_TOKEN is not configured; skipping PyPI publish."
+
+      - uses: actions/download-artifact@v4
+        if: env.MATURIN_PYPI_TOKEN != ''
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Install maturin
+        if: env.MATURIN_PYPI_TOKEN != ''
+        run: pip3 install maturin
+
+      - name: Upload wheels to PyPI
+        if: env.MATURIN_PYPI_TOKEN != ''
+        run: |
+          for whl in dist/wheels/*.whl; do
+            echo "Uploading $whl"
+            maturin upload --skip-existing "$whl"
+          done
+
+  # ---------------------------------------------------------------------------
+  # Publish npm package
+  # ---------------------------------------------------------------------------
+  publish-npm:
+    name: publish-npm
+    runs-on: ubuntu-latest
+    needs: [validate, checksums]
+    env:
+      NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+    steps:
+      - name: Skip when NPM_TOKEN is not configured
+        if: env.NODE_AUTH_TOKEN == ''
+        run: echo "NPM_TOKEN is not configured; skipping npm publish."
+      - uses: actions/checkout@v4
+        if: env.NODE_AUTH_TOKEN != ''
+      - uses: actions/setup-node@v4
+        if: env.NODE_AUTH_TOKEN != ''
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+      - name: Publish npm package
+        if: env.NODE_AUTH_TOKEN != ''
+        run: npm publish ./npm --access public --provenance

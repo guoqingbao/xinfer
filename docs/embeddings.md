@@ -5,11 +5,11 @@ This repository now exposes OpenAI-style embeddings for text-only models (Qwen3,
 ## Start the server (embeddings enabled)
 - CUDA example (Qwen3 text):  
   ```bash
-  target/release/vllm-rs --server --m Qwen/Qwen2.5-7B-Instruct
+  target/release/xinfer --server --m Qwen/Qwen2.5-7B-Instruct
   ```
 - Metal example (LLaMa3 text):  
   ```bash
-  target/release/vllm-rs --server --m meta-llama/Llama-3-8b --max-model-len 32768
+  target/release/xinfer --server --m meta-llama/Llama-3-8b --max-model-len 32768
   ```
 
 ## Request examples

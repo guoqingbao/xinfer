@@ -4,8 +4,8 @@ use candle_core::{DType, Device, Result, Storage, Tensor};
 use image::imageops::FilterType;
 use image::{DynamicImage, GenericImageView};
 use serde::{Deserialize, Serialize};
-pub const IMAGE_PLACEHOLDER: &str = "<|VLLM-RS-IMAGE|>";
-pub const PLACEHOLDER: &str = "<|VLLM-RS-PLACEHOLDER|>";
+pub const IMAGE_PLACEHOLDER: &str = "<|XINFER-IMAGE|>";
+pub const PLACEHOLDER: &str = "<|XINFER-PLACEHOLDER|>";
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ImageData {

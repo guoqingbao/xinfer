@@ -1,6 +1,6 @@
-# vLLM-rs Docker Image
+# xInfer Docker Image
 
-This repository provides a Docker image for **vLLM-rs**, a high-performance inference engine for large language models (LLMs), built using Rust and optimized for NVIDIA GPUs.
+This repository provides a Docker image for **xInfer**, a high-performance inference engine for large language models (LLMs), built using Rust and optimized for NVIDIA GPUs.
 
 ---
 
@@ -38,7 +38,7 @@ Build from script:
 Build from command line:
 
 ```bash
-docker build --network=host -f "Dockerfile" -t "vllm-rs:latest" \
+docker build --network=host -f "Dockerfile" -t "xinfer:latest" \
   --build-arg CUDA_VERSION="12.9.0" \
   --build-arg UBUNTU_VERSION="22.04" \
   --build-arg CUDA_FLAVOR="cudnn-devel" \
@@ -48,26 +48,26 @@ docker build --network=host -f "Dockerfile" -t "vllm-rs:latest" \
   .
 ```
 
-## Run vLLM.rs docker service
+## Run xInfer docker service
 
-### vLLM.rs Help:
+### xInfer Help:
 ```bash
-docker run --rm -it --gpus all --network host vllm-rs:latest vllm-rs --help
+docker run --rm -it --gpus all --network host xinfer:latest xinfer --help
 ```
 ### Run API server (make sure `--network host`):
 
 ```bash
-docker run --rm -it --gpus all --network host vllm-rs:latest vllm-rs --m Qwen/Qwen3-0.6B --server
+docker run --rm -it --gpus all --network host xinfer:latest xinfer --m Qwen/Qwen3-0.6B --server
 ```
 
 ### Run UI + API Server:
 Run interactively:
 ```bash
-docker run --rm -it --gpus all --network host -v /home:/home -v /data:/data vllm-rs:latest bash
+docker run --rm -it --gpus all --network host -v /home:/home -v /data:/data xinfer:latest bash
 ```
 Start the UI + API server
 ```bash
-vllm-rs --w /home/path/Qwen3-Coder-30B-A3B-Instruct-FP8 --ui-server
+xinfer --w /home/path/Qwen3-Coder-30B-A3B-Instruct-FP8 --ui-server
 ```
 
 **Note:** if `Ctrl+C` not working in docker, you need `Ctrl+P` then `Ctrl+Q` to stop the server.

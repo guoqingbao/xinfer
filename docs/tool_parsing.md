@@ -60,7 +60,7 @@ CLI (Rust server):
 --enforce-parser qwen_coder
 ```
 
-Python server example (`server.py` or `vllm_rs.server`):
+Python server example (`server.py` or `xinfer.server`):
 
 ```
 --enforce-parser qwen_coder
@@ -68,7 +68,7 @@ Python server example (`server.py` or `vllm_rs.server`):
 
 ### Environment Variables
 
-- `VLLM_RS_STRICT_TOOL_CALL`:
+- `XINFER_STRICT_TOOL_CALL`:
   - `1` or `true`: Strict validation. Dropping invalid tool calls (calls that do not match the schema) effectively preventing them from being sent to the client. The server logs a warning for dropped calls.
   - `0` or `false` (default): Lenient validation. Invalid tool calls are kept and sent to the client, but a warning is logged by the server. This allows models to output "hallucinated" or malformed calls if desired.
 

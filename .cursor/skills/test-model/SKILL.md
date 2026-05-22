@@ -1,14 +1,14 @@
 ---
 name: test-model
 description: >-
-  Test LLM models served by vllm.rs for correctness, output quality, and
+  Test LLM models served by xinfer for correctness, output quality, and
   performance. Use when the user asks to test, benchmark, validate, or verify
   models — either from a local folder path or HuggingFace model IDs. Supports
-  all vllm.rs-compatible formats: BF16, FP8, MXFP4, NVFP4, GGUF, GPTQ, AWQ,
+  all xinfer-compatible formats: BF16, FP8, MXFP4, NVFP4, GGUF, GPTQ, AWQ,
   ISQ, Dense, MoE, and Multimodal architectures.
 ---
 
-# Test Model — Validate and Benchmark LLM Models on vllm.rs
+# Test Model — Validate and Benchmark LLM Models on xinfer
 
 ## Phase 0: Gather Model List
 
@@ -141,18 +141,18 @@ For MoE models with `A3B` in the name, the weight memory uses total params but f
 
 ## Phase 2: Build the Project
 
-Build using `run.sh` which compiles both the main binary and the runner:
+Build using `build.sh`:
 
 ```bash
 cd <project_root>
-./run.sh --features cuda,nccl,flashinfer,cutlass --release
+./build.sh --install --features cuda,nccl,flashinfer,cutlass
 ```
 
 Verify the build succeeds (exit code 0). The `Error: Must provide model_id or weight_path` message after build is expected — it means the binary compiled correctly.
 
 If the build fails, check and fix compilation errors before proceeding.
 
-Important, if you build on CUDA with cargo build, make sure always build vllm-rs and runner binaries.
+Important, if you build on CUDA with cargo build, make sure always build xinfer and runner binaries.
 ---
 
 ## Phase 3: Create the Test Script
@@ -185,7 +185,7 @@ For each model, execute this sequence:
 ### Step 1: Kill previous instances
 
 ```bash
-pkill -9 -f 'vllm-rs|runner' 2>/dev/null
+pkill -9 -f 'xinfer|runner' 2>/dev/null
 sleep 3
 ```
 
@@ -197,9 +197,9 @@ Build the server command based on model type:
 
 | Model source | Command pattern |
 |-------------|-----------------|
-| Local safetensors | `./target/release/vllm-rs --w <path> --ui-server --d <gpus> --port 7000` |
-| Local GGUF | `./target/release/vllm-rs --w <dir> --f <file.gguf> --ui-server --d <gpus> --port 7000` |
-| HuggingFace ID | `./target/release/vllm-rs --m <hf_id> --ui-server --d <gpus> --port 7000` |
+| Local safetensors | `./target/release/xinfer --w <path> --ui-server --d <gpus> --port 7000` |
+| Local GGUF | `./target/release/xinfer --w <dir> --f <file.gguf> --ui-server --d <gpus> --port 7000` |
+| HuggingFace ID | `./target/release/xinfer --m <hf_id> --ui-server --d <gpus> --port 7000` |
 
 Run the server in the background with `RUST_BACKTRACE=1` for debugging.
 
@@ -272,7 +272,7 @@ Include for each model:
 | `src/core/engine.rs` | Engine loop; `guard.step()` for debug |
 | `src/models/layers/deltanet.rs` | DeltaNet layer; quantization detection |
 | `src/models/layers/linear.rs` | Linear layer loaders (FP8, MXFP4, NVFP4) |
-| `run.sh` | Build script (compiles both vllm-rs and runner) |
+| `build.sh` | Build script (compiles xinfer) |
 
 ### Build features
 

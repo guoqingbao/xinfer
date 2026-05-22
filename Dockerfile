@@ -2,16 +2,12 @@
 
 ARG CUDA_VERSION=12.9.0
 ARG UBUNTU_VERSION=22.04
-# NEW: must be passed by build script (or defaults here)
-# - CUDA major >= 13: devel
-# - else: cudnn-devel
 ARG CUDA_FLAVOR=cudnn-devel
 
 FROM docker.io/nvidia/cuda:${CUDA_VERSION}-${CUDA_FLAVOR}-ubuntu${UBUNTU_VERSION} AS base
 
 ARG DEBIAN_FRONTEND=noninteractive
 
-# Toggle for China mirror mode (0=off, 1=on)
 ARG CHINA_MIRROR=0
 
 RUN set -eux; \
@@ -24,7 +20,6 @@ RUN set -eux; \
     python3-pip; \
   rm -rf /var/lib/apt/lists/*
 
-# Rust (stable) with optional China mirrors
 RUN set -eux; \
   if [ "${CHINA_MIRROR}" = "1" ]; then \
     export RUSTUP_UPDATE_ROOT="https://mirrors.ustc.edu.cn/rust-static/rustup"; \
@@ -57,13 +52,9 @@ ENV CUDA_COMPUTE_CAP="${CUDA_COMPUTE_CAP}" \
 ARG BUILD_FEATURES
 ARG WITH_FEATURES="cuda,nccl,python,flashinfer,cutlass"
 
-WORKDIR /vllm.rs
+WORKDIR /xinfer
 COPY . .
 
-# Conditional Build Logic
-# Logic: If 'python' is in features, run build.sh (assumed to handle python wheel generation).
-#        If 'python' is NOT in features, run cargo build directly for rust binaries only.
-# Note: BUILD_FEATURES takes precedence over WITH_FEATURES.
 RUN set -eux; \
   FEATURES="${BUILD_FEATURES:-$WITH_FEATURES}"; \
   if echo "${FEATURES}" | grep -q '\bpython\b'; then \
@@ -74,23 +65,19 @@ RUN set -eux; \
   fi; \
   ./build.sh --release --features "${FEATURES}"
 
-# Conditional Artifact Installation
-# Gated to ensure python-specific commands (pip, wheel installation) only run if python feature was selected.
-# Rust binaries (libvllm_rs.so, runner, vllm-rs) are installed in both paths assuming they are produced by cargo build.
 RUN set -eux; \
   FEATURES="${BUILD_FEATURES:-$WITH_FEATURES}"; \
-  install -Dm755 target/release/runner /usr/local/bin/runner; \
-  install -Dm755 target/release/vllm-rs /usr/local/bin/vllm-rs; \
+  install -Dm755 target/release/xinfer /usr/local/bin/xinfer; \
   if echo "${FEATURES}" | grep -q '\bpython\b'; then \
-    install -Dm755 target/release/libvllm_rs.so /usr/lib64/libvllm_rs.so; \
+    install -Dm755 target/release/libxinfer.so /usr/lib64/libxinfer.so; \
     pip3 install --no-cache-dir target/wheels/*; \
-    printf '%s\n' '#!/bin/sh' 'exec python3 -m vllm_rs.server "$@"' > /usr/local/bin/vllm-rs-server; \
-    chmod +x /usr/local/bin/vllm-rs-server; \
+    printf '%s\n' '#!/bin/sh' 'exec python3 -m xinfer.server "$@"' > /usr/local/bin/xinfer-server; \
+    chmod +x /usr/local/bin/xinfer-server; \
     cp -r target/wheels/ /opt/wheels; \
   else \
     mkdir /opt/wheels; \
     if [ ! -d /usr/lib64/ ]; then mkdir /usr/lib64 ; fi ; \
-    touch /usr/lib64/libvllm_rs.so; \
+    touch /usr/lib64/libxinfer.so; \
   fi; \
   cargo clean
 

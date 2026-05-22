@@ -1,4 +1,4 @@
-# 🚀 vLLM.rs
+# xInfer
 
 **Blazing-fast LLM inference in pure Rust.** No PyTorch. No Python runtime. Just fast, portable, production-ready inference.
 
@@ -9,50 +9,83 @@
 
 ---
 
-## ✨ Why vLLM.rs?
+## ✨ Why xInfer?
 
-- **Zero Python dependencies** — Pure Rust backend, no PyTorch, no CUDA Python bindings.
-- **Fast** — `Native Flash Attention`, FlashInfer, CUDA Graphs, continuous batching, prefix caching, and PD disaggregation. Up to **175 tok/s** decode speed for `30B+` models on consumer GPUs.
-- **Tiny footprint** — Core scheduling + attention logic in **< 5000 lines** of Rust.
-- **Cross-platform** — CUDA (Linux/Windows), Metal (macOS). Same binary, same API.
-- **Production-ready** — OpenAI/Anthropic-compatible APIs, built-in `ChatGPT-style` Web UI, MCP tool calling, structured outputs, embedding + tokenizer endpoints.
-- **Aggressive KV compression** — TurboQuant (`2–4 bit` KV cache) extends context up to **4.3×** with minimal quality loss. Run `30B+` MoE models with **millions of context** on single 24/32 GB GPUs.
-- **Lightweight Python bindings** — Optional PyO3 wheel when you need a Python entry point.
+| | Feature | Details |
+|---|---|---|
+| **0️⃣** | Zero Python dependencies | Pure Rust backend — no PyTorch, no CUDA Python bindings |
+| **⚡** | Fast | Native Flash Attention, FlashInfer, CUDA Graphs, continuous batching, prefix caching, PD disaggregation. Up to **175 tok/s** decode for `30B+` models on consumer GPUs |
+| **🪶** | Tiny footprint | Core scheduling + attention logic in **< 5 000 lines** of Rust |
+| **🌍** | Cross-platform | CUDA (Linux/Windows), Metal (macOS). Same binary, same API |
+| **🏭** | Production-ready | OpenAI/Anthropic-compatible APIs, built-in ChatGPT-style Web UI, MCP tool calling, structured outputs, embedding + tokenizer endpoints |
+| **🗜️** | Aggressive KV compression | TurboQuant (`2–4 bit` KV cache) extends context up to **4.3×** with minimal quality loss. Run `30B+` MoE models with **millions of context** on single 24/32 GB GPUs |
+| **🐍** | Lightweight Python bindings | Optional PyO3 wheel when you need a Python entry point |
 
 ---
 
-## Quick Start
+## 🚀 Quick Start
 
-### Option A — 🚀 Rust (recommended)
+### 📦 Install
 
+**Option 1 — npm (easiest)**
 ```bash
-# Prerequisites: Rust compiler, CUDA Toolkit (optional) or Metal XCode commandline tool
+npm install -g @trusted-ai/xinfer
+xinfer --m Qwen/Qwen3.6-27B-FP8 --kvcache-dtype turbo4 --ui-server
+```
+
+**Option 2 — Cargo (from source)**
+```bash
+# Prerequisites: Rust compiler, CUDA Toolkit (optional) or Metal Xcode command line tool
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 sudo apt-get install -y git build-essential libssl-dev pkg-config
 
-# Repo for install
-export VLLM_RS_REPO="https://github.com/guoqingbao/vllm.rs"
-
-# 1. Install (one-time, replace features to `metal` on Mac, remove `flashinfer` and `cutlass` features on SM_70/SM_75, e.g., V100)
-cargo install --git $VLLM_RS_REPO vllm-rs --features cuda,nccl,flashinfer,cutlass
-
-# or, git clone and install from local source code
-# git clone $VLLM_RS_REPO && cd vllm.rs
-# ./build.sh --install --features cuda,nccl,flashinfer,cutlass
-
-# 2. Run
-vllm-rs --m Qwen/Qwen3.6-27B-FP8 --kvcache-dtype turbo4 --ui-server
-
-# local model
-# vllm-rs --w /home/Qwen3.6-35B-A3B --d 0,1 --ui-server
-
-# 3. Vibe Coding Client (optinal)
-cargo install xbot # config to use local Base URL
+export XINFER_REPO="https://github.com/guoqingbao/xinfer"
+# MacOS/Metal: replace features to `metal`
+# SM_70/SM_75 (e.g., V100): remove `flashinfer` and `cutlass` features
+cargo install --git $XINFER_REPO xinfer --features cuda,nccl,flashinfer,cutlass
 ```
 
-Open `http://IP:8001` for the built-in chat UI, or use `http://IP:8000/v1/` as API server `Base URL`.
+**Option 3 — pip (Python)**
+```bash
+# Turing/V100 (SM70/SM75), Hopper (SM90) / Blackwell (SM100+): download wheel from `GitHub Releases`
+pip install xinfer # Metal (macOS) / Ampere (SM80, A100)
+```
 
-Optionally add `--kvcache-dtype` to compress KV cache and extend context:
+**Option 4 — Docker**
+```bash
+# Change sm version, example: Hopper (sm_90, CUDA 13.0.0), sm_100/sm_120 (Blackwell)
+# Turing/V100 (sm_70/sm_75): remove `flashinfer` and `cutlass` features
+./build_docker.sh "cuda,nccl,flashinfer,cutlass" sm_80 13.0.0
+```
+
+See [Docker guide →](docs/docker.md)
+
+---
+
+### ▶️ Run
+
+**Using HuggingFace Model ID:**
+```bash
+xinfer --m Qwen/Qwen3.6-27B-FP8 --kvcache-dtype turbo4 --ui-server
+```
+
+**Using local model path:**
+```bash
+xinfer --w /home/Qwen3.6-35B-A3B --d 0,1 --ui-server
+```
+
+**Python usage:**
+```bash
+python3 -m xinfer.server --m Qwen/Qwen3.6-27B-FP8 --kvcache-dtype turbo4 --ui-server
+```
+
+> **Tip:** Open `http://IP:8001` for the built-in chat UI, or use `http://IP:8000/v1/` as your API `Base URL`.
+
+---
+
+### 🗜️ KV Cache Compression
+
+Add `--kvcache-dtype` to compress KV cache and extend context length:
 
 | Flag (`--kvcache-dtype`) | Compression | Quality | GPU Requirement |
 |---|---|---|---|
@@ -62,28 +95,11 @@ Optionally add `--kvcache-dtype` to compress KV cache and extend context:
 | `turbo4` | **3.7×** | Best balance | SM70+ / Apple M1|
 | `turbo3` | **4.7×** | Max compression | SM70+ |
 
-### Option B — 📦 Python (`pip install`)
-- 💡Turing/V100 (SM70/SM75), Hopper (SM90) / Blackwell (SM100+): download wheel from `GitHub Releases`; 
-```bash
-# Metal (macOS) / Ampere (SM80, A100)
-pip install vllm_rs
-python3 -m vllm_rs.server --m Qwen/Qwen3.6-27B-FP8 --kvcache-dtype turbo4 --ui-server
-```
-
-### Option C — Install with Docker
-- 💡Change `sm_xx` to sm_70/sm_75 (Turing/V100, remove `flashinfer` and `cutlass` features), sm_80/sm_89 (Ampere), sm_90 (Hopper), sm_100/sm_120 (Blackwell)
-```bash
-# Example: Hopper (SM_90, CUDA 13.0.0), append extra argument 1 for rust crate mirror (Chinese Mainland)
-./build_docker.sh "cuda,nccl,flashinfer,cutlass" sm_90 13.0.0
-```
-
-See [Docker guide →](docs/docker.md)
-
 ---
 
 ## 📈 Performance
 
-> **V100-32G**, **A100-40G**, **Hopper-80G** and **RTX 5090**
+> Tested on **V100-32G**, **A100-40G**, **Hopper-80G** and **RTX 5090**
 
 | Model | Format | Size | Decoding Speed |
 |---|---|---|---|
@@ -102,9 +118,9 @@ See [Docker guide →](docs/docker.md)
 | **Gemma4-31B** | ISQ (BF16→Q4K) | **31B (Dense)** | **41** tokens/s (**Hopper**) |
 | **Gemma4-26B-A4B** | NVFP4 | **26B (MoE)** | **131** tokens/s (**RTX 5090**) |
 | **MiniMax-M2.5** | NVFP4 | **229B (MoE)** | **62** tokens/s (**Hopper, Software FP4, TP=2**) |
-<details>
 
-<summary>Apple Silicon (M4)</summary>
+<details>
+<summary><b>Apple Silicon (M4)</b></summary>
 
 | Model | Batch Size | Output Tokens | Time (s) | Throughput (tokens/s) |
 |---|---|---|---|---|
@@ -143,6 +159,8 @@ See [Docker guide →](docs/docker.md)
 
 **Formats:** Safetensors (BF16, `FP8-blockwise`, GPTQ, AWQ, MXFP4, `NVFP4`) | GGUF (all quant types) | `ISQ` (on-the-fly quantization)
 
+---
+
 ### TurboQuant KV Cache — Run 30B+ Models on Consumer GPUs
 
 TurboQuant compresses KV cache to 2–4 bits via Walsh-Hadamard transform rotation + per-head absmax quantization. Max context tokens with `turbo4`:
@@ -162,16 +180,16 @@ TurboQuant compresses KV cache to 2–4 bits via Walsh-Hadamard transform rotati
 
 ```bash
 # 35B MoE on single 24/32 GB GPU
-vllm-rs --m unsloth/Qwen3.6-35B-A3B-NVFP4 --kvcache-dtype turbo4
+xinfer --m unsloth/Qwen3.6-35B-A3B-NVFP4 --kvcache-dtype turbo4
 
 # Production precision
-vllm-rs --m Qwen/Qwen3.6-35B-A3B-FP8 --kvcache-dtype fp8
+xinfer --m Qwen/Qwen3.6-35B-A3B-FP8 --kvcache-dtype fp8
 
 # 27B Dense + turbo4
-vllm-rs --m Qwen/Qwen3.6-27B-FP8 --kvcache-dtype turbo4
+xinfer --m Qwen/Qwen3.6-27B-FP8 --kvcache-dtype turbo4
 
 # 30B MoE GGUF + turbo4
-vllm-rs --m unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF \
+xinfer --m unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF \
   --f Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf --kvcache-dtype turbo4
 ```
 
@@ -194,11 +212,11 @@ sudo apt-get install -y cuda-nvcc-12-9 cuda-nvrtc-dev-12-9 libcublas-dev-12-9 li
 sudo apt-get install -y libnccl2 libnccl-dev
 
 # Build & install
-./build.sh --install --features cuda,nccl,flashinfer,cutlass
+cargo --install --features cuda,nccl,flashinfer,cutlass
 # Flash Attention backend alternative:
-./build.sh --install --features cuda,nccl,flashattn,cutlass
+cargo --install --features cuda,nccl,flashattn,cutlass
 # V100 / older (no flash backends):
-./build.sh --install --features cuda,nccl
+cargo --install --features cuda,nccl
 ```
 
 </details>
@@ -229,40 +247,40 @@ See [Docker guide →](docs/docker.md)
 
 ### Running Models
 
-- 💡By default, vllm-rs starts an OpenAI-compatible API server at `http://localhost:8000`. Add `--ui-server` to also launch the built-in ChatGPT-style Web UI at `http://localhost:8001`.
-
-- 💡For built within Docker, refer [**Run vLLM.rs in docker →**](docs/docker.md)
+> **Tip:** By default, xInfer starts an OpenAI-compatible API server at `http://localhost:8000`. Add `--ui-server` to also launch the built-in ChatGPT-style Web UI at `http://localhost:8001`.
+>
+> For Docker builds, refer to [**Run xInfer in Docker →**](docs/docker.md)
 
 ```bash
 # FP8 model (sm90+ with cutlass) + web UI
-vllm-rs --m Qwen/Qwen3.6-27B-FP8 --ui-server
+xinfer --m Qwen/Qwen3.6-27B-FP8 --ui-server
 
 # Unquantized Safetensors (multi-GPU)
-vllm-rs --d 0,1 --m Qwen/Qwen3-30B-A3B-Instruct-2507 --kvcache-dtype fp8
+xinfer --d 0,1 --m Qwen/Qwen3-30B-A3B-Instruct-2507 --kvcache-dtype fp8
 
 # ISQ on-the-fly quantization
-vllm-rs --m Qwen/Qwen3.6-35B-A3B --isq q4k
+xinfer --m Qwen/Qwen3.6-35B-A3B --isq q4k
 
 # NVFP4 model
-vllm-rs --m unsloth/Qwen3.6-27B-NVFP4
+xinfer --m unsloth/Qwen3.6-27B-NVFP4
 
 # MXFP4
-vllm-rs --m olka-fi/Qwen3.5-4B-MXFP4
+xinfer --m olka-fi/Qwen3.5-4B-MXFP4
 
 # GGUF model (4-bit KvCache)
-vllm-rs --m unsloth/Qwen3.5-27B-GGUF --f Qwen3.5-27B-Q4_K_M.gguf --kvcache-dtype turbo4
+xinfer --m unsloth/Qwen3.5-27B-GGUF --f Qwen3.5-27B-Q4_K_M.gguf --kvcache-dtype turbo4
 
 # FP8 on Metal
-vllm-rs --m Qwen/Qwen3.5-4B-FP8
+xinfer --m Qwen/Qwen3.5-4B-FP8
 
 # Gemma4 26B (NVFP4)
-vllm-rs --m unsloth/gemma-4-26b-a4b-it-NVFP4
+xinfer --m unsloth/gemma-4-26b-a4b-it-NVFP4
 
 # MLA model (GLM4.7 Flash)
-vllm-rs --m GadflyII/GLM-4.7-Flash-NVFP4
+xinfer --m GadflyII/GLM-4.7-Flash-NVFP4
 
 # Interactive CLI chat
-vllm-rs --i --m unsloth/Qwen3.5-27B-GGUF --f Qwen3.5-27B-Q4_K_M.gguf
+xinfer --i --m unsloth/Qwen3.5-27B-GGUF --f Qwen3.5-27B-Q4_K_M.gguf
 ```
 
 <details>
@@ -270,13 +288,13 @@ vllm-rs --i --m unsloth/Qwen3.5-27B-GGUF --f Qwen3.5-27B-Q4_K_M.gguf
 
 ```bash
 # ISQ Q4K + FP8 KV cache
-vllm-rs --m Qwen/Qwen3.6-35B-A3B --isq q4k --kvcache-dtype fp8
+xinfer --m Qwen/Qwen3.6-35B-A3B --isq q4k --kvcache-dtype fp8
 
 # ISQ Q4K + TurboQuant KV cache
-vllm-rs --m Qwen/Qwen3.6-35B-A3B --isq q4k --kvcache-dtype turbo4
+xinfer --m Qwen/Qwen3.6-35B-A3B --isq q4k --kvcache-dtype turbo4
 
 # Metal ISQ
-vllm-rs --w /path/Qwen3-4B --isq q6k
+xinfer --w /path/Qwen3-4B --isq q6k
 ```
 
 </details>
@@ -286,10 +304,10 @@ vllm-rs --w /path/Qwen3-4B --isq q6k
 
 ```bash
 # Single GPU — GGUF
-vllm-rs --m unsloth/Qwen3.5-27B-GGUF --f Qwen3.5-27B-Q4_K_M.gguf
+xinfer --m unsloth/Qwen3.5-27B-GGUF --f Qwen3.5-27B-Q4_K_M.gguf
 
 # Multi-GPU — GGUF
-vllm-rs --d 0,1 --f /path/Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf
+xinfer --d 0,1 --f /path/Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf
 ```
 
 </details>
@@ -299,19 +317,19 @@ vllm-rs --d 0,1 --f /path/Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf
 
 ```bash
 # turbo4: 4-bit K+V — 3.7× compression, best tradeoff
-vllm-rs --m Qwen/Qwen3.6-27B-FP8 --kvcache-dtype turbo4
+xinfer --m Qwen/Qwen3.6-27B-FP8 --kvcache-dtype turbo4
 
 # turbo3: 3-bit K + 4-bit V — 4.7× compression
-vllm-rs --m Qwen/Qwen3.6-27B-FP8 --kvcache-dtype turbo3
+xinfer --m Qwen/Qwen3.6-27B-FP8 --kvcache-dtype turbo3
 
 # turbo8: FP8 K + 4-bit V — 2.6× compression, highest quality
-vllm-rs --m Qwen/Qwen3.6-27B-FP8 --kvcache-dtype turbo8
+xinfer --m Qwen/Qwen3.6-27B-FP8 --kvcache-dtype turbo8
 
 # 35B MoE (NVFP4 + turbo4) — fits on single 24 GB GPU
-vllm-rs --m unsloth/Qwen3.6-35B-A3B-NVFP4 --kvcache-dtype turbo4
+xinfer --m unsloth/Qwen3.6-35B-A3B-NVFP4 --kvcache-dtype turbo4
 
 # 30B MoE (GGUF Q4_K_M + turbo4) — consumer GPU
-vllm-rs --m unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF \
+xinfer --m unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF \
   --f Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf --kvcache-dtype turbo4
 ```
 
@@ -324,16 +342,16 @@ vllm-rs --m unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF \
 # Upload images via built-in Chat UI or send image_url in API requests
 
 # Qwen3.6 35B MoE (FP8, multimodal)
-vllm-rs --m Qwen/Qwen3.6-35B-A3B-FP8 --ui-server
+xinfer --m Qwen/Qwen3.6-35B-A3B-FP8 --ui-server
 
 # Qwen3-VL 8B (GGUF)
-vllm-rs --m unsloth/Qwen3-VL-8B-Instruct-GGUF --f Qwen3-VL-8B-Instruct-Q8_0.gguf --ui-server
+xinfer --m unsloth/Qwen3-VL-8B-Instruct-GGUF --f Qwen3-VL-8B-Instruct-Q8_0.gguf --ui-server
 
 # Gemma4 26B MoE (NVFP4, multimodal)
-vllm-rs --m unsloth/gemma-4-26b-a4b-it-NVFP4 --ui-server
+xinfer --m unsloth/gemma-4-26b-a4b-it-NVFP4 --ui-server
 
 # Mistral-3 VL 3B (BF16, multimodal)
-vllm-rs --m mistralai/Ministral-3-3B --ui-server
+xinfer --m mistralai/Ministral-3-3B --ui-server
 ```
 
 </details>
@@ -346,27 +364,27 @@ vllm-rs --m mistralai/Ministral-3-3B --ui-server
 
 ```bash
 # FP8 model + web UI
-python3 -m vllm_rs.server --m Qwen/Qwen3.6-27B-FP8 --ui-server
+python3 -m xinfer.server --m Qwen/Qwen3.6-27B-FP8 --ui-server
 
 # Unquantized Safetensors (multi-GPU)
-python3 -m vllm_rs.server --m Qwen/Qwen3.5-122B-A10B --d 0,1 --kvcache-dtype fp8
+python3 -m xinfer.server --m Qwen/Qwen3.5-122B-A10B --d 0,1 --kvcache-dtype fp8
 
 # ISQ on-the-fly quantization
-python3 -m vllm_rs.server --w /path/Qwen3.6-35B-A3B --isq q4k --d 0 --kvcache-dtype turbo8
+python3 -m xinfer.server --w /path/Qwen3.6-35B-A3B --isq q4k --d 0 --kvcache-dtype turbo8
 
 # NVFP4 / MXFP4
-python3 -m vllm_rs.server --m unsloth/Qwen3.6-27B-NVFP4
-python3 -m vllm_rs.server --m olka-fi/Qwen3.5-4B-MXFP4
-python3 -m vllm_rs.server --m GadflyII/GLM-4.7-Flash-NVFP4
+python3 -m xinfer.server --m unsloth/Qwen3.6-27B-NVFP4
+python3 -m xinfer.server --m olka-fi/Qwen3.5-4B-MXFP4
+python3 -m xinfer.server --m GadflyII/GLM-4.7-Flash-NVFP4
 
 # GGUF
-python3 -m vllm_rs.server --m unsloth/Qwen3.5-27B-GGUF --f Qwen3.5-27B-Q4_K_M.gguf
+python3 -m xinfer.server --m unsloth/Qwen3.5-27B-GGUF --f Qwen3.5-27B-Q4_K_M.gguf
 
 # Multimodal
-python3 -m vllm_rs.server --m Qwen/Qwen3.6-35B-A3B-FP8 --kvcache-dtype fp8
+python3 -m xinfer.server --m Qwen/Qwen3.6-35B-A3B-FP8 --kvcache-dtype fp8
 
 # GPTQ / AWQ
-python3 -m vllm_rs.server --w /home/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4-Marlin
+python3 -m xinfer.server --w /home/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4-Marlin
 ```
 
 See [more Python examples →](python/ReadMe.md)
@@ -387,7 +405,7 @@ pip install maturin maturin[patchelf]
 maturin build --release --features metal,python
 
 # Install
-pip install target/wheels/vllm_rs-*.whl --force-reinstall
+pip install target/wheels/xinfer-*.whl --force-reinstall
 ```
 
 </details>
@@ -407,44 +425,46 @@ Split prefill (prompt processing) and decode (token generation) across GPUs or m
 **Local IPC** (multirank)
 ```bash
 # PD Server (prefill GPU, default port 7000)
-vllm-rs --d 0,1 --m Qwen/Qwen3-30B-A3B-Instruct-2507 --pd-server
+xinfer --d 0,1 --m Qwen/Qwen3-30B-A3B-Instruct-2507 --pd-server
 
 # PD Client (decode GPU + API)
-vllm-rs --d 2,3 --w /path/Qwen3-30B-A3B-Instruct-2507 --isq q4k --ui-server --port 8000 --pd-client
+xinfer --d 2,3 --w /path/Qwen3-30B-A3B-Instruct-2507 --isq q4k --ui-server --port 8000 --pd-client
 ```
 
 **Multinode** (tcp mode)
-
 ```bash
 # Server machine (192.168.1.100)
-target/release/vllm-rs --d 0,1 --m Qwen/... --pd-server --pd-url tcp://0.0.0.0:8100
+target/release/xinfer --d 0,1 --m Qwen/... --pd-server --pd-url tcp://0.0.0.0:8100
 
 # Client machine
-target/release/vllm-rs --d 0,1 --w /path/... --pd-client --pd-url tcp://192.168.1.100:8100 --ui-server --port 8000
+target/release/xinfer --d 0,1 --w /path/... --pd-client --pd-url tcp://192.168.1.100:8100 --ui-server --port 8000
 ```
 
 > Metal/macOS requires `--pd-url` (no LocalIPC support).
+
 <details>
-<summary>Multi-container（file:// mode）</summary>
+<summary><b>Multi-container (file:// mode)</b></summary>
 
 ```bash
 mkdir -p /tmp/pd-sockets
 
 # Server container
 docker run --gpus '"device=0,1"' -v /tmp/pd-sockets:/sockets ...
-target/release/vllm-rs --d 0,1 --m Qwen/... --pd-server --pd-url file:///sockets
+target/release/xinfer --d 0,1 --m Qwen/... --pd-server --pd-url file:///sockets
 
 # Client container
 docker run --gpus '"device=2,3"' -v /tmp/pd-sockets:/sockets ...
-target/release/vllm-rs --d 0,1 --w /path/... --pd-client --pd-url file:///sockets --ui-server --port 8000
+target/release/xinfer --d 0,1 --w /path/... --pd-client --pd-url file:///sockets --ui-server --port 8000
 ```
 
 </details>
 
+---
+
 ## 🔌 MCP Tool Calling
 
 ```bash
-vllm-rs --m unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF \
+xinfer --m unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF \
   --f Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf --ui-server --mcp-config ./mcp.json
 ```
 
@@ -478,7 +498,7 @@ Constraint-based generation via llguidance — Lark grammars, regex, JSON Schema
 | [Add a Model](docs/add_model.md) | Port a new architecture (AI-assisted) |
 | [Test a Model](docs/test_model.md) | Validate model quality (AI-assisted) |
 
-**Using Agents under vLLM.rs backend:** [xbot](docs/xbot.md) · [OpenCode](docs/opencode.md) · [Kilo Code](docs/kilocode.md) · [Claude Code](docs/claude_code.md) · [Goose](docs/goose.md)
+**Using Agents under xInfer backend:** [xbot](docs/xbot.md) · [OpenCode](docs/opencode.md) · [Kilo Code](docs/kilocode.md) · [Claude Code](docs/claude_code.md) · [Goose](docs/goose.md)
 
 ---
 
@@ -567,11 +587,11 @@ Constraint-based generation via llguidance — Lark grammars, regex, JSON Schema
 
 ## Star History
 
-<a href="https://www.star-history.com/?repos=guoqingbao%2Fvllm.rs&type=date&legend=top-left">
+<a href="https://www.star-history.com/?repos=guoqingbao%2Fxinfer&type=date&legend=top-left">
  <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=guoqingbao/vllm.rs&type=date&theme=dark&legend=top-left" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=guoqingbao/vllm.rs&type=date&legend=top-left" />
-   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=guoqingbao/vllm.rs&type=date&legend=top-left" />
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=guoqingbao/xinfer&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=guoqingbao/xinfer&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=guoqingbao/xinfer&type=date&legend=top-left" />
  </picture>
 </a>
 

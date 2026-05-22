@@ -1,5 +1,5 @@
 // src/mcp/mod.rs
-//! Model Context Protocol (MCP) support for vLLM.rs
+//! Model Context Protocol (MCP) support for xInfer
 //!
 //! MCP enables AI applications to connect with external data sources and tools
 //! through a standardized protocol.

@@ -8,25 +8,29 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokenizers::Tokenizer;
-use vllm_rs::core::runner::{ModelRunner, Seqs};
-use vllm_rs::models::layers::distributed::Comm;
-use vllm_rs::models::layers::VarBuilderX;
-use vllm_rs::runner::{receive_local, send_local, MessageType};
-use vllm_rs::transfer::PdRole;
-use vllm_rs::transfer::Transfer;
-use vllm_rs::utils::gguf_helper::load_gguf_info_from_files;
-use vllm_rs::utils::guidance::build_llg_factory;
-use vllm_rs::utils::heartbeat::heartbeat_worker;
-use vllm_rs::utils::new_device;
-use vllm_rs::utils::progress::{ProgressLike, ProgressReporter, RemoteProgressReporter};
+use xinfer::core::runner::{ModelRunner, Seqs};
+use xinfer::models::layers::distributed::Comm;
+use xinfer::models::layers::VarBuilderX;
+use xinfer::runner::{receive_local, send_local, MessageType};
+use xinfer::transfer::PdRole;
+use xinfer::transfer::Transfer;
+use xinfer::utils::gguf_helper::load_gguf_info_from_files;
+use xinfer::utils::guidance::build_llg_factory;
+use xinfer::utils::heartbeat::heartbeat_worker;
+use xinfer::utils::new_device;
+use xinfer::utils::progress::{ProgressLike, ProgressReporter, RemoteProgressReporter};
 
-fn main() -> anyhow::Result<()> {
-    vllm_rs::log_info!("runner started");
+pub fn run_runner() -> anyhow::Result<()> {
+    xinfer::log_info!("runner started");
 
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::INFO)
         .init();
-    let args: Vec<String> = std::env::args().collect();
+    let args: Vec<String> = if let Ok(encoded) = std::env::var("XINFER_RUNNER_ARGS") {
+        encoded.split('\x1f').map(String::from).collect()
+    } else {
+        std::env::args().collect()
+    };
     let sock = args
         .iter()
         .position(|s| s == "--sock")
@@ -48,7 +52,7 @@ fn main() -> anyhow::Result<()> {
         if stream.is_ok() {
             break;
         }
-        vllm_rs::log_info!("Runner retry connecting to socket: {}", sock);
+        xinfer::log_info!("Runner retry connecting to socket: {}", sock);
         stream = LocalStream::connect(sock_name.clone());
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
@@ -58,22 +62,22 @@ fn main() -> anyhow::Result<()> {
 
     ctrlc::set_handler(move || {
         if model_loaded_ctrlc.load(Ordering::SeqCst) {
-            vllm_rs::log_info!("Runner break session!");
+            xinfer::log_info!("Runner break session!");
         } else {
-            vllm_rs::log_warn!("Runner break model loading (Ctrl+C detected)!");
+            xinfer::log_warn!("Runner break model loading (Ctrl+C detected)!");
             std::process::exit(0);
         }
     })
     .expect("Error setting Ctrl+C handler");
 
-    vllm_rs::log_info!("Runner connected to socket: {}", sock);
+    xinfer::log_info!("Runner connected to socket: {}", sock);
     let stop_flag = Arc::new(AtomicBool::new(false));
     let _ = heartbeat_worker(None, true, stop_flag.clone(), &uuid_str);
 
     let msg = receive_local(&mut stream, true)?;
     let runner = match msg {
         MessageType::Init(init_req) => {
-            vllm_rs::log_info!("Received init request: {:?}", init_req);
+            xinfer::log_info!("Received init request: {:?}", init_req);
             // Use init_req.rank to pick device
             let device = new_device(init_req.dev_id)?;
 
@@ -91,9 +95,9 @@ fn main() -> anyhow::Result<()> {
             #[cfg(not(feature = "nccl"))]
             let comm = Rc::new(Comm::default());
 
-            vllm_rs::log_info!("Loading model at rank {}", init_req.rank);
+            xinfer::log_info!("Loading model at rank {}", init_req.rank);
 
-            let progress_sock_name = format!("{}@vllm-rs-progress", uuid_str);
+            let progress_sock_name = format!("{}@xinfer-progress", uuid_str);
 
             let progress_reporter = match RemoteProgressReporter::new(
                 init_req.rank,
@@ -107,7 +111,7 @@ fn main() -> anyhow::Result<()> {
                     reporter
                 }
                 _ => {
-                    vllm_rs::log_error!("Unable to create remote progress reporter!");
+                    xinfer::log_error!("Unable to create remote progress reporter!");
                     let reporter: Arc<RwLock<Box<dyn ProgressLike>>> =
                         Arc::new(RwLock::new(Box::new(ProgressReporter::new(init_req.rank))));
                     reporter
@@ -137,12 +141,12 @@ fn main() -> anyhow::Result<()> {
                     {
                         Ok(f) => Some(f),
                         Err(e) => {
-                            vllm_rs::log_warn!("Failed to build llguidance factory: {}", e);
+                            xinfer::log_warn!("Failed to build llguidance factory: {}", e);
                             None
                         }
                     },
                     Err(e) => {
-                        vllm_rs::log_warn!(
+                        xinfer::log_warn!(
                             "Failed to load GGUF tokenizer metadata; disabling optional llguidance: {}",
                             e
                         );
@@ -155,12 +159,12 @@ fn main() -> anyhow::Result<()> {
                     {
                         Ok(f) => Some(f),
                         Err(e) => {
-                            vllm_rs::log_warn!("Failed to build llguidance factory: {}", e);
+                            xinfer::log_warn!("Failed to build llguidance factory: {}", e);
                             None
                         }
                     },
                     Err(e) => {
-                        vllm_rs::log_warn!(
+                        xinfer::log_warn!(
                             "Failed to load tokenizer from {:?}; disabling optional llguidance: {}",
                             tokenizer_path,
                             e
@@ -169,7 +173,7 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
             } else {
-                vllm_rs::log_warn!(
+                xinfer::log_warn!(
                     "Tokenizer file {:?} not found; disabling optional llguidance",
                     tokenizer_path
                 );
@@ -202,7 +206,7 @@ fn main() -> anyhow::Result<()> {
                 runner
             };
 
-            vllm_rs::log_info!(
+            xinfer::log_info!(
                 "Runner at rank {} created (PD config: {:?})!",
                 init_req.rank,
                 init_req.econfig.pd_config
@@ -213,9 +217,9 @@ fn main() -> anyhow::Result<()> {
                 let arch = init_req.config.architectures.as_ref().unwrap()[0].clone();
                 #[cfg(all(feature = "cuda", feature = "graph"))]
                 if init_req.econfig.disable_cuda_graph {
-                    vllm_rs::log_info!("CUDA graph capture disabled by --disable-cuda-graph");
-                } else if vllm_rs::utils::is_no_cuda_graph_supprt(arch.clone()) {
-                    vllm_rs::log_info!("{arch} does not supprt CUDA graph");
+                    xinfer::log_info!("CUDA graph capture disabled by --disable-cuda-graph");
+                } else if xinfer::utils::is_no_cuda_graph_supprt(arch.clone()) {
+                    xinfer::log_info!("{arch} does not supprt CUDA graph");
                 } else {
                     match runner.warmup_capture() {
                         Ok(_) => {
@@ -239,7 +243,7 @@ fn main() -> anyhow::Result<()> {
             runner
         }
         _ => {
-            vllm_rs::log_error!("Unexpected message type: {:?}", msg);
+            xinfer::log_error!("Unexpected message type: {:?}", msg);
             panic!("Unexpected message type");
         }
     };
@@ -249,7 +253,7 @@ fn main() -> anyhow::Result<()> {
     loop {
         match receive_local(&mut stream, false) {
             Ok(MessageType::Shutdown) => {
-                vllm_rs::log_info!("Runner exit");
+                xinfer::log_info!("Runner exit");
                 break;
             }
             Ok(MessageType::RunPrefill((sequences, is_prefill))) => {
@@ -258,7 +262,7 @@ fn main() -> anyhow::Result<()> {
                     is_prefill,
                 );
                 if outputs.is_err() {
-                    vllm_rs::log_error!("Runner prefill error: {:?}", outputs);
+                    xinfer::log_error!("Runner prefill error: {:?}", outputs);
                 }
                 send_local(
                     &mut vec![stream.try_clone()?],
@@ -269,7 +273,7 @@ fn main() -> anyhow::Result<()> {
             Ok(MessageType::RunDecode((sequences, is_prefill))) => {
                 let outputs = runner.run(Seqs::DecodeVec(&sequences), is_prefill);
                 if outputs.is_err() {
-                    vllm_rs::log_error!("Runner decode error: {:?}", outputs);
+                    xinfer::log_error!("Runner decode error: {:?}", outputs);
                 }
                 send_local(
                     &mut vec![stream.try_clone()?],
@@ -278,12 +282,12 @@ fn main() -> anyhow::Result<()> {
                 )?;
             }
             Ok(MessageType::RunEmbed((sequences, strategy))) => {
-                use vllm_rs::core::sequence::Sequence;
+                use xinfer::core::sequence::Sequence;
                 let refs: Vec<&Sequence> = sequences.iter().collect();
                 let slice: &[&Sequence] = &refs;
                 let outputs = runner.embed(&slice, &strategy);
                 if outputs.is_err() {
-                    vllm_rs::log_error!("Runner embedding error: {:?}", outputs);
+                    xinfer::log_error!("Runner embedding error: {:?}", outputs);
                 }
                 send_local(
                     &mut vec![stream.try_clone()?],
@@ -292,17 +296,17 @@ fn main() -> anyhow::Result<()> {
                 )?;
             }
             Ok(MessageType::LoadingProgress(_)) => {
-                vllm_rs::log_info!("Received loading progress message");
+                xinfer::log_info!("Received loading progress message");
             }
             Ok(MessageType::KVCacheSwap((mappings, swap_in))) => {
-                vllm_rs::log_info!(
+                xinfer::log_info!(
                     "Received KVCacheSwap message: {} kv cache blocks need to {}!",
                     mappings.len(),
                     if swap_in { "swap in" } else { "swap out" },
                 );
                 let ret = runner.swap_kvcache(mappings, swap_in);
                 if ret.is_err() {
-                    vllm_rs::log_error!("KvCache Swap failed: {:?}", ret);
+                    xinfer::log_error!("KvCache Swap failed: {:?}", ret);
                 }
                 send_local(
                     &mut vec![stream.try_clone()?],
@@ -316,7 +320,7 @@ fn main() -> anyhow::Result<()> {
             Ok(MessageType::CaptureMambaPrefixState((seq_id, hash, preserve))) => {
                 let ret = runner.capture_mamba_prefix_state(seq_id, hash, preserve);
                 if ret.is_err() {
-                    vllm_rs::log_error!(
+                    xinfer::log_error!(
                         "CaptureMambaPrefixState failed for seq {} hash {} preserve={} : {:?}",
                         seq_id,
                         hash,
@@ -333,7 +337,7 @@ fn main() -> anyhow::Result<()> {
             Ok(MessageType::HasMambaPrefixState(hash)) => {
                 let ret = runner.has_mamba_prefix_state(hash);
                 if ret.is_err() {
-                    vllm_rs::log_error!("HasMambaPrefixState failed for hash {}: {:?}", hash, ret);
+                    xinfer::log_error!("HasMambaPrefixState failed for hash {}: {:?}", hash, ret);
                 }
                 send_local(
                     &mut vec![stream.try_clone()?],
@@ -344,7 +348,7 @@ fn main() -> anyhow::Result<()> {
             Ok(MessageType::TransferPrefill(sequence)) => {
                 let ret = runner.transfer_prefill(&sequence);
                 // if ret.is_err() {
-                //     vllm_rs::log_error!("Prefill transfer failed: {:?}", ret);
+                //     xinfer::log_error!("Prefill transfer failed: {:?}", ret);
                 // }
                 send_local(
                     &mut vec![stream.try_clone()?],
@@ -373,7 +377,7 @@ fn main() -> anyhow::Result<()> {
             Ok(MessageType::KvCacheSend((sequence, token))) => {
                 let ret = runner.send_kvcache(&sequence, token);
                 if ret.is_err() {
-                    vllm_rs::log_error!("KvCacheSend failed: {:?}", ret);
+                    xinfer::log_error!("KvCacheSend failed: {:?}", ret);
                 }
                 send_local(
                     &mut vec![stream.try_clone()?],
@@ -384,7 +388,7 @@ fn main() -> anyhow::Result<()> {
             Ok(MessageType::KvCacheReceive(sequence)) => {
                 let ret = runner.receive_kvcache(&sequence);
                 if ret.is_err() {
-                    vllm_rs::log_error!("KvCacheReceive failed: {:?}", ret);
+                    xinfer::log_error!("KvCacheReceive failed: {:?}", ret);
                 }
                 send_local(
                     &mut vec![stream.try_clone()?],
@@ -413,7 +417,7 @@ fn main() -> anyhow::Result<()> {
             Ok(MessageType::ClearBlocks(block_ids)) => {
                 let ret = runner.clear_blocks(block_ids);
                 if ret.is_err() {
-                    vllm_rs::log_error!("ClearBlocks failed: {:?}", ret);
+                    xinfer::log_error!("ClearBlocks failed: {:?}", ret);
                 }
                 send_local(
                     &mut vec![stream.try_clone()?],
@@ -423,16 +427,16 @@ fn main() -> anyhow::Result<()> {
             }
             Err(e) => {
                 if e.kind() != std::io::ErrorKind::UnexpectedEof {
-                    vllm_rs::log_error!("Runner exit with error: {:?}", e);
+                    xinfer::log_error!("Runner exit with error: {:?}", e);
                 }
                 break;
             }
             _ => {
-                vllm_rs::log_error!("Unexpected message type");
+                xinfer::log_error!("Unexpected message type");
             }
         }
     }
     stop_flag.store(true, Ordering::Relaxed);
-    vllm_rs::log_info!("Runner finished");
+    xinfer::log_info!("Runner finished");
     std::process::exit(0);
 }

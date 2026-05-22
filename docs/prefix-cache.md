@@ -1,6 +1,6 @@
 # Prefix Cache (KV Reuse)
 
-Prefix cache lets vLLM.rs reuse KV cache blocks from prior requests when a new
+Prefix cache lets xInfer reuse KV cache blocks from prior requests when a new
 prompt shares a prefix. This accelerates consecutive requests with overlapping
 history (for example, chat sessions that replay the same system + earlier turns).
 
@@ -27,7 +27,7 @@ If `--prefix-cache-max-tokens` is not set, defaults are:
 For hybrid Mamba models (for example Qwen3.5), prefix reuse also needs a
 compatible Mamba snapshot at the matched boundary.
 
-Use environment variable `VLLM_RS_MAMBA_SNAPSHOT_STRIDE_BLOCKS` to control
+Use environment variable `XINFER_MAMBA_SNAPSHOT_STRIDE_BLOCKS` to control
 sparse snapshot capture during decode (larger stride side usefull for limited GPU memory):
 - Default: `1` blocks
 - Minimum valid value: `1` (capture every block)

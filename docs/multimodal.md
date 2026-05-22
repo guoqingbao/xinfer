@@ -5,16 +5,15 @@ This project supports vision-language models (Qwen3-VL dense/MoE, Gemma3, Mistra
 ## Starting servers
 - Qwen3-VL (CUDA):  
   ```bash
-  target/release/vllm-rs --m Qwen/Qwen3-VL-8B-Instruct --ui-server
+  target/release/xinfer --m Qwen/Qwen3-VL-8B-Instruct --ui-server
   ```
 - Gemma3 (vision, No Flash attention support):  
   ```bash
-  ./run.sh --release --features cuda -- \
-    --m google/gemma-3-4b-it --ui-server
+  xinfer --m google/gemma-3-4b-it --ui-server
   ```
 - Mistral3-VL (vision):  
   ```bash
-  target/release/vllm-rs --m mistralai/Ministral-3-8B-Reasoning --ui-server
+  target/release/xinfer --m mistralai/Ministral-3-8B-Reasoning --ui-server
   ```
 
 ## Request payloads (OpenAI-compatible)

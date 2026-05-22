@@ -276,20 +276,20 @@ impl LLMEngine {
             #[cfg(feature = "python")]
             pyo3::Python::with_gil(|py| {
                 for (rank, _) in device_ids.iter().enumerate() {
-                    let sock_name = format!("{}@vllm-rs-runner-{}", unique_id, rank);
+                    let sock_name = format!("{}@xinfer-runner-{}", unique_id, rank);
                     spawn_runner(py, &runner_path.display().to_string(), &sock_name, unique_id)
-                        .expect("Failed to spawn runner. \n\r*****Tips: runner is not built within this package, use 'build.sh' script to build package with runner!");
+                        .expect("Failed to spawn runner. \n\r*****Tips: xinfer binary not found in this package, use 'build.sh' script to build.");
                 }
             });
 
             #[cfg(not(feature = "python"))]
             for (rank, _) in device_ids.iter().enumerate() {
-                let sock_name = format!("{}@vllm-rs-runner-{}", unique_id, rank);
+                let sock_name = format!("{}@xinfer-runner-{}", unique_id, rank);
                 spawn_runner(&runner_path.display().to_string(), &sock_name, unique_id)
-                    .expect("Failed to spawn runner. \n\r*****Tips: runner is not built, use 'run.sh' script instead of 'cargo run'!");
+                    .expect("Failed to spawn runner subprocess. \n\r*****Tips: ensure xinfer is built with './build.sh --install --features cuda,nccl'.");
             }
 
-            let progress_sock_name = format!("{}@vllm-rs-progress", unique_id);
+            let progress_sock_name = format!("{}@xinfer-progress", unique_id);
             let progress_handle = spawn_progress_thread(
                 econfig.num_shards.unwrap_or(1),
                 config.num_hidden_layers,
@@ -305,7 +305,7 @@ impl LLMEngine {
                 .enumerate()
                 .map(|(rank, dev_id)| {
                     let model_type = model_type.clone();
-                    let sock_name = format!("{}@vllm-rs-runner-{}", unique_id, rank);
+                    let sock_name = format!("{}@xinfer-runner-{}", unique_id, rank);
                     let listener = ListenerOptions::new()
                         .name(
                             sock_name
@@ -738,7 +738,7 @@ impl LLMEngine {
     ) -> Vec<Vec<u32>> {
         let synthetic_messages = vec![Message {
             role: "user".to_string(),
-            content: "__VLLM_RS_REPLAY_PROBE__".to_string(),
+            content: "__XINFER_REPLAY_PROBE__".to_string(),
             num_images: 0,
             tool_calls: None,
             tool_call_id: None,

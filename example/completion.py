@@ -3,7 +3,7 @@ import os
 import sys
 import argparse
 import warnings
-from vllm_rs import EngineConfig, SamplingParams, Message, GenerationOutput, GenerationConfig, Engine
+from xinfer import EngineConfig, SamplingParams, Message, GenerationOutput, GenerationConfig, Engine
 # Before running this code, first perform maturin build and then install the package in target/wheels
 
 
@@ -108,7 +108,7 @@ def run(args):
     )
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="vllm.rs Python CLI")
+    parser = argparse.ArgumentParser(description="xInfer Python CLI")
     parser.add_argument("--m", help="huggingface model id", type=str, default=None)
     parser.add_argument("--w", help="safetensor weight path", type=str, default=None)
     parser.add_argument("--f", help="gguf file path or gguf file name when model_id is given", type=str, default=None)

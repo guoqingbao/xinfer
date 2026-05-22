@@ -171,7 +171,7 @@ class EngineStream:
 class Engine:
     def __init__(econfig: EngineConfig, dtype: DType) -> Engine:
         """
-        Create a vllm.rs engine with given engine config and dtype ("f16", "bf16", and "f32")
+        Create an xInfer engine with given engine config and dtype ("f16", "bf16", and "f32")
         """
 
     def generate_sync(self,

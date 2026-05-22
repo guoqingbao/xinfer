@@ -22,7 +22,7 @@ impl fmt::Debug for CommandManager {
 
 impl CommandManager {
     pub fn ipc_default_name() -> anyhow::Result<&'static str> {
-        Ok("vllm_rs_daemon")
+        Ok("xinfer_daemon")
     }
 
     pub fn ipc_command_name(command_name: &str) -> anyhow::Result<String> {

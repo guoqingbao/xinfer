@@ -1,18 +1,18 @@
-# Goose + vLLM.rs (OpenAI-compatible endpoint)
+# Goose + xInfer (OpenAI-compatible endpoint)
 
-This guide connects Goose (Rust `AI Agent`) directly to vLLM.rs using the built-in OpenAI-compatible `/v1/chat/completions` API. No proxy required.
+This guide connects Goose (Rust `AI Agent`) directly to xInfer using the built-in OpenAI-compatible `/v1/chat/completions` API. No proxy required.
 
 ```
-Goose -> vLLM.rs (OpenAI-compatible)
+Goose -> xInfer (OpenAI-compatible)
 ```
 
-## 1) Start vLLM.rs on port 8000
+## 1) Start xInfer on port 8000
 
 ```bash
 # Rust
-./run.sh --features cuda,nccl,flashinfer,cutlass --release --m Qwen/Qwen3-Coder-Next-FP8 --server --d 0,1
+xinfer --m Qwen/Qwen3-Coder-Next-FP8 --server --d 0,1
 # Python
-python3 -m vllm_rs.server --m Qwen/Qwen3-30B-A3B-Instruct-2507 --d 0,1 --server
+python3 -m xinfer.server --m Qwen/Qwen3-30B-A3B-Instruct-2507 --d 0,1 --server
 ```
 
 ## 2) Configure Goose
@@ -46,7 +46,7 @@ goose configure
 │  OpenAI Compatible
 │
 ◇  What should we call this provider?
-│  vllm-rs
+│  xinfer
 │
 ◇  Provider API URL:
 │  http://127.0.0.1:8000/v1/
@@ -63,7 +63,7 @@ goose configure
 ◇  Does this provider require custom headers?
 │  No
 │
-└  Custom provider added: vllm-rs
+└  Custom provider added: xinfer
 └  Configuration saved successfully to /root/.config/goose/config.yaml
 ```
 
@@ -75,9 +75,9 @@ goose
 
 ### Trouble shooting
 
-1. Use the chat logger to monitor detailed interactions between Goose and vLLM.rs.
+1. Use the chat logger to monitor detailed interactions between Goose and xInfer.
 
 ```shell
 # Log into files (in folder ./log)
-export VLLM_RS_CHAT_LOGGER=1
+export XINFER_CHAT_LOGGER=1
 ```

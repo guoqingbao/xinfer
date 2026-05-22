@@ -1,6 +1,6 @@
 # Performance Benchmarks
 
-This document contains detailed performance benchmarks for vLLM.rs across different hardware platforms.
+This document contains detailed performance benchmarks for xInfer across different hardware platforms.
 
 ## 🚀 CUDA Performance (A100 40GB)
 
@@ -43,7 +43,7 @@ This document contains detailed performance benchmarks for vLLM.rs across differ
 |------------------|----------|--------|----------|----------------------|
 | vLLM (Reference) | RTX 4070 | 133,966 | 98.37 | 1,361.84 |
 | Nano-vLLM (Reference) | RTX 4070 | 133,966 | 93.41 | 1,434.13 |
-| **vLLM.rs** | **A100** | 262,144 | 23.88 | **10,977.55** |
+| **xInfer** | **A100** | 262,144 | 23.88 | **10,977.55** |
 | Nano-vLLM | A100 | 262,144 | 34.22 | 7,660.26 |
 
 ### Key Insights

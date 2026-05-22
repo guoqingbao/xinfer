@@ -179,7 +179,7 @@ impl ToolGrammarBuilder {
 
         match param_type {
             "string" => {
-                if let Ok(val) = std::env::var("VLLM_LLG_DEFAULT_XML_STR") {
+                if let Ok(val) = std::env::var("XINFER_LLG_DEFAULT_XML_STR") {
                     format!("{}", val)
                 } else {
                     r#"/[ -~]*?/"#.to_string()

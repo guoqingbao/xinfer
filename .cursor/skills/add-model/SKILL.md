@@ -1,14 +1,14 @@
 ---
 name: add-model
 description: >-
-  Adapt and port new LLM model architectures to this vllm.rs project.
+  Adapt and port new LLM model architectures to this xinfer project.
   Use when the user asks to add, port, support, or adapt a new model
   (e.g. Llama, Gemma, Qwen, GPT-OSS, DeepSeek, or any HuggingFace
   architecture) including safetensors and GGUF formats, Dense and MoE
   architectures, and quantization formats (MXFP4, NVFP4, FP8, ISQ).
 ---
 
-# Add Model — Adapt New LLM Architectures to vllm.rs
+# Add Model — Adapt New LLM Architectures to xinfer
 
 ## Phase 0: Gather Required Information
 
@@ -88,7 +88,7 @@ If the model requires operators not in `attention.rs` or `src/models/layers/`:
    cd .. && git clone https://github.com/guoqingbao/attention.rs.git
    ```
    Then switch to the commit that this project relying on.
-2. Point `vllm.rs/Cargo.toml` to local `attention.rs`:
+2. Point `xinfer/Cargo.toml` to local `attention.rs`:
    ```toml
    # In [dependencies], change the git URL to:
    attention-rs = { path = "../attention.rs", ... }
@@ -252,11 +252,11 @@ Add mappings in order:
 | **CUDA (full)** | `cargo build --release --features "cuda,flashinfer,nccl"` |
 | **CUDA (sm90+)** | Add `cutlass` feature: `--features "cuda,flashinfer,nccl,cutlass"` |
 
-If permission errors occur on `target/`, use: `CARGO_TARGET_DIR=/tmp/vllm-rs-check cargo check --features metal`
+If permission errors occur on `target/`, use: `CARGO_TARGET_DIR=/tmp/xinfer-check cargo check --features metal`
 
 ### Verify compilation
 ```bash
-# Check vllm.rs compiles
+# Check xinfer compiles
 cargo check --features metal   # or cuda
 
 # Check attention.rs compiles (if modified)
@@ -280,19 +280,18 @@ cargo run --release --features metal -- --m <model_id_or_path> --port 8080 # or 
 cargo run --release --features "cuda,flashinfer,cutlass" -- --m <model_id_or_path> --port 8080
 ```
 
-**Multi-GPU (CUDA, use run.sh):**
+**Multi-GPU (CUDA):**
 ```bash
-# This builds both the runner binary and the main server, --d used to specifify device ids
-./run.sh --release --features "cuda,flashinfer,cutlass,nccl" -- \
-    --model <model_id_or_path> --port 8080 --d 0,1
+# --d used to specify device ids
+xinfer --m <model_id_or_path> --port 8080 --d 0,1
 ```
 
 ### Before retrying model loading
 
 Always kill all previous instances and verify GPU memory is freed:
 ```bash
-# Kill all vllm-rs and runner processes
-pkill -f vllm-rs; pkill -f runner
+# Kill all xinfer and runner processes
+pkill -f xinfer; pkill -f runner
 sleep 2
 
 # Check GPU memory (CUDA)
@@ -342,7 +341,7 @@ curl -s http://localhost:8000/v1/chat/completions \
 ### Precision validation
 
 Compare outputs against the Python reference:
-1. Run the same prompt through both the Python HF model and vllm.rs
+1. Run the same prompt through both the Python HF model and xinfer
 2. Compare logits for the first few tokens (top-5 should match)
 3. For MoE models, verify expert routing produces the same top-k experts
 
@@ -364,4 +363,4 @@ Compare outputs against the Python reference:
 | `src/core/runner.rs` | Model enum, build_model!, model_call!, graph_wrapper! macros |
 | `src/server/parser.rs` | Tool parsing, structured output per model type |
 | `Cargo.toml` | Feature flags: metal, cuda, flashinfer, nccl, cutlass |
-| `run.sh` | Multi-rank build + run script |
+| `build.sh` | Build script |

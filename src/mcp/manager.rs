@@ -1,5 +1,5 @@
 // src/mcp/manager.rs
-//! MCP client manager for vLLM.rs
+//! MCP client manager for xInfer
 //!
 //! Manages MCP clients and cached tool list.
 
@@ -219,7 +219,7 @@ impl McpClientManager {
                     let args_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
                     match StdioTransport::spawn_with_env(command, &args_refs, env) {
                         Ok(transport) => {
-                            let mut client = McpClient::new(transport, "vllm-rs", "0.6.0");
+                            let mut client = McpClient::new(transport, "xinfer", "0.12.0");
                             if let Err(err) = client.initialize() {
                                 crate::log_error!(
                                     "Failed to initialize MCP server {}: {:?}",
@@ -246,7 +246,7 @@ impl McpClientManager {
                 McpTransportType::Http { url, headers } => {
                     match super::transport::HttpTransport::new(url.clone(), headers.clone()) {
                         Ok(transport) => {
-                            let mut client = McpClient::new(transport, "vllm-rs", "0.6.0");
+                            let mut client = McpClient::new(transport, "xinfer", "0.12.0");
                             if let Err(err) = client.initialize() {
                                 crate::log_error!(
                                     "Failed to initialize remote MCP server {}: {:?}",

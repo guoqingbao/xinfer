@@ -1,23 +1,22 @@
-# Kilo Code + vLLM.rs (OpenAI-compatible endpoint)
+# Kilo Code + xInfer (OpenAI-compatible endpoint)
 
-This guide connects Kilo Code directly to vLLM.rs using the built-in OpenAI-compatible `/v1/chat_completions` API.
+This guide connects Kilo Code directly to xInfer using the built-in OpenAI-compatible `/v1/chat_completions` API.
 
 ```
-Kilo Code -> vLLM.rs (OpenAI-compatible)
+Kilo Code -> xInfer (OpenAI-compatible)
 ```
 
-## 1) Start vLLM.rs on port 8000
+## 1) Start xInfer on port 8000
 
 ```bash
 # Rust
-# Replace `flashinfer` with `flashattn` to use Flash attention backend
-./run.sh --features cuda,nccl,flashinfer,cutlass --release --m Qwen/Qwen3.5-35B-A3B-FP8 --server --d 0
+xinfer --m Qwen/Qwen3.5-35B-A3B-FP8 --server --d 0
 
 # Different model
-./run.sh --features cuda,nccl,flashinfer,cutlass --release --m Qwen/Qwen3.5-27B-FP8 --d 0 --server
+xinfer --m Qwen/Qwen3.5-27B-FP8 --d 0 --server
 
 # Python
-python3 -m vllm_rs.server --m Qwen/Qwen3-Coder-Next-FP8 --d 0,1
+python3 -m xinfer.server --m Qwen/Qwen3-Coder-Next-FP8 --d 0,1
 ```
 
 ## 2) Configure Kilo Code
@@ -35,9 +34,9 @@ Export config into `~/.config/kilo/config.json`
 {
   "$schema": "https://opencode.ai/config.json",
   "provider": {
-    "vllmrs": {
+    "xinfer": {
       "npm": "@ai-sdk/openai-compatible",
-      "name": "vLLM.rs Local",
+      "name": "xInfer Local",
       "options": {
         "baseURL": "http://localhost:8000/v1"
       },
@@ -48,7 +47,7 @@ Export config into `~/.config/kilo/config.json`
       }
     }
   },
-  "model": "vllmrs/qwen3-coder"
+  "model": "xinfer/qwen3-coder"
 }
 ```
 
@@ -62,9 +61,9 @@ kilo
 
 ### Trouble shooting
 
-1. Use the chat logger to monitor detailed interactions between Kilo Code and vLLM.rs.
+1. Use the chat logger to monitor detailed interactions between Kilo Code and xInfer.
 
 ```shell
 # Log into files (in folder ./log)
-export VLLM_RS_CHAT_LOGGER=1
+export XINFER_CHAT_LOGGER=1
 ```

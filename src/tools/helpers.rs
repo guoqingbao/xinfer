@@ -24,7 +24,7 @@ pub fn resolve_tools(request_tools: Option<&[Tool]>, mcp_tools: &[Tool]) -> Vec<
 /// When disabled, parsed tool calls are forwarded to clients (SGLang-style retry loop).
 pub fn strict_tool_call_validation_enabled() -> bool {
     *STRICT_TOOL_CALL_VALIDATION.get_or_init(|| {
-        env::var("VLLM_RS_STRICT_TOOL_CALL")
+        env::var("XINFER_STRICT_TOOL_CALL")
             .ok()
             .map(|raw| {
                 let normalized = raw.trim().to_ascii_lowercase();
@@ -42,7 +42,7 @@ pub fn build_tool_schema_map(tools: &[Tool]) -> HashMap<String, Value> {
             let mut schema = tool.function.parameters.clone();
             if tool.function.strict == Some(false) {
                 if let Some(obj) = schema.as_object_mut() {
-                    obj.insert("x-vllm-rs-lenient".to_string(), Value::Bool(true));
+                    obj.insert("x-xinfer-lenient".to_string(), Value::Bool(true));
                 }
             }
             (tool.function.name.clone(), schema)
@@ -611,11 +611,11 @@ fn missing_required_keys(
 
 fn is_lenient_schema(schema: &Value) -> bool {
     schema
-        .get("x-vllm-rs-lenient")
+        .get("x-xinfer-lenient")
         .and_then(Value::as_bool)
         .unwrap_or(false)
         || schema
-            .get("x-vllm-rs-whitelist")
+            .get("x-xinfer-whitelist")
             .and_then(Value::as_bool)
             .unwrap_or(false)
 }
@@ -814,7 +814,7 @@ mod tests {
         let map = build_tool_schema_map(&tools);
         assert_eq!(
             map.get("lenient_tool")
-                .and_then(|schema| schema.get("x-vllm-rs-lenient"))
+                .and_then(|schema| schema.get("x-xinfer-lenient"))
                 .and_then(Value::as_bool),
             Some(true)
         );
@@ -1014,7 +1014,7 @@ mod tests {
         let schemas = HashMap::from([("write".to_string(), schema)]);
 
         let args = serde_json::json!({
-            "file": "/root/vllm.rs/AGENTS.md\n<parameter=content>\n# Title\n</parameter>"
+            "file": "/root/xinfer/AGENTS.md\n<parameter=content>\n# Title\n</parameter>"
         })
         .to_string();
         let call = crate::tools::new_tool_call("call_1", "write", args);
@@ -1025,7 +1025,7 @@ mod tests {
 
         let args = valid[0].function.arguments.as_ref().unwrap();
         let parsed: Value = serde_json::from_str(args).unwrap();
-        assert_eq!(parsed["filePath"], "/root/vllm.rs/AGENTS.md");
+        assert_eq!(parsed["filePath"], "/root/xinfer/AGENTS.md");
         assert_eq!(parsed["content"], "# Title");
     }
 
@@ -1042,7 +1042,7 @@ mod tests {
         let schemas = HashMap::from([("write".to_string(), schema)]);
 
         let args = serde_json::json!({
-            "filePath": "/root/vllm.rs/AGENTS.md",
+            "filePath": "/root/xinfer/AGENTS.md",
             "file": "<parameter=content>\n## Body\n</parameter>"
         })
         .to_string();
@@ -1054,7 +1054,7 @@ mod tests {
 
         let args = valid[0].function.arguments.as_ref().unwrap();
         let parsed: Value = serde_json::from_str(args).unwrap();
-        assert_eq!(parsed["filePath"], "/root/vllm.rs/AGENTS.md");
+        assert_eq!(parsed["filePath"], "/root/xinfer/AGENTS.md");
         assert_eq!(parsed["content"], "## Body");
     }
 
@@ -1070,7 +1070,7 @@ mod tests {
         let schemas = HashMap::from([("write".to_string(), schema)]);
 
         let args = serde_json::json!({
-            "file\n</parameter": "<parameter=content>\n# vLLM.rs - AGENTS.md\n\n## Overview"
+            "file\n</parameter": "<parameter=content>\n# xInfer - AGENTS.md\n\n## Overview"
         })
         .to_string();
         let call = crate::tools::new_tool_call("call_1", "write", args);
@@ -1081,7 +1081,7 @@ mod tests {
 
         let args = valid[0].function.arguments.as_ref().unwrap();
         let parsed: Value = serde_json::from_str(args).unwrap();
-        assert_eq!(parsed["content"], "# vLLM.rs - AGENTS.md\n\n## Overview");
+        assert_eq!(parsed["content"], "# xInfer - AGENTS.md\n\n## Overview");
     }
 
     #[test]
@@ -1097,8 +1097,8 @@ mod tests {
         let schemas = HashMap::from([("write".to_string(), schema)]);
 
         let args = serde_json::json!({
-            "filePath": "/root/vllm.rs/AGENTS.md",
-            "file\n</parameter": "<parameter=content>\n# vLLM.rs - AGENTS.md\n\n## Overview"
+            "filePath": "/root/xinfer/AGENTS.md",
+            "file\n</parameter": "<parameter=content>\n# xInfer - AGENTS.md\n\n## Overview"
         })
         .to_string();
         let call = crate::tools::new_tool_call("call_1", "write", args);
@@ -1109,8 +1109,8 @@ mod tests {
 
         let args = valid[0].function.arguments.as_ref().unwrap();
         let parsed: Value = serde_json::from_str(args).unwrap();
-        assert_eq!(parsed["filePath"], "/root/vllm.rs/AGENTS.md");
-        assert_eq!(parsed["content"], "# vLLM.rs - AGENTS.md\n\n## Overview");
+        assert_eq!(parsed["filePath"], "/root/xinfer/AGENTS.md");
+        assert_eq!(parsed["content"], "# xInfer - AGENTS.md\n\n## Overview");
     }
 
     #[test]
@@ -1126,7 +1126,7 @@ mod tests {
         let schemas = HashMap::from([("write".to_string(), schema)]);
 
         let args = serde_json::json!({
-            "file\n</parameter": "/root/vllm.rs/AGENTS.md",
+            "file\n</parameter": "/root/xinfer/AGENTS.md",
             "content": "hello"
         })
         .to_string();
@@ -1138,7 +1138,7 @@ mod tests {
 
         let args = valid[0].function.arguments.as_ref().unwrap();
         let parsed: Value = serde_json::from_str(args).unwrap();
-        assert_eq!(parsed["filePath"], "/root/vllm.rs/AGENTS.md");
+        assert_eq!(parsed["filePath"], "/root/xinfer/AGENTS.md");
         assert_eq!(parsed["content"], "hello");
     }
 
@@ -1155,7 +1155,7 @@ mod tests {
         let schemas = HashMap::from([("write".to_string(), schema)]);
 
         let args = serde_json::json!({
-            "filePath": "/root/vllm.rs/AGENTS.md",
+            "filePath": "/root/xinfer/AGENTS.md",
             "file": "<parameter = content>\nhello world"
         })
         .to_string();
@@ -1167,7 +1167,7 @@ mod tests {
 
         let args = valid[0].function.arguments.as_ref().unwrap();
         let parsed: Value = serde_json::from_str(args).unwrap();
-        assert_eq!(parsed["filePath"], "/root/vllm.rs/AGENTS.md");
+        assert_eq!(parsed["filePath"], "/root/xinfer/AGENTS.md");
         assert_eq!(parsed["content"], "hello world");
     }
 
@@ -1207,7 +1207,7 @@ mod tests {
     fn lenient_tool_allows_missing_required_arguments() {
         let schema = serde_json::json!({
             "type": "object",
-            "x-vllm-rs-lenient": true,
+            "x-xinfer-lenient": true,
             "properties": {
                 "path": {"type":"string"},
                 "query": {"type":"string"}

@@ -14,7 +14,7 @@ pub fn heartbeat_worker(
     let uuid_str = uuid.to_string();
     let handle = thread::spawn(move || {
         let flag_clone = Arc::clone(&stop_flag);
-        let sock_name = format!("{}@vllm-rs-runner-heartbeat", uuid_str);
+        let sock_name = format!("{}@xinfer-runner-heartbeat", uuid_str);
         let mut connect_retry_count = 0;
         let mut command_manager = if is_daemon {
             let mut manager = CommandManager::new_command(&sock_name, None, is_daemon);

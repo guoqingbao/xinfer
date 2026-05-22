@@ -1,7 +1,7 @@
-//! Tokenize/Detokenize API Demo for vLLM.rs
+//! Tokenize/Detokenize API Demo for xInfer
 //!
 //! This demonstrates how to use the /tokenize and /detokenize endpoints.
-//! Make sure the vllm.rs server is running before executing this.
+//! Make sure the xinfer server is running before executing this.
 //!
 //! Usage:
 //!     cargo run [-- --url http://localhost:8000]
@@ -129,7 +129,7 @@ fn main() {
         }
         Err(e) => {
             eprintln!("Error: {}", e);
-            eprintln!("Make sure the vllm.rs server is running!");
+            eprintln!("Make sure the xinfer server is running!");
             return;
         }
     }

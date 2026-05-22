@@ -1558,13 +1558,13 @@ pub fn get_runner_path() -> Result<PathBuf> {
     #[cfg(feature = "python")]
     {
         Python::with_gil(|py| {
-            let module = PyModule::import(py, "vllm_rs").map_err(candle_core::Error::wrap)?;
+            let module = PyModule::import(py, "xinfer").map_err(candle_core::Error::wrap)?;
             let file: String = module
                 .getattr("__file__")
                 .map_err(candle_core::Error::wrap)?
                 .extract()
                 .map_err(candle_core::Error::wrap)?;
-            let module_path = Path::new(&file).parent().unwrap().join("runner");
+            let module_path = Path::new(&file).parent().unwrap().join("xinfer");
             Ok(module_path)
         })
     }
@@ -1572,11 +1572,7 @@ pub fn get_runner_path() -> Result<PathBuf> {
     #[cfg(not(feature = "python"))]
     {
         let exe_path = std::env::current_exe()?;
-        let exe_dir = exe_path
-            .parent()
-            .ok_or("Failed to get exe directory")
-            .map_err(candle_core::Error::wrap)?;
-        Ok(exe_dir.join("runner"))
+        Ok(exe_path)
     }
 }
 
@@ -1597,6 +1593,7 @@ pub fn spawn_runner(
             py,
             &[
                 PyString::new(py, runner_path),
+                PyString::new(py, "runner"),
                 PyString::new(py, "--sock"),
                 PyString::new(py, sock_name),
                 PyString::new(py, "--uuid"),
@@ -1615,7 +1612,7 @@ pub fn spawn_runner(
         let libs_dir = Path::new(runner_path)
             .parent()
             .and_then(|p| p.parent())
-            .map(|p| p.join("vllm_rs.libs"));
+            .map(|p| p.join("xinfer.libs"));
         if let Some(libs_dir) = libs_dir {
             if libs_dir.exists() {
                 let abs_libs_dir = libs_dir.canonicalize().unwrap_or(libs_dir);
@@ -1634,7 +1631,7 @@ pub fn spawn_runner(
                     let mut ld_paths: Vec<String> = Vec::new();
                     #[cfg(target_os = "linux")]
                     {
-                        let tmp_dir = std::env::temp_dir().join("vllm_rs.libs");
+                        let tmp_dir = std::env::temp_dir().join("xinfer.libs");
                         if std::fs::create_dir_all(&tmp_dir).is_ok() {
                             if let Ok(entries) = std::fs::read_dir(&abs_libs_dir) {
                                 for entry in entries {
@@ -1728,6 +1725,7 @@ pub fn spawn_runner(
         use std::process::Command;
 
         Command::new(runner_path)
+            .arg("runner")
             .arg("--sock")
             .arg(sock_name)
             .arg("--uuid")

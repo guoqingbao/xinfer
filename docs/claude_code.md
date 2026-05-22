@@ -1,24 +1,23 @@
-# Claude Code + vLLM.rs (Anthropic-compatible endpoint)
+# Claude Code + xInfer (Anthropic-compatible endpoint)
 
-This guide connects Claude Code directly to vLLM.rs using the built-in
+This guide connects Claude Code directly to xInfer using the built-in
 Anthropic-compatible `/v1/messages` API. No proxy required.
 
 ```
-Claude Code -> vLLM.rs (Anthropic-compatible)
+Claude Code -> xInfer (Anthropic-compatible)
 ```
 
-## 1) Start vLLM.rs on port 8000
+## 1) Start xInfer on port 8000
 
 ```bash
 # Rust
-# replace `flashinfer` with `flashattn` to use Flash attention backend
-./run.sh --features cuda,nccl,flashinfer,cutlass --release --m Qwen/Qwen3-Coder-Next-FP8 --server --d 0,1
+xinfer --m Qwen/Qwen3-Coder-Next-FP8 --server --d 0,1
 
 # Different model
-./run.sh --features cuda,nccl,flashattn,cutlass --release --m Qwen/Qwen3.5-27B-FP8 --d 0 --server
+xinfer --m Qwen/Qwen3.5-27B-FP8 --d 0 --server
 
 # Python
-python3 -m vllm_rs.server --m Qwen/Qwen3-Coder-Next-FP8 --d 0,1
+python3 -m xinfer.server --m Qwen/Qwen3-Coder-Next-FP8 --d 0,1
 ```
 
 ## 2) Configure Claude Code
@@ -88,9 +87,9 @@ curl http://127.0.0.1:8000/v1/messages \
 
 ### Trouble shooting
 
-1. Use the chat logger to monitor detailed interactions between Claude Code and vLLM.rs.
+1. Use the chat logger to monitor detailed interactions between Claude Code and xInfer.
 
 ```shell
 # Log into files (in folder ./log)
-export VLLM_RS_CHAT_LOGGER=1
+export XINFER_CHAT_LOGGER=1
 ```

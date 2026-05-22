@@ -1,6 +1,6 @@
 // src/server/logger.rs
 //! Chat completion request/response logger.
-//! Enable by setting environment variable VLLM_RS_CHAT_LOGGER=true
+//! Enable by setting environment variable XINFER_CHAT_LOGGER=true
 //!
 //! Supports both OpenAI API and Claude API server logging.
 
@@ -29,7 +29,7 @@ impl std::fmt::Display for ServerType {
 
 /// Check if chat logging is enabled via environment variable
 pub fn is_logging_enabled() -> bool {
-    std::env::var("VLLM_RS_CHAT_LOGGER")
+    std::env::var("XINFER_CHAT_LOGGER")
         .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
         .unwrap_or(false)
 }

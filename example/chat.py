@@ -3,7 +3,7 @@ import argparse
 import warnings
 import sys
 import readline # input without cutoff
-from vllm_rs import Engine, EngineConfig, SamplingParams, Message, GenerationConfig
+from xinfer import Engine, EngineConfig, SamplingParams, Message, GenerationConfig
 # Before running this code, first perform maturin build and then install the package in target/wheels
 
 
@@ -12,7 +12,7 @@ def current_millis():
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="vllm.rs Python CLI")
+    parser = argparse.ArgumentParser(description="xInfer Python CLI")
     parser.add_argument("--max-num-seqs", type=int, default=1)
     parser.add_argument("--max-model-len", type=int, default=None)
     parser.add_argument("--m", help="huggingface model id", type=str, default=None)

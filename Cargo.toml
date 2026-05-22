@@ -1,13 +1,13 @@
 [package]
-name = "vllm-rs"
-version = "0.11.5"
+name = "xinfer"
+version = "0.12.0"
 edition = "2021"
-default-run = "vllm-rs"
-description = "A minimal, high-performance large language model (LLM) inference engine implementing vLLM in Rust."
-repository = "https://github.com/guoqingbao/vllm.rs"
-homepage = "https://github.com/guoqingbao/vllm.rs"
+default-run = "xinfer"
+description = "xInfer — a minimal, high-performance large language model (LLM) inference engine in Rust."
+repository = "https://github.com/guoqingbao/xinfer"
+homepage = "https://github.com/guoqingbao/xinfer"
 readme = "ReadMe.md"
-keywords = ["llm", "inference", "rust", "candle", "vllm"]
+keywords = ["llm", "inference", "rust", "candle", "xinfer"]
 categories = ["algorithms", "hardware-support", "science"]
 license = "MIT"
 
@@ -74,9 +74,9 @@ openai-protocol = "1.6.0"
 nvtx = { version = "1.3", optional = true }
 
 [lib]
-name = "vllm_rs"
+name = "xinfer"
 path = "src/lib.rs"
-crate-type = ["rlib", "cdylib"]  # cdylib needed for python extension
+crate-type = ["rlib", "cdylib"]
 
 [features]
 cuda = ["candle-core/cuda", "candle-nn/cuda", "attention-rs/cuda", "graph"]
@@ -90,6 +90,11 @@ metal = ["candle-core/metal", "candle-nn/metal", "attention-rs/metal", "attentio
 python = ["pyo3"]
 nvtx = ["dep:nvtx"]
 
-[[bin]]
-name = "runner"
-path = "src/runner/runner.rs"
+[package.metadata.deb]
+name = "xinfer"
+maintainer = "xInfer Team"
+section = "science"
+priority = "optional"
+assets = [
+    ["target/release/xinfer", "usr/local/bin/", "755"],
+]

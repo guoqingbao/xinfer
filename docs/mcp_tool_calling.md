@@ -1,14 +1,14 @@
 # MCP Integration and Tool Calling
 
-vLLM.rs supports **Model Context Protocol (MCP)** integration, allowing you to easily expose tools from MCP servers to your LLM.
+xInfer supports **Model Context Protocol (MCP)** integration, allowing you to easily expose tools from MCP servers to your LLM.
 
-**Important:** vLLM.rs follows the standard OpenAI tool calling specification. This means the server **only handles tool definitions and prompt injection**. It does **not** execute tools internally. When a model calls a tool, the generation stops, and the tool call details are returned to the client. The client is responsible for executing the tool and submitting the results back to the server.
+**Important:** xInfer follows the standard OpenAI tool calling specification. This means the server **only handles tool definitions and prompt injection**. It does **not** execute tools internally. When a model calls a tool, the generation stops, and the tool call details are returned to the client. The client is responsible for executing the tool and submitting the results back to the server.
 
 ## Overview
 
 ### What is MCP?
 
-The **Model Context Protocol (MCP)** is a standardized protocol for connecting LLMs to external tools and services. vLLM.rs supports:
+The **Model Context Protocol (MCP)** is a standardized protocol for connecting LLMs to external tools and services. xInfer supports:
 
 - **Stdio transport**: Connect to local MCP servers via command-line processes
 - **HTTP/SSE transport**: Connect to remote MCP servers via HTTP
@@ -19,8 +19,8 @@ The **Model Context Protocol (MCP)** is a standardized protocol for connecting L
 
 ## Tool Calling Workflow
 
-1. **Configuration**: You configure MCP servers in vLLM.rs (via CLI or `mcp.json`).
-2. **Injection**: vLLM.rs fetches tool definitions from these servers and appends them to the system prompt of your request.
+1. **Configuration**: You configure MCP servers in xInfer (via CLI or `mcp.json`).
+2. **Injection**: xInfer fetches tool definitions from these servers and appends them to the system prompt of your request.
 3. **Generation**: The model generates a tool call.
 4. **Completion**: The stream (or request) finishes with `finish_reason="tool_calls"`.
 5. **Execution (Client-side)**: Your client code receives the tool call, executes the corresponding function (which you must implement or bridge to an MCP client), and sends the result back in a new request.
@@ -102,7 +102,7 @@ When using multiple MCP servers, tool names are prefixed with the server name to
 
 ## Tool Call Parsing Architecture
 
-vLLM.rs uses a dual-strategy approach for detecting tool calls in streaming responses.
+xInfer uses a dual-strategy approach for detecting tool calls in streaming responses.
 
 ### Detection Strategy
 

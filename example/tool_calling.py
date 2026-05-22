@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Tool Calling Example for vLLM.rs
+Tool Calling Example for xInfer
 
-This example demonstrates how to use tool calling with the vLLM.rs server.
+This example demonstrates how to use tool calling with the xInfer server.
 It shows:
 1. Defining tools with JSON Schema
 2. Sending chat completion requests with tools
@@ -191,9 +191,9 @@ def chat_with_tools(user_message: str, tools: list, model: str = "default"):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Tool calling example for vLLM.rs")
+    parser = argparse.ArgumentParser(description="Tool calling example for xInfer")
     parser.add_argument("--url", default="http://localhost:8000/v1", 
-                        help="Base URL for the vLLM.rs server")
+                        help="Base URL for the xInfer server")
     parser.add_argument("--model", default="default", 
                         help="Model name to use")
     args = parser.parse_args()
@@ -204,7 +204,7 @@ def main():
     tools = define_tools()
     
     print("=" * 60)
-    print("🛠️  vLLM.rs Tool Calling Demo")
+    print("🛠️  xInfer Tool Calling Demo")
     print("=" * 60)
     print()
     

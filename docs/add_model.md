@@ -1,11 +1,11 @@
 # Adding New Model Architectures (AI-Assisted)
 
-vLLM.rs ships with a **Cursor Agent Skill** that guides AI coding assistants through the full workflow of adapting a new HuggingFace model architecture to this project. It covers safetensors and GGUF formats, Dense and MoE architectures, and quantization formats (MXFP4, FP8, ISQ, etc.).
+xInfer ships with a **Cursor Agent Skill** that guides AI coding assistants through the full workflow of adapting a new HuggingFace model architecture to this project. It covers safetensors and GGUF formats, Dense and MoE architectures, and quantization formats (MXFP4, FP8, ISQ, etc.).
 
 ## Prerequisites
 
 - [Cursor IDE](https://cursor.sh/) with Agent mode enabled (for other Agents, mention the skill file manually)
-- The vLLM.rs repository cloned locally
+- The xInfer repository cloned locally
 - (Optional) A local copy of [attention.rs](https://github.com/guoqingbao/attention.rs) if custom kernels are needed
 
 ## How It Works
@@ -59,14 +59,13 @@ The skill accepts multiple input forms — provide whichever is convenient:
 
 ## Multi-GPU Models
 
-For models that require multi-GPU inference, the agent uses `run.sh` which builds the `runner` binary alongside the main server:
+For models that require multi-GPU inference:
 
 ```bash
-./run.sh --release --features "cuda,flashinfer,cutlass,nccl" -- \
-    --model <model_id> --port 8000 --tensor-parallel <num_gpus>
+xinfer --m <model_id> --port 8000 --d 0,1
 ```
 
-When retrying after a failed load, the agent will kill all `vllm-rs` and `runner` processes and verify GPU memory is freed before reloading.
+When retrying after a failed load, the agent will kill all `xinfer` processes and verify GPU memory is freed before reloading.
 
 ## Debugging Tips
 

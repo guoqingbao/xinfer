@@ -6,15 +6,12 @@ default-run = "rust-demo"
 
 [dependencies]
 anyhow = "1.0.100"
-vllm_rs = { path = "../../", package = "vllm-rs" }
+xinfer = { path = "../.." }
 
 [features]
-cuda = ["vllm_rs/cuda"]
-flashattn = ["vllm_rs/flashattn"]
-flashinfer = ["vllm_rs/flashinfer"]
-graph = ["vllm_rs/graph"]
-nccl = ["vllm_rs/nccl"]
-metal = ["vllm_rs/metal"]
-
-
-
+cuda = ["xinfer/cuda"]
+flashattn = ["xinfer/flashattn"]
+flashinfer = ["xinfer/flashinfer"]
+graph = ["xinfer/graph"]
+nccl = ["xinfer/nccl"]
+metal = ["xinfer/metal"]

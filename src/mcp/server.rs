@@ -114,7 +114,7 @@ impl McpServer {
             capabilities: self.capabilities.clone(),
             server_info: self.server_info.clone(),
             instructions: Some(format!(
-                "vLLM.rs MCP Server - {} available tools",
+                "xInfer MCP Server - {} available tools",
                 self.tools.len()
             )),
         };

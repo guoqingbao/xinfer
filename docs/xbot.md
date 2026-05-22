@@ -1,12 +1,12 @@
-# xbot + vLLM.rs
+# xbot + xInfer
 
-This guide connects `xbot` directly to `vLLM.rs` through the built-in OpenAI-compatible `/v1/chat/completions` endpoint.
+This guide connects `xbot` directly to `xInfer` through the built-in OpenAI-compatible `/v1/chat/completions` endpoint.
 
 ```
-xbot -> vLLM.rs (OpenAI-compatible)
+xbot -> xInfer (OpenAI-compatible)
 ```
 
-## 1) Start vLLM.rs (at port 8000)
+## 1) Start xInfer (at port 8000)
 
 ```bash
 ./run --release --features cuda,nccl,flashinfer,cutlass \
@@ -17,7 +17,7 @@ or
 
 ```shell
 # Python
-python3 -m vllm_rs.server --m Qwen/Qwen3.6-27B-FP8
+python3 -m xinfer.server --m Qwen/Qwen3.6-27B-FP8
 ```
 
 ## 2) Discover the served model name
@@ -52,7 +52,7 @@ Refer to the following selections:
 
 ```shell
 > Select provider to configure: custom
-> Enter a unique name for this custom provider: vllmrs
+> Enter a unique name for this custom provider: xinfer
 > Enter API Base URL (e.g. https://api.yourprovider.com/v1): http://localhost:8000/v1/
 > Enter API Key? (Optional for local/custom) No
 
@@ -105,6 +105,6 @@ Chat logger:
 
 ```bash
 # Log into files (in folder ./log)
-export VLLM_RS_CHAT_LOGGER=1
+export XINFER_CHAT_LOGGER=1
 ```
 

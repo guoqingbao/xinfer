@@ -1,16 +1,16 @@
-//! Rust Tool Calling Example for vLLM.rs
+//! Rust Tool Calling Example for xInfer
 //!
 //! This example demonstrates:
 //! 1. Defining tools using the builder pattern
 //! 2. Parsing tool calls from model output
 //! 3. Handling tool results
 
-use vllm_rs::tools::parser::ToolParser;
-use vllm_rs::tools::schema::SchemaBuilder;
-use vllm_rs::tools::{Tool, ToolCall, ToolFormat, ToolResult};
+use xinfer::tools::parser::ToolParser;
+use xinfer::tools::schema::SchemaBuilder;
+use xinfer::tools::{Tool, ToolCall, ToolFormat, ToolResult};
 
 fn main() -> anyhow::Result<()> {
-    println!("🛠️  vLLM.rs Tool Calling Demo (Rust API)\n");
+    println!("xInfer Tool Calling Demo (Rust API)\n");
 
     // === Part 1: Define Tools ===
     println!("=== Part 1: Defining Tools ===\n");

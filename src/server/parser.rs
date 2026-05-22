@@ -2872,7 +2872,7 @@ mod tests {
         parser.buffer = r#"<tool_call>
 <function=edit>
 <parameter=filePath>
-/root/vllm.rs/src/models/qwen3_5_moe.rs
+/root/xinfer/src/models/qwen3_5_moe.rs
 </parameter>
 <parameter=newString>
 abc
@@ -2904,7 +2904,7 @@ def
         parser.buffer = r#"<tool_call>
 <function=edit>
 <parameter=filePath>
-/root/vllm.rs/src/models/qwen3_5_moe.rs
+/root/xinfer/src/models/qwen3_5_moe.rs
 </parameter>
 <parameter=newString>
 abc

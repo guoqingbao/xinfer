@@ -330,7 +330,7 @@ impl GrammarComposers {
 /// have_eos: when true, generates simple text rule; when false, uses stop="" fallback
 pub fn chat_text_expression(have_eos: bool) -> String {
     // First check environment variable override
-    if let Ok(val) = std::env::var("VLLM_LLG_DEFAULT_TEXT") {
+    if let Ok(val) = std::env::var("XINFER_LLG_DEFAULT_TEXT") {
         return format!("{}", val);
     }
 
@@ -748,7 +748,7 @@ pub fn get_lark_from_top_level_grammar(gram: &TopLevelGrammar) -> String {
 /// func: %json {"type":"object","properties":{"name":...}}
 /// ```
 ///
-/// ### 4. Current Implementation in vLLM.rs
+/// ### 4. Current Implementation in xInfer
 /// The [`src/core/runner.rs`](src/core/runner.rs) uses logits-based sampling:
 /// ```ignore
 /// // Apply mask: set disallowed tokens to -inf

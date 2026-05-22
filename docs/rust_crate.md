@@ -7,10 +7,10 @@ an OpenAI-compatible service without changing the existing project structure.
 
 ```toml
 [dependencies]
-vllm-rs = { git = "https://github.com/guoqingbao/vllm.rs.git", rev = "1377fa9" }
+xinfer = { git = "https://github.com/guoqingbao/xinfer.git", rev = "1377fa9" }
 
 [features]
-cuda = ["vllm_rs/cuda"]
+cuda = ["xinfer/cuda"]
 ```
 
 Use the same Cargo features you would use for the CLI (`cuda`, `metal`, `nccl`, etc.).
@@ -18,9 +18,9 @@ Use the same Cargo features you would use for the CLI (`cuda`, `metal`, `nccl`, 
 ## Direct generation (text)
 
 ```rust
-use vllm_rs::api::{EngineBuilder, ModelRepo};
-use vllm_rs::server::{ChatMessage, MessageContentType};
-use vllm_rs::utils::{config::SamplingParams, log_throughput};
+use xinfer::api::{EngineBuilder, ModelRepo};
+use xinfer::server::{ChatMessage, MessageContentType};
+use xinfer::utils::{config::SamplingParams, log_throughput};
 
 fn main() -> anyhow::Result<()> {
     let mut engine =
@@ -42,9 +42,9 @@ fn main() -> anyhow::Result<()> {
 ## Multimodal request (URL or base64)
 
 ```rust
-use vllm_rs::api::{EngineBuilder, ModelRepo};
-use vllm_rs::server::{ChatMessage, MessageContent, MessageContentType};
-use vllm_rs::utils::config::SamplingParams;
+use xinfer::api::{EngineBuilder, ModelRepo};
+use xinfer::server::{ChatMessage, MessageContent, MessageContentType};
+use xinfer::utils::config::SamplingParams;
 
 fn main() -> candle_core::Result<()> {
     let mut engine = EngineBuilder::new(ModelRepo::ModelID((
@@ -76,7 +76,7 @@ fn main() -> candle_core::Result<()> {
 ## Serve API
 
 ```rust
-use vllm_rs::api::{EngineBuilder, ModelRepo};
+use xinfer::api::{EngineBuilder, ModelRepo};
 
 fn main() -> candle_core::Result<()> {
     let mut engine = EngineBuilder::new(ModelRepo::ModelID((
@@ -96,7 +96,7 @@ Provide `device_ids` with `with_multirank` (e.g. `"0,1"`) along with the same CU
 you use for the CLI. The Rust API reuses the same engine and scheduler path.
 
 ```rust
-use vllm_rs::api::{EngineBuilder, ModelRepo};
+use xinfer::api::{EngineBuilder, ModelRepo};
 
 fn main() -> candle_core::Result<()> {
     let mut engine = EngineBuilder::new(ModelRepo::ModelFile(vec![
@@ -114,6 +114,6 @@ fn main() -> candle_core::Result<()> {
 [Reference Rust demo](/example/rust-demo/)
 
 ```shell
-# add `nccl` feature for multirank inference (and copy `runner` (which is built with build.sh) to your target path)
-cargo run --release --features cuda
+# add `nccl` feature for multirank inference
+cargo run --release --features cuda -- ARGS
 ```
