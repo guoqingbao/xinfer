@@ -88,7 +88,6 @@ jobs:
             python_features: "cuda,nccl,python,cutlass"
     container:
       image: docker.io/nvidia/cuda:${{ matrix.cuda_version }}-${{ matrix.cuda_version >= '13' && 'devel' || 'cudnn-devel' }}-ubuntu22.04
-      options: --network host
     env:
       CUDA_COMPUTE_CAP: ${{ matrix.sm }}
       DEBIAN_FRONTEND: noninteractive
