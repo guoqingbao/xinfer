@@ -144,23 +144,23 @@ jobs:
           - sm: "80"
             sm_name: sm80
             features: "cuda,nccl,flashinfer,cutlass"
-            python_features: "cuda,nccl,python,cutlass"
+            python_features: "cuda,nccl,flashinfer,cutlass,python"
           - sm: "89"
             sm_name: sm89
             features: "cuda,nccl,flashinfer,cutlass"
-            python_features: "cuda,nccl,python,cutlass"
+            python_features: "cuda,nccl,flashinfer,cutlass,python"
           - sm: "90"
             sm_name: sm90
             features: "cuda,nccl,flashinfer,cutlass"
-            python_features: "cuda,nccl,python,cutlass"
+            python_features: "cuda,nccl,flashinfer,cutlass,python"
           - sm: "100"
             sm_name: sm100
             features: "cuda,nccl,flashinfer,cutlass"
-            python_features: "cuda,nccl,python,cutlass"
+            python_features: "cuda,nccl,flashinfer,cutlass,python"
           - sm: "120"
             sm_name: sm120
             features: "cuda,nccl,flashinfer,cutlass"
-            python_features: "cuda,nccl,python,cutlass"
+            python_features: "cuda,nccl,flashinfer,cutlass,python"
     env:
       CUDA_COMPUTE_CAP: ${{ matrix.sm }}
       RAYON_NUM_THREADS: "128"
