@@ -10,6 +10,7 @@ CLAUDE.md
 *.nsys-rep
 *.sqlite
 .cursor/skills/nobreak/*
+.cursor/skills/write-patent/*
 test_model.py
 .xbot/
 XBOT.md
