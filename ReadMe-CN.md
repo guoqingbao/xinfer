@@ -49,7 +49,10 @@ cargo install --git $XINFER_REPO xinfer --features cuda,nccl,flashinfer,cutlass
 
 **方式 3 — pip（Python）**
 ```bash
-pip install xinfer --index-url https://guoqingbao.github.io/xinfer/
+pip install xinfer --index-url https://guoqingbao.github.io/xinfer/sm80/   # A100/RTX 30xx/40xx（默认）
+pip install xinfer --index-url https://guoqingbao.github.io/xinfer/sm70/   # V100/Turing
+pip install xinfer --index-url https://guoqingbao.github.io/xinfer/sm90/   # Hopper
+pip install xinfer --index-url https://guoqingbao.github.io/xinfer/sm120/  # Blackwell
 ```
 
 **方式 4 — Docker**

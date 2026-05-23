@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "xinfer"
-description = "xInfer — a high-performance LLM inference engine in Rust. Install: pip install xinfer --index-url https://guoqingbao.github.io/xinfer/"
+description = "xInfer — a high-performance LLM inference engine in Rust. Install: pip install xinfer --index-url https://guoqingbao.github.io/xinfer/sm80/"
 requires-python = ">=3.8"
 classifiers = [
     "Programming Language :: Rust",
