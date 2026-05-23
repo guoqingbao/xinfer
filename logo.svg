@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 460 140">
+  <defs>
+    <linearGradient id="xGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#00D4AA"/>
+      <stop offset="50%" stop-color="#0099CC"/>
+      <stop offset="100%" stop-color="#2563EB"/>
+    </linearGradient>
+  </defs>
+
+  <!-- "x" in teal/gradient -->
+  <text x="158" y="88" font-family="'Inter', 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="80" font-weight="600" fill="url(#xGrad)" text-anchor="end">x</text>
+
+  <!-- "Infer" in dark slate -->
+  <text x="158" y="88" font-family="'Inter', 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="80" font-weight="700" fill="#1E293B">Infer</text>
+
+  <!-- Tagline -->
+  <text x="230" y="120" font-family="'Inter', 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="16" font-weight="400" fill="#64748B" letter-spacing="0.5" text-anchor="middle">Blazing-fast LLM Inference in Pure Rust</text>
+</svg>

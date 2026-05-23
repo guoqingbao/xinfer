@@ -1,10 +1,7 @@
-# xInfer
-
-**Blazing-fast LLM inference in pure Rust.** No PyTorch. No Python runtime. Just fast, portable, production-ready inference.
-
 <p align="center">
-  <a href="./ReadMe.md">English</a> |
-  <a href="./ReadMe-CN.md">简体中文</a>
+  <img src="logo.svg" alt="xInfer" width="400"><br>
+  <b>Blazing-fast LLM inference in pure Rust.</b> No PyTorch. No Python runtime. Just fast, portable, production-ready inference.<br>
+  <a href="./ReadMe.md">English</a> | <a href="./ReadMe-CN.md">简体中文</a>
 </p>
 
 ---

@@ -1,10 +1,7 @@
-# xInfer
-
-**纯 Rust 实现的极速 LLM 推理引擎。** 无需 PyTorch，无需 Python 运行时，开箱即用。
-
 <p align="center">
-  <a href="./ReadMe.md">English</a> |
-  <a href="./ReadMe-CN.md">简体中文</a>
+  <img src="logo.svg" alt="xInfer" width="400"><br>
+  <b>纯 Rust 实现的极速 LLM 推理引擎。</b>无需 PyTorch，无需 Python 运行时，开箱即用。<br>
+  <a href="./ReadMe.md">English</a> | <a href="./ReadMe-CN.md">简体中文</a>
 </p>
 
 ---
