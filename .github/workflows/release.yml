@@ -278,8 +278,12 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # Publish wheel index to GitHub Pages (PEP 503 simple repository)
-  # Users install with: pip install xinfer --index-url https://guoqingbao.github.io/xinfer/
-  # (URL resolves correctly after repo is renamed from vllm.rs to xinfer)
+  # Each CUDA arch gets its own index URL:
+  #   pip install xinfer --index-url https://guoqingbao.github.io/xinfer/sm80/  (default)
+  #   pip install xinfer --index-url https://guoqingbao.github.io/xinfer/sm70/  (V100)
+  #   pip install xinfer --index-url https://guoqingbao.github.io/xinfer/sm90/  (Hopper)
+  #   pip install xinfer --index-url https://guoqingbao.github.io/xinfer/sm120/ (Blackwell)
+  # The root index (no arch) defaults to SM80.
   # ---------------------------------------------------------------------------
   publish-index:
     name: publish-index
@@ -304,23 +308,42 @@ jobs:
           REPO: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
         run: |
-          mkdir -p site/xinfer
           RELEASE_BASE="https://github.com/${REPO}/releases/download/${TAG}"
 
-          {
-            echo '<!DOCTYPE html><html><body>'
-            for whl in dist/wheels/*.whl; do
-              [ -f "$whl" ] || continue
-              name="$(basename "$whl")"
-              sha="$(sha256sum "$whl" | cut -d' ' -f1)"
-              echo "<a href=\"${RELEASE_BASE}/${name}#sha256=${sha}\">${name}</a><br/>"
-            done
-            echo '</body></html>'
-          } > site/xinfer/index.html
+          for whl in dist/wheels/*.whl; do
+            [ -f "$whl" ] || continue
+            orig_name="$(basename "$whl")"
+            sha="$(sha256sum "$whl" | cut -d' ' -f1)"
 
+            sm="$(echo "$orig_name" | sed -n 's/.*-\([0-9]\{2,3\}\)-cp.*/\1/p')"
+            [ -z "$sm" ] && continue
+
+            std_name="$(echo "$orig_name" | sed "s/-${sm}-cp/-cp/")"
+
+            # Per-arch index: site/sm{XX}/xinfer/index.html
+            mkdir -p "site/sm${sm}/xinfer"
+            {
+              echo '<!DOCTYPE html><html><body>'
+              echo "<a href=\"${RELEASE_BASE}/${orig_name}#sha256=${sha}\">${std_name}</a><br/>"
+              echo '</body></html>'
+            } > "site/sm${sm}/xinfer/index.html"
+            echo "<!DOCTYPE html><html><body><a href=\"xinfer/\">xinfer</a></body></html>" \
+              > "site/sm${sm}/index.html"
+
+            # SM80 is also the root default
+            if [ "$sm" = "80" ]; then
+              mkdir -p "site/xinfer"
+              cp "site/sm${sm}/xinfer/index.html" "site/xinfer/index.html"
+            fi
+          done
+
+          # Root index
           echo '<!DOCTYPE html><html><body><a href="xinfer/">xinfer</a></body></html>' > site/index.html
-          echo "Generated index:"
-          cat site/xinfer/index.html
+
+          echo "=== Generated indexes ==="
+          for idx in site/*/xinfer/index.html site/xinfer/index.html; do
+            [ -f "$idx" ] && echo "--- $idx ---" && cat "$idx"
+          done
 
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3

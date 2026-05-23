@@ -1,7 +1,7 @@
 #### How to reproduce?
 **xInfer**
 ```shell
-pip install xinfer --index-url https://guoqingbao.github.io/xinfer/
+pip install xinfer --index-url https://guoqingbao.github.io/xinfer/sm80/
 python -m xinfer.completion --w /home/Qwen3-0.6B/ --batch 256 --max-tokens 1024 --max-model-len 1024
 
 # Log
