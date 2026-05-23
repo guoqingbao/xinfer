@@ -49,8 +49,7 @@ cargo install --git $XINFER_REPO xinfer --features cuda,nccl,flashinfer,cutlass
 
 **方式 3 — pip（Python）**
 ```bash
-# Turing/V100 (SM70/SM75)、Hopper (SM90)、Blackwell (SM100+)：请从 GitHub Releases 下载对应 wheel
-pip install xinfer-ai # Metal (macOS) / Ampere (SM80, A100)
+pip install xinfer-ai --index-url https://guoqingbao.github.io/xinfer/
 ```
 
 **方式 4 — Docker**
