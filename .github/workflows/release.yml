@@ -224,8 +224,14 @@ jobs:
         with:
           targets: ${{ matrix.rust_target }}
 
+      - name: Install maturin
+        run: pip3 install --break-system-packages maturin
+
       - name: Build xinfer binary
         run: cargo build --release --target ${{ matrix.rust_target }} --bin xinfer --features "metal"
+
+      - name: Build Python wheel
+        run: maturin build --release --features "metal,python"
 
       - name: Package tar.gz
         run: |
@@ -234,10 +240,22 @@ jobs:
           tar -C dist/xinfer -czf "dist/xinfer-${{ needs.validate.outputs.version }}-${{ matrix.npm_target }}-metal.tar.gz" xinfer
           rm -rf dist/xinfer
 
+      - name: Collect wheel
+        run: |
+          mkdir -p dist/wheels
+          for whl in target/wheels/*.whl; do
+            base="$(basename "$whl")"
+            tagged="$(echo "$base" | sed 's/-cp/-metal-cp/')"
+            cp "$whl" "dist/wheels/$tagged"
+          done
+          ls -la dist/wheels/
+
       - uses: actions/upload-artifact@v4
         with:
           name: xinfer-${{ matrix.npm_target }}-metal
-          path: dist/*.tar.gz
+          path: |
+            dist/*.tar.gz
+            dist/wheels/*.whl
 
   # ---------------------------------------------------------------------------
   # Checksums + GitHub Release
@@ -283,6 +301,7 @@ jobs:
   #   pip install xinfer --index-url https://guoqingbao.github.io/xinfer/sm70/  (V100)
   #   pip install xinfer --index-url https://guoqingbao.github.io/xinfer/sm90/  (Hopper)
   #   pip install xinfer --index-url https://guoqingbao.github.io/xinfer/sm120/ (Blackwell)
+  #   pip install xinfer --index-url https://guoqingbao.github.io/xinfer/metal/ (macOS)
   # The root index (no arch) defaults to SM80.
   # ---------------------------------------------------------------------------
   publish-index:
@@ -310,34 +329,38 @@ jobs:
         run: |
           RELEASE_BASE="https://github.com/${REPO}/releases/download/${TAG}"
 
+          generate_index() {
+            local dir="$1" orig_name="$2" std_name="$3" sha="$4"
+            mkdir -p "site/${dir}/xinfer"
+            {
+              echo '<!DOCTYPE html><html><body>'
+              echo "<a href=\"${RELEASE_BASE}/${orig_name}#sha256=${sha}\">${std_name}</a><br/>"
+              echo '</body></html>'
+            } > "site/${dir}/xinfer/index.html"
+            echo "<!DOCTYPE html><html><body><a href=\"xinfer/\">xinfer</a></body></html>" \
+              > "site/${dir}/index.html"
+          }
+
           for whl in dist/wheels/*.whl; do
             [ -f "$whl" ] || continue
             orig_name="$(basename "$whl")"
             sha="$(sha256sum "$whl" | cut -d' ' -f1)"
 
-            sm="$(echo "$orig_name" | sed -n 's/.*-\([0-9]\{2,3\}\)-cp.*/\1/p')"
-            [ -z "$sm" ] && continue
-
-            std_name="$(echo "$orig_name" | sed "s/-${sm}-cp/-cp/")"
-
-            # Per-arch index: site/sm{XX}/xinfer/index.html
-            mkdir -p "site/sm${sm}/xinfer"
-            {
-              echo '<!DOCTYPE html><html><body>'
-              echo "<a href=\"${RELEASE_BASE}/${orig_name}#sha256=${sha}\">${std_name}</a><br/>"
-              echo '</body></html>'
-            } > "site/sm${sm}/xinfer/index.html"
-            echo "<!DOCTYPE html><html><body><a href=\"xinfer/\">xinfer</a></body></html>" \
-              > "site/sm${sm}/index.html"
-
-            # SM80 is also the root default
-            if [ "$sm" = "80" ]; then
-              mkdir -p "site/xinfer"
-              cp "site/sm${sm}/xinfer/index.html" "site/xinfer/index.html"
+            # Detect variant tag from filename: SM number or "metal"
+            tag="$(echo "$orig_name" | sed -n 's/.*-\([0-9]\{2,3\}\)-cp.*/\1/p')"
+            if [ -n "$tag" ]; then
+              std_name="$(echo "$orig_name" | sed "s/-${tag}-cp/-cp/")"
+              generate_index "sm${tag}" "$orig_name" "$std_name" "$sha"
+              if [ "$tag" = "80" ]; then
+                mkdir -p "site/xinfer"
+                cp "site/sm${tag}/xinfer/index.html" "site/xinfer/index.html"
+              fi
+            elif echo "$orig_name" | grep -q '\-metal\-cp'; then
+              std_name="$(echo "$orig_name" | sed 's/-metal-cp/-cp/')"
+              generate_index "metal" "$orig_name" "$std_name" "$sha"
             fi
           done
 
-          # Root index
           echo '<!DOCTYPE html><html><body><a href="xinfer/">xinfer</a></body></html>' > site/index.html
 
           echo "=== Generated indexes ==="
