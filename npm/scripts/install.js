@@ -65,18 +65,17 @@ function detectCudaComputeCap() {
 
 /**
  * Map detected SM version to the build variant name.
- * Build variants match CI matrix: sm70, sm75, sm89, sm90, sm100, sm120
+ * Build variants match CI matrix: sm70, sm75, sm80, sm89, sm90, sm120
  */
 function smToVariant(sm) {
   const n = parseInt(sm, 10);
   if (n >= 120) return "sm120";
-  if (n >= 100) return "sm100";
   if (n >= 90) return "sm90";
   if (n >= 89) return "sm89";
   if (n >= 80) return "sm80";
   if (n >= 75) return "sm75";
   if (n >= 70) return "sm70";
-  return "sm80"; // safe default
+  return "sm80";
 }
 
 function download(url, destination, redirects = 0) {
