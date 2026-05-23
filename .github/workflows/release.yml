@@ -363,6 +363,42 @@ jobs:
 
           echo '<!DOCTYPE html><html><body><a href="xinfer/">xinfer</a></body></html>' > site/index.html
 
+          # Auto-detect install script
+          cat > site/install.sh << 'SCRIPT'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          INDEX_BASE="https://guoqingbao.github.io/xinfer"
+
+          detect_platform() {
+            if [ "$(uname -s)" = "Darwin" ]; then
+              echo "metal"
+              return
+            fi
+            if ! command -v nvidia-smi &>/dev/null; then
+              echo "No NVIDIA GPU detected. Use: XINFER_PLATFORM=sm80 pip install xinfer --index-url ${INDEX_BASE}/sm80/" >&2
+              exit 1
+            fi
+            local cc
+            cc="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader,nounits | head -1 | tr -d '[:space:]' | tr -d '.')"
+            case "$cc" in
+              70|72) echo "sm70" ;;
+              75)    echo "sm75" ;;
+              80|86) echo "sm80" ;;
+              89)    echo "sm89" ;;
+              90|90a) echo "sm90" ;;
+              100|120) echo "sm${cc}" ;;
+              *) echo "sm80" ;;
+            esac
+          }
+
+          PLATFORM="${XINFER_PLATFORM:-$(detect_platform)}"
+          echo "Detected platform: ${PLATFORM}"
+          echo "Installing: pip install xinfer --index-url ${INDEX_BASE}/${PLATFORM}/"
+          pip install xinfer --index-url "${INDEX_BASE}/${PLATFORM}/"
+          SCRIPT
+          sed -i 's/^          //' site/install.sh
+          chmod +x site/install.sh
+
           echo "=== Generated indexes ==="
           for idx in site/*/xinfer/index.html site/xinfer/index.html; do
             [ -f "$idx" ] && echo "--- $idx ---" && cat "$idx"
