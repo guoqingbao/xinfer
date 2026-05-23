@@ -47,7 +47,7 @@ cargo install --git $XINFER_REPO xinfer --features cuda,nccl,flashinfer,cutlass
 
 **Option 3 — pip (Python)**
 ```bash
-pip install xinfer-ai --index-url https://guoqingbao.github.io/xinfer/
+pip install xinfer --index-url https://guoqingbao.github.io/xinfer/
 ```
 
 **Option 4 — Docker**

@@ -278,7 +278,8 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # Publish wheel index to GitHub Pages (PEP 503 simple repository)
-  # Users install with: pip install xinfer-ai --index-url https://guoqingbao.github.io/xinfer/
+  # Users install with: pip install xinfer --index-url https://guoqingbao.github.io/xinfer/
+  # (URL resolves correctly after repo is renamed from vllm.rs to xinfer)
   # ---------------------------------------------------------------------------
   publish-index:
     name: publish-index
@@ -303,10 +304,9 @@ jobs:
           REPO: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
         run: |
-          mkdir -p site/xinfer-ai
+          mkdir -p site/xinfer
           RELEASE_BASE="https://github.com/${REPO}/releases/download/${TAG}"
 
-          # Package index page
           {
             echo '<!DOCTYPE html><html><body>'
             for whl in dist/wheels/*.whl; do
@@ -316,12 +316,11 @@ jobs:
               echo "<a href=\"${RELEASE_BASE}/${name}#sha256=${sha}\">${name}</a><br/>"
             done
             echo '</body></html>'
-          } > site/xinfer-ai/index.html
+          } > site/xinfer/index.html
 
-          # Root index
-          echo '<!DOCTYPE html><html><body><a href="xinfer-ai/">xinfer-ai</a></body></html>' > site/index.html
+          echo '<!DOCTYPE html><html><body><a href="xinfer/">xinfer</a></body></html>' > site/index.html
           echo "Generated index:"
-          cat site/xinfer-ai/index.html
+          cat site/xinfer/index.html
 
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
