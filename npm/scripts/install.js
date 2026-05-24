@@ -10,6 +10,16 @@ const { spawnSync } = require("child_process");
 
 const pkg = require("../package.json");
 
+function rmrf(target) {
+  try {
+    if (fs.rmSync) {
+      fs.rmSync(target, { recursive: true, force: true });
+    } else if (fs.rmdirSync) {
+      fs.rmdirSync(target, { recursive: true });
+    }
+  } catch (_) {}
+}
+
 function targetTriple() {
   const platform = process.platform;
   const arch = process.arch;
@@ -133,7 +143,7 @@ function expectedSha(manifest, artifactName) {
 
 async function main() {
   const target = targetTriple();
-  const version = process.env.XINFER_INSTALL_VERSION || pkg.version;
+  const version = process.env.XINFER_INSTALL_VERSION || pkg.assetVersion || pkg.version;
   const tag = process.env.XINFER_INSTALL_TAG || `v${version}`;
   const base =
     process.env.XINFER_INSTALL_BASE_URL ||
@@ -186,7 +196,7 @@ async function main() {
       );
     }
 
-    fs.rmSync(installDir, { recursive: true, force: true });
+    rmrf(installDir);
     fs.mkdirSync(installDir, { recursive: true });
     const tar = spawnSync(
       "tar",
@@ -218,7 +228,7 @@ async function main() {
     ].join("\n");
     process.stderr.write(hint + "\n");
   } finally {
-    fs.rmSync(tmpDir, { recursive: true, force: true });
+    rmrf(tmpDir);
   }
 }
 

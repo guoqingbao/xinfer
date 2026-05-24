@@ -28,9 +28,9 @@ jobs:
         id: version
         run: |
           cargo_version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
-          npm_version="$(node -p "require('./npm/package.json').version")"
-          if [ "$cargo_version" != "$npm_version" ]; then
-            echo "Cargo.toml version ($cargo_version) must match npm/package.json version ($npm_version)" >&2
+          npm_asset="$(node -p "require('./npm/package.json').assetVersion || require('./npm/package.json').version")"
+          if [ "$cargo_version" != "$npm_asset" ]; then
+            echo "Cargo.toml version ($cargo_version) must match npm/package.json assetVersion ($npm_asset)" >&2
             exit 1
           fi
           expected_tag="v${cargo_version}"
@@ -592,6 +592,17 @@ jobs:
         with:
           node-version: "20"
           registry-url: "https://registry.npmjs.org"
+      - name: Sync npm package version with release tag
+        if: env.NODE_AUTH_TOKEN != ''
+        run: |
+          VERSION="${{ needs.validate.outputs.version }}"
+          cd npm
+          node -e "
+            const pkg = require('./package.json');
+            pkg.version = '${VERSION}';
+            pkg.assetVersion = '${VERSION}';
+            require('fs').writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
+          "
       - name: Publish npm package
         if: env.NODE_AUTH_TOKEN != ''
         run: npm publish ./npm --access public --provenance
