@@ -103,22 +103,15 @@ jobs:
           . "$HOME/.cargo/env"
           ./build.sh --release --features "${{ matrix.python_features }}"
 
-      - name: Bundle CUDA runtime libs with binary
+      - name: Bundle CUDA runtime with binary
         run: |
-          CUDA_LIB="$(find /usr/local/cuda -name 'libcudart.so.*.*' -not -name '*.a' | head -1)"
+          CUDA_LIB="$(find /usr/local/cuda -follow -name 'libcudart.so.*.*' -not -name '*.a' 2>/dev/null | head -1)"
           if [ -z "$CUDA_LIB" ]; then CUDA_LIB="$(ldconfig -p | grep 'libcudart.so\.' | awk '{print $NF}' | head -1)"; fi
-          NCCL_LIB="$(find /usr -name 'libnccl.so.*.*' -not -name '*.a' 2>/dev/null | head -1)"
-          if [ -z "$NCCL_LIB" ]; then NCCL_LIB="$(ldconfig -p | grep 'libnccl.so\.' | awk '{print $NF}' | head -1)"; fi
           mkdir -p target/release/lib
           if [ -n "$CUDA_LIB" ]; then
             cp "$CUDA_LIB" target/release/lib/
             ln -sf "$(basename "$CUDA_LIB")" target/release/lib/libcudart.so.13
             ln -sf libcudart.so.13 target/release/lib/libcudart.so
-          fi
-          if [ -n "$NCCL_LIB" ]; then
-            cp "$NCCL_LIB" target/release/lib/
-            NCCL_SONAME="$(objdump -p "$NCCL_LIB" 2>/dev/null | awk '/SONAME/{print $2}')"
-            [ -n "$NCCL_SONAME" ] && ln -sf "$(basename "$NCCL_LIB")" "target/release/lib/$NCCL_SONAME"
           fi
           patchelf --set-rpath '$ORIGIN/lib:/usr/local/lib/xinfer' target/release/xinfer
           ls -la target/release/lib/
@@ -198,22 +191,15 @@ jobs:
       - name: Build Python wheel
         run: ./build.sh --release --features "${{ matrix.python_features }}"
 
-      - name: Bundle CUDA runtime libs with binary
+      - name: Bundle CUDA runtime with binary
         run: |
-          CUDA_LIB="$(find /usr/local/cuda -name 'libcudart.so.*.*' -not -name '*.a' | head -1)"
+          CUDA_LIB="$(find /usr/local/cuda -follow -name 'libcudart.so.*.*' -not -name '*.a' 2>/dev/null | head -1)"
           if [ -z "$CUDA_LIB" ]; then CUDA_LIB="$(ldconfig -p | grep 'libcudart.so\.' | awk '{print $NF}' | head -1)"; fi
-          NCCL_LIB="$(find /usr -name 'libnccl.so.*.*' -not -name '*.a' 2>/dev/null | head -1)"
-          if [ -z "$NCCL_LIB" ]; then NCCL_LIB="$(ldconfig -p | grep 'libnccl.so\.' | awk '{print $NF}' | head -1)"; fi
           mkdir -p target/release/lib
           if [ -n "$CUDA_LIB" ]; then
             cp "$CUDA_LIB" target/release/lib/
             ln -sf "$(basename "$CUDA_LIB")" target/release/lib/libcudart.so.13
             ln -sf libcudart.so.13 target/release/lib/libcudart.so
-          fi
-          if [ -n "$NCCL_LIB" ]; then
-            cp "$NCCL_LIB" target/release/lib/
-            NCCL_SONAME="$(objdump -p "$NCCL_LIB" 2>/dev/null | awk '/SONAME/{print $2}')"
-            [ -n "$NCCL_SONAME" ] && ln -sf "$(basename "$NCCL_LIB")" "target/release/lib/$NCCL_SONAME"
           fi
           patchelf --set-rpath '$ORIGIN/lib:/usr/local/lib/xinfer' target/release/xinfer
           ls -la target/release/lib/
