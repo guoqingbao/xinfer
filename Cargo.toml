@@ -97,4 +97,5 @@ section = "science"
 priority = "optional"
 assets = [
     ["target/release/xinfer", "usr/local/bin/", "755"],
+    ["target/release/lib/*", "usr/local/lib/xinfer/", "644"],
 ]

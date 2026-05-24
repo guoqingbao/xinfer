@@ -103,6 +103,26 @@ jobs:
           . "$HOME/.cargo/env"
           ./build.sh --release --features "${{ matrix.python_features }}"
 
+      - name: Bundle CUDA runtime libs with binary
+        run: |
+          CUDA_LIB="$(find /usr/local/cuda -name 'libcudart.so.*.*' -not -name '*.a' | head -1)"
+          if [ -z "$CUDA_LIB" ]; then CUDA_LIB="$(ldconfig -p | grep 'libcudart.so\.' | awk '{print $NF}' | head -1)"; fi
+          NCCL_LIB="$(find /usr -name 'libnccl.so.*.*' -not -name '*.a' 2>/dev/null | head -1)"
+          if [ -z "$NCCL_LIB" ]; then NCCL_LIB="$(ldconfig -p | grep 'libnccl.so\.' | awk '{print $NF}' | head -1)"; fi
+          mkdir -p target/release/lib
+          if [ -n "$CUDA_LIB" ]; then
+            cp "$CUDA_LIB" target/release/lib/
+            ln -sf "$(basename "$CUDA_LIB")" target/release/lib/libcudart.so.13
+            ln -sf libcudart.so.13 target/release/lib/libcudart.so
+          fi
+          if [ -n "$NCCL_LIB" ]; then
+            cp "$NCCL_LIB" target/release/lib/
+            NCCL_SONAME="$(objdump -p "$NCCL_LIB" 2>/dev/null | awk '/SONAME/{print $2}')"
+            [ -n "$NCCL_SONAME" ] && ln -sf "$(basename "$NCCL_LIB")" "target/release/lib/$NCCL_SONAME"
+          fi
+          patchelf --set-rpath '$ORIGIN/lib:/usr/local/lib/xinfer' target/release/xinfer
+          ls -la target/release/lib/
+
       - name: Package deb
         run: |
           . "$HOME/.cargo/env"
@@ -112,7 +132,8 @@ jobs:
         run: |
           mkdir -p dist/xinfer
           cp target/release/xinfer dist/xinfer/xinfer
-          tar -C dist/xinfer -czf "dist/xinfer-${{ needs.validate.outputs.version }}-linux-x64-${{ matrix.sm_name }}.tar.gz" xinfer
+          cp -a target/release/lib dist/xinfer/lib
+          tar -C dist/xinfer -czf "dist/xinfer-${{ needs.validate.outputs.version }}-linux-x64-${{ matrix.sm_name }}.tar.gz" xinfer lib
           rm -rf dist/xinfer
 
       - name: Collect and tag wheel with SM variant
@@ -177,6 +198,26 @@ jobs:
       - name: Build Python wheel
         run: ./build.sh --release --features "${{ matrix.python_features }}"
 
+      - name: Bundle CUDA runtime libs with binary
+        run: |
+          CUDA_LIB="$(find /usr/local/cuda -name 'libcudart.so.*.*' -not -name '*.a' | head -1)"
+          if [ -z "$CUDA_LIB" ]; then CUDA_LIB="$(ldconfig -p | grep 'libcudart.so\.' | awk '{print $NF}' | head -1)"; fi
+          NCCL_LIB="$(find /usr -name 'libnccl.so.*.*' -not -name '*.a' 2>/dev/null | head -1)"
+          if [ -z "$NCCL_LIB" ]; then NCCL_LIB="$(ldconfig -p | grep 'libnccl.so\.' | awk '{print $NF}' | head -1)"; fi
+          mkdir -p target/release/lib
+          if [ -n "$CUDA_LIB" ]; then
+            cp "$CUDA_LIB" target/release/lib/
+            ln -sf "$(basename "$CUDA_LIB")" target/release/lib/libcudart.so.13
+            ln -sf libcudart.so.13 target/release/lib/libcudart.so
+          fi
+          if [ -n "$NCCL_LIB" ]; then
+            cp "$NCCL_LIB" target/release/lib/
+            NCCL_SONAME="$(objdump -p "$NCCL_LIB" 2>/dev/null | awk '/SONAME/{print $2}')"
+            [ -n "$NCCL_SONAME" ] && ln -sf "$(basename "$NCCL_LIB")" "target/release/lib/$NCCL_SONAME"
+          fi
+          patchelf --set-rpath '$ORIGIN/lib:/usr/local/lib/xinfer' target/release/xinfer
+          ls -la target/release/lib/
+
       - name: Package deb
         run: cargo deb --no-build --output "dist/xinfer-linux-x64-${{ matrix.sm_name }}.deb"
 
@@ -184,7 +225,8 @@ jobs:
         run: |
           mkdir -p dist/xinfer
           cp target/release/xinfer dist/xinfer/xinfer
-          tar -C dist/xinfer -czf "dist/xinfer-${{ needs.validate.outputs.version }}-linux-x64-${{ matrix.sm_name }}.tar.gz" xinfer
+          cp -a target/release/lib dist/xinfer/lib
+          tar -C dist/xinfer -czf "dist/xinfer-${{ needs.validate.outputs.version }}-linux-x64-${{ matrix.sm_name }}.tar.gz" xinfer lib
           rm -rf dist/xinfer
 
       - name: Collect and tag wheel with SM variant
@@ -455,6 +497,7 @@ jobs:
             local tarball="$1"
             local url="${RELEASE_BASE}/${tarball}"
             local install_dir="/usr/local/bin"
+            local lib_dir="/usr/local/lib/xinfer"
             local tmp
             tmp="$(mktemp -d)"
             echo "Downloading ${tarball}..."
@@ -472,6 +515,10 @@ jobs:
               echo "  Try: sudo install -m 755 ${tmp}/xinfer ${install_dir}/xinfer" >&2
               echo "  Or re-run with: curl -sSL ${INDEX_BASE}/install.sh | sudo bash" >&2
               return 1
+            fi
+            if [ -d "${tmp}/lib" ]; then
+              ${SUDO} mkdir -p "${lib_dir}"
+              ${SUDO} cp -a "${tmp}/lib/"* "${lib_dir}/"
             fi
             rm -rf "$tmp"
             print_binary_hints
