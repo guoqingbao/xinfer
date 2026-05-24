@@ -7,11 +7,9 @@ FROM docker.io/nvidia/cuda:${CUDA_VERSION}-runtime-ubuntu${UBUNTU_VERSION} AS ru
 ARG DEBIAN_FRONTEND=noninteractive
 
 RUN <<HEREDOC
-    NCCLVER="$(apt-cache madison libnccl2 | \
-      grep $(dpkg -l cuda-libraries* |awk '/cuda-lib/{print$3}'|cut -d'.' -f 1,2)|head -1|awk '{print$3}')"
     apt-get update && \
     apt-get install -y --no-install-recommends --allow-change-held-packages \
-        libnccl2=$NCCLVER \
+        libnccl2=$(apt-cache madison libnccl2|grep $(echo $CUDA_VERSION|cut -d'.' -f1,2)|head -1|cut -d' ' -f5) \
         libomp-dev \
         ca-certificates \
         libssl-dev \
