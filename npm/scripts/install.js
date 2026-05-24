@@ -125,7 +125,7 @@ function expectedSha(manifest, artifactName) {
     if (!trimmed) continue;
     const parts = trimmed.split(/\s+/);
     const checksum = parts[0];
-    const name = parts[parts.length - 1].replace(/^\*/, "");
+    const name = parts[parts.length - 1].replace(/^\*/, "").replace(/^\.\//, "");
     if (name === artifactName) return checksum;
   }
   return null;
@@ -199,7 +199,24 @@ async function main() {
     }
     const binary = path.join(installDir, "xinfer");
     fs.chmodSync(binary, 0o755);
-    console.log(`xinfer installed to ${installDir}`);
+    const hint = [
+      `xinfer installed to ${installDir}`,
+      "",
+      "============================================",
+      " xInfer binary installed via npm",
+      "============================================",
+      "",
+      " HuggingFace model:",
+      "   xinfer --m Qwen/Qwen3-8B --ui-server",
+      "",
+      " Local model path:",
+      "   xinfer --w /path/to/model --ui-server",
+      "",
+      " API server (no UI):",
+      "   xinfer --m Qwen/Qwen3-8B --server",
+      "============================================",
+    ].join("\n");
+    process.stderr.write(hint + "\n");
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }

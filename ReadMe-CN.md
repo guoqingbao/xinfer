@@ -24,39 +24,16 @@
 
 ### 📦 安装
 
-**方式 1 — Python 安装包**
+**方式 1 — 安装 DEB 或 Python包**
 ```bash
 curl -sSL https://guoqingbao.github.io/xinfer/install.sh | bash
-# python3 -m xinfer.server --m Qwen/Qwen3.6-27B-FP8 --kvcache-dtype turbo4 --ui-server
 ```
 
 **方式 2 — npm**
 ```bash
 npm install -g xinfer-ai
-# xinfer --m Qwen/Qwen3.6-27B-FP8 --kvcache-dtype turbo4 --ui-server
 ```
-
-npm 包会自动检测 GPU 的 CUDA 计算能力并下载对应的预编译二进制文件。
-
-**方式 3 — Cargo（从源码安装）**
-```bash
-# 依赖项: Rust 编译器、CUDA 工具链（可选）、Metal 需安装 Xcode 命令行工具（可选）
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-sudo apt-get install -y git build-essential libssl-dev pkg-config
-
-export XINFER_REPO="https://github.com/guoqingbao/xinfer"
-# macOS/Metal：将特性替换为 `--features metal`
-# SM_70/SM_75（如 V100）：去掉 `flashinfer` 和 `cutlass` 编译选项
-cargo install --git $XINFER_REPO xinfer --features cuda,nccl,flashinfer,cutlass
-```
-
-**方式 4 — Docker**
-```bash
-# Turing/V100 (sm_70/sm_75)：去掉 `flashinfer` 和 `cutlass` 编译选项
-./build_docker.sh "cuda,nccl,flashinfer,cutlass"
-```
-
-参考 [Docker 指南 →](docs/docker.md)
+install.sh 和 npm 会自动检测 GPU 的 CUDA 计算能力并下载对应的预编译二进制文件。
 
 ---
 
@@ -193,62 +170,14 @@ xinfer --m unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF \
 
 ---
 
-## 📘 使用方法（Rust）
+## 📘 使用方法
+> **Python包安装后**请使用 `python3 -m xinfer.server` 方式运行
 
-### 安装
-
-<details>
-<summary><b>CUDA（Linux）</b></summary>
-
-```bash
-# 前置依赖
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-sudo apt-get install -y git build-essential libssl-dev pkg-config
-
-# 可选：CUDA toolkit + NCCL
-sudo apt-get install -y cuda-nvcc-12-9 cuda-nvrtc-dev-12-9 libcublas-dev-12-9 libcurand-dev-12-9
-sudo apt-get install -y libnccl2 libnccl-dev
-
-# 编译安装
-cargo --install --features cuda,nccl,flashinfer,cutlass
-# Flash Attention 后端：
-cargo --install --features cuda,nccl,flashattn,cutlass
-# V100 / 较老硬件（无 flash 后端）：
-cargo --install --features cuda,nccl
-```
-
-</details>
-
-<details>
-<summary><b>Metal（macOS）</b></summary>
-
-```bash
-# 先安装 Xcode 命令行工具
-cargo install --features metal
-```
-
-</details>
-
-<details>
-<summary><b>Docker</b></summary>
-
-```bash
-# sm_80 = A100, sm_90 = Hopper, sm_120 = Blackwell
-# 最后一个参数 `0` 改为 `1` 启用中国大陆 Rust 镜像
-./build_docker.sh "cuda,nccl,flashinfer,cutlass,python" sm_80 12.9.0 0
-# 使用 Flash Attention + 生产镜像：
-./build_docker.sh --prod "cuda,nccl,flashattn,cutlass,python" sm_90 13.0.0
-```
-
-参考 [Docker 指南 →](docs/docker.md)
-
-</details>
+> Docker 内构建请参考 [**在 Docker 中运行 xInfer →**](docs/docker.md)
 
 ### 运行模型
 
 > **提示：** 默认启动 OpenAI 兼容 API 服务（`http://localhost:8000`）。添加 `--ui-server` 可同时启动内置 ChatGPT 风格 Web UI（`http://localhost:8001`）。
->
-> Docker 内构建请参考 [**在 Docker 中运行 xInfer →**](docs/docker.md)
 
 ```bash
 # FP8 模型（sm90+ 需启用 cutlass）+ Web UI
@@ -356,39 +285,28 @@ xinfer --m mistralai/Ministral-3-3B --ui-server
 </details>
 
 ---
-
-## 📘 使用方法（Python）
-
-### 运行模型
-
+## 📘 从源码编译安装
+**方式 1 — Cargo**
 ```bash
-# FP8 模型 + Web UI
-python3 -m xinfer.server --m Qwen/Qwen3.6-27B-FP8 --ui-server
+# 依赖项: Rust 编译器、CUDA 工具链（可选）、Metal 需安装 Xcode 命令行工具（可选）
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+sudo apt-get install -y git build-essential libssl-dev pkg-config
 
-# 未量化 Safetensors（多卡）
-python3 -m xinfer.server --m Qwen/Qwen3.5-122B-A10B --d 0,1 --kvcache-dtype fp8
-
-# ISQ 即时量化
-python3 -m xinfer.server --w /path/Qwen3.6-35B-A3B --isq q4k --d 0 --kvcache-dtype turbo8
-
-# NVFP4 / MXFP4
-python3 -m xinfer.server --m unsloth/Qwen3.6-27B-NVFP4
-python3 -m xinfer.server --m olka-fi/Qwen3.5-4B-MXFP4
-python3 -m xinfer.server --m GadflyII/GLM-4.7-Flash-NVFP4
-
-# GGUF
-python3 -m xinfer.server --m unsloth/Qwen3.5-27B-GGUF --f Qwen3.5-27B-Q4_K_M.gguf
-
-# 多模态
-python3 -m xinfer.server --m Qwen/Qwen3.6-35B-A3B-FP8 --kvcache-dtype fp8
-
-# GPTQ / AWQ
-python3 -m xinfer.server --w /home/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4-Marlin
+export XINFER_REPO="https://github.com/guoqingbao/xinfer"
+# macOS/Metal：将特性替换为 `--features metal`
+# SM_70/SM_75（如 V100）：去掉 `flashinfer` 和 `cutlass` 编译选项
+cargo install --git $XINFER_REPO xinfer --features cuda,nccl,flashinfer,cutlass
 ```
 
-查看 [更多 Python 示例 →](python/ReadMe.md)
+**方式 2 — Docker**
+```bash
+# Turing/V100 (sm_70/sm_75)：去掉 `flashinfer` 和 `cutlass` 编译选项
+./build_docker.sh "cuda,nccl,flashinfer,cutlass"
+```
 
-<details>
+参考 [Docker 指南 →](docs/docker.md)
+
+<details open>
 <summary><b>从源码编译 Python wheel</b></summary>
 
 ```bash

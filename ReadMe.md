@@ -24,37 +24,15 @@
 
 ### 📦 Install
 
-**Option 1 — Python package**
+**Option 1 — Install DEB or Python package**
 ```bash
 curl -sSL https://guoqingbao.github.io/xinfer/install.sh | bash
-# python3 -m xinfer.server --m Qwen/Qwen3.6-27B-FP8 --kvcache-dtype turbo4 --ui-server
 ```
 
 **Option 2 — npm**
 ```bash
 npm install -g xinfer-ai
-# xinfer --m Qwen/Qwen3.6-27B-FP8 --kvcache-dtype turbo4 --ui-server
 ```
-
-**Option 3 — Cargo (from source)**
-```bash
-# Prerequisites: Rust compiler, CUDA Toolkit (optional) or Metal Xcode command line tool
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-sudo apt-get install -y git build-essential libssl-dev pkg-config
-
-export XINFER_REPO="https://github.com/guoqingbao/xinfer"
-# MacOS/Metal: replace features to `metal`
-# SM_70/SM_75 (e.g., V100): remove `flashinfer` and `cutlass` features
-cargo install --git $XINFER_REPO xinfer --features cuda,nccl,flashinfer,cutlass
-```
-
-**Option 4 — Docker**
-```bash
-# Turing/V100 (sm_70/sm_75): remove `flashinfer` and `cutlass` features
-./build_docker.sh "cuda,nccl,flashinfer,cutlass"
-```
-
-See [Docker guide →](docs/docker.md)
 
 ---
 
@@ -192,61 +170,14 @@ xinfer --m unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF \
 
 ---
 
-## 📘 Usage (Rust)
+## 📘 Usage
+> For **Python installaion**, running model with `python3 -m xinfer.server` 
 
-### Installation
-
-<details>
-<summary><b>CUDA (Linux)</b></summary>
-
-```bash
-# Prerequisites
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-sudo apt-get install -y git build-essential libssl-dev pkg-config
-
-# Optional: CUDA toolkit + NCCL
-sudo apt-get install -y cuda-nvcc-12-9 cuda-nvrtc-dev-12-9 libcublas-dev-12-9 libcurand-dev-12-9
-sudo apt-get install -y libnccl2 libnccl-dev
-
-# Build & install
-cargo --install --features cuda,nccl,flashinfer,cutlass
-# Flash Attention backend alternative:
-cargo --install --features cuda,nccl,flashattn,cutlass
-# V100 / older (no flash backends):
-cargo --install --features cuda,nccl
-```
-
-</details>
-
-<details>
-<summary><b>Metal (macOS)</b></summary>
-
-```bash
-# Install Xcode command-line tools first
-cargo install --features metal
-```
-
-</details>
-
-<details>
-<summary><b>Docker</b></summary>
-
-```bash
-# sm_80 = A100, sm_90 = Hopper, sm_120 = Blackwell
-./build_docker.sh "cuda,nccl,flashinfer,cutlass,python" sm_80 12.9.0 0
-# Production image with Flash Attention:
-./build_docker.sh --prod "cuda,nccl,flashattn,cutlass,python" sm_90 13.0.0
-```
-
-See [Docker guide →](docs/docker.md)
-
-</details>
+> For Docker builds, refer to [**Run xInfer in Docker →**](docs/docker.md)
 
 ### Running Models
 
 > **Tip:** By default, xInfer starts an OpenAI-compatible API server at `http://localhost:8000`. Add `--ui-server` to also launch the built-in ChatGPT-style Web UI at `http://localhost:8001`.
->
-> For Docker builds, refer to [**Run xInfer in Docker →**](docs/docker.md)
 
 ```bash
 # FP8 model (sm90+ with cutlass) + web UI
@@ -355,36 +286,28 @@ xinfer --m mistralai/Ministral-3-3B --ui-server
 
 ---
 
-## 📘 Usage (Python)
+## 📘 Build from source code
 
-### Running Models
-
+**Option 1 — Cargo**
 ```bash
-# FP8 model + web UI
-python3 -m xinfer.server --m Qwen/Qwen3.6-27B-FP8 --ui-server
+# Prerequisites: Rust compiler, CUDA Toolkit (optional) or Metal Xcode command line tool
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+sudo apt-get install -y git build-essential libssl-dev pkg-config
 
-# Unquantized Safetensors (multi-GPU)
-python3 -m xinfer.server --m Qwen/Qwen3.5-122B-A10B --d 0,1 --kvcache-dtype fp8
-
-# ISQ on-the-fly quantization
-python3 -m xinfer.server --w /path/Qwen3.6-35B-A3B --isq q4k --d 0 --kvcache-dtype turbo8
-
-# NVFP4 / MXFP4
-python3 -m xinfer.server --m unsloth/Qwen3.6-27B-NVFP4
-python3 -m xinfer.server --m olka-fi/Qwen3.5-4B-MXFP4
-python3 -m xinfer.server --m GadflyII/GLM-4.7-Flash-NVFP4
-
-# GGUF
-python3 -m xinfer.server --m unsloth/Qwen3.5-27B-GGUF --f Qwen3.5-27B-Q4_K_M.gguf
-
-# Multimodal
-python3 -m xinfer.server --m Qwen/Qwen3.6-35B-A3B-FP8 --kvcache-dtype fp8
-
-# GPTQ / AWQ
-python3 -m xinfer.server --w /home/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4-Marlin
+export XINFER_REPO="https://github.com/guoqingbao/xinfer"
+# MacOS/Metal: replace features to `metal`
+# SM_70/SM_75 (e.g., V100): remove `flashinfer` and `cutlass` features
+cargo install --git $XINFER_REPO xinfer --features cuda,nccl,flashinfer,cutlass
 ```
 
-See [more Python examples →](python/ReadMe.md)
+**Option 2 — Docker**
+```bash
+# Turing/V100 (sm_70/sm_75): remove `flashinfer` and `cutlass` features
+./build_docker.sh "cuda,nccl,flashinfer,cutlass"
+```
+
+See [Docker guide →](docs/docker.md)
+
 
 <details>
 <summary><b>Build Python wheel from source</b></summary>
@@ -406,6 +329,8 @@ pip install target/wheels/xinfer*.whl --force-reinstall
 ```
 
 </details>
+
+See [more Python examples →](python/ReadMe.md)
 
 ---
 

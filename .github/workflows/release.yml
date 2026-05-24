@@ -528,9 +528,9 @@ jobs:
 
           MODE="${XINFER_MODE:-}"
           if [ -z "$MODE" ]; then
-            if [ -t 0 ]; then
+            if [ -e /dev/tty ]; then
               printf "Choose [1/2%s] (default: 1): " "$([ "$PLATFORM" != "metal" ] && echo "/3")"
-              read -r MODE
+              read -r MODE < /dev/tty
               MODE="${MODE:-1}"
             else
               MODE="1"

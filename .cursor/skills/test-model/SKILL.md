@@ -152,7 +152,7 @@ Verify the build succeeds (exit code 0). The `Error: Must provide model_id or we
 
 If the build fails, check and fix compilation errors before proceeding.
 
-Important, if you build on CUDA with cargo build, make sure always build xinfer and runner binaries.
+Important, if you build on CUDA with cargo build, make sure always build xinfer binaries.
 ---
 
 ## Phase 3: Create the Test Script
@@ -185,7 +185,7 @@ For each model, execute this sequence:
 ### Step 1: Kill previous instances
 
 ```bash
-pkill -9 -f 'xinfer|runner' 2>/dev/null
+pkill -9 -f 'xinfer' 2>/dev/null
 sleep 3
 ```
 

@@ -291,7 +291,7 @@ xinfer --m <model_id_or_path> --port 8080 --d 0,1
 Always kill all previous instances and verify GPU memory is freed:
 ```bash
 # Kill all xinfer and runner processes
-pkill -f xinfer; pkill -f runner
+pkill -f xinfer;
 sleep 2
 
 # Check GPU memory (CUDA)
