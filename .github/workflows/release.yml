@@ -110,8 +110,11 @@ jobs:
           mkdir -p target/release/lib
           if [ -n "$CUDA_LIB" ]; then
             cp "$CUDA_LIB" target/release/lib/
-            ln -sf "$(basename "$CUDA_LIB")" target/release/lib/libcudart.so.13
-            ln -sf libcudart.so.13 target/release/lib/libcudart.so
+            CUDA_SONAME="$(objdump -p "$CUDA_LIB" 2>/dev/null | awk '/SONAME/{print $2}')"
+            if [ -n "$CUDA_SONAME" ]; then
+              ln -sf "$(basename "$CUDA_LIB")" "target/release/lib/$CUDA_SONAME"
+              ln -sf "$CUDA_SONAME" target/release/lib/libcudart.so
+            fi
           fi
           patchelf --set-rpath '$ORIGIN/lib:/usr/local/lib/xinfer' target/release/xinfer
           ls -la target/release/lib/
@@ -198,8 +201,11 @@ jobs:
           mkdir -p target/release/lib
           if [ -n "$CUDA_LIB" ]; then
             cp "$CUDA_LIB" target/release/lib/
-            ln -sf "$(basename "$CUDA_LIB")" target/release/lib/libcudart.so.13
-            ln -sf libcudart.so.13 target/release/lib/libcudart.so
+            CUDA_SONAME="$(objdump -p "$CUDA_LIB" 2>/dev/null | awk '/SONAME/{print $2}')"
+            if [ -n "$CUDA_SONAME" ]; then
+              ln -sf "$(basename "$CUDA_LIB")" "target/release/lib/$CUDA_SONAME"
+              ln -sf "$CUDA_SONAME" target/release/lib/libcudart.so
+            fi
           fi
           patchelf --set-rpath '$ORIGIN/lib:/usr/local/lib/xinfer' target/release/xinfer
           ls -la target/release/lib/
