@@ -1736,7 +1736,6 @@ impl FusedMoeMxfp4 {
         )?;
 
         let down_inputs = gated_activation(&gate_up, self.w_size_n, &self.act)?;
-        drop(gate_up);
 
         let mut ys = moe::moe_gemm_mxfp4(
             &down_inputs,
@@ -2386,7 +2385,6 @@ impl FusedMoeNvfp4 {
         )?;
 
         let down_inputs = gated_activation(&gate_up, self.w_size_n, &self.act)?;
-        drop(gate_up);
 
         let down_topk_weights = if self.apply_router_weight_on_input {
             None
