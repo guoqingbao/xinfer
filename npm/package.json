@@ -1,7 +1,7 @@
 {
   "name": "xinfer-ai",
-  "version": "0.12.4",
-  "assetVersion": "0.12.4",
+  "version": "0.12.5",
+  "assetVersion": "0.12.5",
   "description": "xInfer — a high-performance LLM inference engine in Rust with CUDA/Metal acceleration",
   "license": "MIT",
   "homepage": "https://github.com/guoqingbao/xinfer#readme",

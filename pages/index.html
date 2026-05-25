@@ -419,10 +419,10 @@ footer{padding:56px 0 28px;border-top:1px solid var(--c-border);position:relativ
         <thead><tr><th data-i="k.cm">Mode (--kvcache-dtype)</th><th data-i="k.cc">Compression</th><th data-i="k.cq">Quality</th><th>GPU</th></tr></thead>
         <tbody>
           <tr><td>default (BF16)</td><td>1×</td><td data-i="k.q1">Baseline</td><td>All</td></tr>
-          <tr><td>fp8</td><td><strong>2×</strong></td><td data-i="k.q2">Near-lossless</td><td>SM70+ / M1</td></tr>
-          <tr><td>turbo8</td><td><strong>2.6×</strong></td><td data-i="k.q3">High quality</td><td>SM70+ / M1</td></tr>
-          <tr><td>turbo4</td><td><strong>3.7×</strong></td><td data-i="k.q4">Best balance</td><td>SM70+ / M1</td></tr>
-          <tr><td>turbo3</td><td><strong>4.7×</strong></td><td data-i="k.q5">Max compression</td><td>SM70+</td></tr>
+          <tr><td>fp8</td><td><strong>2×</strong></td><td data-i="k.q2">Near-lossless</td><td>SM70+ / M1+</td></tr>
+          <tr><td>turbo8</td><td><strong>2.6×</strong></td><td data-i="k.q3">High quality</td><td>SM70+ / M1+</td></tr>
+          <tr><td>turbo4</td><td><strong>3.7×</strong></td><td data-i="k.q4">Best balance</td><td>SM70+ / M1+</td></tr>
+          <tr><td>turbo3</td><td><strong>4.7×</strong></td><td data-i="k.q5">Max compression</td><td>SM70+ / M1+</td></tr>
         </tbody>
       </table>
     </div>
@@ -596,7 +596,7 @@ document.querySelectorAll('.cb').forEach(function(bl){
 });
 
 /* ═══ Download cards ═══ */
-var XINFER_VER='0.12.4';
+var XINFER_VER='0.12.5';
 var DL='https://github.com/guoqingbao/xinfer/releases/download/v'+XINFER_VER+'/';
 var archs=[
   {sm:'sm70',n:'70',name:'SM70',gpu:'V100',cuda:'CUDA 12',d:0},

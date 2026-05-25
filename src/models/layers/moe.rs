@@ -1732,24 +1732,23 @@ impl FusedMoeMxfp4 {
             None,
             &topk_ids,
             is_prefill,
+            None,
         )?;
 
         let down_inputs = gated_activation(&gate_up, self.w_size_n, &self.act)?;
+        drop(gate_up);
 
-        let down = moe::moe_gemm_mxfp4(
+        let mut ys = moe::moe_gemm_mxfp4(
             &down_inputs,
             &self.down_blocks,
             &self.down_scales,
             None,
             &topk_ids,
             is_prefill,
-        )?;
-
-        let topk_weights = topk_weights.to_dtype(down.dtype())?;
-        let mut ys = down
-            .broadcast_mul(&topk_weights.unsqueeze(D::Minus1)?)?
-            .reshape((num_tokens, self.routing.num_experts_per_tok, hidden_dim))?
-            .sum(1)?;
+            Some(&topk_weights),
+        )?
+        .reshape((num_tokens, self.routing.num_experts_per_tok, hidden_dim))?
+        .sum(1)?;
 
         if self.world_size > 1 {
             ys = self.all_reduce.apply(&ys)?;
@@ -1764,10 +1763,12 @@ pub struct FusedMoeNvfp4 {
     gate_up_scales: Tensor,
     gate_up_global_scales: Tensor,
     gate_up_input_scales: Tensor,
+    gate_up_scales_swizzled: Option<Tensor>,
     down_blocks: Tensor,
     down_scales: Tensor,
     down_global_scales: Tensor,
     down_input_scales: Tensor,
+    down_scales_swizzled: Option<Tensor>,
     w_size_n: usize,
     act: Activation,
     routing: MoeRouting,
@@ -2286,16 +2287,51 @@ impl FusedMoeNvfp4 {
         let down_global_scales = Tensor::from_vec(down_gscales_vec, (num_experts,), dev)?;
         let down_input_scales = Tensor::from_vec(down_iscales_vec, (num_experts,), dev)?;
 
+        let (gate_up_scales_swizzled, down_scales_swizzled) = {
+            #[cfg(feature = "cuda")]
+            {
+                let sm = attention_rs::cuda_utils::sm_version(dev.as_cuda_device()?).unwrap_or(0)
+                    as usize;
+                if sm >= 100 {
+                    let gu_n = gate_up_scales.dim(1)?;
+                    let gu_k = cfg.hidden_size;
+                    let gu_sw = attention_rs::nvfp4_linear::swizzle_nvfp4_moe_weight_scales(
+                        &gate_up_scales,
+                        num_experts,
+                        gu_n,
+                        gu_k,
+                    )?;
+                    let d_n = down_scales.dim(1)?;
+                    let d_k = moe_cfg.moe_intermediate_size;
+                    let d_sw = attention_rs::nvfp4_linear::swizzle_nvfp4_moe_weight_scales(
+                        &down_scales,
+                        num_experts,
+                        d_n,
+                        d_k,
+                    )?;
+                    (Some(gu_sw), Some(d_sw))
+                } else {
+                    (None, None)
+                }
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                (None, None)
+            }
+        };
+
         Ok(Self {
             gate,
             gate_up_blocks,
             gate_up_scales,
             gate_up_global_scales,
             gate_up_input_scales,
+            gate_up_scales_swizzled,
             down_blocks,
             down_scales,
             down_global_scales,
             down_input_scales,
+            down_scales_swizzled,
             w_size_n,
             act: cfg.hidden_act,
             routing: MoeRouting::from_moe_cfg(moe_cfg, bias),
@@ -2357,11 +2393,20 @@ impl FusedMoeNvfp4 {
             &topk_ids,
             pre_sorted_refs,
             is_prefill,
+            None,
+            self.gate_up_scales_swizzled.as_ref(),
         )?;
 
         let down_inputs = gated_activation(&gate_up, self.w_size_n, &self.act)?;
+        drop(gate_up);
 
-        let down = moe::moe_gemm_nvfp4(
+        let down_topk_weights = if self.apply_router_weight_on_input {
+            None
+        } else {
+            Some(&topk_weights)
+        };
+
+        let mut ys = moe::moe_gemm_nvfp4(
             &down_inputs,
             &self.down_blocks,
             &self.down_scales,
@@ -2371,17 +2416,11 @@ impl FusedMoeNvfp4 {
             &topk_ids,
             pre_sorted_refs,
             is_prefill,
-        )?;
-
-        let mut ys = if self.apply_router_weight_on_input {
-            down.reshape((num_tokens, self.routing.num_experts_per_tok, hidden_dim))?
-                .sum(1)?
-        } else {
-            let topk_weights = topk_weights.to_dtype(down.dtype())?;
-            down.broadcast_mul(&topk_weights.unsqueeze(candle_core::D::Minus1)?)?
-                .reshape((num_tokens, self.routing.num_experts_per_tok, hidden_dim))?
-                .sum(1)?
-        };
+            down_topk_weights,
+            self.down_scales_swizzled.as_ref(),
+        )?
+        .reshape((num_tokens, self.routing.num_experts_per_tok, hidden_dim))?
+        .sum(1)?;
 
         if self.world_size > 1 {
             ys = self.all_reduce.apply(&ys)?;
