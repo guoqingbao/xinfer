@@ -39,6 +39,7 @@ def parse_args():
     parser.add_argument("--kv-fraction", type=float, default=None)
     parser.add_argument("--disable-reasoning", action="store_true")
     parser.add_argument("--disable-cuda-graph", action="store_true")
+    parser.add_argument("--prefill-chunk-size", type=int, default=8192)
 
     return parser.parse_args()
 
@@ -72,6 +73,7 @@ def build_engine_config(args, num_of_prompts, disable_prefix_cache):
         kv_fraction=args.kv_fraction,
         disable_reasoning=args.disable_reasoning,
         disable_cuda_graph=args.disable_cuda_graph,
+        prefill_chunk_size=args.prefill_chunk_size,
     )
 
 def show_tokens_left(tokens_left: int, total_tokens: int):

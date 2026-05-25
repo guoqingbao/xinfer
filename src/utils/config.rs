@@ -329,6 +329,21 @@ impl Config {
                 .is_some_and(|cfg| matches!(cfg.quant_method.as_str(), "mxfp4" | "nvfp4"))
     }
 }
+
+pub const DEFAULT_PREFILL_CHUNK_SIZE: usize = 8 * 1024;
+pub const MIN_PREFILL_CHUNK_SIZE: usize = 1024;
+pub const MAX_PREFILL_CHUNK_SIZE: usize = 32 * 1024;
+
+pub fn default_prefill_chunk_size() -> usize {
+    DEFAULT_PREFILL_CHUNK_SIZE
+}
+
+pub fn normalize_prefill_chunk_size(size: usize) -> usize {
+    let rounded = (size.saturating_add(MIN_PREFILL_CHUNK_SIZE / 2) / MIN_PREFILL_CHUNK_SIZE)
+        * MIN_PREFILL_CHUNK_SIZE;
+    rounded.clamp(MIN_PREFILL_CHUNK_SIZE, MAX_PREFILL_CHUNK_SIZE)
+}
+
 #[cfg(not(feature = "python"))]
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct EngineConfig {
@@ -377,6 +392,8 @@ pub struct EngineConfig {
     pub disable_reasoning: bool,
     #[serde(default)]
     pub disable_cuda_graph: bool,
+    #[serde(default = "default_prefill_chunk_size")]
+    pub prefill_chunk_size: usize,
 }
 
 #[cfg(feature = "python")]
@@ -460,6 +477,22 @@ pub struct EngineConfig {
     pub disable_reasoning: bool,
     #[pyo3(get, set)]
     pub disable_cuda_graph: bool,
+    #[pyo3(get, set)]
+    #[serde(default = "default_prefill_chunk_size")]
+    pub prefill_chunk_size: usize,
+}
+
+impl EngineConfig {
+    pub fn effective_prefill_chunk_size(&self) -> usize {
+        #[cfg(feature = "metal")]
+        {
+            normalize_prefill_chunk_size(self.prefill_chunk_size / 2)
+        }
+        #[cfg(not(feature = "metal"))]
+        {
+            normalize_prefill_chunk_size(self.prefill_chunk_size)
+        }
+    }
 }
 
 #[cfg(not(feature = "python"))]
@@ -497,6 +530,7 @@ impl EngineConfig {
         yarn_scaling_factor: Option<f64>,
         disable_reasoning: bool,
         disable_cuda_graph: bool,
+        prefill_chunk_size: Option<usize>,
     ) -> Self {
         let mut device_ids = device_ids.unwrap_or_default();
         if device_ids.is_empty() {
@@ -547,6 +581,9 @@ impl EngineConfig {
             yarn_scaling_factor,
             disable_reasoning,
             disable_cuda_graph,
+            prefill_chunk_size: normalize_prefill_chunk_size(
+                prefill_chunk_size.unwrap_or(DEFAULT_PREFILL_CHUNK_SIZE),
+            ),
         }
     }
 }

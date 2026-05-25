@@ -446,6 +446,7 @@ Constraint-based generation via llguidance — Lark grammars, regex, JSON Schema
 | `--pd-url` | PD connection URL (`tcp://`, `http://`, `file://`) |
 | `--disable-prefix-cache` | Disable prefix caching |
 | `--prefix-cache-max-tokens` | Cap prefix cache size |
+| `--prefill-chunk-size` | Cap prefill chunk size (default: CUDA 8K, Metal: 4k) |
 | `--disable-cuda-graph` | Disable CUDA graph capture |
 | `--yarn-scaling-factor` | YARN RoPE context extension factor |
 | `--temperature` | Sampling temperature (0–1) |

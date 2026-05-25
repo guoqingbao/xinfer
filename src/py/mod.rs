@@ -283,7 +283,7 @@ impl EngineConfig {
         mcp_command=None, mcp_config=None, mcp_args=None,
         tool_prompt_template=None,
         pd_server_prefix_cache_ratio=None, pd_client_prefix_cache_ratio=None, yarn_scaling_factor=None,
-        disable_reasoning=false, disable_cuda_graph=false,))]
+        disable_reasoning=false, disable_cuda_graph=false, prefill_chunk_size=Some(8192),))]
     pub fn new(
         model_id: Option<String>,
         weight_path: Option<String>,
@@ -317,6 +317,7 @@ impl EngineConfig {
         yarn_scaling_factor: Option<f64>,
         disable_reasoning: bool,
         disable_cuda_graph: bool,
+        prefill_chunk_size: Option<usize>,
     ) -> Self {
         let mut device_ids = device_ids.unwrap_or_default();
         if device_ids.is_empty() {
@@ -368,6 +369,9 @@ impl EngineConfig {
             yarn_scaling_factor,
             disable_reasoning,
             disable_cuda_graph,
+            prefill_chunk_size: crate::utils::config::normalize_prefill_chunk_size(
+                prefill_chunk_size.unwrap_or(crate::utils::config::DEFAULT_PREFILL_CHUNK_SIZE),
+            ),
         }
     }
 }

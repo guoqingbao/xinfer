@@ -42,6 +42,7 @@ def parse_args():
     parser.add_argument("--pd-client-prefix-cache-ratio", type=float, default=None)
     parser.add_argument("--disable-reasoning", action="store_true")
     parser.add_argument("--disable-cuda-graph", action="store_true")
+    parser.add_argument("--prefill-chunk-size", type=int, default=8192)
 
     args = parser.parse_args()
     if args.pd_server and args.ui_server:
@@ -123,6 +124,7 @@ def run_server(args):
         pd_client_prefix_cache_ratio=args.pd_client_prefix_cache_ratio,
         disable_reasoning=args.disable_reasoning,
         disable_cuda_graph=args.disable_cuda_graph,
+        prefill_chunk_size=args.prefill_chunk_size,
     )
 
     engine = Engine(cfg, args.dtype)

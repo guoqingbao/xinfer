@@ -166,6 +166,7 @@ impl EngineBuilder {
             self.yarn_scaling_factor,
             false,
             false,
+            None,
         );
 
         if let Some(kv_dtype) = self.kvcache_dtype {

@@ -79,6 +79,7 @@ class EngineConfig:
     yarn_scaling_factor: Optional[float]
     disable_reasoning: bool
     disable_cuda_graph: bool
+    prefill_chunk_size: Optional[int]
 
     def __init__(
         self,
@@ -114,6 +115,7 @@ class EngineConfig:
         yarn_scaling_factor: Optional[float] = None,
         disable_reasoning: bool = False,
         disable_cuda_graph: bool = False,
+        prefill_chunk_size: Optional[int] = 8192,
     ) -> None: ...
 
 @dataclass

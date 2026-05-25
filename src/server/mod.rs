@@ -1002,6 +1002,11 @@ pub struct Args {
     /// Disable CUDA graph capture (enabled by default when compiled with cuda feature)
     #[arg(long, default_value_t = false)]
     pub disable_cuda_graph: bool,
+
+    /// Base prefill chunk size in tokens. Rounded to 1k, clamped to 1k..32k.
+    /// Metal uses half of this value after rounding.
+    #[arg(long, default_value_t = crate::utils::config::DEFAULT_PREFILL_CHUNK_SIZE)]
+    pub prefill_chunk_size: usize,
 }
 
 /// Result of executing tool calls via MCP

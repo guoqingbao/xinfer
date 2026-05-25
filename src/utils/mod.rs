@@ -1971,6 +1971,8 @@ pub fn prepare_engine_config(
     generation_cfg: &mut Option<GenerationConfig>,
 ) -> (EngineConfig, bool) {
     let mut econfig = econfig.clone();
+    econfig.prefill_chunk_size =
+        crate::utils::config::normalize_prefill_chunk_size(econfig.prefill_chunk_size);
 
     let config_model_len = resolve_config_model_len(config, config_tokenizer);
 

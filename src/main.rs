@@ -217,6 +217,7 @@ async fn main() -> Result<()> {
         args.yarn_scaling_factor,
         args.disable_reasoning,
         args.disable_cuda_graph,
+        Some(args.prefill_chunk_size),
     );
 
     let server_port = if server {

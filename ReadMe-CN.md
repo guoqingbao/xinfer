@@ -441,6 +441,7 @@ xinfer --m unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF \
 | `--pd-url` | PD 连接 URL（`tcp://`、`http://`、`file://`） |
 | `--disable-prefix-cache` | 禁用前缀缓存 |
 | `--prefix-cache-max-tokens` | 前缀缓存大小上限 |
+| `--prefill-chunk-size` | 预填充分块大小 (默认: CUDA 8K, Metal: 4k) |
 | `--disable-cuda-graph` | 禁用 CUDA 图捕获 |
 | `--yarn-scaling-factor` | YARN RoPE 上下文扩展因子 |
 | `--temperature` | 采样温度（0–1） |

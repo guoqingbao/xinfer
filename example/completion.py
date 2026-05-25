@@ -61,6 +61,7 @@ def run(args):
         kv_fraction=args.kv_fraction,
         disable_reasoning=args.disable_reasoning,
         disable_cuda_graph=args.disable_cuda_graph,
+        prefill_chunk_size=args.prefill_chunk_size,
     )
 
 
@@ -132,6 +133,7 @@ if __name__ == "__main__":
     parser.add_argument("--kv-fraction", type=float, default=None)
     parser.add_argument("--disable-reasoning", action="store_true")
     parser.add_argument("--disable-cuda-graph", action="store_true")
+    parser.add_argument("--prefill-chunk-size", type=int, default=8192)
 
     args = parser.parse_args()
     if not os.path.exists(args.w):

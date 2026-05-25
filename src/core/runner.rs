@@ -1045,11 +1045,11 @@ impl ModelRunner {
         let mut max_seqlen_q = 0;
         let mut max_seqlen_k = 0;
         let mut slot_mapping = Vec::new();
-        let CHUNK_SIZE: usize = if cfg!(feature = "cuda") { 8192 } else { 4096 };
+        let chunk_size = self.config.effective_prefill_chunk_size();
         let mut max_context_len = 0;
         for (seq_idx, seq) in seqs.iter().enumerate() {
             let seqlen = seq.len();
-            let num_tokens = std::cmp::min(CHUNK_SIZE, seqlen - seq.num_cached_tokens);
+            let num_tokens = std::cmp::min(chunk_size, seqlen - seq.num_cached_tokens);
             input_ids
                 .extend(&seq.token_ids[seq.num_cached_tokens..seq.num_cached_tokens + num_tokens]);
             positions.extend(

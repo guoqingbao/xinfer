@@ -200,7 +200,7 @@ impl Scheduler {
     pub fn schedule(&mut self) -> Result<(Vec<usize>, bool)> {
         let mut scheduled_ids = Vec::new();
         let mut num_tokens = 0;
-        let CHUNK_SIZE: usize = if cfg!(feature = "cuda") { 8192 } else { 4096 };
+        let chunk_size = self.cfg.effective_prefill_chunk_size();
 
         // PD server: Check for new incoming prefill requests
         if self.is_pd_server() {
@@ -253,7 +253,7 @@ impl Scheduler {
                 break;
             }
 
-            let effective_tokens = std::cmp::min(CHUNK_SIZE, seq.len() - seq.num_cached_tokens);
+            let effective_tokens = std::cmp::min(chunk_size, seq.len() - seq.num_cached_tokens);
 
             if self.running.len() >= max_seqs_limit
                 || scheduled_ids.len() >= std::cmp::max(self.cfg.max_num_seqs, MIN_NUM_SCHEDULED_REQS)
@@ -736,23 +736,23 @@ impl Scheduler {
         let mut remove_ids = Vec::new();
         let mut chunked_info: Vec<(usize, usize, usize)> = Vec::new(); // (seq_id, cached, remain)
         let mut chunk_finished_info: Vec<(usize, usize)> = Vec::new(); // (seq_id, total_len)
-        let CHUNK_SIZE: usize = if cfg!(feature = "cuda") { 8192 } else { 4096 };
+        let chunk_size = self.cfg.effective_prefill_chunk_size();
         for (i, id) in scheduled_ids.iter().enumerate() {
             if *id < self.running.len() {
                 let seq = &self.running[*id];
-                if seq.len() < CHUNK_SIZE || seq.num_cached_tokens + CHUNK_SIZE >= seq.len() {
+                if seq.len() < chunk_size || seq.num_cached_tokens + chunk_size >= seq.len() {
                     self.block_manager
                         .capture_mamba_prefix_state(seq, seq.len());
-                    if seq.len() > CHUNK_SIZE {
+                    if seq.len() > chunk_size {
                         chunk_finished_info.push((seq.id, seq.len()));
                     }
                     finished_seqs.push((i, seq.id));
                 } else {
                     self.block_manager
-                        .capture_mamba_prefix_state(seq, seq.num_cached_tokens + CHUNK_SIZE);
+                        .capture_mamba_prefix_state(seq, seq.num_cached_tokens + chunk_size);
                     remove_ids.push(seq.id);
                     let mut seq = seq.clone();
-                    seq.num_cached_tokens += CHUNK_SIZE;
+                    seq.num_cached_tokens += chunk_size;
                     seq.status = SequenceStatus::Waiting;
                     chunked_info.push((
                         seq.id,
