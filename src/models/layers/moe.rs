@@ -2293,22 +2293,10 @@ impl FusedMoeNvfp4 {
                 let sm = attention_rs::cuda_utils::sm_version(dev.as_cuda_device()?).unwrap_or(0)
                     as usize;
                 if sm >= 100 {
-                    let gu_n = gate_up_scales.dim(1)?;
-                    let gu_k = cfg.hidden_size;
-                    let gu_sw = attention_rs::nvfp4_linear::swizzle_nvfp4_moe_weight_scales(
-                        &gate_up_scales,
-                        num_experts,
-                        gu_n,
-                        gu_k,
-                    )?;
-                    let d_n = down_scales.dim(1)?;
-                    let d_k = moe_cfg.moe_intermediate_size;
-                    let d_sw = attention_rs::nvfp4_linear::swizzle_nvfp4_moe_weight_scales(
-                        &down_scales,
-                        num_experts,
-                        d_n,
-                        d_k,
-                    )?;
+                    let gu_sw =
+                        attention_rs::nvfp4_linear::swizzle_nvfp4_weight_scales(&gate_up_scales)?;
+                    let d_sw =
+                        attention_rs::nvfp4_linear::swizzle_nvfp4_weight_scales(&down_scales)?;
                     (Some(gu_sw), Some(d_sw))
                 } else {
                     (None, None)

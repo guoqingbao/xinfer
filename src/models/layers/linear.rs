@@ -1253,7 +1253,7 @@ impl LnNvfp4 {
                 .unwrap_or(0) as usize;
             if sm >= 100 {
                 Some(attention_rs::nvfp4_linear::swizzle_nvfp4_weight_scales(
-                    &scales, out_dim, in_dim,
+                    &scales,
                 )?)
             } else {
                 None
