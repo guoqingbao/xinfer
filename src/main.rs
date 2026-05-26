@@ -16,9 +16,15 @@ use xinfer::utils::chat_template::Message;
 use xinfer::utils::config::GenerationConfig;
 use xinfer::utils::config::{EngineConfig, SamplingParams};
 use xinfer::utils::get_dtype;
+use xinfer::utils::metrics::prometheus;
+use xinfer::utils::metrics;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Initialize Prometheus exporter FIRST - before any metrics are recorded
+    // This must be done before any metrics are recorded, otherwise they go to NOOP_RECORDER
+    let _prom_handle = prometheus::init_prometheus();
+    xinfer::log_warn!("Prometheus recorder initialized - metrics will be available at /metrics");
     // When invoked as `xinfer runner --sock ... --uuid ...`, run the GPU worker subprocess.
     let args: Vec<String> = std::env::args().collect();
     if args.len() > 1 && args[1] == "runner" {
@@ -268,7 +274,7 @@ async fn main() -> Result<()> {
     };
 
     if args.max_tokens > resolved_max_model_len {
-        log_error!(
+        xinfer::log_error!(
             "Requested max_tokens {} larger than max_model_len {}",
             args.max_tokens,
             resolved_max_model_len
@@ -495,18 +501,24 @@ async fn main() -> Result<()> {
         let decode_time_taken = all_decode_time_taken / outputs.len() as f32;
         xinfer::log_info!("--- Performance Metrics ---");
 
-        tracing::info!(
-            "⏱️ Prompt tokens: {} in {:.2}s ({:.2} tokens/s)",
-            total_prompt_tokens,
-            prompt_time_taken,
-            total_prompt_tokens as f32 / prompt_time_taken,
-        );
-        tracing::info!(
-            "⏱️ Decoded tokens: {} in {:.2}s ({:.2} tokens/s)",
-            total_decoded_tokens,
-            decode_time_taken,
-            total_decoded_tokens as f32 / decode_time_taken,
-        );
+        for output in outputs.iter() {
+            let seq_id = output.seq_id;
+            let prompt_throughput = output.prompt_length as f32 / prompt_time_taken.max(0.001);
+            metrics::record_prompt_throughput(seq_id as u64, prompt_throughput as f64);
+
+            tracing::info!(
+                "[seq_id {}] ⏱️ Prompt tokens: {} in {:.2}s ({:.2} tokens/s)",
+                seq_id, output.prompt_length, prompt_time_taken, prompt_throughput,
+            );
+
+            let decode_throughput = output.decoded_length as f32 / decode_time_taken.max(0.001);
+            metrics::record_decode_throughput(seq_id as u64, decode_throughput as f64);
+
+            tracing::info!(
+                "[seq_id {}] ⏱️ Decoded tokens: {} in {:.2}s ({:.2} tokens/s)",
+                seq_id, output.decoded_length, decode_time_taken, decode_throughput,
+            );
+        }
 
         if !interactive {
             break;

@@ -12,6 +12,7 @@ pub mod guidance;
 pub mod heartbeat;
 pub mod image;
 pub mod kvcache_allocator;
+pub mod metrics;
 pub mod logits_processor;
 pub mod progress;
 pub mod reasoning;

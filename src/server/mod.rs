@@ -35,6 +35,10 @@ use std::path::Path;
 use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
 
+// Instrumentation is always enabled - metrics are available
+use crate::utils::metrics::prometheus;
+use crate::utils::metrics;
+
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum StopSequences {
@@ -1366,6 +1370,52 @@ pub async fn run_server(
     with_ui_server: bool,
 ) -> Result<()> {
     use axum::extract::DefaultBodyLimit;
+
+    // Start metrics collection monitors
+    let metrics_interval = crate::utils::metrics::cpu::get_metrics_interval();
+    crate::log_warn!("[METRICS] Starting metrics collection at {}ms interval", metrics_interval.as_millis());
+    metrics::record_metrics_collection_interval(metrics_interval.as_millis() as u64);
+
+    // Start CPU monitoring
+    let _cpu_monitor = crate::utils::metrics::cpu::start_cpu_monitor(metrics_interval);
+    crate::log_warn!("[METRICS] CPU monitoring started");
+
+    // Start GPU monitoring if cuda feature enabled
+    #[cfg(feature = "cuda")]
+    {
+        // Initialize NVML first
+        if let Err(e) = crate::utils::metrics::nvml::init_nvml() {
+            crate::log_warn!("[METRICS] Failed to initialize NVML: {}", e);
+        } else {
+            crate::log_warn!("[METRICS] NVML initialized successfully");
+        }
+        
+        // Start GPU monitoring if NVML is now initialized
+        if crate::utils::metrics::nvml::is_initialized() {
+            let _gpu_monitor = crate::utils::metrics::nvml::start_gpu_monitor(metrics_interval);
+            crate::log_warn!("[METRICS] GPU monitoring started");
+        } else {
+            crate::log_warn!("[METRICS] GPU monitoring skipped - NVML not initialized");
+        }
+    }
+
+    // Record engine start metrics (always enabled)
+    {
+        metrics::record_engine_step_total();
+        // Note: record_sequence_added should be called with sequence_id when available
+        // For now, we record it without sequence_id as a request-level counter
+        metrics::record_sequence_added_request();
+        // Record sequence count gauge - use next_seq_id as the count (monotonically increasing)
+        // At startup, next_seq_id is 0, so count is 0
+        let seq_count = engine.read().scheduler.get_sequence_count();
+        metrics::record_sequence_count("total", seq_count as u64);
+    }
+
+    // Record server start metrics
+    {
+        metrics::record_engine_step_duration(0.0);
+    }
+
     let (has_vision, model_name, resolved_max_model_len) = {
         let e = engine.read();
         e.get_model_info()
@@ -1422,6 +1472,9 @@ pub async fn run_server(
         .allow_methods(Any)
         .allow_headers(Any);
 
+    // Note: Prometheus exporter is already initialized at the start of run_server()
+    // to ensure metrics recorded during engine setup are also captured
+
     let app = Router::new()
         .route(
             "/v1/models",
@@ -1460,6 +1513,11 @@ pub async fn run_server(
         .route("/v1/usage", get(server::get_usage))
         .route("/tokenize", post(server::tokenize))
         .route("/detokenize", post(server::detokenize))
+        // Prometheus /metrics endpoint (always available)
+        .route(
+            "/metrics",
+            get(move || async move { prometheus::render_metrics().await }),
+        )
         .layer(DefaultBodyLimit::max(100 * 1024 * 1024)) // 100MB body size limit
         .layer(cors)
         .with_state(Arc::new(server_data));
@@ -1524,9 +1582,16 @@ pub async fn run_server(
         .await
         .map_err(candle_core::Error::wrap)?;
 
+    // Record server shutdown metrics
+    {
+        metrics::record_sequence_count("shutdown", 0);
+        metrics::record_engine_step_duration(0.0);
+    }
+
     Ok(())
 }
 
+/// Axum handler for Prometheus metrics endpoint
 #[cfg(test)]
 mod tests {
     use super::*;

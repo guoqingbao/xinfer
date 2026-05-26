@@ -29,6 +29,7 @@ use crate::utils::progress::{spawn_progress_thread, ProgressLike};
 use crate::utils::{chat_template::ChatTemplate, prepare_engine_config};
 use crate::utils::{get_runner_path, init_config_tokenizer, spawn_runner};
 use crate::{log_info, log_warn};
+use crate::utils::metrics;
 use candle_core::{DType, Result};
 use colored::Colorize;
 use either::Either;
@@ -505,6 +506,7 @@ impl LLMEngine {
         Ok(engine)
     }
 
+
     fn add_request_(
         &mut self,
         params: &SamplingParams,
@@ -813,8 +815,13 @@ impl LLMEngine {
     /// Phase 1: Schedule sequences and prepare data for the forward pass.
     /// Returns (scheduled_ids, is_prefill, cloned_sequences) or None if no work.
     pub fn prepare_step(&mut self) -> Result<Option<(Vec<usize>, bool, Vec<Sequence>)>> {
+        let prepare_start = std::time::Instant::now();
         let (scheduled_ids, is_prefill) = match self.scheduler.schedule() {
-            Ok((ids, prefill)) => (ids, prefill),
+            Ok((ids, prefill)) => {
+                // Record batch size metric
+                metrics::record_engine_batch_size(ids.len());
+                (ids, prefill)
+            }
             Err(_) => (vec![], true),
         };
         if scheduled_ids.is_empty() {
@@ -835,6 +842,8 @@ impl LLMEngine {
 
         let seqs = self.scheduler.get_sequences(&scheduled_ids);
         let owned_seqs: Vec<Sequence> = seqs.iter().map(|s| (*s).clone()).collect();
+        let duration = prepare_start.elapsed().as_secs_f64();
+        metrics::record_prepare_step_duration(duration);
         Ok(Some((scheduled_ids, is_prefill, owned_seqs)))
     }
 
@@ -844,7 +853,8 @@ impl LLMEngine {
         owned_seqs: &[Sequence],
         is_prefill: bool,
     ) -> Result<Vec<u32>> {
-        match &mut *runners.write() {
+        let run_start = std::time::Instant::now();
+        let result = match &mut *runners.write() {
             RunnerType::Thread(model_runner) => {
                 let seq_refs: Vec<&Sequence> = owned_seqs.iter().collect();
                 model_runner.run(Seqs::SeqRefs(&seq_refs), is_prefill)
@@ -894,7 +904,10 @@ impl LLMEngine {
                     candle_core::bail!("No output ids received from model runners");
                 }
             }
-        }
+        };
+        let duration = run_start.elapsed().as_secs_f64();
+        metrics::record_run_forward_duration(duration);
+        result
     }
 
     /// Phase 3: Postprocess forward pass results, deliver tokens, and do maintenance.
@@ -904,6 +917,7 @@ impl LLMEngine {
         is_prefill: bool,
         output_ids: Vec<u32>,
     ) -> Result<usize> {
+        let finish_start = std::time::Instant::now();
         pub struct DecodedIds(Either<Vec<usize>, Vec<usize>>);
 
         let decoded_ids = if is_prefill {
@@ -1011,6 +1025,12 @@ impl LLMEngine {
                             .as_millis() as usize;
                         self.decode_start_times.insert(seq_id, cur_time);
                         self.decode_length.insert(seq_id, 1);
+
+                        // Record TTFT (time to first token) for this sequence
+                        // TTFT = first_token_time - request_arrival_time
+                        let ttft_ms = cur_time - s.request_arrival_time();
+                        let ttft_seconds = ttft_ms as f64 / 1000.0;
+                        metrics::record_ttft(seq_id as u64, ttft_seconds);
 
                         let time_costs = cur_time - s.created_time();
                         if time_costs / 100 > 0 && s.len() > 0 {
@@ -1127,6 +1147,9 @@ impl LLMEngine {
         if self.econfig.server_mode.unwrap_or(true) && is_running {
             self.may_print_decoding_throughput(&indices);
         }
+        let duration = finish_start.elapsed().as_secs_f64();
+        metrics::record_finish_step_duration(duration);
+        
         Ok(indices.len())
     }
 
@@ -1705,6 +1728,7 @@ impl LLMEngine {
                 }
 
                 let mut task_processed = 0;
+                let step_start = std::time::Instant::now();
 
                 // Phase 1: Schedule (engine lock held briefly)
                 let prep = {
@@ -1747,6 +1771,10 @@ impl LLMEngine {
                         }
                     }
                 }
+
+                // Record full step duration
+                let step_duration = step_start.elapsed().as_secs_f64();
+                metrics::record_engine_step_duration(step_duration);
 
                 if task_processed == 0 {
                     tokio::time::sleep(tokio::time::Duration::from_millis(if is_pd_server {
