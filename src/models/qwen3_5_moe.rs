@@ -333,6 +333,8 @@ pub struct Qwen3_5MoEForCausalLM {
     dtype: DType,
     vocab_size: usize,
     is_qvar_builder: bool,
+    /// Pre-allocated hidden state buffer for MTP speculative decoding (graph-safe).
+    pub mtp_hidden_buffer: std::sync::Mutex<Option<Tensor>>,
 }
 
 impl Qwen3_5MoEForCausalLM {
@@ -606,6 +608,7 @@ impl Qwen3_5MoEForCausalLM {
             dtype,
             vocab_size,
             is_qvar_builder,
+            mtp_hidden_buffer: std::sync::Mutex::new(None),
         })
     }
 
@@ -616,6 +619,73 @@ impl Qwen3_5MoEForCausalLM {
         } else {
             Ok(xs)
         }
+    }
+
+    pub fn take_last_hidden_for_mtp(&self) -> Option<Tensor> {
+        let guard = self.mtp_hidden_buffer.lock().ok()?;
+        let buf = guard.as_ref()?;
+        buf.get(0).ok()
+    }
+
+    pub fn preallocate_mtp_hidden_buffer(&self, max_batch_size: usize) -> Result<()> {
+        let buf = Tensor::zeros(
+            (max_batch_size, self.config.hidden_size),
+            self.dtype,
+            &self.device,
+        )?;
+        if let Ok(mut guard) = self.mtp_hidden_buffer.lock() {
+            *guard = Some(buf);
+        }
+        Ok(())
+    }
+
+    pub fn forward_with_hidden(
+        &self,
+        input_ids: &Tensor,
+        positions: &Tensor,
+        kv_caches: Option<&Vec<(Tensor, Tensor)>>,
+        input_metadata: &InputMetadata,
+        embeded_inputs: bool,
+    ) -> Result<(Tensor, Tensor)> {
+        let hidden = self.forward_inner(
+            input_ids,
+            positions,
+            kv_caches,
+            input_metadata,
+            embeded_inputs,
+            &None,
+            &None,
+            true,
+        )?;
+        let logits = if self.is_qvar_builder {
+            self.lm_head.forward(&hidden)?
+        } else {
+            self.lm_head
+                .forward(&hidden.to_dtype(self.dtype)?)?
+                .to_dtype(DType::F32)?
+        };
+        Ok((logits, hidden))
+    }
+
+    pub fn forward_lm_head(&self, hidden: &Tensor) -> Result<Tensor> {
+        if self.is_qvar_builder {
+            self.lm_head.forward(hidden)
+        } else {
+            self.lm_head
+                .forward(&hidden.to_dtype(self.dtype)?)?
+                .to_dtype(DType::F32)
+        }
+    }
+
+    pub fn forward_mamba_only(
+        &self,
+        input_ids: &Tensor,
+        positions: &Tensor,
+        kv_caches: Option<&Vec<(Tensor, Tensor)>>,
+        input_metadata: &InputMetadata,
+    ) -> Result<()> {
+        let _ = self.forward(input_ids, positions, kv_caches, input_metadata, false)?;
+        Ok(())
     }
 
     fn forward_inner(
@@ -689,12 +759,21 @@ impl Qwen3_5MoEForCausalLM {
         let xs = self.norm.forward(&xs)?;
         if return_hidden {
             xs.to_dtype(DType::F32)
-        } else if self.is_qvar_builder {
-            self.lm_head.forward(&xs)
         } else {
-            self.lm_head
-                .forward(&xs.to_dtype(self.dtype)?)?
-                .to_dtype(DType::F32)
+            if let Ok(guard) = self.mtp_hidden_buffer.lock() {
+                if let Some(buf) = guard.as_ref() {
+                    if xs.elem_count() <= buf.elem_count() {
+                        let _ = buf.copy_(&xs, 0);
+                    }
+                }
+            }
+            if self.is_qvar_builder {
+                self.lm_head.forward(&xs)
+            } else {
+                self.lm_head
+                    .forward(&xs.to_dtype(self.dtype)?)?
+                    .to_dtype(DType::F32)
+            }
         }
     }
 

@@ -194,8 +194,10 @@ pub struct Qwen3_5ForCausalLM {
     dtype: DType,
     vocab_size: usize,
     is_qvar_builder: bool,
-    /// Cached last hidden state for MTP speculative decoding
-    pub last_hidden_for_mtp: std::sync::Mutex<Option<Tensor>>,
+    /// Pre-allocated hidden state buffer for MTP speculative decoding.
+    /// Allocated outside the CUDA graph pool so copy_ into it is graph-safe.
+    /// Shape: (max_graph_bs, hidden_size), allocated on first decode forward.
+    pub mtp_hidden_buffer: std::sync::Mutex<Option<Tensor>>,
 }
 
 impl Qwen3_5ForCausalLM {
@@ -482,7 +484,7 @@ impl Qwen3_5ForCausalLM {
             dtype,
             vocab_size,
             is_qvar_builder,
-            last_hidden_for_mtp: std::sync::Mutex::new(None),
+            mtp_hidden_buffer: std::sync::Mutex::new(None),
         })
     }
 
@@ -495,9 +497,12 @@ impl Qwen3_5ForCausalLM {
         }
     }
 
-    /// Take the last cached hidden state for MTP (consumes it)
+    /// Get the last hidden state for MTP from the pre-allocated buffer.
+    /// Returns row 0 of the buffer (MTP decode always uses batch_size=1).
     pub fn take_last_hidden_for_mtp(&self) -> Option<Tensor> {
-        self.last_hidden_for_mtp.lock().ok()?.take()
+        let guard = self.mtp_hidden_buffer.lock().ok()?;
+        let buf = guard.as_ref()?;
+        buf.get(0).ok()
     }
 
     fn forward_inner(
@@ -574,9 +579,15 @@ impl Qwen3_5ForCausalLM {
         if return_hidden {
             xs.to_dtype(DType::F32)
         } else {
-            // Cache hidden state for MTP speculative decoding
-            if let Ok(mut cache) = self.last_hidden_for_mtp.lock() {
-                *cache = Some(xs.clone());
+            // Copy hidden state into the pre-allocated MTP buffer (graph-safe).
+            // copy_ is a CUDA memcpy kernel that gets captured into the graph,
+            // so the buffer is updated in-place on every graph replay.
+            if let Ok(guard) = self.mtp_hidden_buffer.lock() {
+                if let Some(buf) = guard.as_ref() {
+                    if xs.elem_count() <= buf.elem_count() {
+                        let _ = buf.copy_(&xs, 0);
+                    }
+                }
             }
             if self.is_qvar_builder {
                 self.lm_head.forward(&xs)
@@ -680,6 +691,23 @@ impl Qwen3_5ForCausalLM {
         )
     }
 
+    /// Re-run forward on accepted tokens to fix mamba/GDN recurrent state.
+    /// KV cache entries are re-written with identical values (same tokens + positions).
+    /// Uses native flash attention (flashinfer_metadata=None in input_metadata).
+    /// Replay accepted tokens through all layers to fix GDN recurrent state
+    /// after a partial MTP rejection. Runs the full forward (attention layers
+    /// must execute to produce correct hidden states for subsequent GDN layers).
+    pub fn forward_mamba_only(
+        &self,
+        input_ids: &Tensor,
+        positions: &Tensor,
+        kv_caches: Option<&Vec<(Tensor, Tensor)>>,
+        input_metadata: &InputMetadata,
+    ) -> Result<()> {
+        let _ = self.forward(input_ids, positions, kv_caches, input_metadata, false)?;
+        Ok(())
+    }
+
     /// Apply lm_head to hidden states to get logits. Used by MTP drafting.
     pub fn forward_lm_head(&self, hidden: &Tensor) -> Result<Tensor> {
         if self.is_qvar_builder {
@@ -717,6 +745,20 @@ impl Qwen3_5ForCausalLM {
 
     pub fn preallocate_mamba_cache(&self, max_num_seqs: usize) -> Result<()> {
         self.mamba_cache.write().reserve_capacity(max_num_seqs)
+    }
+
+    /// Pre-allocate the MTP hidden state buffer outside of CUDA graph capture.
+    /// Must be called before warmup_capture so the buffer lives in regular GPU memory.
+    pub fn preallocate_mtp_hidden_buffer(&self, max_batch_size: usize) -> Result<()> {
+        let buf = Tensor::zeros(
+            (max_batch_size, self.config.hidden_size),
+            self.dtype,
+            &self.device,
+        )?;
+        if let Ok(mut guard) = self.mtp_hidden_buffer.lock() {
+            *guard = Some(buf);
+        }
+        Ok(())
     }
 
     pub fn set_mamba_prefix_cache_capacity(&self, capacity: usize) {

@@ -746,6 +746,13 @@ impl Qwen3VLForConditionalGeneration {
                 input_metadata,
                 embeded_inputs,
             ),
+            Qwen3TextModel::MoE35(m) => m.forward_with_hidden(
+                input_ids,
+                positions,
+                kv_caches,
+                input_metadata,
+                embeded_inputs,
+            ),
             _ => {
                 candle_core::bail!("forward_with_hidden only supported for Qwen3.5 text models")
             }
@@ -756,6 +763,7 @@ impl Qwen3VLForConditionalGeneration {
     pub fn forward_lm_head(&self, hidden: &Tensor) -> Result<Tensor> {
         match &self.text_model {
             Qwen3TextModel::Dense35(m) => m.forward_lm_head(hidden),
+            Qwen3TextModel::MoE35(m) => m.forward_lm_head(hidden),
             _ => candle_core::bail!("forward_lm_head only supported for Qwen3.5 text models"),
         }
     }
@@ -774,7 +782,36 @@ impl Qwen3VLForConditionalGeneration {
     pub fn take_last_hidden_for_mtp(&self) -> Option<candle_core::Tensor> {
         match &self.text_model {
             Qwen3TextModel::Dense35(m) => m.take_last_hidden_for_mtp(),
+            Qwen3TextModel::MoE35(m) => m.take_last_hidden_for_mtp(),
             _ => None,
+        }
+    }
+
+    /// Pre-allocate the MTP hidden state buffer
+    pub fn preallocate_mtp_hidden_buffer(&self, max_batch_size: usize) -> Result<()> {
+        match &self.text_model {
+            Qwen3TextModel::Dense35(m) => m.preallocate_mtp_hidden_buffer(max_batch_size),
+            Qwen3TextModel::MoE35(m) => m.preallocate_mtp_hidden_buffer(max_batch_size),
+            _ => Ok(()),
+        }
+    }
+
+    /// Replay tokens through all layers to fix GDN recurrent state.
+    pub fn forward_mamba_only(
+        &self,
+        input_ids: &Tensor,
+        positions: &Tensor,
+        kv_caches: Option<&Vec<(Tensor, Tensor)>>,
+        input_metadata: &InputMetadata,
+    ) -> Result<()> {
+        match &self.text_model {
+            Qwen3TextModel::Dense35(m) => {
+                m.forward_mamba_only(input_ids, positions, kv_caches, input_metadata)
+            }
+            Qwen3TextModel::MoE35(m) => {
+                m.forward_mamba_only(input_ids, positions, kv_caches, input_metadata)
+            }
+            _ => Ok(()),
         }
     }
 }

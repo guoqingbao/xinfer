@@ -136,21 +136,29 @@ pub fn mtp_stats_avg_tokens_per_step() -> f64 {
     if steps == 0 {
         1.0
     } else {
-        (accepted + steps) as f64 / steps as f64
+        // Each step produces: 1 anchor + accepted drafts + 1 continuation
+        (accepted + 2 * steps) as f64 / steps as f64
     }
 }
 
 pub fn mtp_stats_summary() -> String {
-    let steps = MTP_TOTAL_STEPS.load(Ordering::Relaxed);
     let proposed = MTP_TOTAL_PROPOSED.load(Ordering::Relaxed);
     let accepted = MTP_TOTAL_ACCEPTED.load(Ordering::Relaxed);
+    let steps = MTP_TOTAL_STEPS.load(Ordering::Relaxed);
     format!(
-        "MTP Stats: steps={}, proposed={}, accepted={}, acceptance_rate={:.2}%, avg_tokens/step={:.2}",
-        steps,
+        "MTP Stats: proposed={}, accepted={}, acceptance_rate={:.2}%, avg_tokens/step={:.2}",
         proposed,
         accepted,
-        if proposed > 0 { accepted as f64 / proposed as f64 * 100.0 } else { 0.0 },
-        if steps > 0 { (accepted + steps) as f64 / steps as f64 } else { 1.0 },
+        if proposed > 0 {
+            accepted as f64 / proposed as f64 * 100.0
+        } else {
+            0.0
+        },
+        if steps > 0 {
+            (accepted + 2 * steps) as f64 / steps as f64
+        } else {
+            1.0
+        },
     )
 }
 
