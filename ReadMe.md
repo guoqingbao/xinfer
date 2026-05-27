@@ -16,6 +16,7 @@
 | **🌍** | Cross-platform | CUDA (Linux/Windows), Metal (macOS). Same binary, same API |
 | **🏭** | Production-ready | OpenAI/Anthropic-compatible APIs, built-in ChatGPT-style Web UI, MCP tool calling, structured outputs, embedding + tokenizer endpoints |
 | **🗜️** | Aggressive KV compression | TurboQuant (`2–4 bit` KV cache) extends context up to **4.3×** with minimal quality loss. Run `30B+` MoE models with **millions of context** on single 24/32 GB GPUs |
+| **🔥** | V100 + NVFP4 | First-ever NVFP4 + low-bit KV cache on V100 — no hardware FP4 needed, coherent output on legacy GPUs |
 | **🐍** | Lightweight Python bindings | Optional PyO3 wheel when you need a Python entry point |
 
 ---

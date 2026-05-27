@@ -168,6 +168,13 @@ footer{padding:56px 0 28px;border-top:1px solid var(--c-border);position:relativ
 .foot-links a{font-size:.84rem;color:var(--c-dim);transition:.2s}.foot-links a:hover{color:var(--c-text)}
 .foot-bot{text-align:center;font-size:.77rem;color:var(--c-dim);padding-top:20px;border-top:1px solid var(--c-border)}
 
+/* --- SCROLL NAV --- */
+.scroll-nav{position:fixed;right:20px;bottom:24px;z-index:90;display:flex;flex-direction:column;gap:6px;opacity:0;transition:opacity .3s}
+.scroll-nav.vis{opacity:1}
+.scroll-nav button{width:36px;height:36px;border-radius:8px;display:flex;align-items:center;justify-content:center;
+  background:var(--c-card);border:1px solid var(--c-border);backdrop-filter:blur(10px);color:var(--c-dim);transition:.2s}
+.scroll-nav button:hover{background:var(--c-card-h);border-color:var(--c-border-h);color:var(--c-text)}
+
 /* --- ANIM --- */
 @keyframes fu{from{opacity:0;transform:translateY(18px)}to{opacity:1;transform:translateY(0)}}
 @keyframes fi{from{opacity:0}to{opacity:1}}
@@ -253,6 +260,7 @@ footer{padding:56px 0 28px;border-top:1px solid var(--c-border);position:relativ
   </div>
 </section>
 
+
 <!-- FEATURES -->
 <section id="features">
   <div class="wrap">
@@ -266,6 +274,7 @@ footer{padding:56px 0 28px;border-top:1px solid var(--c-border);position:relativ
       <div class="fcard" data-d="210"><span class="icon">🌍</span><h3 data-i="f.4t">Cross-Platform</h3><p data-i="f.4d">CUDA on Linux, Metal on macOS. Same binary, same API everywhere.</p></div>
       <div class="fcard" data-d="280"><span class="icon">🏭</span><h3 data-i="f.5t">Production Ready</h3><p data-i="f.5d">OpenAI &amp; Anthropic APIs, built-in Web UI, MCP tool calling, structured outputs.</p></div>
       <div class="fcard" data-d="350"><span class="icon">🗜️</span><h3 data-i="f.6t">KV Compression</h3><p data-i="f.6d">TurboQuant 2–4 bit KV cache extends context up to 4.3× with minimal quality loss.</p></div>
+      <div class="fcard" data-d="420"><span class="icon">🔥</span><h3 data-i="f.7t">V100 Renaissance</h3><p data-i="f.7d">NVFP4 + TurboQuant on V100 — first-ever low-bit model + KV cache on legacy GPUs. No hardware FP4 needed.</p></div>
     </div>
   </div>
 </section>
@@ -310,6 +319,27 @@ footer{padding:56px 0 28px;border-top:1px solid var(--c-border);position:relativ
     <div class="badges rv">
       <span class="bdg">Safetensors</span><span class="bdg">GGUF</span><span class="bdg hi">FP8</span><span class="bdg hi">NVFP4</span>
       <span class="bdg">MXFP4</span><span class="bdg">GPTQ</span><span class="bdg">AWQ</span><span class="bdg">ISQ</span>
+    </div>
+  </div>
+</section>
+
+<!-- KV CACHE -->
+<section id="kv">
+  <div class="wrap">
+    <p class="label rv" data-i="k.label">KV Cache</p>
+    <h2 class="stitle rv gt" data-i="k.title">TurboQuant Compression</h2>
+    <p class="sdesc rv" data-i="k.desc">Extend context length up to 4.3× with --kvcache-dtype.</p>
+    <div class="tw rv">
+      <table>
+        <thead><tr><th data-i="k.cm">Mode (--kvcache-dtype)</th><th data-i="k.cc">Compression</th><th data-i="k.cq">Quality</th><th>GPU</th></tr></thead>
+        <tbody>
+          <tr><td>default (BF16)</td><td>1×</td><td data-i="k.q1">Baseline</td><td>All</td></tr>
+          <tr><td>fp8</td><td><strong>2×</strong></td><td data-i="k.q2">Near-lossless</td><td>SM70+ / M1+</td></tr>
+          <tr><td>turbo8</td><td><strong>2.6×</strong></td><td data-i="k.q3">High quality</td><td>SM70+ / M1+</td></tr>
+          <tr><td>turbo4</td><td><strong>3.7×</strong></td><td data-i="k.q4">Best balance</td><td>SM70+ / M1+</td></tr>
+          <tr><td>turbo3</td><td><strong>4.7×</strong></td><td data-i="k.q5">Max compression</td><td>SM70+ / M1+</td></tr>
+        </tbody>
+      </table>
     </div>
   </div>
 </section>
@@ -387,6 +417,26 @@ footer{padding:56px 0 28px;border-top:1px solid var(--c-border);position:relativ
 <span class="t-x" data-i="i.e3"># Python mode</span>
 <span class="t-c">python3</span> <span class="t-f">-m</span> <span class="t-s">xinfer.server</span> <span class="t-f">--m</span> <span class="t-s">Qwen/Qwen3.6-27B-FP8</span> <span class="t-f">--ui-server</span></pre></div>
     </div>
+    <!-- V100 BANNER -->
+    <div class="rv" id="v100-banner" style="margin-top:24px;border-radius:var(--r);background:linear-gradient(135deg,rgba(56,189,248,.05),rgba(129,140,248,.03));border:1px solid rgba(56,189,248,.15);overflow:hidden">
+      <button id="v100-toggle" style="width:100%;display:flex;align-items:center;gap:10px;padding:12px 18px;background:none;border:none;cursor:pointer;text-align:left;color:inherit">
+        <span style="font-size:.65rem;font-weight:700;padding:2px 7px;border-radius:3px;background:rgba(56,189,248,.1);color:var(--c-accent);letter-spacing:.05em" data-i="bt.new">NEW</span>
+        <span style="font-size:.84rem;color:var(--c-dim);flex:1" data-i="bt.msg">Running NVFP4 models under 4-bit KV cache on V100 — first ever.</span>
+        <svg id="v100-chevron" style="width:14px;height:14px;color:var(--c-dim);transition:transform .25s;flex-shrink:0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 9l6 6 6-6"/></svg>
+      </button>
+      <div id="v100-detail" style="max-height:0;overflow:hidden;transition:max-height .3s ease">
+        <div style="padding:0 18px 14px;display:flex;flex-direction:column;gap:8px">
+          <div class="cb" style="margin:0" data-cp="xinfer --m AxionML/Qwen3.5-4B-NVFP4 --ui-server">
+            <div class="cb-h"><div class="cb-dots"><i></i><i></i><i></i></div><span class="cb-t">V100</span><button class="cpb" data-i="cp">Copy</button></div>
+            <div class="cb-b"><pre><span class="t-g">$</span> <span class="t-c">xinfer</span> <span class="t-f">--m</span> <span class="t-s">AxionML/Qwen3.5-4B-NVFP4</span> <span class="t-f">--ui-server</span></pre></div>
+          </div>
+          <div class="cb" style="margin:0" data-cp="xinfer --m AxionML/Qwen3.5-4B-NVFP4 --kvcache-dtype turbo4 --ui-server">
+            <div class="cb-h"><div class="cb-dots"><i></i><i></i><i></i></div><span class="cb-t">V100 + turbo4</span><button class="cpb" data-i="cp">Copy</button></div>
+            <div class="cb-b"><pre><span class="t-g">$</span> <span class="t-c">xinfer</span> <span class="t-f">--m</span> <span class="t-s">AxionML/Qwen3.5-4B-NVFP4</span> <span class="t-f">--kvcache-dtype</span> <span class="t-s">turbo4</span> <span class="t-f">--ui-server</span></pre></div>
+          </div>
+        </div>
+      </div>
+    </div>
   </div>
 </section>
 
@@ -405,27 +455,6 @@ footer{padding:56px 0 28px;border-top:1px solid var(--c-border);position:relativ
     <div class="dgrid" id="dcards"></div>
     <h3 style="margin:36px 0 14px;font-size:.95rem" class="rv" data-i="d.pip">Pre-built Python Wheels (pip)</h3>
     <div class="pgrid rv" id="pgrid"></div>
-  </div>
-</section>
-
-<!-- KV CACHE -->
-<section id="kv">
-  <div class="wrap">
-    <p class="label rv" data-i="k.label">KV Cache</p>
-    <h2 class="stitle rv gt" data-i="k.title">TurboQuant Compression</h2>
-    <p class="sdesc rv" data-i="k.desc">Extend context length up to 4.3× with --kvcache-dtype.</p>
-    <div class="tw rv">
-      <table>
-        <thead><tr><th data-i="k.cm">Mode (--kvcache-dtype)</th><th data-i="k.cc">Compression</th><th data-i="k.cq">Quality</th><th>GPU</th></tr></thead>
-        <tbody>
-          <tr><td>default (BF16)</td><td>1×</td><td data-i="k.q1">Baseline</td><td>All</td></tr>
-          <tr><td>fp8</td><td><strong>2×</strong></td><td data-i="k.q2">Near-lossless</td><td>SM70+ / M1+</td></tr>
-          <tr><td>turbo8</td><td><strong>2.6×</strong></td><td data-i="k.q3">High quality</td><td>SM70+ / M1+</td></tr>
-          <tr><td>turbo4</td><td><strong>3.7×</strong></td><td data-i="k.q4">Best balance</td><td>SM70+ / M1+</td></tr>
-          <tr><td>turbo3</td><td><strong>4.7×</strong></td><td data-i="k.q5">Max compression</td><td>SM70+ / M1+</td></tr>
-        </tbody>
-      </table>
-    </div>
   </div>
 </section>
 
@@ -451,6 +480,12 @@ footer{padding:56px 0 28px;border-top:1px solid var(--c-border);position:relativ
     </div>
   </div>
 </section>
+
+<!-- SCROLL NAV -->
+<div class="scroll-nav" id="scroll-nav">
+  <button id="scroll-up" aria-label="Scroll up"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 15l-6-6-6 6"/></svg></button>
+  <button id="scroll-down" aria-label="Scroll down"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 9l6 6 6-6"/></svg></button>
+</div>
 
 <!-- FOOTER -->
 <footer>
@@ -483,6 +518,7 @@ en:{
 'hero.sub':'No PyTorch. No Python runtime. Just fast, portable, production-ready inference.',
 'hero.term':'terminal','hero.cta1':'Get Started','hero.cta2':'View on GitHub →',
 'cp':'Copy','cpd':'Copied!',
+'bt.new':'NEW','bt.msg':'Running NVFP4 models under 4-bit KV cache on V100 — first ever.',
 'f.label':'Features','f.title':'Built for Speed & Simplicity',
 'f.desc':'Everything you need for production LLM inference — without the Python baggage.',
 'f.1t':'Zero Dependencies','f.1d':'Pure Rust backend — no PyTorch, no CUDA Python bindings, no Python runtime.',
@@ -491,10 +527,11 @@ en:{
 'f.4t':'Cross-Platform','f.4d':'CUDA on Linux, Metal on macOS. Same binary, same API everywhere.',
 'f.5t':'Production Ready','f.5d':'OpenAI & Anthropic APIs, built-in Web UI, MCP tool calling, structured outputs.',
 'f.6t':'KV Compression','f.6d':'TurboQuant 2–4 bit KV cache extends context up to 4.3× with minimal quality loss.',
+'f.7t':'V100 Renaissance','f.7d':'NVFP4 + TurboQuant on V100 — first-ever low-bit model + KV cache on legacy GPUs. No hardware FP4 needed.',
 'p.label':'Performance','p.title':'Real-World Benchmarks','p.desc':'Tested on V100, A100, Hopper H800, and RTX 5090.',
 'p.m':'Model','p.fmt':'Format','p.sz':'Size','p.hw':'Hardware','p.sp':'Speed','p.note':'Note',
 'p.n1':'HW NVFP4','p.n2':'HW FP8','p.n3':'SW quant','p.n4':'SW NVFP4 (no HW)','p.n5':'SW FP4',
-'p.fn':'* HW = hardware-accelerated. Hopper (SM90) supports HW FP8 but not HW NVFP4; Blackwell (SM120) supports both. NVFP4 on Hopper uses software emulation.',
+'p.fn':'* HW = hardware-accelerated. Hopper (SM90) supports HW FP8 but not HW NVFP4; Blackwell (SM120) supports both. NVFP4 on Hopper/V100 uses software emulation.',
 'm.label':'Models','m.title':'Supported Models & Formats',
 'm.desc':'From 3B to 397B — dense, MoE, and multimodal architectures.','m.fmts':'Supported Formats',
 'i.label':'Quick Start','i.title':'Install & Run','i.desc':'Get up and running in minutes.',
@@ -520,6 +557,7 @@ cn:{
 'hero.sub':'无需 PyTorch，无需 Python 运行时，开箱即用。',
 'hero.term':'终端','hero.cta1':'快速开始','hero.cta2':'查看 GitHub →',
 'cp':'复制','cpd':'已复制!',
+'bt.new':'新','bt.msg':'V100 上运行 NVFP4 模型 + 4-bit KV 缓存 — 业内首次。',
 'f.label':'功能特性','f.title':'为速度与简洁而生',
 'f.desc':'生产级 LLM 推理所需的一切 — 无需 Python 依赖。',
 'f.1t':'零依赖','f.1d':'纯 Rust 后端 — 无需 PyTorch、CUDA Python 绑定或 Python 运行时。',
@@ -528,10 +566,11 @@ cn:{
 'f.4t':'跨平台','f.4d':'Linux 上 CUDA，macOS 上 Metal。同一二进制，同一 API。',
 'f.5t':'生产就绪','f.5d':'OpenAI/Anthropic API、内置 Web UI、MCP 工具、结构化输出。',
 'f.6t':'KV 压缩','f.6d':'TurboQuant 2–4 bit KV 缓存，上下文扩展最高 4.3 倍。',
+'f.7t':'V100 复兴','f.7d':'V100 上 NVFP4 + TurboQuant — 业界首创低位模型 + KV 缓存在旧 GPU 上运行。无需硬件 FP4 支持。',
 'p.label':'性能','p.title':'真实基准测试','p.desc':'在 V100、A100、Hopper H800 和 RTX 5090 上测试。',
 'p.m':'模型','p.fmt':'格式','p.sz':'大小','p.hw':'硬件','p.sp':'速度','p.note':'说明',
 'p.n1':'硬件 NVFP4','p.n2':'硬件 FP8','p.n3':'软件量化','p.n4':'软件 NVFP4 (无硬件加速)','p.n5':'软件 FP4',
-'p.fn':'* HW = 硬件加速。Hopper (SM90) 支持硬件 FP8 但不支持硬件 NVFP4；Blackwell (SM120) 两者均支持。Hopper 上的 NVFP4 为软件模拟。',
+'p.fn':'* HW = 硬件加速。Hopper (SM90) 支持硬件 FP8 但不支持硬件 NVFP4；Blackwell (SM120) 两者均支持。V100/Hopper 上的 NVFP4 为软件模拟。',
 'm.label':'模型','m.title':'支持的模型与格式',
 'm.desc':'从 3B 到 397B — 稠密、MoE 和多模态架构。','m.fmts':'支持的格式',
 'i.label':'快速开始','i.title':'安装与运行','i.desc':'几分钟内即可运行。',
@@ -565,6 +604,14 @@ document.getElementById('b-en').onclick=function(){setLang('en')};
 document.getElementById('b-cn').onclick=function(){setLang('cn')};
 setLang(lang);
 
+/* ═══ V100 Banner Toggle ═══ */
+var v100t=document.getElementById('v100-toggle'),v100d=document.getElementById('v100-detail'),v100c=document.getElementById('v100-chevron'),v100open=false;
+if(v100t){v100t.onclick=function(){
+  v100open=!v100open;
+  if(v100open){v100d.style.maxHeight=v100d.scrollHeight+'px';v100c.style.transform='rotate(180deg)'}
+  else{v100d.style.maxHeight='0px';v100c.style.transform='rotate(0deg)'}
+}}
+
 /* ═══ Nav scroll ═══ */
 var nv=document.getElementById('nav');
 window.addEventListener('scroll',function(){nv.classList.toggle('scrolled',window.scrollY>30)},{passive:true});
@@ -596,7 +643,7 @@ document.querySelectorAll('.cb').forEach(function(bl){
 });
 
 /* ═══ Download cards ═══ */
-var XINFER_VER='0.12.5';
+var XINFER_VER='0.12.6';
 var DL='https://github.com/guoqingbao/xinfer/releases/download/v'+XINFER_VER+'/';
 var archs=[
   {sm:'sm70',n:'70',name:'SM70',gpu:'V100',cuda:'CUDA 12',d:0},
@@ -688,6 +735,14 @@ var pio=new IntersectionObserver(function(ee){
   });
 },{threshold:.25});
 var ps=document.getElementById('perf');if(ps)pio.observe(ps);
+
+/* ═══ Scroll Nav ═══ */
+var snav=document.getElementById('scroll-nav');
+if(snav){
+  window.addEventListener('scroll',function(){snav.classList.toggle('vis',window.scrollY>200)},{passive:true});
+  document.getElementById('scroll-up').onclick=function(){window.scrollBy({top:-window.innerHeight,behavior:'smooth'})};
+  document.getElementById('scroll-down').onclick=function(){window.scrollBy({top:window.innerHeight,behavior:'smooth'})};
+}
 
 /* ═══ Particles ═══ */
 var cv=document.createElement('canvas');

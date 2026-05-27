@@ -16,6 +16,7 @@
 | **🌍** | 跨平台 | CUDA（Linux/Windows）、Metal（macOS），统一二进制，统一 API |
 | **🏭** | 生产就绪 | OpenAI/Anthropic 兼容 API、内置 ChatGPT 风格 Web UI、MCP 工具调用、结构化输出、Embedding + 分词器端点 |
 | **🗜️** | 极致 KV 压缩 | TurboQuant（`2–4 位` KV 缓存）以极小的质量损失将上下文扩展至 **4.3 倍**。单卡 24/32 GB GPU 即可运行 `30B+` MoE 模型并支持**百万级上下文** |
+| **🔥** | V100 + NVFP4 | 业界首创：V100 上运行 NVFP4 + 低位 KV 缓存推理 — 无需硬件 FP4，旧 GPU 重获新生 |
 | **🐍** | 轻量 Python 绑定 | 需要 Python 入口时可选 PyO3 wheel 包 |
 
 ---
