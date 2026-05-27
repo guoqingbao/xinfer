@@ -76,6 +76,12 @@ impl GLM4DecoderLayer {
         .cloned()
         .collect();
 
+        let norm_dtype = if config.higher_precision_required() {
+            DType::F32
+        } else {
+            dtype
+        };
+
         let input_layernorm = rms_norm(
             config.hidden_size,
             config.rms_norm_eps,
@@ -84,7 +90,7 @@ impl GLM4DecoderLayer {
             } else {
                 vb.pp("input_layernorm").clone()
             },
-            dtype,
+            norm_dtype,
             false,
         )?;
 
@@ -96,7 +102,7 @@ impl GLM4DecoderLayer {
             } else {
                 vb.pp("post_attention_layernorm").clone()
             },
-            dtype,
+            norm_dtype,
             false,
         )?;
 
@@ -108,7 +114,7 @@ impl GLM4DecoderLayer {
             } else {
                 vb.pp("post_self_attn_layernorm").clone()
             },
-            dtype,
+            norm_dtype,
             false,
         )?;
 
@@ -120,7 +126,7 @@ impl GLM4DecoderLayer {
             } else {
                 vb.pp("post_mlp_layernorm").clone()
             },
-            dtype,
+            norm_dtype,
             false,
         )?;
 
@@ -242,6 +248,11 @@ impl GLM4ForCausalLM {
             reporter.write().set_progress(i + 1);
         }
 
+        let norm_dtype = if config.higher_precision_required() {
+            DType::F32
+        } else {
+            dtype
+        };
         let norm = rms_norm(
             config.hidden_size,
             config.rms_norm_eps,
@@ -250,7 +261,7 @@ impl GLM4ForCausalLM {
             } else {
                 vb.pp("model.norm")
             },
-            dtype,
+            norm_dtype,
             false,
         )?;
 

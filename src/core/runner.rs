@@ -682,6 +682,40 @@ impl ModelRunner {
             );
         }
 
+        #[cfg(feature = "cuda")]
+        if dtype == DType::F16 {
+            let sm = device
+                .as_cuda_device()
+                .ok()
+                .and_then(|d| attention_rs::cuda_utils::sm_version(d))
+                .unwrap_or(0);
+            if sm >= 80 {
+                let will_use_native_flash = {
+                    #[cfg(feature = "flashinfer")]
+                    {
+                        skip_flashinfer_init
+                    }
+                    #[cfg(all(feature = "flashattn", not(feature = "flashinfer")))]
+                    {
+                        config.kvcache_dtype.is_turboquant()
+                            || (config.kvcache_dtype.is_fp8_keys() && sm != 90)
+                    }
+                    #[cfg(not(any(feature = "flashinfer", feature = "flashattn")))]
+                    {
+                        true
+                    }
+                };
+                if will_use_native_flash {
+                    candle_core::bail!(
+                        "F16 dtype is not supported with native flash attention on SM80+ (detected SM{}). \
+                         Native flash kernels on SM80+ are compiled for BF16 only. \
+                         Use --dtype bf16 (default), or build with flashinfer/flashattn features which support F16.",
+                        sm
+                    );
+                }
+            }
+        }
+
         Ok(Self {
             model,
             gpu_kv_cache: Arc::new(Mutex::new(gpu_kv_cache)),

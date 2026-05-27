@@ -121,6 +121,7 @@ impl LLMEngine {
         let (mut econfig, use_runner) =
             prepare_engine_config(econfig, &config, &config_tokenizer, &mut generation_cfg);
         config.kvcache_dtype = econfig.kvcache_dtype;
+        config.is_f16_mode = dtype == DType::F16;
 
         // In case config file missing bos and eos configuration
         config.apply_generation_cfg(generation_cfg.as_ref());

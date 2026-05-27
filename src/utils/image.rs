@@ -679,6 +679,7 @@ mod tests {
             quantization_config: None,
             is_multi_model: None,
             extra_config_json,
+            is_f16_mode: false,
         }
     }
 

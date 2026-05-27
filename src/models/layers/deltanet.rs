@@ -61,6 +61,7 @@ pub struct GatedDeltaNet {
     gdn_layer_idx: usize,
     rms_norm_eps: f64,
     scale: f64,
+    kernel_dtype: DType,
 }
 
 impl GatedDeltaNet {
@@ -172,7 +173,7 @@ impl GatedDeltaNet {
                 value_dim_global,
                 projection_key_map["in_proj_z"],
                 comm.clone(),
-                dtype,
+                DType::F32,
                 |w| {
                     undo_tiled_v_heads_first_dim(
                         &w,
@@ -204,7 +205,7 @@ impl GatedDeltaNet {
                 num_v_heads_global,
                 projection_key_map["in_proj_b"],
                 comm.clone(),
-                dtype,
+                DType::F32,
                 |w| undo_tiled_v_heads_first_dim(&w, num_k_heads_global, num_v_heads_global, 1),
             )
         } else {
@@ -228,7 +229,7 @@ impl GatedDeltaNet {
                 num_v_heads_global,
                 projection_key_map["in_proj_a"],
                 comm.clone(),
-                dtype,
+                DType::F32,
                 |w| undo_tiled_v_heads_first_dim(&w, num_k_heads_global, num_v_heads_global, 1),
             )
         } else {
@@ -262,7 +263,7 @@ impl GatedDeltaNet {
                             head_v_dim,
                             projection_key_map["in_proj_qkv"],
                             comm.clone(),
-                            dtype,
+                            DType::F32,
                         )
                     } else {
                         let vb_qkv = vb.pp(projection_key_map["in_proj_qkv"]);
@@ -311,7 +312,7 @@ impl GatedDeltaNet {
                         key_dim_global * 2 + value_dim_global,
                         projection_key_map["in_proj_qkv"],
                         comm.clone(),
-                        dtype,
+                        DType::F32,
                         |w| {
                             restore_qwen35_qkv_weight(
                                 &w,
@@ -489,7 +490,7 @@ impl GatedDeltaNet {
         }
 
         let is_quantized = config.quantization_config.is_some();
-        let kernel_dtype = if vb.is_qvar_builder() {
+        let kernel_dtype = if vb.is_qvar_builder() || config.is_f16_mode {
             DType::F32
         } else {
             dtype
@@ -617,7 +618,7 @@ impl GatedDeltaNet {
                 hidden_size,
                 gdn_key_map["out_proj"],
                 comm.clone(),
-                dtype,
+                DType::F32,
                 |w| {
                     undo_tiled_v_heads_last_dim(
                         &w,
@@ -667,6 +668,7 @@ impl GatedDeltaNet {
             )
             .ok();
         let scale = 1.0f64 / (head_k_dim as f64).sqrt();
+
         Ok(Self {
             projection,
             out_proj,
@@ -686,6 +688,7 @@ impl GatedDeltaNet {
             gdn_layer_idx,
             rms_norm_eps: config.rms_norm_eps,
             scale,
+            kernel_dtype,
         })
     }
 
@@ -700,9 +703,29 @@ impl GatedDeltaNet {
         if slot_count == 0 {
             candle_core::bail!("Linear attention requires non-empty sequence slots");
         }
+        let original_dtype = xs.dtype();
+
+        // For GGUF (qvar_builder), input is already F32 — project in F32.
+        // For quantized models (FP8/NVFP4), projections need the model dtype (F16/BF16),
+        // so we project first, THEN convert to kernel_dtype for GDN core ops.
         let (token_count, _hidden) = xs.dims2()?;
         let is_prefill = input_metadata.is_prefill;
         let (q, k, v, z, b, a) = self.project_inputs(xs)?;
+
+        // Convert projection outputs to kernel_dtype for GDN core (conv1d, gating, recurrence).
+        // For GGUF and F16 mode, kernel_dtype is F32 to avoid precision loss.
+        let (q, k, v, z, b, a) = if q.dtype() != self.kernel_dtype {
+            (
+                q.to_dtype(self.kernel_dtype)?,
+                k.to_dtype(self.kernel_dtype)?,
+                v.to_dtype(self.kernel_dtype)?,
+                z.to_dtype(self.kernel_dtype)?,
+                b.to_dtype(self.kernel_dtype)?,
+                a.to_dtype(self.kernel_dtype)?,
+            )
+        } else {
+            (q, k, v, z, b, a)
+        };
         let mixed_qkv = Tensor::cat(&[&q, &k, &v], 1)?;
 
         let (kv_conv, prefill_conv_state) = if is_prefill {
@@ -815,7 +838,8 @@ impl GatedDeltaNet {
             self.head_v_dim,
         )?;
 
-        // Output projection
-        self.out_proj.forward(&gated_output.to_dtype(xs.dtype())?)
+        // Output projection — cast back to the caller's original dtype
+        self.out_proj
+            .forward(&gated_output.to_dtype(original_dtype)?)
     }
 }

@@ -301,6 +301,8 @@ pub struct Config {
     pub quantization_config: Option<QuantConfig>,
     pub is_multi_model: Option<bool>,
     pub extra_config_json: Option<String>,
+    #[serde(default)]
+    pub is_f16_mode: bool,
 }
 
 impl Config {
@@ -322,7 +324,8 @@ impl Config {
     }
 
     pub fn higher_precision_required(&self) -> bool {
-        self.quant.is_some()
+        self.is_f16_mode
+            || self.quant.is_some()
             || self
                 .quantization_config
                 .as_ref()

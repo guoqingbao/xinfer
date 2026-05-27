@@ -316,6 +316,7 @@ pub struct FusedMoe {
     all_reduce: AllReduce,
     world_size: usize,
     dtype: DType,
+    gate_dtype: DType,
 }
 
 impl FusedMoe {
@@ -497,6 +498,11 @@ This usually means packed down_proj / gate_up_proj layout was interpreted incorr
             cfg.quantization_config.is_none(),
             "Invalid quantization format!"
         );
+        let gate_dtype = if cfg.higher_precision_required() {
+            DType::F32
+        } else {
+            dtype
+        };
         let gate = linear_no_bias(
             cfg.hidden_size,
             num_experts,
@@ -504,7 +510,7 @@ This usually means packed down_proj / gate_up_proj layout was interpreted incorr
             Shard::default(),
             &None,
             &None,
-            dtype,
+            gate_dtype,
         )?;
 
         let (gate_w, up_w, down_w) = Self::load_packed(cfg, experts_vb, comm.clone())?;
@@ -525,11 +531,17 @@ This usually means packed down_proj / gate_up_proj layout was interpreted incorr
             all_reduce: AllReduce::new(comm),
             world_size,
             dtype,
+            gate_dtype,
         })
     }
 
     pub fn forward(&self, xs: &Tensor, is_prefill: bool) -> Result<Tensor> {
-        let router_logits = self.gate.forward(&xs)?.to_dtype(DType::F32)?;
+        let gate_input = if xs.dtype() != self.gate_dtype {
+            std::borrow::Cow::Owned(xs.to_dtype(self.gate_dtype)?)
+        } else {
+            std::borrow::Cow::Borrowed(xs)
+        };
+        let router_logits = self.gate.forward(&gate_input)?.to_dtype(DType::F32)?;
         let (topk_weights, topk_ids) = self.routing.route(&router_logits, is_prefill)?;
 
         self.forward_with_routing(xs, topk_weights, topk_ids, is_prefill)
@@ -1239,6 +1251,7 @@ pub struct FusedMoeFp8 {
     world_size: usize,
     dtype: DType,
     block_size: Vec<usize>,
+    gate_dtype: DType,
 }
 
 impl FusedMoeFp8 {
@@ -1282,6 +1295,11 @@ impl FusedMoeFp8 {
         let by = block_size[0]; // for scale_n
         let bx = block_size[1]; // for scale_k
 
+        let gate_dtype = if cfg.higher_precision_required() {
+            DType::F32
+        } else {
+            dtype
+        };
         let gate = linear_no_bias(
             cfg.hidden_size,
             num_experts,
@@ -1289,7 +1307,7 @@ impl FusedMoeFp8 {
             Shard::default(),
             &None,
             &None,
-            dtype,
+            gate_dtype,
         )?;
 
         let (
@@ -1499,12 +1517,18 @@ impl FusedMoeFp8 {
             world_size: comm.world_size(),
             dtype,
             block_size: vec![by, bx],
+            gate_dtype,
         })
     }
 
     pub fn forward(&self, xs: &Tensor, is_prefill: bool) -> Result<Tensor> {
         let (num_tokens, hidden_dim) = xs.dims2()?;
-        let router_logits = self.gate.forward(&xs)?.to_dtype(DType::F32)?;
+        let gate_input = if xs.dtype() != self.gate_dtype {
+            std::borrow::Cow::Owned(xs.to_dtype(self.gate_dtype)?)
+        } else {
+            std::borrow::Cow::Borrowed(xs)
+        };
+        let router_logits = self.gate.forward(&gate_input)?.to_dtype(DType::F32)?;
         let (topk_weights, topk_ids) = self.routing.route(&router_logits, is_prefill)?;
 
         let xs = if xs.dtype() == DType::F32 {
@@ -1565,6 +1589,7 @@ pub struct FusedMoeMxfp4 {
     all_reduce: AllReduce,
     world_size: usize,
     dtype: DType,
+    gate_dtype: DType,
 }
 
 impl FusedMoeMxfp4 {
@@ -1599,6 +1624,11 @@ impl FusedMoeMxfp4 {
         let moe_cfg = cfg.moe_cfg.as_ref().expect("MoE config is not available!");
         let num_experts = moe_cfg.num_experts.unwrap();
 
+        let gate_dtype = if cfg.higher_precision_required() {
+            DType::F32
+        } else {
+            dtype
+        };
         let gate = linear_no_bias(
             cfg.hidden_size,
             num_experts,
@@ -1606,7 +1636,7 @@ impl FusedMoeMxfp4 {
             Shard::default(),
             &cfg.quantization_config,
             &None,
-            dtype,
+            gate_dtype,
         )?;
 
         let mut gate_blocks_vec = Vec::new();
@@ -1711,12 +1741,18 @@ impl FusedMoeMxfp4 {
             all_reduce: AllReduce::new(comm.clone()),
             world_size: comm.world_size(),
             dtype,
+            gate_dtype,
         })
     }
 
     pub fn forward(&self, xs: &Tensor, is_prefill: bool) -> Result<Tensor> {
         let (num_tokens, hidden_dim) = xs.dims2()?;
-        let router_logits = self.gate.forward(xs)?.to_dtype(DType::F32)?;
+        let gate_input = if xs.dtype() != self.gate_dtype {
+            std::borrow::Cow::Owned(xs.to_dtype(self.gate_dtype)?)
+        } else {
+            std::borrow::Cow::Borrowed(xs)
+        };
+        let router_logits = self.gate.forward(&gate_input)?.to_dtype(DType::F32)?;
         let (topk_weights, topk_ids) = self.routing.route(&router_logits, is_prefill)?;
 
         let xs = if xs.dtype() == DType::F32 {
@@ -1775,6 +1811,7 @@ pub struct FusedMoeNvfp4 {
     world_size: usize,
     dtype: DType,
     apply_router_weight_on_input: bool,
+    gate_dtype: DType,
 }
 
 impl FusedMoeNvfp4 {
@@ -1852,6 +1889,11 @@ impl FusedMoeNvfp4 {
         let moe_cfg = cfg.moe_cfg.as_ref().expect("MoE config is not available!");
         let num_experts = moe_cfg.num_experts.unwrap();
 
+        let gate_dtype = if cfg.higher_precision_required() {
+            DType::F32
+        } else {
+            dtype
+        };
         let gate = linear_no_bias(
             cfg.hidden_size,
             num_experts,
@@ -1859,7 +1901,7 @@ impl FusedMoeNvfp4 {
             Shard::default(),
             &cfg.quantization_config,
             &None,
-            dtype,
+            gate_dtype,
         )?;
 
         Self::load_experts(
@@ -1871,6 +1913,7 @@ impl FusedMoeNvfp4 {
             comm,
             dtype,
             None,
+            gate_dtype,
         )
     }
 
@@ -1895,6 +1938,11 @@ impl FusedMoeNvfp4 {
         let moe_cfg = cfg.moe_cfg.as_ref().expect("MoE config is not available!");
         let num_experts = moe_cfg.num_experts.unwrap();
 
+        let gate_dtype = if cfg.higher_precision_required() {
+            DType::F32
+        } else {
+            dtype
+        };
         let gate = linear_no_bias(
             cfg.hidden_size,
             num_experts,
@@ -1902,7 +1950,7 @@ impl FusedMoeNvfp4 {
             Shard::default(),
             &None,
             &None,
-            dtype,
+            gate_dtype,
         )?;
 
         let bias = bias_vb.and_then(|bvb| try_load_e_score_correction_bias(bvb, num_experts));
@@ -1915,6 +1963,7 @@ impl FusedMoeNvfp4 {
             comm,
             dtype,
             bias,
+            gate_dtype,
         )
     }
 
@@ -1927,6 +1976,7 @@ impl FusedMoeNvfp4 {
         comm: Rc<Comm>,
         dtype: DType,
         bias: Option<Tensor>,
+        gate_dtype: DType,
     ) -> Result<Self> {
         let mut gate_blocks_vec = Vec::new();
         let mut gate_scales_vec = Vec::new();
@@ -2326,6 +2376,7 @@ impl FusedMoeNvfp4 {
             world_size: comm.world_size(),
             dtype,
             apply_router_weight_on_input: false,
+            gate_dtype,
         })
     }
 
@@ -2338,7 +2389,12 @@ impl FusedMoeNvfp4 {
     }
 
     pub fn forward(&self, xs: &Tensor, is_prefill: bool) -> Result<Tensor> {
-        let router_logits = self.gate.forward(xs)?.to_dtype(DType::F32)?;
+        let gate_input = if xs.dtype() != self.gate_dtype {
+            std::borrow::Cow::Owned(xs.to_dtype(self.gate_dtype)?)
+        } else {
+            std::borrow::Cow::Borrowed(xs)
+        };
+        let router_logits = self.gate.forward(&gate_input)?.to_dtype(DType::F32)?;
         let (topk_weights, topk_ids) = self.routing.route(&router_logits, is_prefill)?;
 
         self.forward_with_routing(xs, topk_weights, topk_ids, is_prefill)

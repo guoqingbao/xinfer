@@ -529,12 +529,15 @@ impl Attention {
             dtype,
         )?;
 
-        let norm_dtype =
-            if is_qvar_builder || config.quant.is_some() || config.quantization_config.is_some() {
-                DType::F32
-            } else {
-                dtype
-            };
+        let norm_dtype = if is_qvar_builder
+            || config.quant.is_some()
+            || config.quantization_config.is_some()
+            || config.is_f16_mode
+        {
+            DType::F32
+        } else {
+            dtype
+        };
         let q_norm_vb = if is_qvar_builder {
             vb.pp(key_map["q_norm"])
         } else {

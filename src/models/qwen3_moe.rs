@@ -210,6 +210,12 @@ impl Qwen3DecoderLayer {
         .cloned()
         .collect();
 
+        let norm_dtype = if config.higher_precision_required() {
+            DType::F32
+        } else {
+            dtype
+        };
+
         let input_layernorm = rms_norm(
             config.hidden_size,
             config.rms_norm_eps,
@@ -218,7 +224,7 @@ impl Qwen3DecoderLayer {
             } else {
                 vb.pp("input_layernorm").clone()
             },
-            dtype,
+            norm_dtype,
             false,
         )?;
 
@@ -230,7 +236,7 @@ impl Qwen3DecoderLayer {
             } else {
                 vb.pp("post_attention_layernorm").clone()
             },
-            dtype,
+            norm_dtype,
             false,
         )?;
 
@@ -405,6 +411,11 @@ impl Qwen3MoEForCausalLM {
             reporter.write().set_progress(i + 1);
         }
 
+        let norm_dtype = if config.higher_precision_required() {
+            DType::F32
+        } else {
+            dtype
+        };
         let norm = rms_norm(
             config.hidden_size,
             config.rms_norm_eps,
@@ -413,7 +424,7 @@ impl Qwen3MoEForCausalLM {
             } else {
                 vb.pp(&format!("{}norm", prefix))
             },
-            dtype,
+            norm_dtype,
             false,
         )?;
 

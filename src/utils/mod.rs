@@ -349,7 +349,7 @@ pub fn config_from_gguf<R: std::io::Seek + std::io::Read>(
             .map(|v| v.to_owned())
     };
 
-    let mod_cfg = if arch == "gemma4" {
+    let moe_cfg = if arch == "gemma4" {
         let expert_count = md_get(format!("{arch}.expert_count").as_str())
             .and_then(|v| v.to_u32())
             .ok()
@@ -524,7 +524,7 @@ pub fn config_from_gguf<R: std::io::Seek + std::io::Read>(
             .and_then(|v| v.to_f64())
             .ok();
 
-        let enable_moe = mod_cfg.is_some();
+        let enable_moe = moe_cfg.is_some();
 
         let num_global_kv_heads = md_get(format!("{arch}.attention.head_count_kv").as_str())
             .ok()
@@ -615,11 +615,12 @@ pub fn config_from_gguf<R: std::io::Seek + std::io::Read>(
         hidden_act: candle_nn::Activation::Silu,
         rope_scaling,
         quant: None,
-        moe_cfg: mod_cfg,
+        moe_cfg,
         kvcache_dtype: crate::utils::config::KvCacheDtype::Auto,
         quantization_config: None,
         is_multi_model: None,
         extra_config_json,
+        is_f16_mode: false,
     };
 
     if arch == "gemma4" || arch == "gemma3" {
@@ -2277,6 +2278,7 @@ mod tests {
             quantization_config: None,
             is_multi_model: Some(true),
             extra_config_json: Some(extra_config_json.to_string()),
+            is_f16_mode: false,
         }
     }
 

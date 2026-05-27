@@ -72,8 +72,6 @@ pub struct Qwen3_5MoEDecoderLayer {
     input_layernorm: NormX,
     post_attention_layernorm: NormX,
     rotary_emb: Option<Arc<ScalingRotaryEmbedding>>,
-    dtype: DType,
-    is_qvar_builder: bool,
 }
 
 impl Qwen3_5MoEDecoderLayer {
@@ -212,7 +210,11 @@ impl Qwen3_5MoEDecoderLayer {
             (None, None)
         };
 
-        let norm_dtype = if is_qvar_builder { DType::F32 } else { dtype };
+        let norm_dtype = if is_qvar_builder || config.higher_precision_required() {
+            DType::F32
+        } else {
+            dtype
+        };
         let input_layernorm = rms_norm(
             config.hidden_size,
             config.rms_norm_eps,
@@ -251,8 +253,6 @@ impl Qwen3_5MoEDecoderLayer {
             input_layernorm,
             post_attention_layernorm,
             rotary_emb: rotary,
-            dtype,
-            is_qvar_builder,
         })
     }
 
@@ -282,19 +282,7 @@ impl Qwen3_5MoEDecoderLayer {
                 )?
             }
             Qwen3_5MoEAttnType::LinearAttention(gdn) => {
-                if self.is_qvar_builder {
-                    gdn.forward(&xs, mamba_cache, input_metadata, seq_slots)?
-                } else if xs.dtype() != self.dtype {
-                    gdn.forward(
-                        &xs.to_dtype(self.dtype)?,
-                        mamba_cache,
-                        input_metadata,
-                        seq_slots,
-                    )?
-                    .to_dtype(xs.dtype())?
-                } else {
-                    gdn.forward(&xs, mamba_cache, input_metadata, seq_slots)?
-                }
+                gdn.forward(&xs, mamba_cache, input_metadata, seq_slots)?
             }
         };
 
@@ -521,7 +509,11 @@ impl Qwen3_5MoEForCausalLM {
 
         let num_gdn_layers = gdn_layer_idx;
 
-        let norm_dtype = if is_qvar_builder { DType::F32 } else { dtype };
+        let norm_dtype = if is_qvar_builder || config.higher_precision_required() {
+            DType::F32
+        } else {
+            dtype
+        };
         let norm = rms_norm(
             config.hidden_size,
             config.rms_norm_eps,
@@ -576,7 +568,11 @@ impl Qwen3_5MoEForCausalLM {
         // Start small and let runner preallocate to the final engine capacity.
         let max_batch_size = 1;
 
-        let conv_cache_dtype = if is_qvar_builder { DType::F32 } else { dtype };
+        let conv_cache_dtype = if is_qvar_builder || config.is_f16_mode {
+            DType::F32
+        } else {
+            dtype
+        };
         let mamba_cache = if num_gdn_layers > 0 {
             MambaCache::new(
                 num_gdn_layers,
