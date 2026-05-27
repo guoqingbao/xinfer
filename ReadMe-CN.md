@@ -164,6 +164,9 @@ xinfer --m Qwen/Qwen3.6-35B-A3B-FP8 --kvcache-dtype fp8
 # 27B Dense + turbo4
 xinfer --m Qwen/Qwen3.6-27B-FP8 --kvcache-dtype turbo4
 
+# 26B Gemma4 (本地模型, 使用`--kv-fraction`选项增加kvcache占用)
+xinfer --w /data/gemma-4-26B-A4B-it --ui-server --port 9000 --kv-fraction 0.8
+
 # 30B MoE GGUF + turbo4
 xinfer --m unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF \
   --f Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf --kvcache-dtype turbo4

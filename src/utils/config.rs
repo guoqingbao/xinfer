@@ -303,6 +303,10 @@ pub struct Config {
     pub extra_config_json: Option<String>,
     #[serde(default)]
     pub is_f16_mode: bool,
+    #[serde(default)]
+    pub mtp_num_hidden_layers: Option<usize>,
+    #[serde(default)]
+    pub mtp_use_dedicated_embeddings: Option<bool>,
 }
 
 impl fmt::Debug for Config {
@@ -429,6 +433,10 @@ pub struct EngineConfig {
     pub master_addr: Option<String>,
     #[serde(default = "default_master_port")]
     pub master_port: u16,
+    /// MTP (Multi-Token Prediction) speculative decoding: number of draft tokens per step.
+    /// None means MTP is disabled.
+    #[serde(default)]
+    pub mtp_num_speculative_tokens: Option<usize>,
 }
 
 fn default_num_nodes() -> usize {
@@ -533,6 +541,8 @@ pub struct EngineConfig {
     #[pyo3(get, set)]
     #[serde(default = "default_master_port")]
     pub master_port: u16,
+    #[serde(default)]
+    pub mtp_num_speculative_tokens: Option<usize>,
 }
 
 impl EngineConfig {
@@ -645,7 +655,13 @@ impl EngineConfig {
             node_rank,
             master_addr,
             master_port,
+            mtp_num_speculative_tokens: None,
         }
+    }
+
+    pub fn with_mtp(mut self, mtp_tokens: Option<usize>) -> Self {
+        self.mtp_num_speculative_tokens = mtp_tokens;
+        self
     }
 }
 

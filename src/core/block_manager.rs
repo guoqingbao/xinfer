@@ -145,6 +145,13 @@ impl BlockManager {
         }
     }
 
+    /// Allocate a single free block and return its ID, or None if no blocks available.
+    pub fn alloc_free_block(&mut self) -> Option<usize> {
+        let block_id = self.free_block_ids.pop_front()?;
+        self.allocate_block(block_id);
+        Some(block_id)
+    }
+
     fn image_prefix_seed(images: &ImageData) -> u64 {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         images.raw.hash(&mut hasher);

@@ -1039,6 +1039,12 @@ pub struct Args {
     /// Master node port for multi-node NCCL bootstrap and forward-pass coordination.
     #[arg(long, default_value_t = 29500)]
     pub master_port: u16,
+
+    /// Enable MTP (Multi-Token Prediction) speculative decoding.
+    /// Specifies the number of speculative draft tokens per step (e.g. 3-7).
+    /// The model must have MTP heads (e.g. Qwen3.5, DeepSeek-V3).
+    #[arg(long, default_value = None)]
+    pub mtp: Option<usize>,
 }
 
 impl Args {

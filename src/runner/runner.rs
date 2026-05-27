@@ -281,6 +281,26 @@ pub fn run_runner() -> anyhow::Result<()> {
                     false,
                 )?;
             }
+            Ok(MessageType::RunDecodeMTP(sequences)) => {
+                let outputs = runner.run_mtp_decode(Seqs::DecodeVec(&sequences));
+                match outputs {
+                    Ok(multi_tokens) => {
+                        send_local(
+                            &mut vec![stream.try_clone()?],
+                            &MessageType::RunResponseMTP(multi_tokens),
+                            false,
+                        )?;
+                    }
+                    Err(e) => {
+                        xinfer::log_error!("Runner MTP decode error: {:?}", e);
+                        send_local(
+                            &mut vec![stream.try_clone()?],
+                            &MessageType::RunResponseMTP(vec![]),
+                            false,
+                        )?;
+                    }
+                }
+            }
             Ok(MessageType::RunEmbed((sequences, strategy))) => {
                 use xinfer::core::sequence::Sequence;
                 let refs: Vec<&Sequence> = sequences.iter().collect();

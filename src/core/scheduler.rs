@@ -642,6 +642,98 @@ impl Scheduler {
         }
     }
 
+    /// MTP-aware postprocess: accepts multiple tokens per sequence.
+    /// For each sequence in `ids`, `multi_output_ids[i]` contains all accepted tokens
+    /// (anchor + drafts + continuation). Each token is appended and checked for EOS/stop.
+    pub fn postprocess_multi(&mut self, ids: &[usize], multi_output_ids: &[Vec<u32>]) {
+        for (i, &idx) in ids.iter().enumerate() {
+            if idx >= self.running.len() {
+                continue;
+            }
+            let tokens = &multi_output_ids[i];
+            for &token in tokens {
+                let _seq_id = self.running[idx].id;
+
+                if self.is_pd_server() {
+                    break;
+                }
+
+                if self.running[idx].sampling_params.mcp_mode.is_some() {
+                    let is_end = self.is_tool_call_end(token, idx);
+                    if is_end {
+                        let seq = &mut self.running[idx];
+                        seq.append_token(token);
+                        seq.is_tool_call_end = true;
+                        seq.status = SequenceStatus::Finished;
+                        self.block_manager
+                            .capture_mamba_prefix_state(seq, seq.len());
+                        self.block_manager.cache_sequence(seq);
+                        self.block_manager.deallocate(seq);
+                        break;
+                    }
+                }
+
+                let matched_stop_sequence_idx =
+                    self.stop_sequence_match_index(token, &self.running[idx]);
+                let hit_stop_sequence = matched_stop_sequence_idx.is_some();
+                let seq = &mut self.running[idx];
+
+                if hit_stop_sequence
+                    || self.eos_token_id.contains(&token)
+                    || seq.output_len() >= seq.sampling_params.max_tokens.unwrap_or(16384)
+                    || seq.len() > self.cfg.max_num_batched_tokens
+                {
+                    if hit_stop_sequence {
+                        seq.hit_stop_sequence = true;
+                        seq.stop_sequence = matched_stop_sequence_idx.and_then(|stop_idx| {
+                            seq.sampling_params
+                                .stop_sequences
+                                .as_ref()
+                                .and_then(|stops| stops.get(stop_idx))
+                                .cloned()
+                        });
+                    }
+                    seq.status = SequenceStatus::Finished;
+                    self.block_manager
+                        .capture_mamba_prefix_state(seq, seq.len());
+                    self.block_manager.cache_sequence(seq);
+                    self.block_manager.deallocate(seq);
+                    break;
+                } else {
+                    seq.append_token(token);
+                    if seq.len() % self.cfg.block_size == 1 && seq.len() > 1 {
+                        let _ = self.block_manager.may_append(seq);
+                    }
+                    if seq.len() % self.cfg.block_size == 0 {
+                        self.block_manager
+                            .capture_mamba_prefix_state(seq, seq.len());
+                    }
+                }
+            }
+        }
+    }
+
+    /// Pre-allocate KV cache blocks for MTP speculative tokens.
+    /// Called before MTP runs to ensure the verification forward has room
+    /// to write KV for speculative positions.
+    pub fn pre_allocate_mtp_blocks(&mut self, ids: &[usize], extra_tokens: usize) {
+        for &idx in ids {
+            if idx >= self.running.len() {
+                continue;
+            }
+            let seq = &mut self.running[idx];
+            let needed_len = seq.len() + extra_tokens;
+            let needed_blocks = needed_len.div_ceil(self.cfg.block_size);
+            while seq.block_table.len() < needed_blocks {
+                if let Some(block_id) = self.block_manager.alloc_free_block() {
+                    seq.block_table.push(block_id as u32);
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+
     pub fn clear_finished(&mut self) {
         let is_pd_server = self.is_pd_server();
         let mut finished_counts = Vec::new();

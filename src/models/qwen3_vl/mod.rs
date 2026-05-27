@@ -728,4 +728,53 @@ impl Qwen3VLForConditionalGeneration {
             _ => Ok(()),
         }
     }
+
+    /// Forward pass that returns both logits and hidden states (for MTP drafting).
+    pub fn forward_with_hidden(
+        &self,
+        input_ids: &Tensor,
+        positions: &Tensor,
+        kv_caches: Option<&Vec<(Tensor, Tensor)>>,
+        input_metadata: &InputMetadata,
+        embeded_inputs: bool,
+    ) -> Result<(Tensor, Tensor)> {
+        match &self.text_model {
+            Qwen3TextModel::Dense35(m) => m.forward_with_hidden(
+                input_ids,
+                positions,
+                kv_caches,
+                input_metadata,
+                embeded_inputs,
+            ),
+            _ => {
+                candle_core::bail!("forward_with_hidden only supported for Qwen3.5 text models")
+            }
+        }
+    }
+
+    /// Apply lm_head to hidden states (for MTP drafting).
+    pub fn forward_lm_head(&self, hidden: &Tensor) -> Result<Tensor> {
+        match &self.text_model {
+            Qwen3TextModel::Dense35(m) => m.forward_lm_head(hidden),
+            _ => candle_core::bail!("forward_lm_head only supported for Qwen3.5 text models"),
+        }
+    }
+
+    /// Get token embedding for a single token (for MTP drafting).
+    pub fn embed_forward(&self, input_ids: &Tensor) -> Result<Tensor> {
+        match &self.text_model {
+            Qwen3TextModel::Dense35(m) => m.embed_forward(input_ids),
+            Qwen3TextModel::MoE35(m) => m.embed_forward(input_ids),
+            Qwen3TextModel::Dense(m) => m.embed_forward(input_ids),
+            Qwen3TextModel::MoE(m) => m.embed_forward(input_ids),
+        }
+    }
+
+    /// Take the cached last hidden state for MTP
+    pub fn take_last_hidden_for_mtp(&self) -> Option<candle_core::Tensor> {
+        match &self.text_model {
+            Qwen3TextModel::Dense35(m) => m.take_last_hidden_for_mtp(),
+            _ => None,
+        }
+    }
 }

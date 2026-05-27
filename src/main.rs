@@ -246,7 +246,8 @@ async fn main() -> Result<()> {
         args.node_rank,
         args.master_addr.clone(),
         args.master_port,
-    );
+    )
+    .with_mtp(args.mtp);
 
     // Multi-node worker nodes run a daemon loop instead of the full engine
     if econfig.num_nodes > 1 && econfig.node_rank > 0 {

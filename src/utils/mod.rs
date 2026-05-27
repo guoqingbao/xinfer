@@ -641,6 +641,8 @@ pub fn config_from_gguf<R: std::io::Seek + std::io::Read>(
         is_multi_model: None,
         extra_config_json,
         is_f16_mode: false,
+        mtp_num_hidden_layers: None,
+        mtp_use_dedicated_embeddings: None,
     };
 
     if arch == "gemma4" || arch == "gemma3" {

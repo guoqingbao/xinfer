@@ -848,6 +848,89 @@ impl Attention {
         };
         self.o_proj.forward(&y)
     }
+
+    /// Optimized single-token attention without KV cache or paged attention.
+    /// For seq_len=1, self-attention is trivially: softmax([1x1]) * V = V.
+    /// We still compute Q/K/V projections and apply RoPE for correctness of
+    /// the output projection, but skip the attention kernel entirely.
+    pub fn forward_single_token_no_cache(
+        &self,
+        xs: &Tensor,
+        rotary_emb: &Arc<dyn ApplyRotaryEmbedding>,
+        positions: &Tensor,
+    ) -> Result<Tensor> {
+        let (seq_len, _) = xs.dims2()?;
+
+        let (q_raw, k, v) = match &self.qkv_proj {
+            QkvProjection::Separate {
+                q_proj,
+                k_proj,
+                v_proj,
+            } => (
+                q_proj.forward(xs)?,
+                k_proj.forward(xs)?,
+                v_proj.forward(xs)?,
+            ),
+            QkvProjection::Packed(qkv_proj) => {
+                let qkv = qkv_proj.forward(xs)?;
+                (qkv[0].clone(), qkv[1].clone(), qkv[2].clone())
+            }
+        };
+
+        // Handle attn_output_gate (Qwen3.5 uses gated attention: Q proj outputs Q + gate)
+        let local_q_dim = self.num_heads * self.head_dim;
+        let (q_linear, gate) = if self.attn_output_gate {
+            let q_gate = q_raw.reshape((seq_len, self.num_heads, self.head_dim * 2))?;
+            let q = q_gate.narrow(2, 0, self.head_dim)?;
+            let gate = q_gate.narrow(2, self.head_dim, self.head_dim)?;
+            (
+                q.reshape((seq_len, local_q_dim))?,
+                Some(gate.reshape((seq_len, local_q_dim))?),
+            )
+        } else {
+            (q_raw, None)
+        };
+
+        let q = q_linear.reshape((seq_len, self.num_heads, self.head_dim))?;
+        let k = k.reshape((seq_len, self.num_kv_heads, self.head_dim))?;
+        let v = v.reshape((seq_len, self.num_kv_heads, self.head_dim))?;
+
+        // Apply rotary embeddings (needed even for single token for positional encoding)
+        let (_q, _k) = match rotary_emb.apply_rotary_emb_qkv(&q, &k, positions)? {
+            Some((q_new, k_new)) => (q_new, k_new),
+            None => (q, k),
+        };
+
+        // For seq_len=1: softmax(Q*K^T / sqrt(d)) * V = V (single element softmax = 1.0)
+        // Output shape: (seq_len, num_heads * head_dim) after GQA expansion
+        let n_rep = self.num_heads / self.num_kv_heads;
+        let y = if n_rep > 1 {
+            v.unsqueeze(2)?
+                .expand((seq_len, self.num_kv_heads, n_rep, self.head_dim))?
+                .reshape((seq_len, self.num_heads * self.head_dim))?
+        } else {
+            v.reshape((seq_len, self.num_heads * self.head_dim))?
+        };
+
+        // Apply gated attention if needed
+        let y = if let Some(gate) = gate {
+            let gate = if gate.dtype() != y.dtype() {
+                gate.to_dtype(y.dtype())?
+            } else {
+                gate
+            };
+            y.broadcast_mul(&candle_nn::ops::sigmoid(&gate)?)?
+        } else {
+            y
+        };
+
+        let y = if self.is_qvar_builder {
+            y
+        } else {
+            y.to_dtype(xs.dtype())?
+        };
+        self.o_proj.forward(&y)
+    }
 }
 
 pub struct NaiveAttention {

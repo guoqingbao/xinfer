@@ -1001,6 +1001,16 @@ impl LLMEngine {
             }
         }
 
+        // Pre-allocate blocks for MTP speculative positions before cloning sequences
+        if !is_prefill {
+            if let Some(mtp_tokens) = self.econfig.mtp_num_speculative_tokens {
+                if mtp_tokens > 0 {
+                    self.scheduler
+                        .pre_allocate_mtp_blocks(&scheduled_ids, mtp_tokens + 1);
+                }
+            }
+        }
+
         let seqs = self.scheduler.get_sequences(&scheduled_ids);
         let owned_seqs: Vec<Sequence> = seqs.iter().map(|s| (*s).clone()).collect();
         Ok(Some((scheduled_ids, is_prefill, owned_seqs)))
@@ -1123,6 +1133,194 @@ impl LLMEngine {
         } else {
             candle_core::bail!("No output ids received from model runners");
         }
+    }
+
+    /// Phase 2b: Run MTP speculative decode forward pass.
+    /// Returns Vec<Vec<u32>> where each inner vec contains all accepted tokens for that sequence.
+    pub fn run_forward_mtp(
+        runners: &Arc<RwLock<RunnerType>>,
+        owned_seqs: &[Sequence],
+    ) -> Result<Vec<Vec<u32>>> {
+        match &mut *runners.write() {
+            RunnerType::Thread(model_runner) => {
+                let seq_refs: Vec<&Sequence> = owned_seqs.iter().collect();
+                model_runner.run_mtp_decode(Seqs::SeqRefs(&seq_refs))
+            }
+            RunnerType::Process(ref mut runner_streams) => {
+                use crate::runner::{receive_local, send_local, MessageType};
+                use interprocess::TryClone;
+
+                let sequences = owned_seqs
+                    .iter()
+                    .map(|s| DecodeSequence::new(s))
+                    .collect::<Vec<_>>();
+                let request = MessageType::RunDecodeMTP(sequences);
+
+                let cloned_streams: Vec<LocalStream> = runner_streams
+                    .iter_mut()
+                    .map(|s| s.try_clone().expect("clone failed"))
+                    .collect();
+
+                if let Some(mut stream) = cloned_streams.into_iter().next() {
+                    send_local(&mut vec![stream.try_clone()?], &request, false)?;
+                    let response = receive_local(&mut stream, false)?;
+                    match response {
+                        MessageType::RunResponseMTP(multi_tokens) => {
+                            if multi_tokens.is_empty() {
+                                candle_core::bail!("MTP runner returned empty response")
+                            }
+                            Ok(multi_tokens)
+                        }
+                        other => {
+                            candle_core::bail!("Unexpected MTP response type: {:?}", other)
+                        }
+                    }
+                } else {
+                    candle_core::bail!("No runner streams available for MTP")
+                }
+            }
+            RunnerType::MultiNodeMaster {
+                ref mut local_streams,
+                ref mut remote_streams,
+            } => {
+                use crate::runner::{receive_local, send_local, MessageType};
+                use interprocess::TryClone;
+
+                let sequences = owned_seqs
+                    .iter()
+                    .map(|s| DecodeSequence::new(s))
+                    .collect::<Vec<_>>();
+                let request = MessageType::RunDecodeMTP(sequences);
+                let serialized =
+                    bincode::serialize(&request).expect("Bincode serialization failed");
+
+                for tcp_stream in remote_streams.iter_mut() {
+                    if let Err(e) = crate::utils::multi_node::send_tcp(tcp_stream, &serialized) {
+                        candle_core::bail!("Failed to send MTP forward to remote worker: {}", e);
+                    }
+                }
+
+                let cloned_streams: Vec<LocalStream> = local_streams
+                    .iter_mut()
+                    .map(|s| s.try_clone().expect("clone failed"))
+                    .collect();
+
+                let result = if let Some(mut stream) = cloned_streams.into_iter().next() {
+                    send_local(&mut vec![stream.try_clone()?], &request, false)?;
+                    let response = receive_local(&mut stream, false)?;
+                    match response {
+                        MessageType::RunResponseMTP(multi_tokens) => {
+                            if multi_tokens.is_empty() {
+                                candle_core::bail!("MTP runner returned empty response")
+                            }
+                            Ok(multi_tokens)
+                        }
+                        other => {
+                            candle_core::bail!("Unexpected MTP response type: {:?}", other)
+                        }
+                    }
+                } else {
+                    candle_core::bail!("No local runner streams available for MTP")
+                };
+
+                for tcp_stream in remote_streams.iter_mut() {
+                    let _ = crate::utils::multi_node::recv_tcp(tcp_stream);
+                }
+
+                result
+            }
+        }
+    }
+
+    /// Phase 3b: MTP-aware finish step that handles multiple tokens per sequence.
+    pub fn finish_step_mtp(
+        &mut self,
+        scheduled_ids: Vec<usize>,
+        multi_output_ids: Vec<Vec<u32>>,
+    ) -> Result<usize> {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        self.scheduler
+            .postprocess_multi(&scheduled_ids, &multi_output_ids);
+
+        let mut count = 0;
+        for (i, &idx) in scheduled_ids.iter().enumerate() {
+            let sq = self.scheduler.get_running(idx);
+            if let Some(s) = sq {
+                let seq_id = s.id;
+                let tokens = &multi_output_ids[i];
+
+                if s.is_finished() {
+                    if let Some(sender) = self.stream_senders.get_mut(&seq_id) {
+                        if let Some(request_type) = self.request_types.get(&seq_id) {
+                            let prompt_start_time = s.created_time();
+                            let decode_finish_time = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .expect("Time went backwards")
+                                .as_millis()
+                                as usize;
+                            let decode_start_time = self
+                                .decode_start_times
+                                .get(&seq_id)
+                                .copied()
+                                .unwrap_or(decode_finish_time);
+
+                            if *request_type == RequestType::Stream {
+                                for &tok in tokens {
+                                    if let Some(decoder) = self.stream_decoders.get_mut(&seq_id) {
+                                        if let Some(text) = decoder.step(tok)? {
+                                            let _ = sender.try_send(StreamItem::Token(text, tok));
+                                        }
+                                    }
+                                }
+                                let _ = sender.try_send(StreamItem::Done((
+                                    prompt_start_time,
+                                    decode_start_time,
+                                    decode_finish_time,
+                                    s.output_ids.len(),
+                                    s.stop_sequence.clone(),
+                                )));
+                            } else {
+                                let _ = sender.try_send(StreamItem::Completion((
+                                    prompt_start_time,
+                                    decode_start_time,
+                                    decode_finish_time,
+                                    s.output_ids.clone(),
+                                    s.stop_sequence.clone(),
+                                )));
+                            }
+                        }
+                    }
+                    count += 1;
+                } else {
+                    if !self.decode_start_times.contains_key(&seq_id) {
+                        let now = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .expect("Time went backwards")
+                            .as_millis() as usize;
+                        self.decode_start_times.insert(seq_id, now);
+                    }
+                    if let Some(sender) = self.stream_senders.get_mut(&seq_id) {
+                        if let Some(request_type) = self.request_types.get(&seq_id) {
+                            for &tok in tokens {
+                                if *request_type == RequestType::Stream {
+                                    if let Some(decoder) = self.stream_decoders.get_mut(&seq_id) {
+                                        if let Some(text) = decoder.step(tok)? {
+                                            let _ = sender.try_send(StreamItem::Token(text, tok));
+                                        }
+                                    }
+                                } else {
+                                    let _ = sender.try_send(StreamItem::TokenID(tok));
+                                }
+                            }
+                        }
+                    }
+                    count += 1;
+                }
+            }
+        }
+        self.check_canceled(None);
+        Ok(count)
     }
 
     /// Phase 3: Postprocess forward pass results, deliver tokens, and do maintenance.
@@ -1994,11 +2192,13 @@ impl LLMEngine {
     pub fn start_engine(engine: Arc<RwLock<Self>>) {
         GLOBAL_RT.spawn(async move {
             let engine = engine.clone();
-            let (is_pd_server, runners) = {
+            let (is_pd_server, runners, mtp_enabled) = {
                 let guard = engine.read();
+                let has_mtp = guard.econfig.mtp_num_speculative_tokens.is_some();
                 (
                     guard.is_pd_mode() && guard.is_pd_server(),
                     guard.runners.clone(),
+                    has_mtp,
                 )
             };
             loop {
@@ -2031,26 +2231,54 @@ impl LLMEngine {
                 // Engine lock released -- server can accept new requests during forward pass
 
                 if let Some((scheduled_ids, is_prefill, owned_seqs)) = prep {
-                    // Phase 2: Forward pass (only runner lock, engine lock FREE)
-                    match Self::run_forward(&runners, &owned_seqs, is_prefill) {
-                        Ok(output_ids) => {
-                            // Phase 3: Postprocess (engine lock held briefly)
-                            let mut guard = engine.write();
-                            match guard.finish_step(scheduled_ids, is_prefill, output_ids) {
-                                Ok(n) => task_processed = n,
-                                Err(e) => {
-                                    crate::log_error!("[Engine Loop] Finish error: {:?}", e);
-                                    if !guard.cancel_all_with_reason(Some(e.to_string())) {
-                                        std::process::exit(1);
+                    // Use MTP for decode steps when enabled (batch_size=1 only for now)
+                    if mtp_enabled && !is_prefill && owned_seqs.len() == 1 {
+                        match Self::run_forward_mtp(&runners, &owned_seqs) {
+                            Ok(multi_output_ids) => {
+                                let mut guard = engine.write();
+                                match guard.finish_step_mtp(scheduled_ids, multi_output_ids) {
+                                    Ok(n) => task_processed = n,
+                                    Err(e) => {
+                                        crate::log_error!(
+                                            "[Engine Loop] MTP Finish error: {:?}",
+                                            e
+                                        );
+                                        if !guard.cancel_all_with_reason(Some(e.to_string())) {
+                                            std::process::exit(1);
+                                        }
                                     }
                                 }
                             }
+                            Err(e) => {
+                                crate::log_error!("[Engine Loop] MTP Forward error: {:?}", e);
+                                let mut guard = engine.write();
+                                if !guard.cancel_all_with_reason(Some(e.to_string())) {
+                                    std::process::exit(1);
+                                }
+                            }
                         }
-                        Err(e) => {
-                            crate::log_error!("[Engine Loop] Forward error: {:?}", e);
-                            let mut guard = engine.write();
-                            if !guard.cancel_all_with_reason(Some(e.to_string())) {
-                                std::process::exit(1);
+                    } else {
+                        // Phase 2: Standard forward pass (only runner lock, engine lock FREE)
+                        match Self::run_forward(&runners, &owned_seqs, is_prefill) {
+                            Ok(output_ids) => {
+                                // Phase 3: Postprocess (engine lock held briefly)
+                                let mut guard = engine.write();
+                                match guard.finish_step(scheduled_ids, is_prefill, output_ids) {
+                                    Ok(n) => task_processed = n,
+                                    Err(e) => {
+                                        crate::log_error!("[Engine Loop] Finish error: {:?}", e);
+                                        if !guard.cancel_all_with_reason(Some(e.to_string())) {
+                                            std::process::exit(1);
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                crate::log_error!("[Engine Loop] Forward error: {:?}", e);
+                                let mut guard = engine.write();
+                                if !guard.cancel_all_with_reason(Some(e.to_string())) {
+                                    std::process::exit(1);
+                                }
                             }
                         }
                     }
