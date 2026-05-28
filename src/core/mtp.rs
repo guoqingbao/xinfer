@@ -38,12 +38,13 @@ pub struct MtpVerifyResult {
 
 /// Verify draft tokens against target model logits (greedy / argmax).
 ///
+/// Uses a single batched argmax over all rows + vectorized comparison on GPU,
+/// then transfers results to CPU in one shot.
+///
 /// `verify_logits`: shape [N+1, vocab_size] where N = len(draft_tokens).
 ///   - Position 0 predicts draft_tokens[0]
 ///   - Position i predicts draft_tokens[i] (for i < N)
 ///   - Position N provides the continuation token after last accepted draft
-///
-/// Returns the verification result with accepted tokens and continuation.
 pub fn verify_draft_greedy(
     verify_logits: &Tensor,
     draft_tokens: &[u32],
@@ -68,37 +69,27 @@ pub fn verify_draft_greedy(
         });
     }
 
-    let mut accepted_tokens = Vec::with_capacity(num_proposed);
+    // Keep verifier argmax aligned with the normal sampler path, which promotes
+    // logits to F32 before selecting tokens.
+    let verify_logits = verify_logits.to_dtype(candle_core::DType::F32)?;
+    let all_target_tokens = verify_logits.argmax(D::Minus1)?;
+    let target_vec: Vec<u32> = all_target_tokens.to_vec1()?;
 
-    for (i, &draft_token) in draft_tokens.iter().enumerate() {
-        if i >= num_positions {
-            break;
-        }
-        let row_logits = verify_logits.get(i)?;
-        let target_token = row_logits.argmax(D::Minus1)?.to_scalar::<u32>()?;
-
-        if target_token == draft_token {
-            accepted_tokens.push(draft_token);
+    let compare_len = num_proposed.min(num_positions);
+    let mut num_accepted = 0;
+    for i in 0..compare_len {
+        if target_vec[i] == draft_tokens[i] {
+            num_accepted += 1;
         } else {
-            return Ok(MtpVerifyResult {
-                accepted_tokens,
-                continuation_token: target_token,
-                num_accepted: i,
-                num_proposed,
-            });
+            break;
         }
     }
 
-    let num_accepted = accepted_tokens.len();
-    let continuation_idx = num_accepted.min(num_positions - 1);
-    let continuation_logits = verify_logits.get(continuation_idx)?;
+    let accepted_tokens = draft_tokens[..num_accepted].to_vec();
     let continuation_token = if num_accepted < num_positions {
-        verify_logits
-            .get(num_accepted)?
-            .argmax(D::Minus1)?
-            .to_scalar::<u32>()?
+        target_vec[num_accepted]
     } else {
-        continuation_logits.argmax(D::Minus1)?.to_scalar::<u32>()?
+        target_vec[num_positions - 1]
     };
 
     Ok(MtpVerifyResult {

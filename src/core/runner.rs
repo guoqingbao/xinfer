@@ -155,7 +155,6 @@ struct MtpSeqInfo {
 impl ModelRunner {
     // Mamba slots track concurrent sequence states (not KV token blocks).
     const MAMBA_CACHE_FIXED_CAPACITY: usize = 64;
-    const MTP_MAMBA_SNAPSHOT_TAG: u64 = 0x4d54_5000_0000_0000;
     #[cfg(all(feature = "cuda", feature = "graph"))]
     const GRAPH_CAPTURE_MIN_BATCH: usize = 16;
 
@@ -166,8 +165,72 @@ impl ModelRunner {
         )
     }
 
-    fn mtp_mamba_snapshot_hash(seq_id: usize) -> u64 {
-        Self::MTP_MAMBA_SNAPSHOT_TAG ^ seq_id as u64
+    fn compute_slot_mappings(
+        &self,
+        seq_info: &MtpSeqInfo,
+        num_tokens: usize,
+        block_size: usize,
+        ctx: &str,
+    ) -> Result<Vec<i64>> {
+        let mut slots = Vec::with_capacity(num_tokens);
+        for i in 0..num_tokens {
+            let pos = seq_info.len + i;
+            let block_idx = pos / block_size;
+            let block_offset = pos % block_size;
+            if block_idx < seq_info.block_table.len() {
+                let physical_block = seq_info.block_table[block_idx] as i64;
+                slots.push(physical_block * block_size as i64 + block_offset as i64);
+            } else {
+                candle_core::bail!(
+                    "MTP {} missing KV block: block_idx {} >= block_table.len() {}. \
+                     Blocks must be pre-allocated before MTP.",
+                    ctx,
+                    block_idx,
+                    seq_info.block_table.len()
+                );
+            }
+        }
+        Ok(slots)
+    }
+
+    fn build_mtp_metadata(
+        &self,
+        seq_info: &MtpSeqInfo,
+        slot_mappings: &[i64],
+        q_len: usize,
+    ) -> Result<InputMetadata> {
+        let total_kv_len = (seq_info.len + q_len) as u32;
+        let mamba_slot_mapping =
+            self.prepare_mamba_slot_mapping(&[seq_info.id], false)?;
+        Ok(InputMetadata {
+            is_prefill: true,
+            is_mla: self.is_mla_model(),
+            sequence_ids: Some(vec![seq_info.id]),
+            mamba_slot_mapping,
+            slot_mapping: Tensor::from_vec(slot_mappings.to_vec(), (q_len,), &self.device)?,
+            context_lens: Some(Tensor::from_vec(vec![total_kv_len], (1,), &self.device)?),
+            block_tables: Some(Tensor::from_vec(
+                seq_info.block_table.clone(),
+                (1, seq_info.block_table.len()),
+                &self.device,
+            )?),
+            seqlens: None,
+            cu_seqlens_q: Some(Tensor::from_vec(
+                vec![0u32, q_len as u32],
+                (2,),
+                &self.device,
+            )?),
+            cu_seqlens_k: Some(Tensor::from_vec(
+                vec![0u32, total_kv_len],
+                (2,),
+                &self.device,
+            )?),
+            max_seqlen_q: q_len,
+            max_seqlen_k: seq_info.len + q_len,
+            max_context_len: seq_info.len + q_len,
+            flashinfer_metadata: None,
+            is_mtp_verify: true,
+        })
     }
 
     fn prepare_mamba_slot_mapping(
@@ -752,45 +815,60 @@ impl ModelRunner {
             }
         }
 
-        // MTP head initialization: load if model has MTP layers and user enabled MTP
-        let (mtp_head, mtp_num_speculative) =
-            if let Some(num_spec) = econfig.mtp_num_speculative_tokens {
-                if config.mtp_num_hidden_layers.unwrap_or(0) > 0
-                    && matches!(
-                        model_type,
-                        ModelType::Qwen3_5 | ModelType::Qwen3_5MoE | ModelType::Qwen3VL
-                    )
-                {
-                    match crate::models::qwen3_5_mtp::Qwen3_5MtpHead::new(
-                        vb,
-                        comm.clone(),
-                        config,
-                        dtype,
-                        is_rope_i,
-                        &device,
-                    ) {
-                        Ok(head) => {
-                            crate::log_info!(
-                                "MTP head loaded: {} speculative tokens per step",
-                                num_spec
-                            );
-                            (Some(Arc::new(head)), num_spec)
-                        }
-                        Err(e) => {
-                            crate::log_warn!("Failed to load MTP head: {}. MTP disabled.", e);
-                            (None, 0)
-                        }
+        let (mtp_head, mtp_num_speculative) = if let Some(num_spec) =
+            econfig.mtp_num_speculative_tokens
+        {
+            let is_mtp_model_type = matches!(
+                model_type,
+                ModelType::Qwen3_5 | ModelType::Qwen3_5MoE | ModelType::Qwen3VL
+            );
+            let has_mtp_config = config.mtp_num_hidden_layers.unwrap_or(0) > 0;
+            let has_mtp_weights = vb.pp("mtp").has_key("fc.weight")
+                || vb.pp("mtp").has_key("layers.0.mlp.gate_proj.weight")
+                || vb.pp("mtp").has_key("layers.0.mlp.gate.weight");
+
+            if is_mtp_model_type && has_mtp_config && has_mtp_weights {
+                match crate::models::qwen3_5_mtp::Qwen3_5MtpHead::new(
+                    vb,
+                    comm.clone(),
+                    config,
+                    dtype,
+                    is_rope_i,
+                    &device,
+                ) {
+                    Ok(head) => {
+                        crate::log_info!(
+                            "MTP head loaded: {} speculative tokens per step",
+                            num_spec
+                        );
+                        (Some(Arc::new(head)), num_spec)
                     }
-                } else {
-                    crate::log_warn!(
-                        "MTP requested but model has no MTP layers (mtp_num_hidden_layers={})",
+                    Err(e) => {
+                        crate::log_warn!("Failed to load MTP head: {}. MTP disabled.", e);
+                        (None, 0)
+                    }
+                }
+            } else if !is_mtp_model_type {
+                crate::log_info!(
+                    "MTP requested but model type {:?} does not support MTP. MTP disabled.",
+                    model_type
+                );
+                (None, 0)
+            } else if !has_mtp_weights {
+                crate::log_info!(
+                    "MTP requested but model weights do not contain MTP layers. MTP disabled."
+                );
+                (None, 0)
+            } else {
+                crate::log_info!(
+                        "MTP requested but model config has no MTP layers (mtp_num_hidden_layers={}). MTP disabled.",
                         config.mtp_num_hidden_layers.unwrap_or(0)
                     );
-                    (None, 0)
-                }
-            } else {
                 (None, 0)
-            };
+            }
+        } else {
+            (None, 0)
+        };
 
         Ok(Self {
             model,
@@ -936,6 +1014,15 @@ impl ModelRunner {
             Model::Qwen3_5MoE(model) => Ok(model.remove_mamba_prefix_state(hash)),
             Model::Qwen3VL(model) => Ok(model.remove_mamba_prefix_state(hash)),
             _ => Ok(true),
+        }
+    }
+
+    fn mtp_rollback_mamba(&self, seq_id: usize, keep_tokens: usize) -> Result<bool> {
+        match &self.model {
+            Model::Qwen3_5(m) => m.mtp_rollback_mamba(seq_id, keep_tokens),
+            Model::Qwen3_5MoE(m) => m.mtp_rollback_mamba(seq_id, keep_tokens),
+            Model::Qwen3VL(m) => m.mtp_rollback_mamba(seq_id, keep_tokens),
+            _ => Ok(false),
         }
     }
 
@@ -1257,7 +1344,7 @@ impl ModelRunner {
     ///   2. Sample anchor token from logits
     ///   3. MTP head drafts K tokens autoregressively (no KV cache)
     ///   4. Verify: run main model on [anchor, draft_0, ..., draft_{K-1}] using native flash
-    ///   5. On partial rejection: restore mamba state + replay accepted prefix (mamba-only commit)
+    ///   5. On partial rejection: roll back GDN state to the accepted token boundary
     ///   6. Greedy-accept matching prefix; take bonus token at first mismatch
     pub fn run_mtp_decode(&self, seqs: Seqs) -> Result<Vec<Vec<u32>>> {
         let mtp_head = match &self.mtp_head {
@@ -1304,16 +1391,15 @@ impl ModelRunner {
         // Step 1: Main model decode for logits + hidden state.
         let (anchor_token, seq_hidden) = self.mtp_decode_step1(seqs, seq_info)?;
 
-        // Step 2: Draft K tokens using MTP head
-        let device = self.device.clone();
-        let embed_fn = |token: u32| -> Result<Tensor> {
-            let token_tensor = Tensor::from_vec(vec![token], (1,), &device)?;
-            match &self.model {
-                Model::Qwen3_5(m) => m.embed_forward(&token_tensor),
-                Model::Qwen3_5MoE(m) => m.embed_forward(&token_tensor),
-                Model::Qwen3VL(m) => m.embed_forward(&token_tensor),
-                _ => unreachable!(),
-            }
+        // Step 2: Draft K tokens using MTP head (GPU-resident, no per-step CPU sync)
+        let embed_weight = match &self.model {
+            Model::Qwen3_5(m) => m.embed_weight().clone(),
+            Model::Qwen3_5MoE(m) => m.embed_weight().clone(),
+            Model::Qwen3VL(m) => m
+                .embed_weight()
+                .expect("Qwen3VL MTP requires Qwen3.5 text backbone")
+                .clone(),
+            _ => unreachable!(),
         };
         let lm_head_fn = |hidden: &Tensor| -> Result<Tensor> {
             match &self.model {
@@ -1325,11 +1411,12 @@ impl ModelRunner {
         };
 
         let base_position = seq_info.len.saturating_sub(1);
-        let (draft_tokens, _last_hidden) = mtp_head.draft_tokens(
+        let anchor_token_tensor = Tensor::from_vec(vec![anchor_token], (1,), &self.device)?;
+        let (draft_tokens, _last_hidden) = mtp_head.draft_tokens_gpu(
             &seq_hidden,
-            anchor_token,
+            &anchor_token_tensor,
             num_draft,
-            embed_fn,
+            &embed_weight,
             lm_head_fn,
             base_position,
         )?;
@@ -1338,219 +1425,108 @@ impl ModelRunner {
             return Ok(vec![vec![anchor_token]]);
         }
 
-        let snapshot_hash = Self::mtp_mamba_snapshot_hash(seq_info.id);
-        if !self.capture_mamba_prefix_state(seq_info.id, snapshot_hash, false)? {
-            candle_core::bail!(
-                "MTP requires a Qwen3.5 mamba-state snapshot for seq {}, but snapshot capture failed",
-                seq_info.id
-            );
-        }
-
-        // Step 3: Verify draft tokens using main model (prefill-style forward).
-        // Use native flash attention instead of FlashInfer to avoid expensive
-        // prefill_plan() overhead for small verify sequences (2-8 tokens).
+        // Step 3: Verify draft tokens via prefill-style forward on [anchor, draft_0..K-1].
         let mut verify_tokens = vec![anchor_token];
         verify_tokens.extend_from_slice(&draft_tokens);
         let verify_len = verify_tokens.len();
 
-        let verify_input_ids = Tensor::from_vec(verify_tokens, (verify_len,), &self.device)?;
-        let verify_positions: Vec<i64> =
-            (0..verify_len).map(|i| (seq_info.len + i) as i64).collect();
-        let verify_positions_tensor =
-            Tensor::from_vec(verify_positions, (verify_len,), &self.device)?;
-
         let block_size = self.config.block_size;
-        let mut slot_mappings = Vec::with_capacity(verify_len);
-        for i in 0..verify_len {
-            let pos = seq_info.len + i;
-            let block_idx = pos / block_size;
-            let block_offset = pos % block_size;
-            if block_idx < seq_info.block_table.len() {
-                let physical_block = seq_info.block_table[block_idx] as i64;
-                slot_mappings.push(physical_block * block_size as i64 + block_offset as i64);
-            } else {
-                candle_core::bail!(
-                    "MTP verify missing KV block: block_idx {} >= block_table.len() {}. \
-                     Blocks must be pre-allocated before MTP verification.",
-                    block_idx,
-                    seq_info.block_table.len()
-                );
-            }
-        }
+        let slot_mappings =
+            self.compute_slot_mappings(seq_info, verify_len, block_size, "verify")?;
 
-        let total_kv_len = (seq_info.len + verify_len) as u32;
+        let verify_input_ids = Tensor::from_vec(verify_tokens, (verify_len,), &self.device)?;
+        let verify_positions_tensor = Tensor::from_vec(
+            (0..verify_len)
+                .map(|i| (seq_info.len + i) as i64)
+                .collect::<Vec<_>>(),
+            (verify_len,),
+            &self.device,
+        )?;
 
-        // Native flash path: skip FlashInfer prefill_plan entirely
-        let verify_metadata = InputMetadata {
-            is_prefill: true,
-            is_mla: self.is_mla_model(),
-            sequence_ids: Some(vec![seq_info.id]),
-            mamba_slot_mapping: None,
-            slot_mapping: Tensor::from_vec(slot_mappings, (verify_len,), &self.device)?,
-            context_lens: Some(Tensor::from_vec(vec![total_kv_len], (1,), &self.device)?),
-            block_tables: Some(Tensor::from_vec(
-                seq_info.block_table.clone(),
-                (1, seq_info.block_table.len()),
-                &self.device,
-            )?),
-            seqlens: None,
-            cu_seqlens_q: Some(Tensor::from_vec(
-                vec![0u32, verify_len as u32],
-                (2,),
-                &self.device,
-            )?),
-            cu_seqlens_k: Some(Tensor::from_vec(
-                vec![0u32, total_kv_len],
-                (2,),
-                &self.device,
-            )?),
-            max_seqlen_q: verify_len,
-            max_seqlen_k: seq_info.len + verify_len,
-            max_context_len: seq_info.len + verify_len,
-            flashinfer_metadata: None,
-        };
+        let verify_metadata =
+            self.build_mtp_metadata(seq_info, &slot_mappings[..verify_len], verify_len)?;
 
         let _prefill_guard = set_linear_is_prefill(true);
-        let kv_cache = self.get_kv_cache();
-        let all_logits = match &self.model {
-            Model::Qwen3_5(model) => model.forward(
-                &verify_input_ids,
-                &verify_positions_tensor,
-                Some(&kv_cache),
-                &verify_metadata,
-                false,
-            )?,
-            Model::Qwen3_5MoE(model) => model.forward(
-                &verify_input_ids,
-                &verify_positions_tensor,
-                Some(&kv_cache),
-                &verify_metadata,
-                false,
-            )?,
-            Model::Qwen3VL(model) => model.forward(
-                &verify_input_ids,
-                &verify_positions_tensor,
-                Some(&kv_cache),
-                &verify_metadata,
-                None,
-            )?,
-            _ => unreachable!(),
-        };
-        drop(kv_cache);
 
-        let verify_result = crate::core::mtp::verify_draft_greedy(&all_logits, &draft_tokens)?;
+        #[cfg(all(feature = "cuda", feature = "graph"))]
+        let use_mtp_graph = self.capturer.is_mtp_captured(verify_len);
+        #[cfg(not(all(feature = "cuda", feature = "graph")))]
+        let use_mtp_graph = false;
+
+        let all_logits_result = if use_mtp_graph {
+            #[cfg(all(feature = "cuda", feature = "graph"))]
+            {
+                self.capturer.replay_mtp(
+                    &verify_input_ids,
+                    &verify_positions_tensor,
+                    &verify_metadata,
+                )
+            }
+            #[cfg(not(all(feature = "cuda", feature = "graph")))]
+            {
+                unreachable!()
+            }
+        } else {
+            let kv_cache = self.get_kv_cache();
+            let res = match &self.model {
+                Model::Qwen3_5(model) => model.forward(
+                    &verify_input_ids,
+                    &verify_positions_tensor,
+                    Some(&kv_cache),
+                    &verify_metadata,
+                    false,
+                ),
+                Model::Qwen3_5MoE(model) => model.forward(
+                    &verify_input_ids,
+                    &verify_positions_tensor,
+                    Some(&kv_cache),
+                    &verify_metadata,
+                    false,
+                ),
+                Model::Qwen3VL(model) => model.forward(
+                    &verify_input_ids,
+                    &verify_positions_tensor,
+                    Some(&kv_cache),
+                    &verify_metadata,
+                    None,
+                ),
+                _ => unreachable!(),
+            };
+            drop(kv_cache);
+            res
+        };
+        let all_logits = match all_logits_result {
+            Ok(logits) => logits,
+            Err(err) => {
+                return Err(err);
+            }
+        };
+
+        let verify_result = match crate::core::mtp::verify_draft_greedy(&all_logits, &draft_tokens)
+        {
+            Ok(result) => result,
+            Err(err) => {
+                return Err(err);
+            }
+        };
 
         if verify_result.num_accepted < verify_result.num_proposed {
-            let restored = self.restore_mamba_prefix_state(seq_info.id, snapshot_hash)?;
+            let commit_len = 1 + verify_result.num_accepted;
+            // KV cache does not need explicit rollback because the next decode writes
+            // the continuation token at the first rejected slot and stale later slots
+            // are outside the sequence length.
+            let restored = self.mtp_rollback_mamba(seq_info.id, commit_len)?;
             if !restored {
                 candle_core::bail!(
-                    "MTP failed to restore Qwen3.5 mamba-state snapshot for seq {}",
-                    seq_info.id
+                    "MTP failed to roll back mamba-state snapshot for seq {} to {} verified token(s)",
+                    seq_info.id,
+                    commit_len
                 );
-            }
-
-            let commit_len = 1 + verify_result.num_accepted;
-            if commit_len > 0 {
-                let mut commit_tokens = vec![anchor_token];
-                commit_tokens.extend_from_slice(&verify_result.accepted_tokens);
-
-                let commit_input_ids =
-                    Tensor::from_vec(commit_tokens, (commit_len,), &self.device)?;
-                let commit_positions: Vec<i64> =
-                    (0..commit_len).map(|i| (seq_info.len + i) as i64).collect();
-                let commit_positions_tensor =
-                    Tensor::from_vec(commit_positions, (commit_len,), &self.device)?;
-
-                let mut commit_slot_mappings = Vec::with_capacity(commit_len);
-                for i in 0..commit_len {
-                    let pos = seq_info.len + i;
-                    let block_idx = pos / block_size;
-                    let block_offset = pos % block_size;
-                    if block_idx < seq_info.block_table.len() {
-                        let physical_block = seq_info.block_table[block_idx] as i64;
-                        commit_slot_mappings
-                            .push(physical_block * block_size as i64 + block_offset as i64);
-                    } else {
-                        candle_core::bail!(
-                            "MTP commit missing KV block: block_idx {} >= block_table.len() {}",
-                            block_idx,
-                            seq_info.block_table.len()
-                        );
-                    }
-                }
-
-                let commit_total_kv_len = (seq_info.len + commit_len) as u32;
-                let commit_metadata = InputMetadata {
-                    is_prefill: true,
-                    is_mla: self.is_mla_model(),
-                    sequence_ids: Some(vec![seq_info.id]),
-                    mamba_slot_mapping: None,
-                    slot_mapping: Tensor::from_vec(
-                        commit_slot_mappings,
-                        (commit_len,),
-                        &self.device,
-                    )?,
-                    context_lens: Some(Tensor::from_vec(
-                        vec![commit_total_kv_len],
-                        (1,),
-                        &self.device,
-                    )?),
-                    block_tables: Some(Tensor::from_vec(
-                        seq_info.block_table.clone(),
-                        (1, seq_info.block_table.len()),
-                        &self.device,
-                    )?),
-                    seqlens: None,
-                    cu_seqlens_q: Some(Tensor::from_vec(
-                        vec![0u32, commit_len as u32],
-                        (2,),
-                        &self.device,
-                    )?),
-                    cu_seqlens_k: Some(Tensor::from_vec(
-                        vec![0u32, commit_total_kv_len],
-                        (2,),
-                        &self.device,
-                    )?),
-                    max_seqlen_q: commit_len,
-                    max_seqlen_k: seq_info.len + commit_len,
-                    max_context_len: seq_info.len + commit_len,
-                    flashinfer_metadata: None,
-                };
-
-                let _commit_guard = set_linear_is_prefill(true);
-                let kv_cache = self.get_kv_cache();
-                match &self.model {
-                    Model::Qwen3_5(model) => {
-                        model.forward_mamba_only(
-                            &commit_input_ids,
-                            &commit_positions_tensor,
-                            Some(&kv_cache),
-                            &commit_metadata,
-                        )?;
-                    }
-                    Model::Qwen3_5MoE(model) => {
-                        model.forward_mamba_only(
-                            &commit_input_ids,
-                            &commit_positions_tensor,
-                            Some(&kv_cache),
-                            &commit_metadata,
-                        )?;
-                    }
-                    Model::Qwen3VL(model) => {
-                        model.forward_mamba_only(
-                            &commit_input_ids,
-                            &commit_positions_tensor,
-                            Some(&kv_cache),
-                            &commit_metadata,
-                        )?;
-                    }
-                    _ => unreachable!(),
-                }
-                drop(kv_cache);
             }
         }
 
-        let mut result_tokens = vec![anchor_token];
+        let mut result_tokens = Vec::with_capacity(2 + verify_result.num_accepted);
+        result_tokens.push(anchor_token);
         result_tokens.extend_from_slice(&verify_result.accepted_tokens);
         result_tokens.push(verify_result.continuation_token);
 
@@ -1890,6 +1866,7 @@ impl ModelRunner {
             max_context_len,
             seqlens: Some(cu_seqlens_q_vec[1..].to_vec()),
             flashinfer_metadata,
+            is_mtp_verify: false,
         };
 
         Ok((input_ids, positions, input_metadata))
@@ -2039,6 +2016,7 @@ impl ModelRunner {
             max_context_len,
             seqlens: None,
             flashinfer_metadata,
+            is_mtp_verify: false,
         };
 
         Ok((input_ids, positions, input_metadata))
@@ -2268,7 +2246,7 @@ impl ModelRunner {
 
     #[cfg(all(feature = "cuda", feature = "graph"))]
     pub fn warmup_capture(&mut self) -> Result<()> {
-        let kv_cache_lock = self.gpu_kv_cache.lock().unwrap(); // no custom method call on `self`
+        let kv_cache_lock = self.gpu_kv_cache.lock().unwrap();
         self.capturer.capture(&self.device, Some(&kv_cache_lock))?;
         match &self.model {
             Model::Qwen3_5(model) => model.reset_mamba_cache()?,
@@ -2276,6 +2254,22 @@ impl ModelRunner {
             Model::Qwen3VL(model) => model.reset_mamba_cache()?,
             _ => {}
         }
+
+        if self.mtp_num_speculative > 0 {
+            crate::log_info!(
+                "Capturing MTP verify graphs for up to {} draft tokens...",
+                self.mtp_num_speculative
+            );
+            self.capturer
+                .capture_mtp(&self.device, Some(&kv_cache_lock), self.mtp_num_speculative)?;
+            match &self.model {
+                Model::Qwen3_5(model) => model.reset_mamba_cache()?,
+                Model::Qwen3_5MoE(model) => model.reset_mamba_cache()?,
+                Model::Qwen3VL(model) => model.reset_mamba_cache()?,
+                _ => {}
+            }
+        }
+
         self.restored_prefix_sequences.write().clear();
         Ok(())
     }

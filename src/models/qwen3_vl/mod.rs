@@ -721,6 +721,14 @@ impl Qwen3VLForConditionalGeneration {
         }
     }
 
+    pub fn mtp_rollback_mamba(&self, seq_id: usize, keep_tokens: usize) -> Result<bool> {
+        match &self.text_model {
+            Qwen3TextModel::Dense35(m) => m.mtp_rollback_mamba(seq_id, keep_tokens),
+            Qwen3TextModel::MoE35(m) => m.mtp_rollback_mamba(seq_id, keep_tokens),
+            _ => Ok(false),
+        }
+    }
+
     pub fn reset_mamba_cache(&self) -> Result<()> {
         match &self.text_model {
             Qwen3TextModel::Dense35(m) => m.reset_mamba_cache(),
@@ -778,6 +786,14 @@ impl Qwen3VLForConditionalGeneration {
         }
     }
 
+    pub fn embed_weight(&self) -> Option<&candle_core::Tensor> {
+        match &self.text_model {
+            Qwen3TextModel::Dense35(m) => Some(m.embed_weight()),
+            Qwen3TextModel::MoE35(m) => Some(m.embed_weight()),
+            _ => None,
+        }
+    }
+
     /// Take the cached last hidden state for MTP
     pub fn take_last_hidden_for_mtp(&self) -> Option<candle_core::Tensor> {
         match &self.text_model {
@@ -792,25 +808,6 @@ impl Qwen3VLForConditionalGeneration {
         match &self.text_model {
             Qwen3TextModel::Dense35(m) => m.preallocate_mtp_hidden_buffer(max_batch_size),
             Qwen3TextModel::MoE35(m) => m.preallocate_mtp_hidden_buffer(max_batch_size),
-            _ => Ok(()),
-        }
-    }
-
-    /// Replay tokens through all layers to fix GDN recurrent state.
-    pub fn forward_mamba_only(
-        &self,
-        input_ids: &Tensor,
-        positions: &Tensor,
-        kv_caches: Option<&Vec<(Tensor, Tensor)>>,
-        input_metadata: &InputMetadata,
-    ) -> Result<()> {
-        match &self.text_model {
-            Qwen3TextModel::Dense35(m) => {
-                m.forward_mamba_only(input_ids, positions, kv_caches, input_metadata)
-            }
-            Qwen3TextModel::MoE35(m) => {
-                m.forward_mamba_only(input_ids, positions, kv_caches, input_metadata)
-            }
             _ => Ok(()),
         }
     }

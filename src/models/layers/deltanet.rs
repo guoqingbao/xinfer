@@ -67,6 +67,8 @@ pub struct GatedDeltaNet {
     /// The model's native dtype (BF16/F16). Used for projection input and weight loading.
     /// Quantized projections (FP8/NVFP4/QLinear) handle dtype internally.
     model_dtype: DType,
+    conv_mtp_state: Tensor,
+    recurrent_mtp_state: Tensor,
 }
 
 impl GatedDeltaNet {
@@ -709,7 +711,18 @@ impl GatedDeltaNet {
             )
             .ok();
         let scale = 1.0f64 / (head_k_dim as f64).sqrt();
-
+        let d_conv = key_dim * 2 + value_dim;
+        let max_verify_tokens = 16;
+        let conv_mtp_state = Tensor::zeros(
+            (max_verify_tokens, d_conv, conv_kernel_size - 1),
+            gdn_dtype,
+            &vb.device(),
+        )?;
+        let recurrent_mtp_state = Tensor::zeros(
+            (max_verify_tokens, num_v_heads, head_k_dim, head_v_dim),
+            DType::F32,
+            &vb.device(),
+        )?;
         Ok(Self {
             projection,
             out_proj,
@@ -735,6 +748,8 @@ impl GatedDeltaNet {
             } else {
                 dtype
             },
+            conv_mtp_state,
+            recurrent_mtp_state,
         })
     }
 
@@ -755,9 +770,6 @@ impl GatedDeltaNet {
         let is_prefill = input_metadata.is_prefill;
         let (q, k, v, z, b, a) = self.project_inputs(xs)?;
 
-        // Upcast projection outputs to gdn_dtype for GDN core ops (conv1d, gating, recurrence).
-        // For GGUF/F16 mode (gdn_dtype=F32), this promotes BF16 outputs to F32.
-        // For standard BF16 models (gdn_dtype=BF16), this is a no-op.
         let (q, k, v, z, b, a) = if q.dtype() != self.gdn_dtype {
             (
                 q.to_dtype(self.gdn_dtype)?,
@@ -779,13 +791,19 @@ impl GatedDeltaNet {
                 .as_ref()
                 .expect("cu_seqlens_q must be present in prefill!");
 
+            let conv_snapshots = if input_metadata.is_mtp_verify {
+                Some(self.conv_mtp_state.narrow(0, 0, token_count)?)
+            } else {
+                None
+            };
             let out = gdn::causal_conv1d_fwd(
                 &mixed_qkv,
                 &self.conv_weight,
                 self.conv_bias.as_ref(),
                 &mut conv_state,
+                conv_snapshots.as_ref(),
                 Some(cu_seqlens),
-                true, // SiLU activation
+                true,
             )?;
             (out, Some(conv_state))
         } else {
@@ -834,6 +852,11 @@ impl GatedDeltaNet {
                 .expect("cu_seqlens_q must be present in prefill!");
 
             let global_state = mamba_cache.recurrent_state_mut(self.gdn_layer_idx);
+            let recurrent_snapshots = if input_metadata.is_mtp_verify {
+                Some(self.recurrent_mtp_state.narrow(0, 0, token_count)?)
+            } else {
+                None
+            };
 
             if self.num_k_heads != self.num_v_heads {
                 gdn::gated_delta_rule_recurrence_varlen_gqa(
@@ -858,6 +881,7 @@ impl GatedDeltaNet {
                     global_state,
                     seq_slots,
                     &cu_seqlens,
+                    recurrent_snapshots.as_ref(),
                 )?
             }
         } else {
@@ -904,5 +928,28 @@ impl GatedDeltaNet {
         } else {
             Ok(out)
         }
+    }
+
+    /// Roll back this layer's GDN state to the position after `keep_tokens` tokens
+    /// were processed during MTP verification. Indexes into the per-token snapshot
+    /// buffers written by the prefill kernels and restores the slot state.
+    pub fn rollback_mtp_verify(
+        &self,
+        mamba_cache: &mut MambaCache,
+        seq_slots: &Tensor,
+        keep_tokens: usize,
+    ) -> Result<()> {
+        if keep_tokens == 0 {
+            return Ok(());
+        }
+        let idx = keep_tokens - 1;
+
+        let conv_snapshot = self.conv_mtp_state.narrow(0, idx, 1)?;
+        mamba_cache.set_batch_conv_state(self.gdn_layer_idx, seq_slots, &conv_snapshot)?;
+
+        let rec_snapshot = self.recurrent_mtp_state.narrow(0, idx, 1)?;
+        mamba_cache.set_batch_recurrent_state(self.gdn_layer_idx, seq_slots, &rec_snapshot)?;
+
+        Ok(())
     }
 }

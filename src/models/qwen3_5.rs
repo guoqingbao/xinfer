@@ -497,6 +497,10 @@ impl Qwen3_5ForCausalLM {
         }
     }
 
+    pub fn embed_weight(&self) -> &Tensor {
+        self.embed_tokens.embeddings()
+    }
+
     /// Get the last hidden state for MTP from the pre-allocated buffer.
     /// Returns row 0 of the buffer (MTP decode always uses batch_size=1).
     pub fn take_last_hidden_for_mtp(&self) -> Option<Tensor> {
@@ -691,23 +695,6 @@ impl Qwen3_5ForCausalLM {
         )
     }
 
-    /// Re-run forward on accepted tokens to fix mamba/GDN recurrent state.
-    /// KV cache entries are re-written with identical values (same tokens + positions).
-    /// Uses native flash attention (flashinfer_metadata=None in input_metadata).
-    /// Replay accepted tokens through all layers to fix GDN recurrent state
-    /// after a partial MTP rejection. Runs the full forward (attention layers
-    /// must execute to produce correct hidden states for subsequent GDN layers).
-    pub fn forward_mamba_only(
-        &self,
-        input_ids: &Tensor,
-        positions: &Tensor,
-        kv_caches: Option<&Vec<(Tensor, Tensor)>>,
-        input_metadata: &InputMetadata,
-    ) -> Result<()> {
-        let _ = self.forward(input_ids, positions, kv_caches, input_metadata, false)?;
-        Ok(())
-    }
-
     /// Apply lm_head to hidden states to get logits. Used by MTP drafting.
     pub fn forward_lm_head(&self, hidden: &Tensor) -> Result<Tensor> {
         if self.is_qvar_builder {
@@ -789,6 +776,22 @@ impl Qwen3_5ForCausalLM {
 
     pub fn restore_mamba_prefix_state(&self, seq_id: usize, hash: u64) -> Result<bool> {
         self.mamba_cache.write().restore_prefix_state(seq_id, hash)
+    }
+
+    pub fn mtp_rollback_mamba(&self, seq_id: usize, keep_tokens: usize) -> Result<bool> {
+        let mut mamba_cache = self.mamba_cache.write();
+        let slots = mamba_cache
+            .get_slots_for_sequences(&[seq_id])?
+            .into_iter()
+            .map(|s| s as i64)
+            .collect::<Vec<_>>();
+        let seq_slots = Tensor::from_vec(slots, (1,), &self.device)?;
+        for layer in &self.layers {
+            if let Qwen3_5AttnType::LinearAttention(gdn) = &layer.attn {
+                gdn.rollback_mtp_verify(&mut mamba_cache, &seq_slots, keep_tokens)?;
+            }
+        }
+        Ok(true)
     }
 
     pub fn reset_mamba_cache(&self) -> Result<()> {

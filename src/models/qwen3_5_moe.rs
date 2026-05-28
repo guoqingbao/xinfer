@@ -621,6 +621,10 @@ impl Qwen3_5MoEForCausalLM {
         }
     }
 
+    pub fn embed_weight(&self) -> &Tensor {
+        self.embed_tokens.embeddings()
+    }
+
     pub fn take_last_hidden_for_mtp(&self) -> Option<Tensor> {
         let guard = self.mtp_hidden_buffer.lock().ok()?;
         let buf = guard.as_ref()?;
@@ -675,17 +679,6 @@ impl Qwen3_5MoEForCausalLM {
                 .forward(&hidden.to_dtype(self.dtype)?)?
                 .to_dtype(DType::F32)
         }
-    }
-
-    pub fn forward_mamba_only(
-        &self,
-        input_ids: &Tensor,
-        positions: &Tensor,
-        kv_caches: Option<&Vec<(Tensor, Tensor)>>,
-        input_metadata: &InputMetadata,
-    ) -> Result<()> {
-        let _ = self.forward(input_ids, positions, kv_caches, input_metadata, false)?;
-        Ok(())
     }
 
     fn forward_inner(
@@ -895,6 +888,23 @@ impl Qwen3_5MoEForCausalLM {
 
     pub fn restore_mamba_prefix_state(&self, seq_id: usize, hash: u64) -> Result<bool> {
         self.mamba_cache.write().restore_prefix_state(seq_id, hash)
+    }
+
+    pub fn mtp_rollback_mamba(&self, seq_id: usize, keep_tokens: usize) -> Result<bool> {
+        let mut mamba_cache = self.mamba_cache.write();
+
+        let slots = mamba_cache
+            .get_slots_for_sequences(&[seq_id])?
+            .into_iter()
+            .map(|s| s as i64)
+            .collect::<Vec<_>>();
+        let seq_slots = Tensor::from_vec(slots, (1,), &self.device)?;
+        for layer in &self.layers {
+            if let Qwen3_5MoEAttnType::LinearAttention(gdn) = &layer.attn {
+                gdn.rollback_mtp_verify(&mut mamba_cache, &seq_slots, keep_tokens)?;
+            }
+        }
+        Ok(true)
     }
 
     pub fn reset_mamba_cache(&self) -> Result<()> {

@@ -100,6 +100,9 @@ pub trait CudaGraphModule {
         embeded_inputs: bool,
     ) -> Result<Tensor>;
     fn report_graph_pool_usage(&self) -> Result<()>;
+    fn start_capture_mtp(&mut self, verify_len: usize) -> Result<()>;
+    fn end_capture_mtp(&mut self, verify_len: usize, save: bool) -> Result<()>;
+    fn replay_mtp(&self, verify_len: usize) -> Result<()>;
 }
 
 pub struct CudaGraphHandle {
@@ -136,6 +139,7 @@ where
     device: Arc<CudaDevice>,
     pub pool_handle: RwLock<Option<i64>>,
     captured_bs: Vec<usize>,
+    mtp_captured_graphs: BTreeMap<usize, CudaGraphHandle>,
 }
 
 impl<M> CudaGraphWrapper<M>
@@ -157,6 +161,7 @@ where
             device,
             pool_handle: RwLock::new(None),
             captured_bs: Vec::new(),
+            mtp_captured_graphs: BTreeMap::new(),
         }
     }
 
@@ -337,6 +342,44 @@ where
         );
         Ok(())
     }
+
+    fn start_capture_mtp(&mut self, verify_len: usize) -> Result<()> {
+        self.capturing = true;
+        self.current_bs = Some(verify_len);
+        self.sync_stream()?;
+        self.set_capture_mem_pool()?;
+        CudaGraph::begin_capture(
+            self.device.cu_stream().clone(),
+            CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED,
+        )?;
+        Ok(())
+    }
+
+    fn end_capture_mtp(&mut self, verify_len: usize, save: bool) -> Result<()> {
+        self.capturing = false;
+        self.current_bs = None;
+
+        let graph = CudaGraph::end_capture(
+            self.device.cu_stream().clone(),
+            CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH,
+        )?;
+        if save {
+            self.mtp_captured_graphs
+                .insert(verify_len, CudaGraphHandle::new(Arc::new(graph)));
+        }
+        self.sync_stream()?;
+        Ok(())
+    }
+
+    fn replay_mtp(&self, verify_len: usize) -> Result<()> {
+        if let Some(graph) = self.mtp_captured_graphs.get(&verify_len) {
+            self.sync_stream()?;
+            graph.replay()?;
+            self.sync_stream()
+        } else {
+            candle_core::bail!("MTP verify graph for len {} is not captured!", verify_len)
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -374,6 +417,18 @@ pub struct GraphCaptureVars {
     pub outputs: BTreeMap<usize, Tensor>,
 }
 
+pub struct MtpGraphCaptureVars {
+    pub input_ids: Tensor,
+    pub positions: Tensor,
+    pub mamba_slot_mapping: Tensor,
+    pub slot_mapping: Tensor,
+    pub context_lens: Tensor,
+    pub block_tables: Tensor,
+    pub cu_seqlens_q: Tensor,
+    pub cu_seqlens_k: Tensor,
+    pub outputs: BTreeMap<usize, Tensor>,
+}
+
 pub struct GraphCapturer<M: CudaGraphModule> {
     pub model: M,
     pub graph_bs: Vec<usize>,
@@ -386,6 +441,8 @@ pub struct GraphCapturer<M: CudaGraphModule> {
     #[cfg(feature = "flashinfer")]
     pub flashinfer_kv_params: Option<FlashInferKvParams>,
     pub is_mla: bool,
+    pub mtp_num_speculative: usize,
+    pub mtp_graph_vars: Option<MtpGraphCaptureVars>,
 }
 
 pub fn planned_graph_capture_batches(max_num_seqs: usize) -> Vec<usize> {
@@ -463,6 +520,8 @@ impl<M: CudaGraphModule> GraphCapturer<M> {
             #[cfg(feature = "flashinfer")]
             flashinfer_kv_params: flashinfer_kv_params.clone(),
             is_mla,
+            mtp_num_speculative: 0,
+            mtp_graph_vars: None,
         }
     }
 
@@ -599,6 +658,7 @@ impl<M: CudaGraphModule> GraphCapturer<M> {
                     max_context_len: self.max_model_len,
                     seqlens: None,
                     flashinfer_metadata,
+                    is_mtp_verify: false,
                 };
 
                 let should_capture =
@@ -792,6 +852,155 @@ impl<M: CudaGraphModule> GraphCapturer<M> {
         } else {
             candle_core::bail!("Graph is not captured!")
         }
+    }
+
+    pub fn capture_mtp(
+        &mut self,
+        device: &Device,
+        kv_caches: Option<&Vec<(Tensor, Tensor)>>,
+        mtp_num_speculative: usize,
+    ) -> Result<()> {
+        if mtp_num_speculative == 0 {
+            return Ok(());
+        }
+        self.mtp_num_speculative = mtp_num_speculative;
+
+        let max_verify_len = mtp_num_speculative + 1;
+        let max_num_blocks = (self.max_model_len + self.block_size - 1) / self.block_size;
+
+        let input_ids = Tensor::zeros((max_verify_len,), DType::U32, device)?;
+        let positions = Tensor::zeros((max_verify_len,), DType::I64, device)?;
+        let mamba_slot_mapping = Tensor::zeros((1,), DType::I64, device)?;
+        let slot_mapping = Tensor::zeros((max_verify_len,), DType::I64, device)?;
+        let context_lens = Tensor::zeros((1,), DType::U32, device)?;
+        let block_tables = Tensor::zeros((1, max_num_blocks), DType::U32, device)?;
+        let cu_seqlens_q = Tensor::zeros((2,), DType::U32, device)?;
+        let cu_seqlens_k = Tensor::zeros((2,), DType::U32, device)?;
+
+        let mut outputs = BTreeMap::<usize, Tensor>::new();
+
+        for verify_len in 2..=max_verify_len {
+            let input_ids_vl = input_ids.narrow(0, 0, verify_len)?;
+            let positions_vl = positions.narrow(0, 0, verify_len)?;
+            let slot_mapping_vl = slot_mapping.narrow(0, 0, verify_len)?;
+
+            let input_metadata = InputMetadata {
+                is_prefill: true,
+                is_mla: self.is_mla,
+                sequence_ids: Some(vec![0]),
+                mamba_slot_mapping: Some(mamba_slot_mapping.clone()),
+                slot_mapping: slot_mapping_vl,
+                block_tables: Some(block_tables.clone()),
+                context_lens: Some(context_lens.clone()),
+                cu_seqlens_q: Some(cu_seqlens_q.clone()),
+                cu_seqlens_k: Some(cu_seqlens_k.clone()),
+                max_seqlen_q: verify_len,
+                max_seqlen_k: self.max_model_len,
+                max_context_len: self.max_model_len,
+                seqlens: None,
+                flashinfer_metadata: None,
+                is_mtp_verify: true,
+            };
+
+            for is_warmup in [true, false] {
+                if !is_warmup {
+                    self.model.start_capture_mtp(verify_len)?;
+                }
+                let out = self.model.forward(
+                    &input_ids_vl,
+                    &positions_vl,
+                    kv_caches,
+                    &input_metadata,
+                    false,
+                )?;
+                if !is_warmup {
+                    self.model.end_capture_mtp(verify_len, true)?;
+                    outputs.insert(verify_len, out);
+                }
+            }
+        }
+
+        crate::log_warn!("Captured MTP verify graphs {:?}", outputs.keys());
+
+        self.mtp_graph_vars = Some(MtpGraphCaptureVars {
+            input_ids,
+            positions,
+            mamba_slot_mapping,
+            slot_mapping,
+            context_lens,
+            block_tables,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            outputs,
+        });
+        Ok(())
+    }
+
+    pub fn is_mtp_captured(&self, verify_len: usize) -> bool {
+        self.mtp_graph_vars
+            .as_ref()
+            .map_or(false, |v| v.outputs.contains_key(&verify_len))
+    }
+
+    pub fn replay_mtp(
+        &self,
+        input_ids: &Tensor,
+        positions: &Tensor,
+        input_metadata: &InputMetadata,
+    ) -> Result<Tensor> {
+        let verify_len = input_ids.dim(0)?;
+        let max_num_blocks = (self.max_model_len + self.block_size - 1) / self.block_size;
+
+        let mtp_vars = self
+            .mtp_graph_vars
+            .as_ref()
+            .ok_or_else(|| candle_core::Error::msg("MTP graphs not captured"))?;
+
+        if !mtp_vars.outputs.contains_key(&verify_len) {
+            candle_core::bail!(
+                "MTP verify graph for len {} is not captured!",
+                verify_len
+            );
+        }
+
+        mtp_vars.input_ids.zero_()?;
+        mtp_vars.input_ids.copy_(input_ids, 0)?;
+        mtp_vars.positions.zero_()?;
+        mtp_vars.positions.copy_(positions, 0)?;
+
+        if let Some(ms_mapping) = input_metadata.mamba_slot_mapping.as_ref() {
+            mtp_vars.mamba_slot_mapping.zero_()?;
+            mtp_vars.mamba_slot_mapping.copy_(ms_mapping, 0)?;
+        }
+
+        mtp_vars.slot_mapping.zero_()?;
+        mtp_vars
+            .slot_mapping
+            .copy_(&input_metadata.slot_mapping, 0)?;
+
+        if let Some(c_lens) = input_metadata.context_lens.as_ref() {
+            mtp_vars.context_lens.zero_()?;
+            mtp_vars.context_lens.copy_(c_lens, 0)?;
+        }
+
+        if let Some(b_tables) = input_metadata.block_tables.as_ref() {
+            let padded_table = b_tables
+                .pad_with_zeros(1, 0, max_num_blocks - b_tables.dim(1)?)?
+                .contiguous()?;
+            mtp_vars.block_tables.zero_()?;
+            mtp_vars.block_tables.copy_(&padded_table, 0)?;
+        }
+
+        if let Some(cu_q) = input_metadata.cu_seqlens_q.as_ref() {
+            mtp_vars.cu_seqlens_q.copy_(cu_q, 0)?;
+        }
+        if let Some(cu_k) = input_metadata.cu_seqlens_k.as_ref() {
+            mtp_vars.cu_seqlens_k.copy_(cu_k, 0)?;
+        }
+
+        self.model.replay_mtp(verify_len)?;
+
+        mtp_vars.outputs[&verify_len].contiguous()
     }
 }
 
