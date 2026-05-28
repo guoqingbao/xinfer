@@ -1531,7 +1531,7 @@ impl ModelRunner {
         result_tokens.push(verify_result.continuation_token);
 
         crate::core::mtp::mtp_stats_update(verify_result.num_proposed, verify_result.num_accepted);
-        if crate::core::mtp::MTP_TOTAL_STEPS.load(std::sync::atomic::Ordering::Relaxed) % 16 == 0 {
+        if crate::core::mtp::MTP_TOTAL_STEPS.load(std::sync::atomic::Ordering::Relaxed) % 256 == 0 {
             crate::log_info!("{}", crate::core::mtp::mtp_stats_summary());
         }
 

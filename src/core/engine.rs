@@ -1251,6 +1251,9 @@ impl LLMEngine {
                 let tokens = &multi_output_ids[i];
 
                 if s.is_finished() {
+                    let num_appended =
+                        s.output_ids.len() - self.decode_length.get(&seq_id).copied().unwrap_or(0);
+                    let tokens_to_stream = &tokens[..num_appended.min(tokens.len())];
                     if let Some(sender) = self.stream_senders.get_mut(&seq_id) {
                         if let Some(request_type) = self.request_types.get(&seq_id) {
                             let prompt_start_time = s.created_time();
@@ -1265,8 +1268,21 @@ impl LLMEngine {
                                 .copied()
                                 .unwrap_or(decode_finish_time);
 
+                            if s.is_tool_call_end {
+                                if *request_type == RequestType::Stream {
+                                    if let Some(decoder) = self.stream_decoders.get_mut(&seq_id) {
+                                        if let Some(tok) = decoder.step(s.last_token)? {
+                                            let _ = sender
+                                                .try_send(StreamItem::Token(tok, s.last_token));
+                                        }
+                                    }
+                                } else {
+                                    let _ = sender.try_send(StreamItem::TokenID(s.last_token));
+                                }
+                            }
+
                             if *request_type == RequestType::Stream {
-                                for &tok in tokens {
+                                for &tok in tokens_to_stream {
                                     if let Some(decoder) = self.stream_decoders.get_mut(&seq_id) {
                                         if let Some(text) = decoder.step(tok)? {
                                             let _ = sender.try_send(StreamItem::Token(text, tok));
@@ -1291,6 +1307,10 @@ impl LLMEngine {
                             }
                         }
                     }
+                    self.decode_start_times.remove(&seq_id);
+                    self.decode_length.remove(&seq_id);
+                    self.active_requests.remove(&seq_id);
+                    let _ = self.notify_runner_finished(seq_id);
                     count += 1;
                 } else {
                     if !self.decode_start_times.contains_key(&seq_id) {
@@ -1299,6 +1319,11 @@ impl LLMEngine {
                             .expect("Time went backwards")
                             .as_millis() as usize;
                         self.decode_start_times.insert(seq_id, now);
+                    }
+                    if let Some(length) = self.decode_length.get_mut(&seq_id) {
+                        *length = s.output_len();
+                    } else {
+                        self.decode_length.insert(seq_id, s.output_len());
                     }
                     if let Some(sender) = self.stream_senders.get_mut(&seq_id) {
                         if let Some(request_type) = self.request_types.get(&seq_id) {
@@ -1318,6 +1343,9 @@ impl LLMEngine {
                     count += 1;
                 }
             }
+        }
+        if self.econfig.server_mode.unwrap_or(true) {
+            self.may_print_decoding_throughput(&scheduled_ids);
         }
         self.check_canceled(None);
         Ok(count)
