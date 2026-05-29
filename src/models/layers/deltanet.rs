@@ -62,6 +62,9 @@ pub struct GatedDeltaNet {
     rms_norm_eps: f64,
     scale: f64,
     kernel_dtype: DType,
+    /// The dtype that projection weights were loaded in (e.g. F16/BF16).
+    /// Used to cast input before projection when norms output a different dtype (e.g. F32).
+    projection_dtype: DType,
 }
 
 impl GatedDeltaNet {
@@ -391,6 +394,14 @@ impl GatedDeltaNet {
         &self,
         xs: &Tensor,
     ) -> Result<(Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)> {
+        // When norms output F32 (is_f16_mode / higher_precision) but projection weights
+        // are in the original model dtype (F16/BF16), cast input to match weights.
+        // GGUF (QLinear) handles this internally, but unquantized Linear requires matching dtypes.
+        let xs = &if xs.dtype() != self.projection_dtype {
+            xs.to_dtype(self.projection_dtype)?
+        } else {
+            xs.clone()
+        };
         match &self.projection {
             GdnProjection::FusedQkvzBa {
                 in_proj_qkvz,
@@ -435,7 +446,6 @@ impl GatedDeltaNet {
                 let q = qkv[0].clone();
                 let k = qkv[1].clone();
                 let v = qkv[2].clone();
-                // z/b/a are projected from the original hidden states, not q/k/v chunks.
                 let z = in_proj_z.forward(xs)?;
                 let b = in_proj_b.forward(xs)?;
                 let a = in_proj_a.forward(xs)?;
@@ -492,6 +502,14 @@ impl GatedDeltaNet {
         let is_quantized = config.quantization_config.is_some();
         let kernel_dtype = if vb.is_qvar_builder() || config.is_f16_mode {
             DType::F32
+        } else {
+            dtype
+        };
+        // GGUF (QLinear) casts input to F32 internally, so any input dtype works.
+        // Quantized formats (LnFp8/LnNvfp4/LnMxfp4) and unquantized Linear both need
+        // input in the model's weight dtype (F16/BF16).
+        let projection_dtype = if vb.is_qvar_builder() {
+            kernel_dtype
         } else {
             dtype
         };
@@ -689,6 +707,7 @@ impl GatedDeltaNet {
             rms_norm_eps: config.rms_norm_eps,
             scale,
             kernel_dtype,
+            projection_dtype,
         })
     }
 
@@ -838,8 +857,14 @@ impl GatedDeltaNet {
             self.head_v_dim,
         )?;
 
-        // Output projection — cast back to the caller's original dtype
-        self.out_proj
-            .forward(&gated_output.to_dtype(original_dtype)?)
+        // Output projection — cast to projection dtype for matmul, then restore original dtype
+        let out = self
+            .out_proj
+            .forward(&gated_output.to_dtype(self.projection_dtype)?)?;
+        if out.dtype() != original_dtype {
+            out.to_dtype(original_dtype)
+        } else {
+            Ok(out)
+        }
     }
 }
