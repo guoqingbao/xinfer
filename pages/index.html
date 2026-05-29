@@ -168,13 +168,6 @@ footer{padding:56px 0 28px;border-top:1px solid var(--c-border);position:relativ
 .foot-links a{font-size:.84rem;color:var(--c-dim);transition:.2s}.foot-links a:hover{color:var(--c-text)}
 .foot-bot{text-align:center;font-size:.77rem;color:var(--c-dim);padding-top:20px;border-top:1px solid var(--c-border)}
 
-/* --- SCROLL NAV --- */
-.scroll-nav{position:fixed;right:20px;bottom:24px;z-index:90;display:flex;flex-direction:column;gap:6px;opacity:0;transition:opacity .3s}
-.scroll-nav.vis{opacity:1}
-.scroll-nav button{width:36px;height:36px;border-radius:8px;display:flex;align-items:center;justify-content:center;
-  background:var(--c-card);border:1px solid var(--c-border);backdrop-filter:blur(10px);color:var(--c-dim);transition:.2s}
-.scroll-nav button:hover{background:var(--c-card-h);border-color:var(--c-border-h);color:var(--c-text)}
-
 /* --- ANIM --- */
 @keyframes fu{from{opacity:0;transform:translateY(18px)}to{opacity:1;transform:translateY(0)}}
 @keyframes fi{from{opacity:0}to{opacity:1}}
@@ -481,12 +474,6 @@ footer{padding:56px 0 28px;border-top:1px solid var(--c-border);position:relativ
   </div>
 </section>
 
-<!-- SCROLL NAV -->
-<div class="scroll-nav" id="scroll-nav">
-  <button id="scroll-up" aria-label="Scroll up"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 15l-6-6-6 6"/></svg></button>
-  <button id="scroll-down" aria-label="Scroll down"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 9l6 6 6-6"/></svg></button>
-</div>
-
 <!-- FOOTER -->
 <footer>
   <div class="wrap">
@@ -643,7 +630,7 @@ document.querySelectorAll('.cb').forEach(function(bl){
 });
 
 /* ═══ Download cards ═══ */
-var XINFER_VER='0.12.6';
+var XINFER_VER='0.12.7';
 var DL='https://github.com/guoqingbao/xinfer/releases/download/v'+XINFER_VER+'/';
 var archs=[
   {sm:'sm70',n:'70',name:'SM70',gpu:'V100',cuda:'CUDA 12',d:0},
@@ -735,14 +722,6 @@ var pio=new IntersectionObserver(function(ee){
   });
 },{threshold:.25});
 var ps=document.getElementById('perf');if(ps)pio.observe(ps);
-
-/* ═══ Scroll Nav ═══ */
-var snav=document.getElementById('scroll-nav');
-if(snav){
-  window.addEventListener('scroll',function(){snav.classList.toggle('vis',window.scrollY>200)},{passive:true});
-  document.getElementById('scroll-up').onclick=function(){window.scrollBy({top:-window.innerHeight,behavior:'smooth'})};
-  document.getElementById('scroll-down').onclick=function(){window.scrollBy({top:window.innerHeight,behavior:'smooth'})};
-}
 
 /* ═══ Particles ═══ */
 var cv=document.createElement('canvas');
