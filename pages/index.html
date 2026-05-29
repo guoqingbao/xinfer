@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>xInfer — Blazing-fast LLM Inference in Pure Rust</title>
-<meta name="description" content="High-performance LLM inference engine in pure Rust. No PyTorch. CUDA &amp; Metal. 175+ tok/s.">
+<meta name="description" content="High-performance LLM inference engine in pure Rust. No PyTorch. CUDA &amp; Metal. 180+ tok/s.">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><text y='20' font-size='20'>⚡</text></svg>">
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
@@ -282,14 +282,14 @@ footer{padding:56px 0 28px;border-top:1px solid var(--c-border);position:relativ
       <table>
         <thead><tr><th data-i="p.m">Model</th><th data-i="p.fmt">Format</th><th data-i="p.sz">Size</th><th data-i="p.hw">Hardware</th><th data-i="p.sp">Speed</th><th data-i="p.note">Note</th></tr></thead>
         <tbody>
-          <tr><td>Qwen3-30B-A3B</td><td>NVFP4</td><td>30B MoE</td><td>RTX 5090 (SM120)</td><td><span class="sv" data-n="175.30">0</span> tok/s</td><td data-i="p.n1">HW NVFP4</td></tr>
-          <tr><td>Gemma4-26B-A4B</td><td>NVFP4</td><td>26B MoE</td><td>RTX 5090 (SM120)</td><td><span class="sv" data-n="131">0</span> tok/s</td><td data-i="p.n1">HW NVFP4</td></tr>
-          <tr><td>Qwen3.6-35B-A3B</td><td>FP8</td><td>35B MoE</td><td>H800 (SM90)</td><td><span class="sv" data-n="102">0</span> tok/s</td><td data-i="p.n2">HW FP8</td></tr>
-          <tr><td>DeepSeek-R1-Qwen3-8B</td><td>Q4_K_M</td><td>8B</td><td>A100 (SM80)</td><td><span class="sv" data-n="124.87">0</span> tok/s</td><td>GGUF</td></tr>
-          <tr><td>Llama-3.1-8B</td><td>ISQ Q4K</td><td>8B</td><td>A100 (SM80)</td><td><span class="sv" data-n="120.74">0</span> tok/s</td><td data-i="p.n3">SW quant</td></tr>
-          <tr><td>MiniMax-M2.5</td><td>NVFP4</td><td>229B MoE</td><td>H800 ×2 (SM90)</td><td><span class="sv" data-n="62">0</span> tok/s</td><td data-i="p.n4">SW NVFP4 (no HW)</td></tr>
-          <tr><td>Qwen3-30B-A3B</td><td>NVFP4</td><td>30B MoE</td><td>V100 (SM70)</td><td><span class="sv" data-n="67.10">0</span> tok/s</td><td data-i="p.n5">SW FP4</td></tr>
-          <tr><td>Qwen3.6-27B</td><td>FP8</td><td>27B Dense</td><td>H800 (SM90)</td><td><span class="sv" data-n="42">0</span> tok/s</td><td data-i="p.n2">HW FP8</td></tr>
+          <tr><td>Qwen3-30B-A3B</td><td>NVFP4</td><td>30B MoE</td><td>RTX 5090 (SM120)</td><td><span class="sv" data-n="181.59">0</span> tok/s</td><td data-i="p.n1">HW NVFP4</td></tr>
+          <tr><td>Gemma4-26B-A4B</td><td>NVFP4</td><td>26B MoE</td><td>RTX 5090 (SM120)</td><td><span class="sv" data-n="137.23">0</span> tok/s</td><td data-i="p.n1">HW NVFP4</td></tr>
+          <tr><td>Qwen3.6-35B-A3B</td><td>FP8</td><td>35B MoE</td><td>H800 (SM90)</td><td><span class="sv" data-n="110">0</span> tok/s</td><td data-i="p.n2">HW FP8</td></tr>
+          <tr><td>DeepSeek-R1-Qwen3-8B</td><td>Q4_K_M</td><td>8B</td><td>A100 (SM80)</td><td><span class="sv" data-n="139.25">0</span> tok/s</td><td>GGUF</td></tr>
+          <tr><td>Llama-3.1-8B</td><td>ISQ Q4K</td><td>8B</td><td>A100 (SM80)</td><td><span class="sv" data-n="133.10">0</span> tok/s</td><td data-i="p.n3">SW quant</td></tr>
+          <tr><td>MiniMax-M2.5</td><td>NVFP4</td><td>229B MoE</td><td>H800 ×2 (SM90)</td><td><span class="sv" data-n="64.50">0</span> tok/s</td><td data-i="p.n4">SW NVFP4 (no HW)</td></tr>
+          <tr><td>Qwen3-30B-A3B</td><td>NVFP4</td><td>30B MoE</td><td>V100 (SM70)</td><td><span class="sv" data-n="72.86">0</span> tok/s</td><td data-i="p.n5">SW FP4</td></tr>
+          <tr><td>Qwen3.6-27B</td><td>FP8</td><td>27B Dense</td><td>H800 (SM90)</td><td><span class="sv" data-n="45">0</span> tok/s</td><td data-i="p.n2">HW FP8</td></tr>
         </tbody>
       </table>
     </div>
@@ -509,7 +509,7 @@ en:{
 'f.label':'Features','f.title':'Built for Speed & Simplicity',
 'f.desc':'Everything you need for production LLM inference — without the Python baggage.',
 'f.1t':'Zero Dependencies','f.1d':'Pure Rust backend — no PyTorch, no CUDA Python bindings, no Python runtime.',
-'f.2t':'Blazing Fast','f.2d':'Flash Attention, FlashInfer, CUDA Graphs, continuous batching. Up to 175+ tok/s.',
+'f.2t':'Blazing Fast','f.2d':'Flash Attention, FlashInfer, CUDA Graphs, continuous batching. Up to 180+ tok/s.',
 'f.3t':'Tiny Footprint','f.3d':'Core scheduling & attention logic in under 5,000 lines of Rust.',
 'f.4t':'Cross-Platform','f.4d':'CUDA on Linux, Metal on macOS. Same binary, same API everywhere.',
 'f.5t':'Production Ready','f.5d':'OpenAI & Anthropic APIs, built-in Web UI, MCP tool calling, structured outputs.',
@@ -548,7 +548,7 @@ cn:{
 'f.label':'功能特性','f.title':'为速度与简洁而生',
 'f.desc':'生产级 LLM 推理所需的一切 — 无需 Python 依赖。',
 'f.1t':'零依赖','f.1d':'纯 Rust 后端 — 无需 PyTorch、CUDA Python 绑定或 Python 运行时。',
-'f.2t':'极速推理','f.2d':'Flash Attention、FlashInfer、CUDA Graphs、连续批处理。175+ tok/s。',
+'f.2t':'极速推理','f.2d':'Flash Attention、FlashInfer、CUDA Graphs、连续批处理。180+ tok/s。',
 'f.3t':'轻量核心','f.3d':'核心调度与注意力逻辑不足 5,000 行 Rust 代码。',
 'f.4t':'跨平台','f.4d':'Linux 上 CUDA，macOS 上 Metal。同一二进制，同一 API。',
 'f.5t':'生产就绪','f.5d':'OpenAI/Anthropic API、内置 Web UI、MCP 工具、结构化输出。',

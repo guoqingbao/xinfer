@@ -11,7 +11,7 @@
 | | 特性 | 详情 |
 |---|---|---|
 | **0️⃣** | 零 Python 依赖 | 纯 Rust 后端 — 不需要 PyTorch 或 CUDA Python 绑定 |
-| **⚡** | 极致性能 | 原生 Flash Attention、FlashInfer、CUDA Graphs、持续批处理、前缀缓存、PD 分离。消费级 GPU 上 `30B+` 模型解码速度高达 **175 tok/s** |
+| **⚡** | 极致性能 | 原生 Flash Attention、FlashInfer、CUDA Graphs、持续批处理、前缀缓存、PD 分离。消费级 GPU 上 `30B+` 模型解码速度高达 **181 tok/s** |
 | **🪶** | 极简内核 | 核心调度 + 注意力逻辑仅 **< 5000 行** Rust 代码 |
 | **🌍** | 跨平台 | CUDA（Linux/Windows）、Metal（macOS），统一二进制，统一 API |
 | **🏭** | 生产就绪 | OpenAI/Anthropic 兼容 API、内置 ChatGPT 风格 Web UI、MCP 工具调用、结构化输出、Embedding + 分词器端点 |
@@ -79,21 +79,21 @@ python3 -m xinfer.server --m Qwen/Qwen3.6-27B-FP8 --kvcache-dtype turbo4 --ui-se
 
 | 模型 | 格式 | 大小 | 输出速度 |
 |---|---|---|---|
-| Ministral-3-3B (**多模态**) | ISQ (BF16→Q4K) | 3B | **171.92** tokens/s |
-| Qwen3-VL-8B-Instruct (**多模态**) | Q8_0 | 8B | **105.31** tokens/s |
-| Llama-3.1-8B | ISQ (BF16→Q4K) | 8B | **120.74** tokens/s |
-| DeepSeek-R1-0528-Qwen3-8B | Q4_K_M | 8B | **124.87** tokens/s |
-| GLM-4-9B-0414 | Q4_K_M | 9B | **70.38** tokens/s |
-| QwQ-32B | Q4_K_M | 32B | **41.36** tokens/s |
-| **Qwen3-30B-A3B** | NVFP4 | **30B (MoE)** | **175.30** tokens/s (**RTX 5090**) |
-| **Qwen3-30B-A3B** | NVFP4 | **30B (MoE)** | **67.10** tokens/s (**V100, Software FP4**) |
-| **Qwen3.5-27B** (**多模态**) | Q4_K_M | **27B (Dense)** | **45.20** tokens/s |
-| **Qwen3.5-27B/Qwen3.6-27B** | FP8 | **27B (Dense)** | **42** tokens/s (**Hopper**) |
-| **Qwen3.6-35B-A3B** (**多模态**) | FP8 | **35B (MoE)** | **102** tokens/s (**Hopper**) |
+| Ministral-3-3B (**多模态**) | ISQ (BF16→Q4K) | 3B | **193.67** tokens/s |
+| Qwen3-VL-8B-Instruct (**多模态**) | Q8_0 | 8B | **112.51** tokens/s |
+| Llama-3.1-8B | ISQ (BF16→Q4K) | 8B | **133.10** tokens/s |
+| DeepSeek-R1-0528-Qwen3-8B | Q4_K_M | 8B | **139.25** tokens/s |
+| GLM-4-9B-0414 | Q4_K_M | 9B | **77.48** tokens/s |
+| QwQ-32B | Q4_K_M | 32B | **46.02** tokens/s |
+| **Qwen3-30B-A3B** | NVFP4 | **30B (MoE)** | **181.59** tokens/s (**RTX 5090**) |
+| **Qwen3-30B-A3B** | NVFP4 | **30B (MoE)** | **72.86** tokens/s (**V100, Software FP4**) |
+| **Qwen3.5-27B** (**多模态**) | Q4_K_M | **27B (Dense)** | **49.33** tokens/s |
+| **Qwen3.5-27B/Qwen3.6-27B** | FP8 | **27B (Dense)** | **45** tokens/s (**Hopper**) |
+| **Qwen3.6-35B-A3B** (**多模态**) | FP8 | **35B (MoE)** | **110** tokens/s (**Hopper**) |
 | **GLM4.7 Flash** | NVFP4 | **30B (MoE)** | **79** tokens/s (**Hopper, Software FP4**) |
-| **Gemma4-31B** | ISQ (BF16→Q4K) | **31B (Dense)** | **41** tokens/s (**Hopper**) |
-| **Gemma4-26B-A4B** | NVFP4 | **26B (MoE)** | **131** tokens/s (**RTX 5090**) |
-| **MiniMax-M2.5** | NVFP4 | **229B (MoE)** | **62** tokens/s (**Hopper, Software FP4, TP=2**) |
+| **Gemma4-31B** | ISQ (BF16→Q4K) | **31B (Dense)** | **47** tokens/s (**Hopper**) |
+| **Gemma4-26B-A4B** | NVFP4 | **26B (MoE)** | **137.23** tokens/s (**RTX 5090**) |
+| **MiniMax-M2.5** | NVFP4 | **229B (MoE)** | **64.50** tokens/s (**Hopper, Software FP4, TP=2**) |
 
 <details>
 <summary><b>Apple Silicon (M4)</b></summary>

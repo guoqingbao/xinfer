@@ -10,21 +10,21 @@ This document contains detailed performance benchmarks for xInfer across differe
 
 | Model | Format | Size | Hardware | Decoding Speed |
 |-------|--------|------|----------|----------------|
-| Qwen3-30B-A3B | NVFP4 | 30B MoE | RTX 5090 (SM120) | **175.30** tokens/s |
-| Gemma4-26B-A4B | NVFP4 | 26B MoE | RTX 5090 (SM120) | **131** tokens/s |
-| Ministral-3-3B (Multimodal) | ISQ (BF16→Q4K) | 3B | A100 (SM80) | **171.92** tokens/s |
-| DeepSeek-R1-0528-Qwen3-8B | Q4_K_M | 8B | A100 (SM80) | **124.87** tokens/s |
-| Llama-3.1-8B | ISQ (BF16→Q4K) | 8B | A100 (SM80) | **120.74** tokens/s |
-| Qwen3-VL-8B-Instruct (Multimodal) | Q8_0 | 8B | A100 (SM80) | **105.31** tokens/s |
-| Qwen3.6-35B-A3B (Multimodal) | FP8 | 35B MoE | H800 (SM90) | **102** tokens/s |
-| GLM4.7 Flash | NVFP4 | 30B MoE | H800 (SM90) | **79** tokens/s |
-| Qwen3-30B-A3B | NVFP4 | 30B MoE | V100 (SM70) | **67.10** tokens/s |
-| GLM-4-9B-0414 | Q4_K_M | 9B | A100 (SM80) | **70.38** tokens/s |
-| MiniMax-M2.5 | NVFP4 | 229B MoE | H800 ×2 (SM90) | **62** tokens/s |
-| Qwen3.5-27B (Multimodal) | Q4_K_M | 27B Dense | A100 (SM80) | **45.20** tokens/s |
-| Qwen3.5-27B/Qwen3.6-27B | FP8 | 27B Dense | H800 (SM90) | **42** tokens/s |
-| QwQ-32B | Q4_K_M | 32B | A100 (SM80) | **41.36** tokens/s |
-| Gemma4-31B | ISQ (BF16→Q4K) | 31B Dense | H800 (SM90) | **41** tokens/s |
+| Ministral-3-3B (**Multimodal**) | ISQ (BF16→Q4K) | 3B | A100| **193.67** tokens/s |
+| Qwen3-VL-8B-Instruct (**Multimodal**) | Q8_0 | 8B | A100| **112.51** tokens/s |
+| Llama-3.1-8B | ISQ (BF16→Q4K) | 8B | A100| **133.10** tokens/s |
+| DeepSeek-R1-0528-Qwen3-8B | Q4_K_M | 8B | A100| **139.25** tokens/s |
+| GLM-4-9B-0414 | Q4_K_M | 9B | A100| **77.48** tokens/s |
+| QwQ-32B | Q4_K_M | 32B | A100| **46.02** tokens/s |
+| **Qwen3-30B-A3B** | NVFP4 | **30B (MoE)** | RTX 5090 | **181.59** tokens/s|
+| **Qwen3-30B-A3B** | NVFP4 | **30B (MoE)** | V100 | **72.86** tokens/s (**Software FP4**) |
+| **Qwen3.5-27B** (**Multimodal**) | Q4_K_M | **27B (Dense)** | Hopper | **49.33** tokens/s |
+| **Qwen3.5-27B/Qwen3.6-27B** | FP8 | **27B (Dense)** | Hopper | **45** tokens/s|
+| **Qwen3.6-35B-A3B** (**Multimodal**) | FP8 | **35B (MoE)** | Hopper | **110** tokens/s |
+| **GLM4.7 Flash** | NVFP4 | **30B (MoE)** | Hopper | **79** tokens/s (**Software FP4**) |
+| **Gemma4-31B** | ISQ (BF16→Q4K) | **31B (Dense)** | Hopper| **47** tokens/s |
+| **Gemma4-26B-A4B** | NVFP4 | **26B (MoE)** | RTX 5090 | **137.23** tokens/s|
+| **MiniMax-M2.5** | NVFP4 | **229B (MoE)** | Hopper | **64.50** tokens/s (**Software FP4, TP=2**) |
 
 ### V100 + NVFP4 + TurboQuant (First-Ever)
 
