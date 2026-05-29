@@ -854,6 +854,13 @@ impl MergedParallelColumnLinear {
                             Shard::default(),
                             DType::U8,
                         )?
+                    } else if v.contains_tensor("weight") {
+                        v.get_with_hints_dtype(
+                            (out_dim, in_dim / pack_factor),
+                            "weight",
+                            Shard::default(),
+                            DType::U8,
+                        )?
                     } else {
                         v.get_with_hints_dtype(
                             (out_dim, in_dim / pack_factor),
