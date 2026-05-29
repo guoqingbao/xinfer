@@ -339,6 +339,25 @@ where
     }
 }
 
+#[derive(Clone, Copy)]
+enum CapturePhase {
+    CachePrewarm,
+    Warmup,
+    Capture,
+}
+
+impl CapturePhase {
+    const ALL: [Self; 3] = [Self::CachePrewarm, Self::Warmup, Self::Capture];
+
+    fn is_cache_prewarm(self) -> bool {
+        matches!(self, Self::CachePrewarm)
+    }
+
+    fn is_warmup(self) -> bool {
+        !matches!(self, Self::Capture)
+    }
+}
+
 pub struct GraphCaptureVars {
     pub input_ids: Tensor,
     pub positions: Tensor,
@@ -497,8 +516,9 @@ impl<M: CudaGraphModule> GraphCapturer<M> {
         let capture_in_warmup = false;
 
         let mut outputs = BTreeMap::<usize, Tensor>::new();
-        for is_warmup in [true, false] {
-            let iter: Box<dyn Iterator<Item = usize>> = if is_warmup {
+        let _guard = candle_core::cuda_backend::cuda_param_cache_scope(true);
+        for phase in CapturePhase::ALL {
+            let iter: Box<dyn Iterator<Item = usize>> = if phase.is_warmup() {
                 Box::new(0..self.graph_bs.len())
             } else {
                 Box::new(tqdm(0..self.graph_bs.len()).desc(Some("Graph capturing")))
@@ -581,10 +601,12 @@ impl<M: CudaGraphModule> GraphCapturer<M> {
                     flashinfer_metadata,
                 };
 
-                if !is_warmup || capture_in_warmup {
+                let should_capture =
+                    !phase.is_cache_prewarm() && (!phase.is_warmup() || capture_in_warmup);
+                if should_capture {
                     self.model.start_capture(bs)?;
                 }
-                if is_warmup {
+                if phase.is_warmup() {
                     let _ = self.model.forward(
                         &input_ids_bs,
                         &positions_bs,
@@ -602,8 +624,8 @@ impl<M: CudaGraphModule> GraphCapturer<M> {
                     )?;
                     outputs.insert(bs, out);
                 }
-                if !is_warmup || capture_in_warmup {
-                    self.model.end_capture(!is_warmup)?;
+                if should_capture {
+                    self.model.end_capture(!phase.is_warmup())?;
                 }
             }
         }
