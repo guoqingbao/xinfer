@@ -1,5 +1,6 @@
 use crate::models::layers::linear::{
-    linear_b_x as linear_b, linear_no_bias_x as linear, LinearX as Linear, LnFp8, QLinear,
+    linear_b_x as linear_b, linear_no_bias_x as linear, LinearX as Linear, LnFp8, LnMxfp4, LnNvfp4,
+    QLinear,
 };
 use crate::models::layers::VarBuilderX;
 use crate::utils::config::QuantConfig;
@@ -635,12 +636,23 @@ impl MergedParallelColumnLinear {
             false
         };
 
+        let is_nvfp4_quant = if let Some(cfg) = quant_cfg {
+            cfg.quant_method == "nvfp4"
+        } else {
+            false
+        };
+        let is_mxfp4_quant = if let Some(cfg) = quant_cfg {
+            cfg.quant_method == "mxfp4"
+        } else {
+            false
+        };
+
         if vb.is_qvar_builder() {
             candle_core::bail!(
                 "Merged quantized weight is not supported for GGUF varbuilder at the moment!"
             );
         }
-        if quant_cfg.is_some() && !is_fp8_quant {
+        if quant_cfg.is_some() && !is_fp8_quant && !is_nvfp4_quant && !is_mxfp4_quant {
             candle_core::bail!(
                 "Merged quantized weight is not supported at the moment, using ISQ instead!"
             );
@@ -825,6 +837,200 @@ impl MergedParallelColumnLinear {
                     });
                     let ln = TensorParallelColumnLinear { linear };
                     vec_linear.push(ln);
+                    output_splits = Some(local_output_splits);
+                } else if is_nvfp4_quant || is_mxfp4_quant {
+                    if chunk_dim != 0 {
+                        candle_core::bail!(
+                            "FP4 merged chunk loading currently supports chunk_dim=0 only, got {}",
+                            chunk_dim
+                        );
+                    }
+
+                    let pack_factor = 2; // 2 FP4 values per byte
+                    let blocks = if v.contains_tensor("weight_packed") {
+                        v.get_with_hints_dtype(
+                            (out_dim, in_dim / pack_factor),
+                            "weight_packed",
+                            Shard::default(),
+                            DType::U8,
+                        )?
+                    } else {
+                        v.get_with_hints_dtype(
+                            (out_dim, in_dim / pack_factor),
+                            "blocks",
+                            Shard::default(),
+                            DType::U8,
+                        )?
+                    };
+
+                    let scale_block_size: usize = if is_nvfp4_quant { 16 } else { 32 };
+                    let scale_cols = in_dim / scale_block_size;
+                    let scales = if v.contains_tensor("weight_scale") {
+                        v.get_with_hints_dtype(
+                            (out_dim, scale_cols),
+                            "weight_scale",
+                            Shard::default(),
+                            DType::U8,
+                        )?
+                    } else {
+                        v.get_with_hints_dtype(
+                            (out_dim, scale_cols),
+                            "scales",
+                            Shard::default(),
+                            DType::U8,
+                        )?
+                    };
+
+                    let (nvfp4_global_scale, nvfp4_input_scale, nvfp4_sm) = if is_nvfp4_quant {
+                        let no_shard = Shard::default();
+                        let global_scale = if v.contains_tensor("weight_global_scale") {
+                            let t = match v.get_with_hints_dtype(
+                                (1,),
+                                "weight_global_scale",
+                                no_shard,
+                                DType::F32,
+                            ) {
+                                Ok(t) => t,
+                                Err(_) => v.get_with_hints_dtype(
+                                    (),
+                                    "weight_global_scale",
+                                    no_shard,
+                                    DType::F32,
+                                )?,
+                            };
+                            let raw = t.flatten_all()?.to_vec1::<f32>()?[0];
+                            if raw != 0.0 {
+                                1.0 / raw
+                            } else {
+                                1.0
+                            }
+                        } else if v.contains_tensor("weight_scale_2") {
+                            let t = match v.get_with_hints_dtype(
+                                (1,),
+                                "weight_scale_2",
+                                no_shard,
+                                DType::F32,
+                            ) {
+                                Ok(t) => t,
+                                Err(_) => v.get_with_hints_dtype(
+                                    (),
+                                    "weight_scale_2",
+                                    no_shard,
+                                    DType::F32,
+                                )?,
+                            };
+                            t.flatten_all()?.to_vec1::<f32>()?[0]
+                        } else {
+                            1.0f32
+                        };
+
+                        let input_scale = if v.contains_tensor("input_scale") {
+                            let t = match v.get_with_hints_dtype(
+                                (1,),
+                                "input_scale",
+                                no_shard,
+                                DType::F32,
+                            ) {
+                                Ok(t) => t,
+                                Err(_) => {
+                                    v.get_with_hints_dtype((), "input_scale", no_shard, DType::F32)?
+                                }
+                            };
+                            t.flatten_all()?.to_vec1::<f32>()?[0]
+                        } else if v.contains_tensor("input_global_scale") {
+                            let t = match v.get_with_hints_dtype(
+                                (1,),
+                                "input_global_scale",
+                                no_shard,
+                                DType::F32,
+                            ) {
+                                Ok(t) => t,
+                                Err(_) => v.get_with_hints_dtype(
+                                    (),
+                                    "input_global_scale",
+                                    no_shard,
+                                    DType::F32,
+                                )?,
+                            };
+                            let raw = t.flatten_all()?.to_vec1::<f32>()?[0];
+                            if raw != 0.0 {
+                                1.0 / raw
+                            } else {
+                                1.0
+                            }
+                        } else {
+                            1.0f32
+                        };
+
+                        #[cfg(feature = "cuda")]
+                        let sm = attention_rs::cuda_utils::sm_version(v.device().as_cuda_device()?)
+                            .unwrap_or(0) as usize;
+                        #[cfg(not(feature = "cuda"))]
+                        let sm = 0usize;
+
+                        (global_scale, input_scale, sm)
+                    } else {
+                        (1.0f32, 1.0f32, 0usize)
+                    };
+
+                    let mut chunk_start = 0;
+                    let mut local_output_splits = Vec::<usize>::with_capacity(chunks.len());
+                    for chunk_idx in 0..chunks.len() {
+                        let chunk_size = chunks[chunk_idx];
+                        let chunk_shard = if let Some(chunk_shards) = &chunk_shards {
+                            chunk_shards[chunk_idx]
+                        } else {
+                            shard(0, comm.rank(), comm.world_size())
+                        };
+                        if chunk_size % chunk_shard.world_size != 0 {
+                            candle_core::bail!(
+                                "FP4 merged chunk {} dim {} is not divisible by shard world_size {}",
+                                chunk_idx,
+                                chunk_size,
+                                chunk_shard.world_size
+                            );
+                        }
+                        let local_out = chunk_size / chunk_shard.world_size;
+                        let local_start = chunk_start + chunk_shard.rank * local_out;
+
+                        let blocks_chunk =
+                            blocks.narrow(0, local_start, local_out)?.contiguous()?;
+                        let scales_chunk =
+                            scales.narrow(0, local_start, local_out)?.contiguous()?;
+
+                        let linear = if is_nvfp4_quant {
+                            #[cfg(feature = "cuda")]
+                            let weight_scale_swizzled = if nvfp4_sm >= 100 {
+                                Some(attention_rs::nvfp4_linear::swizzle_nvfp4_weight_scales(
+                                    &scales_chunk,
+                                )?)
+                            } else {
+                                None
+                            };
+                            #[cfg(not(feature = "cuda"))]
+                            let weight_scale_swizzled: Option<Tensor> = None;
+
+                            LinearX::LnNvfp4(LnNvfp4 {
+                                blocks: blocks_chunk,
+                                scales: scales_chunk,
+                                global_scale: nvfp4_global_scale,
+                                input_scale: nvfp4_input_scale,
+                                bias: None,
+                                weight_scale_swizzled,
+                            })
+                        } else {
+                            LinearX::LnMxfp4(LnMxfp4 {
+                                blocks: blocks_chunk,
+                                scales: scales_chunk,
+                                bias: None,
+                            })
+                        };
+
+                        local_output_splits.push(local_out);
+                        let ln = TensorParallelColumnLinear { linear };
+                        vec_linear.push(ln);
+                        chunk_start += chunk_size;
+                    }
                     output_splits = Some(local_output_splits);
                 } else {
                     let weight = v.get((out_dim, in_dim), "weight")?;

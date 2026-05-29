@@ -84,6 +84,7 @@ impl GatedDeltaNet {
                 let has_modelopt = vb.has_key("weight_scale_2") || vb.has_key("input_scale");
                 (has_packed && has_scale) || (has_modelopt && has_scale)
             }
+            "gptq" | "awq" => vb.has_key("qweight") || vb.has_key("B"),
             _ => true,
         }
     }
