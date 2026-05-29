@@ -267,7 +267,25 @@ Fix all errors and warnings before proceeding.
 
 ---
 
-## Phase 6: Test the Model
+## Phase 6: Check Model Compatibility
+
+**Before testing**, invoke the **check-model** skill (`.cursor/skills/check-model/SKILL.md`) to validate the new model's tensor format and multi-rank compatibility.
+
+Provide:
+1. The model's `config.json` (local path or HuggingFace URL)
+2. Weight tensor info (names, shapes, dtypes) — from a local safetensors file or HuggingFace model page
+
+The check-model skill will verify:
+- Tensor names match the loader's expected format (e.g. `weight_packed` vs `weight` vs `blocks` for FP4)
+- Quantized vs unquantized layer detection matches the `ignore` list in `quantization_config`
+- All TP-sharded dimensions are divisible by common GPU counts (1, 2, 4, 8)
+- FP8 block alignment and FP4 scale group alignment are correct for multi-rank
+
+Fix any `[ERROR]` findings before proceeding to the test phase. `[WARN]` items should be reviewed but may not block loading.
+
+---
+
+## Phase 7: Test the Model
 
 ### Start the server
 

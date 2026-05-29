@@ -20,7 +20,8 @@ The skill lives at `.cursor/skills/add-model/SKILL.md` and is **automatically ac
 | **3 — Implement** | Creates the model file (`src/models/<arch>.rs`), handles HF and GGUF weight paths, MoE construction, packed expert layouts. |
 | **4 — Register** | Wires the model into `mod.rs`, `config.rs`, `utils/mod.rs`, `runner.rs`, and `parser.rs`. |
 | **5 — Build** | Compiles with the correct platform features and fixes all errors/warnings. |
-| **6 — Test** | Starts the server, sends OpenAI-compatible requests, debugs common issues (NaN, crashes, wrong output). |
+| **6 — Check** | Invokes the [check-model skill](check_model.md) to validate tensor format, quantization consistency, and multi-GPU TP divisibility before testing. |
+| **7 — Test** | Starts the server, sends OpenAI-compatible requests, debugs common issues (NaN, crashes, wrong output). |
 
 ## Quick Start
 
