@@ -2169,6 +2169,7 @@ pub async fn messages(
             &model_type,
             &model_id,
             chat_template,
+            engine_config.disable_reasoning,
         );
 
         if let Some(ref grammar) = params.grammar {

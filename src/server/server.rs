@@ -459,6 +459,7 @@ pub async fn chat_completion(
             tool_parser_name,
             &tokenizer,
             Some(chat_template),
+            engine_config.disable_reasoning,
         );
         dispatcher.build_grammar()
     };

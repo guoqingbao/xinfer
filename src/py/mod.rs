@@ -500,6 +500,7 @@ impl SamplingParams {
     fn reasoning_effort(&self) -> Option<String> {
         self.reasoning_effort.as_ref().map(|effort| match effort {
             ReasoningEffort::None => "none".to_string(),
+            ReasoningEffort::ModelDefault => "model_default".to_string(),
             ReasoningEffort::Low => "low".to_string(),
             ReasoningEffort::Medium => "medium".to_string(),
             ReasoningEffort::High => "high".to_string(),

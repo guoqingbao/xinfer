@@ -1282,6 +1282,8 @@ impl fmt::Debug for QuantConfig {
     pub enum ReasoningEffort {
         /// No structured reasoning - direct output only
         None,
+        /// Default model reasoning output as induced by opening a reasoning tag
+        ModelDefault,
         /// Constrained single-paragraph reasoning (~150 chars max)
         Low,
         /// Standard multi-step Chain-of-Thought (CoT)
@@ -1297,7 +1299,7 @@ impl fmt::Debug for QuantConfig {
 
     impl Default for ReasoningEffort {
         fn default() -> Self {
-            ReasoningEffort::None
+            ReasoningEffort::ModelDefault
         }
     }
 
@@ -1327,6 +1329,7 @@ impl std::fmt::Display for ReasoningEffort {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ReasoningEffort::None => write!(f, "none"),
+            ReasoningEffort::ModelDefault => write!(f, "model_default"),
             ReasoningEffort::Low => write!(f, "low"),
             ReasoningEffort::Medium => write!(f, "medium"),
             ReasoningEffort::High => write!(f, "high"),

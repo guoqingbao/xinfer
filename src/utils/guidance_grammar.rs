@@ -335,21 +335,23 @@ reasoning_block: <[{start_id}]> "\n\n" <[{end_id}]> "\n\n"
 "#
                 )
             }
-            ReasoningEffort::Low => {
-                // Fast Thinking: Single paragraph constraint (max ~150 chars)
-                // Limits generation space to reduce hallucination risk
-                // Uses non-greedy matching to prevent runaway generation
+            ReasoningEffort::ModelDefault => {
                 format!(
                     r#"start: reasoning_block
-reasoning_block: <[{start_id}]> "\n" think_text "\n" (think_text+)? "\n" <[{end_id}]> "\n\n"
+reasoning_block: <[{start_id}]> "\n" think_text? "\n" <[{end_id}]> "\n"
+think_text: /(?s:.+?)/
+"#
+                )
+            }
+            ReasoningEffort::Low => {
+                format!(
+                    r#"start: reasoning_block
+reasoning_block: <[{start_id}]> "\n" think_text "\n" (think_text+ "\n")? "\n" <[{end_id}]> "\n\n"
 think_text[suffix="\n"]: /[ -~]{{16,256}}/
 "#
                 )
             }
             ReasoningEffort::Medium => {
-                // Standard CoT: Multi-step reasoning with natural sentence termination
-                // Implements Wei et al. (2022) baseline pattern
-                // Allows multiple steps but enforces sentence boundaries
                 format!(
                     r#"start: reasoning_block
 reasoning_block: <[{start_id}]> "\n" think_text <[{end_id}]> "\n\n"
@@ -358,9 +360,6 @@ think_text[suffix="\n\n"]: /[\x20-\x7E\x0A\x0D]{{32,768}}/
                 )
             }
             ReasoningEffort::High => {
-                // Adversarial Analysis: Explicit self-correction phases
-                // Implements Cheng & Su (2025) adversarial critique pattern
-                // Forces model to challenge its own reasoning before finalizing
                 format!(
                     r#"start: reasoning_block
 reasoning_block: <[{start_id}]> analysis_block critique_block structure_block <[{end_id}]> "\n\n"
@@ -374,9 +373,6 @@ structure_text[suffix="\n</structure_response>\n"]: /[\x20-\x7E\x0A\x0D]{{24,512
                 )
             }
             ReasoningEffort::ChainOfThought => {
-                // Best-of-breed: CoVe + Adversarial Critique + Final Consolidation
-                // Combines Madaan et al. (2024) Chain-of-Verification with self-correction
-                // Maximum accuracy for complex/fact-sensitive tasks
                 format!(
                     r#"start: reasoning_block
 reasoning_block: <[{start_id}]> draft_block verification_block critique_block structure_block <[{end_id}]> "\n\n"
@@ -1498,6 +1494,7 @@ pub struct GrammarRequestDispatcher<'a> {
     pub parser_name: String,
     pub tokenizer: &'a Tokenizer,
     pub chat_template: Option<crate::utils::chat_template::ChatTemplate>,
+    pub disable_reasoning: bool,
 }
 
 impl<'a> GrammarRequestDispatcher<'a> {
@@ -1510,6 +1507,7 @@ impl<'a> GrammarRequestDispatcher<'a> {
         parser_name: String,
         tokenizer: &'a Tokenizer,
         chat_template: Option<crate::utils::chat_template::ChatTemplate>,
+        disable_reasoning: bool,
     ) -> Self {
         Self {
             request,
@@ -1520,6 +1518,7 @@ impl<'a> GrammarRequestDispatcher<'a> {
             parser_name,
             tokenizer,
             chat_template,
+            disable_reasoning,
         }
     }
 
@@ -1550,6 +1549,7 @@ impl<'a> GrammarRequestDispatcher<'a> {
             max_tokens,
             self.chat_template,
             self.tokenizer,
+            self.disable_reasoning,
         ))
     }
 
@@ -1721,14 +1721,23 @@ impl GrammarComposer {
         max_tokens: usize,
         chat_template: Option<crate::utils::chat_template::ChatTemplate>,
         tokenizer: &Tokenizer,
+        disable_reasoning: bool,
     ) -> TopLevelGrammar {
         // Use ChatResponseGrammar as default when no constraints specified
         let merged_constraints = Self::merge_constraints(constraint_grammars);
         let composed_with_tools =
             Self::compose_constraint_with_tools(merged_constraints, tool_grammar);
-        let final_grammar =
-            Self::wrap_with_reasoning(composed_with_tools, reasoning_effort, guidance_tokens);
+        let final_grammar = Self::wrap_with_reasoning(
+            composed_with_tools,
+            reasoning_effort,
+            guidance_tokens,
+            disable_reasoning,
+        );
         let mut grammar = Self::finalize_with_eos(final_grammar, guidance_tokens);
+        // Models like MiniMax allow us to change the model's role in responding to permit "multi-agent" conversations
+        // Need a helper to extract the capability from the chat template and role name from request
+        let role = "assistant".to_string();
+        grammar = Self::prefix_with_bos(grammar, guidance_tokens, role);
 
         // Apply thinking fallback transformation after all composition is complete
         // This transforms <[token_id]> syntax to string literals for models without reasoning tokens
@@ -1780,23 +1789,84 @@ impl GrammarComposer {
         base: StructuredOutputsGrammar,
         effort: Option<ReasoningEffort>,
         guidance_tokens: &GuidanceTokens,
+        disable_reasoning: bool,
     ) -> StructuredOutputsGrammar {
-        if let Some(effort) = effort {
-            if effort != ReasoningEffort::None {
-                // Build reasoning grammar that wraps the base
-                let start_id = *guidance_tokens.reasoning_start_ids.first().unwrap_or(&0);
-                let end_id = *guidance_tokens.reasoning_end_ids.first().unwrap_or(&0);
-                let mut reasoning = ReasoningGrammar::new(start_id, end_id, effort);
-                let mut reasoning_grammar = StructuredOutputsGrammar::new(
-                    StructuredConstraint::Lark(reasoning.build_lark()),
-                );
-                // Use sequence: reasoning_block followed by base
-                let mut base_mut = base;
-                return reasoning_grammar.compose_sequence(&mut base_mut);
-            }
+        // If reasoning is disabled, return base without reasoning
+        if disable_reasoning {
+            return base;
+        }
+
+        // If no explicit effort passed, use ModelDefault
+        let effort = effort.unwrap_or(ReasoningEffort::ModelDefault);
+
+        if effort != ReasoningEffort::None {
+            // Build reasoning grammar that wraps the base
+            let start_id = *guidance_tokens.reasoning_start_ids.first().unwrap_or(&0);
+            let end_id = *guidance_tokens.reasoning_end_ids.first().unwrap_or(&0);
+            let mut reasoning = ReasoningGrammar::new(start_id, end_id, effort);
+            let mut reasoning_grammar = StructuredOutputsGrammar::new(
+                StructuredConstraint::Lark(reasoning.build_lark()),
+            );
+            // Use sequence: reasoning_block followed by base
+            let mut base_mut = base;
+            return reasoning_grammar.compose_sequence(&mut base_mut);
         }
         base
     }
+
+    fn prefix_with_bos(
+        mut grammar: TopLevelGrammar,
+        guidance_tokens: &GuidanceTokens,
+        role: String,
+    ) -> TopLevelGrammar {
+        if guidance_tokens.bos_token_ids.is_empty() {
+            return grammar;
+        }
+
+        // Check if grammar already has bos rule - avoid duplication
+        let lark = get_lark_from_top_level_grammar(&grammar);
+        if lark.contains("bos") {
+            return grammar;
+        }
+
+        // Extract current start rule RHS
+        let first_line = lark.lines().next().unwrap_or("");
+        let current_start_rhs = if let Some(rhs) = first_line.strip_prefix("start: ") {
+            rhs.trim()
+        } else {
+            "text"
+        };
+
+        // Build BOS rule(s) - support multiple BOS tokens with alternation
+        let bos_rule = if guidance_tokens.bos_token_ids.len() == 1 {
+            format!(r#"bos: <[{}]> "{}:" "\n" "#, guidance_tokens.bos_token_ids[0], &role)
+        } else {
+            let ids: Vec<String> = guidance_tokens
+                .bos_token_ids
+                .iter()
+                .map(|id| format!("<[{}]>", id))
+                .collect();
+            format!(r#"bos: ( {} ) "{}:" "\n" "#, ids.join(" | "), &role)
+        };
+
+        // Construct new grammar with BOS prefix
+        // Remove old start line, keep other rules, add new start and bos
+        let remaining_rules: Vec<String> = lark
+            .lines()
+            .skip(1)
+            .filter(|l| !l.trim().is_empty())
+            .map(|s| s.trim().to_string())
+            .collect();
+
+        let new_lark = format!(
+            "start: bos {}\n{}\n{}",
+            current_start_rhs,
+            remaining_rules.join("\n"),
+            bos_rule
+        );
+
+        TopLevelGrammar::from_lark_ascii(&new_lark)
+}
 
     fn finalize_with_eos(
         mut grammar: StructuredOutputsGrammar,
@@ -2090,6 +2160,7 @@ pub fn generate_grammar_from_request(
     parser_name: String,
     tokenizer: &Tokenizer,
     chat_template: Option<ChatTemplate>,
+    disable_reasoning: bool,
 ) -> Option<TopLevelGrammar> {
     // Use new GrammarRequestDispatcher for grammar composition
     let tool_config = ToolConfig::from_tokenizer(tokenizer, model_type);
@@ -2103,6 +2174,7 @@ pub fn generate_grammar_from_request(
         parser_name,
         tokenizer,
         chat_template,
+        disable_reasoning,
     );
 
     dispatcher.build_grammar()
@@ -2144,6 +2216,7 @@ pub fn build_guided_decoding_grammar(
     model_type: &crate::utils::config::ModelType,
     model_id: &str,
     chat_template: Option<ChatTemplate>,
+    disable_reasoning: bool,
 ) -> Option<TopLevelGrammar> {
     // If constraint_grammar is provided, extract the Lark string and set it as a constraint
     // The dispatcher will handle this in build_constraint_grammar
@@ -2180,19 +2253,23 @@ pub fn build_guided_decoding_grammar(
         reasoning_effort: reasoning_effort.map(|e| e.to_string()),
     };
 
-    // Call generate_grammar_from_request with the synthetic request
-    // Pass chat_template for reasoning token detection
-    generate_grammar_from_request(
+    // Use GrammarRequestDispatcher with disable_reasoning
+    let tool_config = ToolConfig::from_tokenizer(tokenizer, model_type);
+    let parser_name = tool_parser_name.to_string();
+
+    let dispatcher = GrammarRequestDispatcher::new(
         &synthetic_request,
         guidance_tokens,
+        &tool_config,
         enable_tool_grammar,
         allow_constraint_api,
-        model_type,
-        model_id,
-        tool_parser_name.to_string(),
+        parser_name,
         tokenizer,
         chat_template,
-    )
+        disable_reasoning,
+    );
+
+    dispatcher.build_grammar()
 }
 
 /// Lark literal - returns string with quotes for non-special tags
@@ -3102,6 +3179,7 @@ mod tests {
             "qwen_coder".to_string(),
             &tokenizer,
             None,
+            false, // disable_reasoning
         );
         let mut grammar = dispatcher
             .build_tool_grammar()
@@ -3146,6 +3224,7 @@ mod tests {
             "qwen_coder".to_string(),
             &tokenizer,
             None,
+            false, // disable_reasoning
         );
         let mut grammar = dispatcher
             .build_tool_grammar()
@@ -3194,6 +3273,7 @@ mod tests {
             "qwen_coder".to_string(),
             &tokenizer,
             None,
+            false, // disable_reasoning
         );
         let mut grammar = dispatcher
             .build_tool_grammar()
@@ -3297,6 +3377,7 @@ mod tests {
             "qwen_coder".to_string(),
             &tokenizer,
             None,
+            false, // disable_reasoning
         );
         let mut grammar = dispatcher
             .build_tool_grammar()
@@ -3339,6 +3420,7 @@ mod tests {
             "qwen_coder".to_string(),
             &tokenizer,
             None,
+            false, // disable_reasoning
         );
         let mut grammar = dispatcher
             .build_tool_grammar()
@@ -3376,6 +3458,7 @@ mod tests {
             "qwen_coder".to_string(),
             &tokenizer,
             None,
+            false, // disable_reasoning
         );
         let grammar = dispatcher
             .build_tool_grammar()

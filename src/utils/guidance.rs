@@ -149,7 +149,9 @@ impl GuidanceState {
         let mut grammar = grammar.clone();
         // Add generation space for EOS token to prevent overrun if max_tokens reached
         if let Some(max_tokens) = grammar.max_tokens {
-            grammar.max_tokens = Some(max_tokens + 1);
+            let bos_len = 1; // Placeholders which get compiled-out in case this ever changes
+            let eos_len = 1;
+            grammar.max_tokens = Some(max_tokens + bos_len + eos_len);
         };
         let parser = factory.create_parser(grammar)?;
         let matcher = Matcher::new(Ok(parser));
