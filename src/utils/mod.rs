@@ -1560,6 +1560,7 @@ pub fn init_config_tokenizer(
                         chat_template: None,
                         bos_token: None,
                         eos_token: None,
+                        pad_token: None,
                     }
                 }
             }
@@ -1659,6 +1660,7 @@ pub fn init_config_tokenizer(
             bos,
             eos,
             unk: _,
+            pad_token,
             context_length,
             chat_template,
         } = load_gguf_info_from_files(&model_pathes.get_weight_filenames()).map_err(|e| {
@@ -1731,6 +1733,7 @@ pub fn init_config_tokenizer(
             chat_template,
             bos_token: bos,
             eos_token: eos,
+            pad_token,
         };
         let archs = config.architectures.as_ref().unwrap();
 

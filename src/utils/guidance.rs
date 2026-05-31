@@ -6,6 +6,7 @@
 // - Mask operations: batch mask bias and early exit validation
 
 use crate::utils::special_tokens::SpecialTokens;
+use crate::utils::config::TokenizerConfig;
 use anyhow::Result;
 use candle_core::Tensor;
 use llguidance::{api::TopLevelGrammar, Matcher, ParserFactory as LlgParserFactory};
@@ -31,12 +32,14 @@ pub struct GuidanceTokens {
     pub reasoning_end_ids: Vec<u32>,
     pub tool_call_start_ids: Vec<u32>,
     pub tool_call_end_ids: Vec<u32>,
+    pub add_bos_token: bool,
 }
 
 pub fn extract_guidance_tokens(
     tokenizer: &Tokenizer,
     eos_token_ids: Vec<u32>,
     bos_token_ids: Vec<u32>,
+    tokenizer_config: &TokenizerConfig,
 ) -> GuidanceTokens {
     let special_tokens = SpecialTokens::new(tokenizer);
 
@@ -56,13 +59,30 @@ pub fn extract_guidance_tokens(
         eos_token_ids
     };
 
+    let validated_bos: Vec<u32> = {
+        let retained: Vec<u32> = bos_token_ids
+            .into_iter()
+            .filter(|id| !validated_eos.contains(id))
+            .collect();
+        if retained.is_empty() {
+            special_tokens.bos_token_ids()
+        } else {
+            retained
+        }
+    };
+
+    // Determine if BOS token should be added based on tokenizer config
+    // add_bos_token == Some(true) means the tokenizer adds BOS automatically
+    let add_bos_token = tokenizer_config.add_bos_token == Some(true);
+
     GuidanceTokens {
-        bos_token_ids,
+        bos_token_ids: validated_bos,
         eos_token_ids: validated_eos,
         reasoning_start_ids: special_tokens.reasoning_start_ids(),
         reasoning_end_ids: special_tokens.reasoning_end_ids(),
         tool_call_start_ids: special_tokens.tool_call_start_ids(),
         tool_call_end_ids: special_tokens.tool_call_end_ids(),
+        add_bos_token,
     }
 }
 

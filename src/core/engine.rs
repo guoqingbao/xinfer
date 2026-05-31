@@ -159,6 +159,7 @@ impl LLMEngine {
                 .map(EosTokenId::to_vec)
                 .unwrap_or_default(),
             config.bos_token_id.map_or(Vec::new(), |bos| vec![bos as u32]),
+            &config_tokenizer,
         );
         assert!(
             config.architectures.is_some() && config.architectures.as_ref().unwrap().len() == 1,
@@ -1677,15 +1678,38 @@ impl LLMEngine {
         }
         // Generation alignment and open/close parity enforcement
         if let Some(grammar) = &params.grammar {
-            if let Ok(bos_string) = self.tokenizer.decode(&self.guidance_tokens.bos_token_ids, false) {
-                if let Some((prompt, _trimmed)) = prompt.rsplit_once(&bos_string) {
-                    return (prompt.to_string(), image_idx)
-                }
-            }
-            for bos_token in self.guidance_tokens.bos_token_ids.iter() {
-                if let Ok(bos_string) = self.tokenizer.decode(&[bos_token.clone()], false) {
+            if self.guidance_tokens.add_bos_token {
+                // BOS-based trimming: trim at BOS token (for models with add_bos_token=true)
+                if let Ok(bos_string) = self.tokenizer.decode(&self.guidance_tokens.bos_token_ids, false) {
                     if let Some((prompt, _trimmed)) = prompt.rsplit_once(&bos_string) {
                         return (prompt.to_string(), image_idx)
+                    }
+                }
+                for bos_token in self.guidance_tokens.bos_token_ids.iter() {
+                    if let Ok(bos_string) = self.tokenizer.decode(&[bos_token.clone()], false) {
+                        if let Some((prompt, _trimmed)) = prompt.rsplit_once(&bos_string) {
+                            return (prompt.to_string(), image_idx)
+                        }
+                    }
+                }
+            } else {
+                // Reasoning tag-based trimming: check for reasoning start/end tokens
+                if let Some((start_str, end_str)) = get_reasoning_token_strings(&self.guidance_tokens, &self.tokenizer) {
+                    if is_reasoning_grammar(&grammar) {
+                        // Control entire reasoning block via guidance
+                        if prompt.trim().ends_with(&start_str) || prompt.trim().ends_with(&end_str) {
+                            if let Some((prompt, _trimmed)) = prompt.rsplit_once(&start_str) {
+                                return (prompt.to_string(), image_idx)
+                            }
+                        }
+                    } else {
+                        // Ensure guided grammar which will not generate a think-stop token is not within reasoning envelope
+                        // A completed inert <think>\n\n</think> block or even an injected think template are harmless
+                        if prompt.trim().ends_with(&start_str) {
+                            if let Some((prompt, _trimmed)) = prompt.rsplit_once(&start_str) {
+                                return (prompt.to_string(), image_idx)
+                            }
+                        }
                     }
                 }
             }
@@ -2301,6 +2325,7 @@ mod tests {
             reasoning_end_ids: vec![100],
             tool_call_start_ids: Vec::new(),
             tool_call_end_ids: Vec::new(),
+            add_bos_token: false,
         };
 
         assert_eq!(
@@ -2318,6 +2343,7 @@ mod tests {
             reasoning_end_ids: vec![100],
             tool_call_start_ids: Vec::new(),
             tool_call_end_ids: Vec::new(),
+            add_bos_token: false,
         };
 
         assert_eq!(
@@ -2335,6 +2361,7 @@ mod tests {
             reasoning_end_ids: vec![100],
             tool_call_start_ids: Vec::new(),
             tool_call_end_ids: Vec::new(),
+            add_bos_token: false,
         };
 
         assert_eq!(
@@ -2352,6 +2379,7 @@ mod tests {
             reasoning_end_ids: vec![100],
             tool_call_start_ids: Vec::new(),
             tool_call_end_ids: Vec::new(),
+            add_bos_token: false,
         };
 
         assert_eq!(
@@ -2369,6 +2397,7 @@ mod tests {
             reasoning_end_ids: vec![100],
             tool_call_start_ids: Vec::new(),
             tool_call_end_ids: Vec::new(),
+            add_bos_token: false,
         };
 
         assert_eq!(

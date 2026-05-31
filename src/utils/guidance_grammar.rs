@@ -294,7 +294,7 @@ pub fn lark_special_token(token_ids: &HashSet<u32>) -> String {
     format!("<{}>", ids.join(","))
 }
 
-// REASONING GRAMMAR - ReasoningEffort is now defined in utils/config.rs
+// REASONING GRAMMAR - ReasoningEffort is defined in utils/config.rs
 
 #[derive(Clone, Debug)]
 pub struct ReasoningGrammar {
@@ -331,7 +331,7 @@ impl ReasoningGrammar {
                 // Minimal latency, no structured thinking
                 format!(
                     r#"start: reasoning_block
-reasoning_block: <[{start_id}]> "\n\n" <[{end_id}]> "\n\n"
+reasoning_block: <[{start_id}]> "\n\n" <[{end_id}]> "\n"
 "#
                 )
             }
@@ -339,51 +339,51 @@ reasoning_block: <[{start_id}]> "\n\n" <[{end_id}]> "\n\n"
                 format!(
                     r#"start: reasoning_block
 reasoning_block: <[{start_id}]> "\n" think_text? "\n" <[{end_id}]> "\n"
-think_text: /(?s:.+?)/
+think_text[temperature=0, max_tokens=768]: /(?s:.+?)/
 "#
                 )
             }
             ReasoningEffort::Low => {
                 format!(
                     r#"start: reasoning_block
-reasoning_block: <[{start_id}]> "\n" think_text "\n" (think_text+ "\n")? "\n" <[{end_id}]> "\n\n"
-think_text[suffix="\n"]: /[ -~]{{16,256}}/
+reasoning_block: <[{start_id}]> "\n" think_text "\n" (think_text+ "\n")? <[{end_id}]> "\n"
+think_text[temperature=0.3, max_tokens=256]: /(?s:.+?)/
 "#
                 )
             }
             ReasoningEffort::Medium => {
                 format!(
                     r#"start: reasoning_block
-reasoning_block: <[{start_id}]> "\n" think_text <[{end_id}]> "\n\n"
-think_text[suffix="\n\n"]: /[\x20-\x7E\x0A\x0D]{{32,768}}/
+reasoning_block: <[{start_id}]> "\n" think_text "\n" <[{end_id}]> "\n"
+think_text[temperature=0.5, max_tokens=768]: /(?s:.+?)/
 "#
                 )
             }
             ReasoningEffort::High => {
                 format!(
                     r#"start: reasoning_block
-reasoning_block: <[{start_id}]> analysis_block critique_block structure_block <[{end_id}]> "\n\n"
+reasoning_block: <[{start_id}]> analysis_block critique_block structure_block "\n" <[{end_id}]> "\n"
 analysis_block: "\n<analysis>\n" analysis_text
-analysis_text[suffix="\n</analysis>\n"]: /[\x20-\x7E\x0A\x0D]{{24,512}}/
+analysis_text[suffix="\n</analysis>\n", temperature=0.8, max_tokens=512]: /(?s:.+?)/
 critique_block: "\n<critique>\n" critique_text
-critique_text[suffix="\n</critique>\n"]: /[\x20-\x7E\x0A\x0D]{{24,512}}/
+critique_text[suffix="\n</critique>\n", temperature=0, max_tokens=512]: /(?s:.+?)/
 structure_block: "\n<structure_response>\n" structure_text
-structure_text[suffix="\n</structure_response>\n"]: /[\x20-\x7E\x0A\x0D]{{24,512}}/
+structure_text[suffix="\n</structure_response>\n", temperature=0.8, max_tokens=512]: /(?s:.+?)/
 "#
                 )
             }
             ReasoningEffort::ChainOfThought => {
                 format!(
                     r#"start: reasoning_block
-reasoning_block: <[{start_id}]> draft_block verification_block critique_block structure_block <[{end_id}]> "\n\n"
+reasoning_block: <[{start_id}]> draft_block verification_block critique_block structure_block "\n" <[{end_id}]> "\n"
 draft_block: "\n<draft>\nCardinalities of concern, intended outcomes, and structures of consideration:\n" draft_text
-draft_text[suffix="\n</draft>\n"]: /[\x20-\x7E\x0A\x0D]{{32,768}}/
+draft_text[suffix="\n</draft>\n", temperature=0.8, max_tokens=768]: /(?s:.+?)/
 verification_block: "\n<verify>\nQuestions, assumptions, and suppositions:\n" verification_text
-verification_text[suffix="\n</verify>\n"]: /[\x20-\x7E\x0A\x0D]{{32,768}}/
+verification_text[suffix="\n</verify>\n", temperature=0, max_tokens=768]: /(?s:.+?)/
 critique_block: "\n<critique>\nAdversarial assessment of evaluation:\n" critique_text
-critique_text[suffix="\n</critique>\n"]: /[\x20-\x7E\x0A\x0D]{{32,768}}/
+critique_text[suffix="\n</critique>\n", temperature=0.6, max_tokens=768]: /(?s:.+?)/
 structure_block: "\n<structure_response>\n" structure_text
-structure_text[suffix="\n</structure_response>\n"]: /[\x20-\x7E\x0A\x0D]{{32,768}}/
+structure_text[suffix="\n</structure_response>\n", temperature=0.8, max_tokens=768]: /(?s:.+?)/
 "#
                 )
             }
@@ -417,7 +417,7 @@ impl GrammarBuilder for ReasoningGrammar {
     fn format(&mut self) -> TopLevelGrammar {
         let lark = self.build_lark();
         if lark.is_empty() {
-            TopLevelGrammar::from_lark_ascii("start: text\ntext: /(?s:.+?)/")
+            TopLevelGrammar::from_lark_ascii("startf\ntext: /(?s:.+?)/")
         } else {
             TopLevelGrammar::from_lark_ascii(&lark)
         }
@@ -494,9 +494,14 @@ impl GrammarBuilder for ChatResponseGrammar {
 text: /(?s:.+?)/"#
                 .to_string()
         } else {
-            r#"start: text
-text[stop=""]: /((?s).*?)/"#
+            if let Some(max_tokens) = self.max_tokens {
+                format!(r#"start: text
+text[stop="", max_tokens={}]: /(?s:.+?)/"#, max_tokens)
+            } else {
+                r#"start: text
+text[stop=""]: /(?s:.+?)/"#
                 .to_string()
+            }
         }
     }
     fn compose_alternate(&mut self, _other: &mut Self) -> Self {
@@ -1737,7 +1742,11 @@ impl GrammarComposer {
         // Models like MiniMax allow us to change the model's role in responding to permit "multi-agent" conversations
         // Need a helper to extract the capability from the chat template and role name from request
         let role = "assistant".to_string();
-        grammar = Self::prefix_with_bos(grammar, guidance_tokens, role);
+        
+        // Only prefix with BOS if add_bos_token is true
+        if guidance_tokens.add_bos_token {
+            grammar = Self::prefix_with_bos(grammar, guidance_tokens, role);
+        }
 
         // Apply thinking fallback transformation after all composition is complete
         // This transforms <[token_id]> syntax to string literals for models without reasoning tokens
@@ -2321,6 +2330,7 @@ mod tests {
             reasoning_end_ids: vec![151658],
             tool_call_start_ids: vec![151657],
             tool_call_end_ids: vec![151658],
+            add_bos_token: false,
         }
     }
 

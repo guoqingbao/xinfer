@@ -729,6 +729,7 @@ pub struct TokenizerConfig {
     pub bos_token: Option<String>,
     #[serde(default, deserialize_with = "deserialize_token_field")]
     pub eos_token: Option<String>,
+    pub pad_token: Option<String>,
 }
 
 #[cfg(not(feature = "python"))]

@@ -267,6 +267,7 @@ pub struct GGUFInfo {
     pub bos: Option<String>,
     pub eos: Option<String>,
     pub unk: Option<String>,
+    pub pad_token: Option<String>,
     pub context_length: Option<usize>,
     pub chat_template: Option<String>,
 }
@@ -281,6 +282,7 @@ struct PropsGGUF {
     unk: Option<u32>,
     eos: Option<u32>,
     bos: Option<u32>,
+    pad: Option<u32>,
 }
 
 impl TryFrom<ContentMetadata<'_>> for PropsGGUF {
@@ -300,6 +302,7 @@ impl TryFrom<ContentMetadata<'_>> for PropsGGUF {
             unk: c.get_value("unknown_token_id").ok(),
             eos: c.get_value("eos_token_id").ok(),
             bos: c.get_value("bos_token_id").ok(),
+            pad: c.get_value("pad_token_id").ok(),
         };
 
         Ok(props)
@@ -388,11 +391,17 @@ pub fn get_gguf_info<R: std::io::Seek + std::io::Read>(
         _ => None,
     };
 
+    let pad_token = match props.pad {
+        Some(u) => Some(props.tokens[u as usize].clone()),
+        _ => None,
+    };
+
     Ok(GGUFInfo {
         tokenizer,
         bos,
         eos,
         unk,
+        pad_token,
         context_length: Some(context_length as usize),
         chat_template,
     })
