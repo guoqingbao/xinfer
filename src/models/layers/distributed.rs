@@ -782,8 +782,8 @@ impl MergedParallelColumnLinear {
                             .contiguous()?;
                         local_output_splits.push(local_out);
 
-                        let scale_row_start = local_out_start / by;
-                        let scale_rows = (local_out + by - 1) / by;
+                        let scale_row_start = local_out_start.div_ceil(by);
+                        let scale_rows = local_out.div_ceil(by);
                         if scale_row_start + scale_rows > scale_dim0 {
                             candle_core::bail!(
                                 "FP8 merged chunk {} scale slice out of bounds: start={}, rows={}, total={}",
@@ -1000,10 +1000,25 @@ impl MergedParallelColumnLinear {
                         let local_out = chunk_size / chunk_shard.world_size;
                         let local_start = chunk_start + chunk_shard.rank * local_out;
 
+                        let scale_block_size: usize = if is_nvfp4_quant { 16 } else { 32 };
+                        let scale_local_start = local_start.div_ceil(scale_block_size);
+                        let scale_local_out = local_out.div_ceil(scale_block_size);
+
                         let blocks_chunk =
                             blocks.narrow(0, local_start, local_out)?.contiguous()?;
                         let scales_chunk =
-                            scales.narrow(0, local_start, local_out)?.contiguous()?;
+                            scales.narrow(0, scale_local_start, scale_local_out)?.contiguous()?;
+
+                        // Verify scale shard is within bounds
+                        let scale_dim0 = scales.dim(0)?;
+                        if scale_local_start + scale_local_out > scale_dim0 {
+                            candle_core::bail!(
+                                "FP4 scale shard out of bounds: start={}, rows={}, total={}",
+                                scale_local_start,
+                                scale_local_out,
+                                scale_dim0
+                            );
+                        }
 
                         let linear = if is_nvfp4_quant {
                             #[cfg(feature = "cuda")]
