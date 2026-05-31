@@ -14,6 +14,7 @@ use crate::utils::config::ModelType;
 use crate::utils::config::ReasoningEffort;
 use crate::utils::guidance::GuidanceTokens;
 use tokenizers::Tokenizer;
+use crate::utils::env::default_reasoning_max_tokens;
 
 // COMMON TRAITS
 
@@ -336,10 +337,11 @@ reasoning_block: <[{start_id}]> "\n\n" <[{end_id}]> "\n"
                 )
             }
             ReasoningEffort::ModelDefault => {
+                let rmt = default_reasoning_max_tokens();
                 format!(
                     r#"start: reasoning_block
 reasoning_block: <[{start_id}]> "\n" think_text? "\n" <[{end_id}]> "\n"
-think_text[temperature=0, max_tokens=768]: /(?s:.+?)/
+think_text[temperature=0, max_tokens={rmt}]: /(?s:.+?)/
 "#
                 )
             }

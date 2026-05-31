@@ -52,3 +52,20 @@ pub fn mamba_snapshot_block_stride_blocks(default: usize) -> usize {
         }
     }
 }
+
+pub const DEFAULT_REASONING_MAX_TOKENS_ENV: &str = "XINFER_DEFAULT_REASONING_MAX_TOKENS";
+pub const DEFAULT_REASONING_MAX_TOKENS_VALUE: usize = 512;
+
+static DEFAULT_REASONING_MAX_TOKENS: OnceLock<usize> = OnceLock::new();
+
+pub fn default_reasoning_max_tokens() -> usize {
+    *DEFAULT_REASONING_MAX_TOKENS.get_or_init(|| {
+        env::var(DEFAULT_REASONING_MAX_TOKENS_ENV)
+            .map(|raw| {
+                raw.trim().parse::<usize>()
+                    .map(|n| if n == 0 { DEFAULT_REASONING_MAX_TOKENS_VALUE } else { n })
+                    .unwrap_or(DEFAULT_REASONING_MAX_TOKENS_VALUE)
+            })
+            .unwrap_or(DEFAULT_REASONING_MAX_TOKENS_VALUE)
+    })
+}
