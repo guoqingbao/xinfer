@@ -888,6 +888,7 @@ impl MergedParallelColumnLinear {
                         )?
                     };
 
+                    #[allow(unused_variables)]
                     let (nvfp4_global_scale, nvfp4_input_scale, nvfp4_sm) = if is_nvfp4_quant {
                         let no_shard = Shard::default();
                         let global_scale = if v.contains_tensor("weight_global_scale") {
