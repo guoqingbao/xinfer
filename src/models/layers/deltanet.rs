@@ -61,9 +61,9 @@ pub struct GatedDeltaNet {
     gdn_layer_idx: usize,
     rms_norm_eps: f64,
     scale: f64,
-    kernel_dtype: DType,
-    /// The dtype that projection weights were loaded in (e.g. F16/BF16).
-    /// Used to cast input before projection when norms output a different dtype (e.g. F32).
+    /// The dtype for projection weights and GDN core ops (conv1d, gating, recurrence).
+    /// For GGUF/F16 mode/Metal: F32; otherwise: model dtype (BF16/F16).
+    /// Quantized projections (FP8/NVFP4) handle dtype internally.
     projection_dtype: DType,
 }
 
@@ -415,9 +415,6 @@ impl GatedDeltaNet {
         &self,
         xs: &Tensor,
     ) -> Result<(Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)> {
-        // When norms output F32 (is_f16_mode / higher_precision) but projection weights
-        // are in the original model dtype (F16/BF16), cast input to match weights.
-        // GGUF (QLinear) handles this internally, but unquantized Linear requires matching dtypes.
         let xs = &if xs.dtype() != self.projection_dtype {
             xs.to_dtype(self.projection_dtype)?
         } else {
@@ -521,16 +518,8 @@ impl GatedDeltaNet {
         }
 
         let is_quantized = config.quantization_config.is_some();
-        let kernel_dtype = if vb.is_qvar_builder() || config.is_f16_mode {
+        let projection_dtype = if vb.is_qvar_builder() || config.is_f16_mode {
             DType::F32
-        } else {
-            dtype
-        };
-        // GGUF (QLinear) casts input to F32 internally, so any input dtype works.
-        // Quantized formats (LnFp8/LnNvfp4/LnMxfp4) and unquantized Linear both need
-        // input in the model's weight dtype (F16/BF16).
-        let projection_dtype = if vb.is_qvar_builder() {
-            kernel_dtype
         } else {
             dtype
         };
@@ -593,7 +582,7 @@ impl GatedDeltaNet {
             head_v_dim,
             comm.clone(),
             config,
-            dtype,
+            projection_dtype,
             is_quantized,
         )?;
 
@@ -637,7 +626,7 @@ impl GatedDeltaNet {
             )?;
         }
         v_w = tensor_parallel_chunk(&v_w, 0, rank, world_size, "linear_attn.conv1d.weight[v]")?;
-        let conv_weight = Tensor::cat(&[&q_w, &k_w, &v_w], 0)?.to_dtype(kernel_dtype)?;
+        let conv_weight = Tensor::cat(&[&q_w, &k_w, &v_w], 0)?.to_dtype(projection_dtype)?;
 
         let conv_bias = vb.get((conv_dim_global,), gdn_key_map["conv1d.bias"]).ok();
         let conv_bias = if let Some(cb) = conv_bias {
@@ -653,7 +642,7 @@ impl GatedDeltaNet {
                 )?;
             }
             v_b = tensor_parallel_chunk(&v_b, 0, rank, world_size, "linear_attn.conv1d.bias[v]")?;
-            Some(Tensor::cat(&[&q_b, &k_b, &v_b], 0)?.to_dtype(kernel_dtype)?)
+            Some(Tensor::cat(&[&q_b, &k_b, &v_b], 0)?.to_dtype(projection_dtype)?)
         } else {
             None
         };
@@ -690,7 +679,7 @@ impl GatedDeltaNet {
                 comm.clone(),
                 &qc_out,
                 &q_out,
-                dtype,
+                projection_dtype,
             )?
         };
 
@@ -736,7 +725,6 @@ impl GatedDeltaNet {
             gdn_layer_idx,
             rms_norm_eps: config.rms_norm_eps,
             scale,
-            kernel_dtype,
             projection_dtype,
         })
     }
@@ -754,24 +742,21 @@ impl GatedDeltaNet {
         }
         let original_dtype = xs.dtype();
 
-        // For GGUF (qvar_builder), input is already F32 — project in F32.
-        // For quantized models (FP8/NVFP4), projections need the model dtype (F16/BF16),
-        // so we project first, THEN convert to kernel_dtype for GDN core ops.
         let (token_count, _hidden) = xs.dims2()?;
         let is_prefill = input_metadata.is_prefill;
         let (q, k, v, z, b, a) = self.project_inputs(xs)?;
 
-        // Convert projection outputs to kernel_dtype for GDN core (conv1d, gating, recurrence).
-        // For GGUF, F16 mode, and configs requesting float32 SSM, the GDN
-        // core runs in F32 to avoid recurrent-state precision loss.
-        let (q, k, v, z, b, a) = if q.dtype() != self.kernel_dtype {
+        // Ensure projection outputs match projection_dtype for GDN core (conv1d, gating, recurrence).
+        // For GGUF/F16 mode (projection_dtype=F32), unquantized projections already output F32.
+        // For quantized projections (FP8/NVFP4), output may differ — upcast if needed.
+        let (q, k, v, z, b, a) = if q.dtype() != self.projection_dtype {
             (
-                q.to_dtype(self.kernel_dtype)?,
-                k.to_dtype(self.kernel_dtype)?,
-                v.to_dtype(self.kernel_dtype)?,
-                z.to_dtype(self.kernel_dtype)?,
-                b.to_dtype(self.kernel_dtype)?,
-                a.to_dtype(self.kernel_dtype)?,
+                q.to_dtype(self.projection_dtype)?,
+                k.to_dtype(self.projection_dtype)?,
+                v.to_dtype(self.projection_dtype)?,
+                z.to_dtype(self.projection_dtype)?,
+                b.to_dtype(self.projection_dtype)?,
+                a.to_dtype(self.projection_dtype)?,
             )
         } else {
             (q, k, v, z, b, a)
@@ -902,7 +887,6 @@ impl GatedDeltaNet {
             self.head_v_dim,
         )?;
 
-        // Output projection — cast to projection dtype for matmul, then restore original dtype
         let out = self
             .out_proj
             .forward(&gated_output.to_dtype(self.projection_dtype)?)?;
