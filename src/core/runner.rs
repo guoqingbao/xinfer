@@ -1813,11 +1813,8 @@ impl ModelRunner {
                 }),
         };
 
-        let (guided_logits, guided_seq_ids) =
-            self.apply_requested_guidance(logits, &seqs, &seq_ids)?;
-
         // Apply penalties using cached values (same for all sequences in batch)
-        // This is done AFTER LLG masking so penalties only affect tokens allowed by grammar
+        // This is done BEFORE LLG masking so as to avoid impacting masked logits
         let has_any_penalty =
             cached_params.frequency_penalty.is_some() || cached_params.presence_penalty.is_some();
 
@@ -1839,16 +1836,19 @@ impl ModelRunner {
                 .collect();
 
             self.logit_processor.apply_batch_repeat_penalty(
-                &guided_logits,
+                logits,
                 vec![cached_params.frequency_penalty.unwrap_or(0.0); batch_size],
                 vec![cached_params.presence_penalty.unwrap_or(0.0); batch_size],
                 reference_tokens,
             )?
         } else {
-            guided_logits.to_owned()
+            logits.to_owned()
         };
 
-        let tokens = self.sample_processed_logits(&logits, &cached_params.sampling)?;
+        let (guided_logits, guided_seq_ids) =
+            self.apply_requested_guidance(&logits, &seqs, &seq_ids)?;
+
+        let tokens = self.sample_processed_logits(&guided_logits, &cached_params.sampling)?;
 
         self.commit_guided_tokens(&seq_ids, &tokens, guided_seq_ids);
 
