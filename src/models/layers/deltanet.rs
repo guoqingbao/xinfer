@@ -566,14 +566,12 @@ impl GatedDeltaNet {
         } else {
             a_log_loaded
         };
-        let mut dt_bias = vb
-            .get_with_hints_dtype(
-                (num_v_heads_global,),
-                gdn_key_map["dt_bias"],
-                sd,
-                DType::F32,
-            )?
-            .to_dtype(kernel_dtype)?;
+        let mut dt_bias = vb.get_with_hints_dtype(
+            (num_v_heads_global,),
+            gdn_key_map["dt_bias"],
+            sd,
+            DType::F32,
+        )?;
         if vb.is_qvar_builder() && num_k_heads_global != num_v_heads_global {
             a_log =
                 undo_tiled_v_heads_first_dim(&a_log, num_k_heads_global, num_v_heads_global, 1)?;

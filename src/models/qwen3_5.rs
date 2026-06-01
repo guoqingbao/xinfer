@@ -444,15 +444,6 @@ impl Qwen3_5ForCausalLM {
 
         // Start small and let runner preallocate to the final engine capacity.
         let max_batch_size = 1;
-        let ssm_dtype_is_f32 = hybrid
-            .mamba_ssm_dtype
-            .as_deref()
-            .is_some_and(|dt| dt.eq_ignore_ascii_case("float32") || dt.eq_ignore_ascii_case("f32"));
-        let conv_cache_dtype = if is_qvar_builder || config.is_f16_mode || ssm_dtype_is_f32 {
-            DType::F32
-        } else {
-            dtype
-        };
         let mamba_cache = if num_gdn_layers > 0 {
             MambaCache::new(
                 num_gdn_layers,
@@ -462,13 +453,13 @@ impl Qwen3_5ForCausalLM {
                 num_v_heads,
                 key_head_dim,
                 value_head_dim,
-                conv_cache_dtype,
+                DType::F32,
                 DType::F32,
                 device,
             )?
         } else {
             // No GDN layers, create minimal cache
-            MambaCache::new(0, 1, 1, 2, 1, 1, 1, conv_cache_dtype, DType::F32, device)?
+            MambaCache::new(0, 1, 1, 2, 1, 1, 1, DType::F32, DType::F32, device)?
         };
 
         Ok(Self {
