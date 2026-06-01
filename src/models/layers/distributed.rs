@@ -981,6 +981,8 @@ impl MergedParallelColumnLinear {
                     };
 
                     let mut chunk_start = 0;
+                    let mut local_block_chunks = Vec::<Tensor>::with_capacity(chunks.len());
+                    let mut local_scale_chunks = Vec::<Tensor>::with_capacity(chunks.len());
                     let mut local_output_splits = Vec::<usize>::with_capacity(chunks.len());
                     for chunk_idx in 0..chunks.len() {
                         let chunk_size = chunks[chunk_idx];
@@ -1000,44 +1002,57 @@ impl MergedParallelColumnLinear {
                         let local_out = chunk_size / chunk_shard.world_size;
                         let local_start = chunk_start + chunk_shard.rank * local_out;
 
-                        let blocks_chunk =
-                            blocks.narrow(0, local_start, local_out)?.contiguous()?;
-                        let scales_chunk =
-                            scales.narrow(0, local_start, local_out)?.contiguous()?;
-
-                        let linear = if is_nvfp4_quant {
-                            #[cfg(feature = "cuda")]
-                            let weight_scale_swizzled = if nvfp4_sm >= 100 {
-                                Some(attention_rs::nvfp4_linear::swizzle_nvfp4_weight_scales(
-                                    &scales_chunk,
-                                )?)
-                            } else {
-                                None
-                            };
-                            #[cfg(not(feature = "cuda"))]
-                            let weight_scale_swizzled: Option<Tensor> = None;
-
-                            LinearX::LnNvfp4(LnNvfp4 {
-                                blocks: blocks_chunk,
-                                scales: scales_chunk,
-                                global_scale: nvfp4_global_scale,
-                                input_scale: nvfp4_input_scale,
-                                bias: None,
-                                weight_scale_swizzled,
-                            })
-                        } else {
-                            LinearX::LnMxfp4(LnMxfp4 {
-                                blocks: blocks_chunk,
-                                scales: scales_chunk,
-                                bias: None,
-                            })
-                        };
-
+                        local_block_chunks
+                            .push(blocks.narrow(0, local_start, local_out)?.contiguous()?);
+                        local_scale_chunks
+                            .push(scales.narrow(0, local_start, local_out)?.contiguous()?);
                         local_output_splits.push(local_out);
-                        let ln = TensorParallelColumnLinear { linear };
-                        vec_linear.push(ln);
                         chunk_start += chunk_size;
                     }
+
+                    let merged_blocks = if local_block_chunks.len() == 1 {
+                        local_block_chunks.remove(0)
+                    } else {
+                        let refs = local_block_chunks.iter().collect::<Vec<_>>();
+                        Tensor::cat(&refs, 0)?
+                    };
+                    let merged_scales = if local_scale_chunks.len() == 1 {
+                        local_scale_chunks.remove(0)
+                    } else {
+                        let refs = local_scale_chunks.iter().collect::<Vec<_>>();
+                        Tensor::cat(&refs, 0)?
+                    };
+
+                    let linear = if is_nvfp4_quant {
+                        #[cfg(feature = "cuda")]
+                        let weight_scale_swizzled = if nvfp4_sm >= 100 {
+                            Some(attention_rs::nvfp4_linear::swizzle_nvfp4_weight_scales(
+                                &merged_scales,
+                            )?)
+                        } else {
+                            None
+                        };
+                        #[cfg(not(feature = "cuda"))]
+                        let weight_scale_swizzled: Option<Tensor> = None;
+
+                        LinearX::LnNvfp4(LnNvfp4 {
+                            blocks: merged_blocks,
+                            scales: merged_scales,
+                            global_scale: nvfp4_global_scale,
+                            input_scale: nvfp4_input_scale,
+                            bias: None,
+                            weight_scale_swizzled,
+                        })
+                    } else {
+                        LinearX::LnMxfp4(LnMxfp4 {
+                            blocks: merged_blocks,
+                            scales: merged_scales,
+                            bias: None,
+                        })
+                    };
+
+                    let ln = TensorParallelColumnLinear { linear };
+                    vec_linear.push(ln);
                     output_splits = Some(local_output_splits);
                 } else {
                     let weight = v.get((out_dim, in_dim), "weight")?;

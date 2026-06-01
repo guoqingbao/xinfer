@@ -23,12 +23,72 @@ use std::fmt;
 
 /// Reserved memory constants - used for post-allocation warnings
 const CUDA_RESERVED_BYTES: u64 = 512 * 1024 * 1024; // 512 MB recommended minimum remaining memory
+/// Minimum activation reserve when model-aware computation yields a very small value.
+const MIN_ACTIVATION_RESERVE_BYTES: u64 = 256 * 1024 * 1024; // 256 MB floor
 const SIZE_IN_MB: f64 = (1024 * 1024) as f64;
 const SIZE_IN_GB: f64 = 1024.0 * 1024.0 * 1024.0;
 const DEFAULT_HYBRID_MAMBA_FRACTION: f64 = 0.15;
 const MAX_HYBRID_MAMBA_FRACTION: f64 = 0.3;
 const HYBRID_MAMBA_ACTIVE_SLOT_MULTIPLIER: usize = 3;
 const HYBRID_MAMBA_MIN_ACTIVE_SLOTS: usize = 8;
+
+/// Per-category GPU memory budget computed deterministically from model config.
+#[derive(Debug, Clone)]
+pub struct GpuMemoryBudget {
+    /// FlashInfer float+int workspace (fixed, 0 if disabled)
+    pub flashinfer_bytes: u64,
+    /// CUTLASS workspace (fixed, 0 if disabled)
+    pub cutlass_bytes: u64,
+    /// MoE activation pool peak estimate
+    pub moe_pool_bytes: u64,
+    /// Per-layer Flash split-K workspace total
+    pub flash_splitk_bytes: u64,
+    /// Transient activation overhead (largest forward-pass intermediate)
+    pub transient_bytes: u64,
+    /// Total workspace reserve (sum of above)
+    pub total_bytes: u64,
+}
+
+impl GpuMemoryBudget {
+    pub fn report(&self, min_available_before: u64) {
+        let mut parts = Vec::new();
+        if self.flashinfer_bytes > 0 {
+            parts.push(format!(
+                "FlashInfer {:.0}M",
+                self.flashinfer_bytes as f64 / SIZE_IN_MB
+            ));
+        }
+        if self.cutlass_bytes > 0 {
+            parts.push(format!(
+                "CUTLASS {:.0}M",
+                self.cutlass_bytes as f64 / SIZE_IN_MB
+            ));
+        }
+        if self.moe_pool_bytes > 0 {
+            parts.push(format!(
+                "MoE pool {:.0}M",
+                self.moe_pool_bytes as f64 / SIZE_IN_MB
+            ));
+        }
+        if self.flash_splitk_bytes > 0 {
+            parts.push(format!(
+                "SplitK {:.0}M",
+                self.flash_splitk_bytes as f64 / SIZE_IN_MB
+            ));
+        }
+        parts.push(format!(
+            "Transient {:.0}M",
+            self.transient_bytes as f64 / SIZE_IN_MB
+        ));
+        crate::log_warn!(
+            "GPU Memory Budget: {:.2} GB available → {:.2} GB workspace reserve ({}) → {:.2} GB for caches",
+            min_available_before as f64 / SIZE_IN_GB,
+            self.total_bytes as f64 / SIZE_IN_GB,
+            parts.join(" + "),
+            (min_available_before.saturating_sub(self.total_bytes)) as f64 / SIZE_IN_GB
+        );
+    }
+}
 
 /// Represents the result of KVCache allocation planning
 #[derive(Debug, Clone)]
@@ -120,6 +180,13 @@ pub struct KVCacheAllocator {
     /// Per-layer KV cache config: (num_kv_heads, head_dim) per KV layer.
     /// When set, overrides uniform num_kv_heads/head_dim for cache allocation.
     per_layer_cache_config: Option<Vec<(usize, usize)>>,
+    // MoE config for workspace budget computation
+    num_attention_heads: usize,
+    hidden_size: usize,
+    moe_intermediate_size: usize,
+    moe_num_experts_per_tok: usize,
+    is_moe: bool,
+    prefill_chunk_size: usize,
 }
 
 impl KVCacheAllocator {
@@ -306,6 +373,22 @@ impl KVCacheAllocator {
             None => None,
         };
 
+        let is_moe = config.moe_cfg.is_some()
+            && config
+                .moe_cfg
+                .as_ref()
+                .is_some_and(|m| m.num_experts.unwrap_or(0) > 1);
+        let moe_intermediate_size = config
+            .moe_cfg
+            .as_ref()
+            .map(|m| m.moe_intermediate_size)
+            .unwrap_or(0);
+        let moe_num_experts_per_tok = config
+            .moe_cfg
+            .as_ref()
+            .map(|m| m.num_experts_per_tok)
+            .unwrap_or(0);
+
         Self {
             num_hidden_layers: config.num_hidden_layers,
             num_kv_layers,
@@ -335,11 +418,95 @@ impl KVCacheAllocator {
             mla_kv_lora_rank,
             mla_qk_rope_head_dim,
             per_layer_cache_config,
+            num_attention_heads: config.num_attention_heads,
+            hidden_size: config.hidden_size,
+            moe_intermediate_size,
+            moe_num_experts_per_tok,
+            is_moe,
+            prefill_chunk_size: econfig.effective_prefill_chunk_size(),
         }
     }
 
     pub fn resolved_kvcache_dtype(&self) -> crate::utils::config::KvCacheDtype {
         self.kvcache_dtype
+    }
+
+    /// Compute the deterministic workspace budget from model and engine config.
+    ///
+    /// This replaces the flat `ACTIVATION_RESERVE_BYTES` with a model-aware
+    /// calculation that accounts for all known persistent and transient GPU
+    /// memory consumers that are not tracked in KV cache or mamba budgets.
+    pub fn compute_workspace_budget(&self) -> GpuMemoryBudget {
+        // FlashInfer workspace: 512 MiB float + 128 MiB int (GPU) + 128 MiB pinned host (not GPU)
+        // Graph capture duplicates the GPU buffers, but those are tracked separately.
+        let flashinfer_bytes: u64 = if cfg!(feature = "flashinfer") {
+            (512 + 128) * 1024 * 1024 // float + int buffers
+        } else {
+            0
+        };
+
+        // CUTLASS workspace: 512 MiB dedicated buffer
+        let cutlass_bytes: u64 = if cfg!(feature = "cutlass") {
+            512 * 1024 * 1024
+        } else {
+            0
+        };
+
+        // MoE activation pool: only for NVFP4/MXFP4 MoE models with cutlass
+        // Peak = prefill_chunk_size × topk × max(hidden, 2×intermediate) × dtype_size
+        // Covers: gathered, rep_out (largest buffers); act_packed and act_scales are smaller.
+        let moe_pool_bytes: u64 =
+            if cfg!(feature = "cutlass") && self.is_moe && self.moe_num_experts_per_tok > 0 {
+                let topk = self.moe_num_experts_per_tok;
+                let size_m = self.prefill_chunk_size * topk;
+                let hidden = self.hidden_size / self.num_shards.max(1);
+                let inter = self.moe_intermediate_size / self.num_shards.max(1);
+                let largest_dim = hidden.max(2 * inter);
+                // gathered: size_m × hidden × dtype, rep_out: size_m × inter × dtype,
+                // act_packed: size_m × hidden/2, act_scales: ~size_m × hidden/16
+                let gathered = size_m * hidden * self.model_dtype_size;
+                let rep_out = size_m * inter * self.model_dtype_size;
+                let act_packed = size_m * hidden / 2;
+                let act_scales = size_m * (hidden / 16 + 128);
+                // Use sum of the four main pool buffers
+                let pool_total = gathered + rep_out + act_packed + act_scales;
+                // Also account for per-call transient output: size_m × largest_dim × dtype
+                let transient_output = size_m * largest_dim * self.model_dtype_size;
+                (pool_total + transient_output) as u64
+            } else {
+                0
+            };
+
+        // Flash split-K workspace: per KV layer, 64 seqs × q_heads × 8 splits × (head_dim+2) × 4 bytes
+        let flash_splitk_bytes: u64 = if cfg!(feature = "flash") || cfg!(feature = "flashattn") {
+            let q_heads_per_shard = self.num_attention_heads / self.num_shards.max(1);
+            let splits = 8usize; // flash::NUM_SPLITS
+            let per_layer = 64 * q_heads_per_shard * splits * (self.head_dim + 2) * 4;
+            (per_layer * self.num_kv_layers) as u64
+        } else {
+            0
+        };
+
+        // Transient activation overhead: largest intermediate tensor during forward pass.
+        // Approximately 2 × prefill_chunk_size × hidden_size × dtype_size (for gate+up projections).
+        let transient_bytes =
+            (2 * self.prefill_chunk_size * self.hidden_size * self.model_dtype_size) as u64;
+
+        let total_bytes = flashinfer_bytes
+            + cutlass_bytes
+            + moe_pool_bytes
+            + flash_splitk_bytes
+            + transient_bytes;
+        let total_bytes = total_bytes.max(MIN_ACTIVATION_RESERVE_BYTES);
+
+        GpuMemoryBudget {
+            flashinfer_bytes,
+            cutlass_bytes,
+            moe_pool_bytes,
+            flash_splitk_bytes,
+            transient_bytes,
+            total_bytes,
+        }
     }
 
     /// Set per-layer KV cache configuration for models with heterogeneous head dims
@@ -353,6 +520,12 @@ impl KVCacheAllocator {
     pub fn plan(&self, device_ids: &[usize], econfig: &mut EngineConfig) -> Result<()> {
         match self.get_available_memory(device_ids) {
             Ok(min_available) => {
+                let workspace_budget = self.compute_workspace_budget();
+                workspace_budget.report(min_available);
+                let activation_reserve = workspace_budget
+                    .total_bytes
+                    .min(min_available.saturating_sub(1));
+                let min_available = min_available.saturating_sub(activation_reserve);
                 let mut kv_budget = min_available;
                 let mut mamba_budget = 0u64;
                 let mut mamba_budget_slots = 0usize;

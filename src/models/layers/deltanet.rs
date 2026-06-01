@@ -81,17 +81,27 @@ impl GatedDeltaNet {
             "nvfp4" => {
                 let has_packed = vb.has_key("weight_packed") || vb.has_key("blocks");
                 let has_scale = vb.has_key("weight_scale") || vb.has_key("scales");
-                let has_modelopt = vb.has_key("weight_scale_2") || vb.has_key("input_scale");
-                (has_packed && has_scale) || (has_modelopt && has_scale)
+                let has_nvfp4_second_scale =
+                    vb.has_key("weight_scale_2") || vb.has_key("weight_global_scale");
+                (has_packed && has_scale) || (has_nvfp4_second_scale && has_scale)
             }
             "gptq" | "awq" => vb.has_key("qweight") || vb.has_key("B"),
             _ => true,
         }
     }
 
+    fn is_weight_fp8(vb: &VarBuilderX) -> bool {
+        if vb.is_qvar_builder() {
+            return false;
+        }
+        vb.has_key("weight_scale") || vb.has_key("weight_scale_inv")
+    }
+
     /// Resolve effective quantization config for a specific weight.
     /// If the weight is not actually quantized, returns (None, None) so
     /// the loader falls back to the standard unquantized path.
+    /// For mixed-precision models (nvfp4 global with FP8 per-weight), detects
+    /// FP8 weights and returns an FP8 config so they load correctly.
     fn resolve_quant_for_weight(
         vb: &VarBuilderX,
         quantization_config: &Option<crate::utils::config::QuantConfig>,
@@ -100,6 +110,11 @@ impl GatedDeltaNet {
         if let Some(cfg) = quantization_config {
             if Self::is_weight_quantized(vb, &cfg.quant_method) {
                 return (quantization_config.clone(), quant.clone());
+            }
+            if cfg.quant_method == "nvfp4" && Self::is_weight_fp8(vb) {
+                let mut fp8_cfg = cfg.clone();
+                fp8_cfg.quant_method = "fp8".to_string();
+                return (Some(fp8_cfg), quant.clone());
             }
         }
         (None, None)

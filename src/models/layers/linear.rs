@@ -516,6 +516,17 @@ fn has_fp4_scale_tensors(vb: &VarBuilder) -> bool {
         || vb.contains_tensor("blocks")
 }
 
+fn has_nvfp4_specific_tensors(vb: &VarBuilder) -> bool {
+    vb.contains_tensor("weight_packed")
+        || vb.contains_tensor("blocks")
+        || vb.contains_tensor("weight_scale_2")
+        || vb.contains_tensor("weight_global_scale")
+}
+
+fn has_fp8_tensors(vb: &VarBuilder) -> bool {
+    vb.contains_tensor("weight_scale") || vb.contains_tensor("weight_scale_inv")
+}
+
 pub fn linear_x(
     in_dim: usize,
     out_dim: usize,
@@ -573,6 +584,16 @@ pub fn linear_x(
                     {
                         let ln = linear(in_dim, out_dim, vb.clone(), shards, dtype)?;
                         return Ok(LinearX::Linear(ln));
+                    }
+                    if !has_nvfp4_specific_tensors(&vb) && has_fp8_tensors(&vb) {
+                        match load_ln_fp8_with_hints(in_dim, out_dim, vb.clone(), shards, cfg, true)
+                        {
+                            Ok(ln) => return Ok(LinearX::LnFp8(ln)),
+                            Err(_) => {
+                                let ln = linear(in_dim, out_dim, vb.clone(), shards, dtype)?;
+                                return Ok(LinearX::Linear(ln));
+                            }
+                        }
                     }
                     let ln = LnNvfp4::load(in_dim, out_dim, vb.clone(), shards, true)?;
                     return Ok(LinearX::LnNvfp4(ln));
@@ -675,6 +696,23 @@ pub fn linear_no_bias_x(
                     if !has_fp4_scale_tensors(&vb) {
                         let ln = linear_no_bias(in_dim, out_dim, vb.clone(), shards, dtype)?;
                         return Ok(LinearX::Linear(ln));
+                    }
+                    if !has_nvfp4_specific_tensors(&vb) && has_fp8_tensors(&vb) {
+                        match load_ln_fp8_with_hints(
+                            in_dim,
+                            out_dim,
+                            vb.clone(),
+                            shards,
+                            cfg,
+                            false,
+                        ) {
+                            Ok(ln) => return Ok(LinearX::LnFp8(ln)),
+                            Err(_) => {
+                                let ln =
+                                    linear_no_bias(in_dim, out_dim, vb.clone(), shards, dtype)?;
+                                return Ok(LinearX::Linear(ln));
+                            }
+                        }
                     }
                     let ln = LnNvfp4::load(in_dim, out_dim, vb.clone(), shards, false)?;
                     return Ok(LinearX::LnNvfp4(ln));

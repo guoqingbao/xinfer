@@ -854,6 +854,8 @@ pub struct QuantConfig {
     pub quant_algo: Option<String>,
     #[serde(default)]
     pub mode: Option<String>,
+    #[serde(default)]
+    pub quantized_layers: Option<serde_json::Value>,
 }
 
 impl QuantConfig {
@@ -880,6 +882,22 @@ impl QuantConfig {
                     }
                     if self.bits == 0 {
                         self.bits = 4;
+                    }
+                    return;
+                }
+                if algo.eq_ignore_ascii_case("FP8") {
+                    self.quant_method = "fp8".to_string();
+                    return;
+                }
+                if algo.eq_ignore_ascii_case("MIXED_PRECISION") {
+                    if self.detect_nvfp4_from_config_groups()
+                        || self.detect_nvfp4_from_quantized_layers()
+                    {
+                        self.quant_method = "nvfp4".to_string();
+                        self.bits = 4;
+                        self.group_size = 16;
+                    } else if self.detect_fp8_from_quantized_layers() {
+                        self.quant_method = "fp8".to_string();
                     }
                     return;
                 }
@@ -986,6 +1004,40 @@ impl QuantConfig {
                         if fmt.contains("mxfp4") {
                             return true;
                         }
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    fn detect_nvfp4_from_quantized_layers(&self) -> bool {
+        let layers = match &self.quantized_layers {
+            Some(v) => v,
+            None => return false,
+        };
+        if let Some(obj) = layers.as_object() {
+            for (_key, layer_info) in obj {
+                if let Some(algo) = layer_info.get("quant_algo").and_then(|v| v.as_str()) {
+                    if algo.contains("NVFP4") || algo.contains("nvfp4") {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    fn detect_fp8_from_quantized_layers(&self) -> bool {
+        let layers = match &self.quantized_layers {
+            Some(v) => v,
+            None => return false,
+        };
+        if let Some(obj) = layers.as_object() {
+            for (_key, layer_info) in obj {
+                if let Some(algo) = layer_info.get("quant_algo").and_then(|v| v.as_str()) {
+                    if algo == "FP8" || algo == "fp8" {
+                        return true;
                     }
                 }
             }
@@ -1137,6 +1189,7 @@ mod tests {
             config_groups: None,
             quant_algo: None,
             mode: None,
+            quantized_layers: None,
         };
         assert!(cfg.should_skip_module("model.layers.0.self_attn.q_proj"));
         assert!(cfg.should_skip_module("model.layers.5.linear_attn.out_proj"));
@@ -1561,5 +1614,62 @@ mod tests {
         assert_eq!(cfg.quant_method, "nvfp4");
         assert_eq!(cfg.bits, 4);
         assert_eq!(cfg.group_size, 16);
+    }
+
+    #[test]
+    fn test_mixed_precision_nvfp4_fp8_from_quantized_layers() {
+        let json = r#"{
+            "quant_method": "modelopt",
+            "quant_algo": "MIXED_PRECISION",
+            "config_groups": {
+                "group_0": {
+                    "input_activations": {"dynamic": false, "num_bits": 8, "type": "float"},
+                    "weights": {"dynamic": false, "num_bits": 8, "type": "float"},
+                    "targets": ["model.layers.0.linear_attn.in_proj_qkv"]
+                },
+                "group_1": {
+                    "input_activations": {"dynamic": false, "num_bits": 4, "type": "float", "group_size": 16},
+                    "weights": {"dynamic": false, "num_bits": 4, "type": "float", "group_size": 16},
+                    "targets": ["model.layers.0.mlp.experts"]
+                }
+            },
+            "quantized_layers": {
+                "model.layers.0.linear_attn.in_proj_qkv": {"quant_algo": "FP8"},
+                "model.layers.0.mlp.experts": {"quant_algo": "W4A16_NVFP4", "group_size": 16}
+            },
+            "ignore": ["mtp*"]
+        }"#;
+        let mut cfg: QuantConfig = serde_json::from_str(json).unwrap();
+        cfg.normalize_compressed_tensors();
+        assert_eq!(cfg.quant_method, "nvfp4");
+        assert_eq!(cfg.group_size, 16);
+        assert_eq!(cfg.bits, 4);
+    }
+
+    #[test]
+    fn test_mixed_precision_fp8_only_from_quantized_layers() {
+        let json = r#"{
+            "quant_method": "modelopt",
+            "quant_algo": "MIXED_PRECISION",
+            "quantized_layers": {
+                "model.layers.0.self_attn.q_proj": {"quant_algo": "FP8"},
+                "model.layers.0.self_attn.k_proj": {"quant_algo": "FP8"}
+            },
+            "ignore": ["mtp*"]
+        }"#;
+        let mut cfg: QuantConfig = serde_json::from_str(json).unwrap();
+        cfg.normalize_compressed_tensors();
+        assert_eq!(cfg.quant_method, "fp8");
+    }
+
+    #[test]
+    fn test_modelopt_fp8_normalization() {
+        let json = r#"{
+            "quant_method": "modelopt",
+            "quant_algo": "FP8"
+        }"#;
+        let mut cfg: QuantConfig = serde_json::from_str(json).unwrap();
+        cfg.normalize_compressed_tensors();
+        assert_eq!(cfg.quant_method, "fp8");
     }
 }
