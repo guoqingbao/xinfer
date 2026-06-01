@@ -81,6 +81,9 @@ impl Qwen3VLForConditionalGeneration {
 
             let vision_vb = if vb.is_qvar_builder() {
                 vb.aux()
+            } else if vb.has_key("vision_tower.patch_embed.proj.weight") {
+                // MLX-style prefix: vision_tower.*
+                Some(vb.pp("vision_tower"))
             } else {
                 Some(vb.pp("model.visual"))
             };
@@ -119,6 +122,11 @@ impl Qwen3VLForConditionalGeneration {
             > 0;
         let text_prefix = if vb.is_qvar_builder() {
             None
+        } else if vb.has_key("language_model.model.embed_tokens.weight")
+            || vb.has_key("language_model.model.embed_tokens.scales")
+        {
+            // MLX-style prefix: language_model.model.*
+            Some("language_model.model.".to_string())
         } else {
             Some("model.language_model.".to_string())
         };

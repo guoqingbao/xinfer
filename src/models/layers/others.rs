@@ -109,11 +109,15 @@ pub fn embedding(
                 vocab_size.is_some(),
                 "vocab_size must be specified for safetensor models"
             );
-            (
-                vb.get((vocab_size.unwrap(), hidden_size), "weight")?
-                    .to_dtype(dtype)?,
-                vocab_size.unwrap(),
-            )
+            let vs = vocab_size.unwrap();
+            if vb.contains_tensor("scales") {
+                // MLX NVFP4: quantized embedding with U32 weights + U8 FP8 E4M3 scales.
+                // Dequantize at load time since embeddings are looked up, not matmul'd.
+                let emb = dequantize_mlx_nvfp4_embedding(vb, vs, hidden_size, dtype)?;
+                (emb, vs)
+            } else {
+                (vb.get((vs, hidden_size), "weight")?.to_dtype(dtype)?, vs)
+            }
         }
         Either::Right(vb) => {
             let weight = if vocab_size.is_some() {
@@ -127,6 +131,40 @@ pub fn embedding(
         }
     };
     Ok((Embedding::new(embeddings, hidden_size), vocab_size))
+}
+
+fn dequantize_mlx_nvfp4_embedding(
+    vb: &candle_nn::var_builder::ShardedVarBuilder,
+    vocab_size: usize,
+    hidden_size: usize,
+    dtype: DType,
+) -> Result<Tensor> {
+    use candle_nn::var_builder::Shard;
+    let no_shard = Shard::default();
+    let w_u32 = vb.get_with_hints_dtype(
+        (vocab_size, hidden_size / 8),
+        "weight",
+        no_shard,
+        DType::U32,
+    )?;
+    let scales = vb.get_with_hints_dtype(
+        (vocab_size, hidden_size / 16),
+        "scales",
+        no_shard,
+        DType::U8,
+    )?;
+
+    let out_dtype = match dtype {
+        DType::F16 | DType::BF16 => dtype,
+        _ => DType::BF16,
+    };
+    attention_rs::nvfp4_linear::mlx_dequant_embedding(
+        &w_u32,
+        &scales,
+        vocab_size,
+        hidden_size,
+        out_dtype,
+    )
 }
 
 pub fn conv2d(
@@ -233,7 +271,23 @@ impl Conv3dNoBias {
             kernel_sizes[2],
         );
         let ws = match vb.0 {
-            Either::Left(v) => v.get(expected_shape, "weight")?,
+            Either::Left(v) => {
+                match v.get(expected_shape, "weight") {
+                    Ok(w) => w,
+                    Err(_) => {
+                        // MLX stores conv weights as (O, T, H, W, C) instead of (O, C, T, H, W).
+                        let mlx_shape = (
+                            out_channels,
+                            kernel_sizes[0],
+                            kernel_sizes[1],
+                            kernel_sizes[2],
+                            in_channels / cfg.groups,
+                        );
+                        let w = v.get(mlx_shape, "weight")?;
+                        w.permute((0, 4, 1, 2, 3))?
+                    }
+                }
+            }
             _ => {
                 panic!("Unsupported quantized format for conv3d")
             }

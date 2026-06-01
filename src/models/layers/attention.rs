@@ -439,8 +439,13 @@ impl Attention {
         .collect();
         let is_gemma = arch == "Gemma3ForConditionalGeneration".to_string()
             || arch == "Gemma3ForCausalLM".to_string();
-        // Qwen3.5/Qwen3Next per-head q/k norms use Gemma-style +1 weight semantics.
-        let qk_norm_add_one = is_gemma || (is_qwen35_or_next && !is_qvar_builder);
+        let is_mlx_nvfp4 = config
+            .quantization_config
+            .as_ref()
+            .is_some_and(|q| q.is_mlx_nvfp4);
+        // Qwen3.5/Qwen3Next HF weights use Gemma-style +1 weight semantics for
+        // q/k norms. MLX-sanitized NVFP4 checkpoints store the actual weights.
+        let qk_norm_add_one = is_gemma || (is_qwen35_or_next && !is_qvar_builder && !is_mlx_nvfp4);
 
         let world_size = comm.world_size();
         let attention_heads = num_heads / world_size;

@@ -914,6 +914,7 @@ pub struct Qwen3HybridRawConfig {
     pub linear_num_key_value_heads: Option<usize>,
     pub linear_key_head_dim: Option<usize>,
     pub linear_value_head_dim: Option<usize>,
+    pub mamba_ssm_dtype: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -924,6 +925,7 @@ pub struct Qwen3HybridConfig {
     pub num_k_heads: usize,
     pub key_head_dim: usize,
     pub value_head_dim: usize,
+    pub mamba_ssm_dtype: Option<String>,
 }
 
 pub fn is_qwen3_hybrid_arch_name(arch: &str) -> bool {
@@ -937,6 +939,59 @@ pub fn is_qwen3_hybrid_arch_name(arch: &str) -> bool {
             | "Qwen3NextForConditionalGeneration"
     )
 }
+
+fn is_qwen_chat_template_arch_name(arch: &str) -> bool {
+    matches!(
+        arch,
+        "Qwen3ForCausalLM"
+            | "Qwen3ForConditionalGeneration"
+            | "Qwen3MoeForCausalLM"
+            | "Qwen3VLForConditionalGeneration"
+            | "Qwen3VLMoeForConditionalGeneration"
+            | "Qwen3_5ForCausalLM"
+            | "Qwen3_5ForConditionalGeneration"
+            | "Qwen3_5MoeForCausalLM"
+            | "Qwen3_5MoeForConditionalGeneration"
+            | "Qwen3NextForCausalLM"
+            | "Qwen3NextForConditionalGeneration"
+    )
+}
+
+const QWEN_THINKING_CHAT_TEMPLATE: &str = r#"
+{%- for message in messages %}
+{%- if message.content is string %}
+{%- set content = message.content %}
+{%- else %}
+{%- set content = '' %}
+{%- endif %}
+{%- if message.role == "system" or message.role == "user" %}
+{{- '<|im_start|>' + message.role + '\n' + content + '<|im_end|>\n' }}
+{%- elif message.role == "assistant" %}
+{%- set reasoning_content = '' %}
+{%- if message.reasoning_content is string %}
+{%- set reasoning_content = message.reasoning_content %}
+{%- elif '</think>' in content %}
+{%- set reasoning_content = content.split('</think>')[0].rstrip('\n').split('<think>')[-1].lstrip('\n') %}
+{%- set content = content.split('</think>')[-1].lstrip('\n') %}
+{%- endif %}
+{%- if reasoning_content %}
+{{- '<|im_start|>' + message.role + '\n<think>\n' + reasoning_content.strip('\n') + '\n</think>\n\n' + content.lstrip('\n') + '<|im_end|>\n' }}
+{%- else %}
+{{- '<|im_start|>' + message.role + '\n' + content + '<|im_end|>\n' }}
+{%- endif %}
+{%- elif message.role == "tool" %}
+{{- '<|im_start|>user\n<tool_response>\n' + content + '\n</tool_response><|im_end|>\n' }}
+{%- endif %}
+{%- endfor %}
+{%- if add_generation_prompt %}
+{{- '<|im_start|>assistant\n' }}
+{%- if enable_thinking is defined and enable_thinking is false %}
+{{- '<think>\n\n</think>\n\n' }}
+{%- else %}
+{{- '<think>\n' }}
+{%- endif %}
+{%- endif %}
+"#;
 
 fn is_qwen3_hybrid_arch(config: &Config) -> bool {
     let arch = config.architectures.as_ref().and_then(|a| a.first());
@@ -1013,6 +1068,7 @@ pub fn resolve_qwen3_hybrid_config(config: &Config) -> Qwen3HybridConfig {
         num_k_heads,
         key_head_dim,
         value_head_dim,
+        mamba_ssm_dtype: raw_cfg.mamba_ssm_dtype,
     }
 }
 
@@ -1290,12 +1346,10 @@ pub fn init_config_tokenizer(
         if let Some(qcfg) = &mut config.quantization_config {
             qcfg.normalize_compressed_tensors();
             if let Some(mode) = &qcfg.mode {
-                if mode.eq_ignore_ascii_case("nvfp4") || mode.eq_ignore_ascii_case("mxfp4") {
+                if mode.eq_ignore_ascii_case("mxfp4") && qcfg.quant_method.is_empty() {
                     panic!(
-                        "MLX-quantized models (mode=\"{}\") are not supported. \
-                         MLX uses an incompatible packing format (U32 weights with integer scales). \
-                         Please use a modelopt or compressed-tensors quantized model instead \
-                         (e.g. AxionML/Qwen3.5-*-NVFP4 or nvidia/*-NVFP4).",
+                        "MLX-quantized models (mode=\"{}\") with mxfp4 are not supported. \
+                         Please use a compressed-tensors quantized model instead.",
                         mode
                     );
                 }
@@ -1422,6 +1476,11 @@ pub fn init_config_tokenizer(
                         std::fs::read_to_string(&dir.join("chat_template.jinja"))
                             .map_err(candle_core::Error::wrap)?,
                     );
+                } else if is_qwen_chat_template_arch_name(arch_name.as_str()) {
+                    crate::log_warn!(
+                        "No chat_template.jinja found; using built-in Qwen chat template"
+                    );
+                    config_tokenizer.chat_template = Some(QWEN_THINKING_CHAT_TEMPLATE.to_string());
                 }
             } else if let Some(f) = model_pathes.get_chat_template_filename() {
                 crate::log_warn!("Try loading chat template from chat_template.json");
@@ -1814,19 +1873,19 @@ pub fn get_arch_rope(
         | "qwen2"
         | "qwen3" => (
             ModelType::Qwen3,
-            "<|im_start|>user\n {} <|im_end|>".to_string(),
+            "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n".to_string(),
         ),
         "qwen2moe" | "Qwen2MoeForCausalLM" | "qwen3moe" | "Qwen3MoeForCausalLM" => (
             ModelType::Qwen3MoE,
-            "<|im_start|>user\n {} <|im_end|>".to_string(),
+            "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n".to_string(),
         ),
         "Qwen3_5ForCausalLM" | "qwen35" => (
             ModelType::Qwen3_5,
-            "<|im_start|>user\n {} <|im_end|>".to_string(),
+            "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n".to_string(),
         ),
         "Qwen3_5MoeForCausalLM" | "Qwen3NextForCausalLM" | "qwen35moe" => (
             ModelType::Qwen3_5MoE,
-            "<|im_start|>user\n {} <|im_end|>".to_string(),
+            "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n".to_string(),
         ),
         "Qwen3VLForConditionalGeneration"
         | "Qwen3VLMoeForConditionalGeneration"
@@ -1836,7 +1895,7 @@ pub fn get_arch_rope(
         | "qwen3vl"
         | "qwen3vlmoe" => (
             ModelType::Qwen3VL,
-            "<|im_start|>user\n {} <|im_end|>".to_string(),
+            "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n".to_string(),
         ),
         "LlamaForCausalLM"
         | "MistralForCausalLM"

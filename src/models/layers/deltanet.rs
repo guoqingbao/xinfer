@@ -83,7 +83,12 @@ impl GatedDeltaNet {
                 let has_scale = vb.has_key("weight_scale") || vb.has_key("scales");
                 let has_nvfp4_second_scale =
                     vb.has_key("weight_scale_2") || vb.has_key("weight_global_scale");
-                (has_packed && has_scale) || (has_nvfp4_second_scale && has_scale)
+                // MLX NVFP4: just "weight" (U32) + "scales" (U8), no separate global scale
+                let is_mlx_nvfp4 = vb.has_key("weight")
+                    && vb.has_key("scales")
+                    && !has_packed
+                    && !has_nvfp4_second_scale;
+                (has_packed && has_scale) || (has_nvfp4_second_scale && has_scale) || is_mlx_nvfp4
             }
             "gptq" | "awq" => vb.has_key("qweight") || vb.has_key("B"),
             _ => true,
@@ -604,10 +609,21 @@ impl GatedDeltaNet {
             )?
             .unsqueeze(1)?
         } else {
-            vb.get(
+            let w = vb.get(
                 (conv_dim_global, 1, conv_kernel_size),
                 gdn_key_map["conv1d.weight"],
-            )?
+            );
+            match w {
+                Ok(t) => t,
+                Err(_) => {
+                    // MLX stores conv1d weight as (out, kernel, 1) instead of (out, 1, kernel)
+                    vb.get(
+                        (conv_dim_global, conv_kernel_size, 1),
+                        gdn_key_map["conv1d.weight"],
+                    )?
+                    .permute((0, 2, 1))?
+                }
+            }
         };
         let q_start = rank * key_dim;
         let k_start = key_dim_global + rank * key_dim;
@@ -748,7 +764,8 @@ impl GatedDeltaNet {
         let (q, k, v, z, b, a) = self.project_inputs(xs)?;
 
         // Convert projection outputs to kernel_dtype for GDN core (conv1d, gating, recurrence).
-        // For GGUF and F16 mode, kernel_dtype is F32 to avoid precision loss.
+        // For GGUF, F16 mode, and configs requesting float32 SSM, the GDN
+        // core runs in F32 to avoid recurrent-state precision loss.
         let (q, k, v, z, b, a) = if q.dtype() != self.kernel_dtype {
             (
                 q.to_dtype(self.kernel_dtype)?,

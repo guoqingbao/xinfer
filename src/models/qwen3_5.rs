@@ -48,6 +48,11 @@ impl Qwen3_5DecoderLayer {
         dtype: DType,
     ) -> Result<Self> {
         let is_qvar_builder = vb.is_qvar_builder();
+        let use_norm_offset = !is_qvar_builder
+            && !config
+                .quantization_config
+                .as_ref()
+                .is_some_and(|q| q.is_mlx_nvfp4);
 
         let attn = if layer_type == "full_attention" {
             Qwen3_5AttnType::FullAttention(Attention::new(
@@ -102,7 +107,7 @@ impl Qwen3_5DecoderLayer {
                 vb.pp("input_layernorm").clone()
             },
             DType::F32,
-            !is_qvar_builder,
+            use_norm_offset,
         )?;
 
         let post_attention_layernorm = rms_norm(
@@ -114,7 +119,7 @@ impl Qwen3_5DecoderLayer {
                 vb.pp("post_attention_layernorm").clone()
             },
             DType::F32,
-            !is_qvar_builder,
+            use_norm_offset,
         )?;
 
         let rotary = if layer_type == "full_attention" {
@@ -381,29 +386,42 @@ impl Qwen3_5ForCausalLM {
                 vb.pp(&format!("{}norm", prefix))
             },
             DType::F32,
-            !is_qvar_builder,
+            !is_qvar_builder
+                && !config
+                    .quantization_config
+                    .as_ref()
+                    .is_some_and(|q| q.is_mlx_nvfp4),
         )?;
 
-        let lm_head = ReplicatedLinear::load_no_bias(
-            config.hidden_size,
-            vocab_size,
-            if tie_word_embeddings.is_some_and(|x| x) {
-                if is_qvar_builder {
-                    vb.pp(&format!("{}{}", gguf_prefix, key_map["embed_tokens"]))
+        let is_mlx_nvfp4_tied = tie_word_embeddings.is_some_and(|x| x)
+            && config
+                .quantization_config
+                .as_ref()
+                .map_or(false, |q| q.is_mlx_nvfp4);
+        let lm_head = if is_mlx_nvfp4_tied {
+            ReplicatedLinear::from_weight_bias(embed_tokens.embeddings().clone(), None)?
+        } else {
+            ReplicatedLinear::load_no_bias(
+                config.hidden_size,
+                vocab_size,
+                if tie_word_embeddings.is_some_and(|x| x) {
+                    if is_qvar_builder {
+                        vb.pp(&format!("{}{}", gguf_prefix, key_map["embed_tokens"]))
+                    } else {
+                        vb.pp(&format!("{}embed_tokens", prefix))
+                    }
                 } else {
-                    vb.pp(&format!("{}embed_tokens", prefix))
-                }
-            } else {
-                if is_qvar_builder {
-                    vb.pp(key_map["lm_head"])
-                } else {
-                    vb.pp("lm_head")
-                }
-            },
-            &None,
-            &None,
-            dtype,
-        )?;
+                    if is_qvar_builder {
+                        vb.pp(key_map["lm_head"])
+                    } else {
+                        vb.pp("lm_head")
+                    }
+                },
+                &None,
+                &None,
+                dtype,
+            )?
+        };
 
         // Initialize MambaCache for GDN layers
         let world_size = comm.world_size();
@@ -426,7 +444,11 @@ impl Qwen3_5ForCausalLM {
 
         // Start small and let runner preallocate to the final engine capacity.
         let max_batch_size = 1;
-        let conv_cache_dtype = if is_qvar_builder || config.is_f16_mode {
+        let ssm_dtype_is_f32 = hybrid
+            .mamba_ssm_dtype
+            .as_deref()
+            .is_some_and(|dt| dt.eq_ignore_ascii_case("float32") || dt.eq_ignore_ascii_case("f32"));
+        let conv_cache_dtype = if is_qvar_builder || config.is_f16_mode || ssm_dtype_is_f32 {
             DType::F32
         } else {
             dtype

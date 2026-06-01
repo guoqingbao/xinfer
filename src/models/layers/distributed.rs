@@ -846,8 +846,18 @@ impl MergedParallelColumnLinear {
                         );
                     }
 
+                    let is_mlx = quant_cfg.as_ref().map_or(false, |c| c.is_mlx_nvfp4);
                     let pack_factor = 2; // 2 FP4 values per byte
-                    let blocks = if v.contains_tensor("weight_packed") {
+                    let blocks = if is_mlx {
+                        // MLX: weight is U32 [out_dim, in_dim/8], repack to U8 on GPU
+                        let w_u32 = v.get_with_hints_dtype(
+                            (out_dim, in_dim / 8),
+                            "weight",
+                            Shard::default(),
+                            DType::U32,
+                        )?;
+                        attention_rs::nvfp4_linear::mlx_repack_u32_to_u8(&w_u32)?
+                    } else if v.contains_tensor("weight_packed") {
                         v.get_with_hints_dtype(
                             (out_dim, in_dim / pack_factor),
                             "weight_packed",
@@ -890,93 +900,107 @@ impl MergedParallelColumnLinear {
 
                     #[allow(unused_variables)]
                     let (nvfp4_global_scale, nvfp4_input_scale, nvfp4_sm) = if is_nvfp4_quant {
-                        let no_shard = Shard::default();
-                        let global_scale = if v.contains_tensor("weight_global_scale") {
-                            let t = match v.get_with_hints_dtype(
-                                (1,),
-                                "weight_global_scale",
-                                no_shard,
-                                DType::F32,
-                            ) {
-                                Ok(t) => t,
-                                Err(_) => v.get_with_hints_dtype(
-                                    (),
+                        if is_mlx {
+                            #[cfg(feature = "cuda")]
+                            let sm =
+                                attention_rs::cuda_utils::sm_version(v.device().as_cuda_device()?)
+                                    .unwrap_or(0) as usize;
+                            #[cfg(not(feature = "cuda"))]
+                            let sm = 0usize;
+                            (1.0f32, 1.0f32, sm)
+                        } else {
+                            let no_shard = Shard::default();
+                            let global_scale = if v.contains_tensor("weight_global_scale") {
+                                let t = match v.get_with_hints_dtype(
+                                    (1,),
                                     "weight_global_scale",
                                     no_shard,
                                     DType::F32,
-                                )?,
-                            };
-                            let raw = t.flatten_all()?.to_vec1::<f32>()?[0];
-                            if raw != 0.0 {
-                                1.0 / raw
-                            } else {
-                                1.0
-                            }
-                        } else if v.contains_tensor("weight_scale_2") {
-                            let t = match v.get_with_hints_dtype(
-                                (1,),
-                                "weight_scale_2",
-                                no_shard,
-                                DType::F32,
-                            ) {
-                                Ok(t) => t,
-                                Err(_) => v.get_with_hints_dtype(
-                                    (),
+                                ) {
+                                    Ok(t) => t,
+                                    Err(_) => v.get_with_hints_dtype(
+                                        (),
+                                        "weight_global_scale",
+                                        no_shard,
+                                        DType::F32,
+                                    )?,
+                                };
+                                let raw = t.flatten_all()?.to_vec1::<f32>()?[0];
+                                if raw != 0.0 {
+                                    1.0 / raw
+                                } else {
+                                    1.0
+                                }
+                            } else if v.contains_tensor("weight_scale_2") {
+                                let t = match v.get_with_hints_dtype(
+                                    (1,),
                                     "weight_scale_2",
                                     no_shard,
                                     DType::F32,
-                                )?,
+                                ) {
+                                    Ok(t) => t,
+                                    Err(_) => v.get_with_hints_dtype(
+                                        (),
+                                        "weight_scale_2",
+                                        no_shard,
+                                        DType::F32,
+                                    )?,
+                                };
+                                t.flatten_all()?.to_vec1::<f32>()?[0]
+                            } else {
+                                1.0f32
                             };
-                            t.flatten_all()?.to_vec1::<f32>()?[0]
-                        } else {
-                            1.0f32
-                        };
 
-                        let input_scale = if v.contains_tensor("input_scale") {
-                            let t = match v.get_with_hints_dtype(
-                                (1,),
-                                "input_scale",
-                                no_shard,
-                                DType::F32,
-                            ) {
-                                Ok(t) => t,
-                                Err(_) => {
-                                    v.get_with_hints_dtype((), "input_scale", no_shard, DType::F32)?
-                                }
-                            };
-                            t.flatten_all()?.to_vec1::<f32>()?[0]
-                        } else if v.contains_tensor("input_global_scale") {
-                            let t = match v.get_with_hints_dtype(
-                                (1,),
-                                "input_global_scale",
-                                no_shard,
-                                DType::F32,
-                            ) {
-                                Ok(t) => t,
-                                Err(_) => v.get_with_hints_dtype(
-                                    (),
+                            let input_scale = if v.contains_tensor("input_scale") {
+                                let t = match v.get_with_hints_dtype(
+                                    (1,),
+                                    "input_scale",
+                                    no_shard,
+                                    DType::F32,
+                                ) {
+                                    Ok(t) => t,
+                                    Err(_) => v.get_with_hints_dtype(
+                                        (),
+                                        "input_scale",
+                                        no_shard,
+                                        DType::F32,
+                                    )?,
+                                };
+                                t.flatten_all()?.to_vec1::<f32>()?[0]
+                            } else if v.contains_tensor("input_global_scale") {
+                                let t = match v.get_with_hints_dtype(
+                                    (1,),
                                     "input_global_scale",
                                     no_shard,
                                     DType::F32,
-                                )?,
-                            };
-                            let raw = t.flatten_all()?.to_vec1::<f32>()?[0];
-                            if raw != 0.0 {
-                                1.0 / raw
+                                ) {
+                                    Ok(t) => t,
+                                    Err(_) => v.get_with_hints_dtype(
+                                        (),
+                                        "input_global_scale",
+                                        no_shard,
+                                        DType::F32,
+                                    )?,
+                                };
+                                let raw = t.flatten_all()?.to_vec1::<f32>()?[0];
+                                if raw != 0.0 {
+                                    1.0 / raw
+                                } else {
+                                    1.0
+                                }
                             } else {
-                                1.0
-                            }
-                        } else {
-                            1.0f32
-                        };
+                                1.0f32
+                            };
 
-                        #[cfg(feature = "cuda")]
-                        let sm = attention_rs::cuda_utils::sm_version(v.device().as_cuda_device()?)
-                            .unwrap_or(0) as usize;
-                        #[cfg(not(feature = "cuda"))]
-                        let sm = 0usize;
+                            #[cfg(feature = "cuda")]
+                            let sm =
+                                attention_rs::cuda_utils::sm_version(v.device().as_cuda_device()?)
+                                    .unwrap_or(0) as usize;
+                            #[cfg(not(feature = "cuda"))]
+                            let sm = 0usize;
 
-                        (global_scale, input_scale, sm)
+                            (global_scale, input_scale, sm)
+                        }
                     } else {
                         (1.0f32, 1.0f32, 0usize)
                     };

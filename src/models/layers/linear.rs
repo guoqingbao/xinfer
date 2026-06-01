@@ -508,19 +508,27 @@ impl LinearX {
     }
 }
 
-fn has_fp4_scale_tensors(vb: &VarBuilder) -> bool {
-    vb.contains_tensor("weight_scale")
-        || vb.contains_tensor("weight_scale_2")
-        || vb.contains_tensor("weight_global_scale")
-        || vb.contains_tensor("weight_packed")
-        || vb.contains_tensor("blocks")
+fn has_fp4_scale_tensors(vb: &VarBuilder, is_mlx_nvfp4: bool) -> bool {
+    if is_mlx_nvfp4 {
+        vb.contains_tensor("weight") && vb.contains_tensor("scales")
+    } else {
+        vb.contains_tensor("weight_scale")
+            || vb.contains_tensor("weight_scale_2")
+            || vb.contains_tensor("weight_global_scale")
+            || vb.contains_tensor("weight_packed")
+            || vb.contains_tensor("blocks")
+    }
 }
 
-fn has_nvfp4_specific_tensors(vb: &VarBuilder) -> bool {
-    vb.contains_tensor("weight_packed")
-        || vb.contains_tensor("blocks")
-        || vb.contains_tensor("weight_scale_2")
-        || vb.contains_tensor("weight_global_scale")
+fn has_nvfp4_specific_tensors(vb: &VarBuilder, is_mlx_nvfp4: bool) -> bool {
+    if is_mlx_nvfp4 {
+        vb.contains_tensor("weight") && vb.contains_tensor("scales")
+    } else {
+        vb.contains_tensor("weight_packed")
+            || vb.contains_tensor("blocks")
+            || vb.contains_tensor("weight_scale_2")
+            || vb.contains_tensor("weight_global_scale")
+    }
 }
 
 fn has_fp8_tensors(vb: &VarBuilder) -> bool {
@@ -570,7 +578,7 @@ pub fn linear_x(
                         let ln = linear(in_dim, out_dim, vb.clone(), shards, dtype)?;
                         return Ok(LinearX::Linear(ln));
                     }
-                    if !has_fp4_scale_tensors(&vb) {
+                    if !has_fp4_scale_tensors(&vb, false) {
                         let ln = linear(in_dim, out_dim, vb.clone(), shards, dtype)?;
                         return Ok(LinearX::Linear(ln));
                     }
@@ -579,13 +587,14 @@ pub fn linear_x(
                 }
 
                 if cfg.quant_method == "nvfp4" {
+                    let is_mlx = cfg.is_mlx_nvfp4;
                     if should_skip_quant_for_module(&module_path, cfg)
-                        || !has_fp4_scale_tensors(&vb)
+                        || !has_fp4_scale_tensors(&vb, is_mlx)
                     {
                         let ln = linear(in_dim, out_dim, vb.clone(), shards, dtype)?;
                         return Ok(LinearX::Linear(ln));
                     }
-                    if !has_nvfp4_specific_tensors(&vb) && has_fp8_tensors(&vb) {
+                    if !is_mlx && !has_nvfp4_specific_tensors(&vb, false) && has_fp8_tensors(&vb) {
                         match load_ln_fp8_with_hints(in_dim, out_dim, vb.clone(), shards, cfg, true)
                         {
                             Ok(ln) => return Ok(LinearX::LnFp8(ln)),
@@ -595,7 +604,11 @@ pub fn linear_x(
                             }
                         }
                     }
-                    let ln = LnNvfp4::load(in_dim, out_dim, vb.clone(), shards, true)?;
+                    let ln = if is_mlx {
+                        LnNvfp4::load_mlx(in_dim, out_dim, vb.clone(), shards, true)?
+                    } else {
+                        LnNvfp4::load(in_dim, out_dim, vb.clone(), shards, true)?
+                    };
                     return Ok(LinearX::LnNvfp4(ln));
                 }
 
@@ -679,7 +692,7 @@ pub fn linear_no_bias_x(
 
                 if cfg.quant_method == "mxfp4" {
                     if should_skip_quant_for_module(&module_path, cfg)
-                        || !has_fp4_scale_tensors(&vb)
+                        || !has_fp4_scale_tensors(&vb, false)
                     {
                         let ln = linear_no_bias(in_dim, out_dim, vb.clone(), shards, dtype)?;
                         return Ok(LinearX::Linear(ln));
@@ -689,15 +702,16 @@ pub fn linear_no_bias_x(
                 }
 
                 if cfg.quant_method == "nvfp4" {
+                    let is_mlx = cfg.is_mlx_nvfp4;
                     if should_skip_quant_for_module(&module_path, cfg) {
                         let ln = linear_no_bias(in_dim, out_dim, vb.clone(), shards, dtype)?;
                         return Ok(LinearX::Linear(ln));
                     }
-                    if !has_fp4_scale_tensors(&vb) {
+                    if !has_fp4_scale_tensors(&vb, is_mlx) {
                         let ln = linear_no_bias(in_dim, out_dim, vb.clone(), shards, dtype)?;
                         return Ok(LinearX::Linear(ln));
                     }
-                    if !has_nvfp4_specific_tensors(&vb) && has_fp8_tensors(&vb) {
+                    if !is_mlx && !has_nvfp4_specific_tensors(&vb, false) && has_fp8_tensors(&vb) {
                         match load_ln_fp8_with_hints(
                             in_dim,
                             out_dim,
@@ -714,7 +728,11 @@ pub fn linear_no_bias_x(
                             }
                         }
                     }
-                    let ln = LnNvfp4::load(in_dim, out_dim, vb.clone(), shards, false)?;
+                    let ln = if is_mlx {
+                        LnNvfp4::load_mlx(in_dim, out_dim, vb.clone(), shards, false)?
+                    } else {
+                        LnNvfp4::load(in_dim, out_dim, vb.clone(), shards, false)?
+                    };
                     return Ok(LinearX::LnNvfp4(ln));
                 }
 
@@ -1211,7 +1229,37 @@ impl LnNvfp4 {
         shard: Shard,
         load_bias: bool,
     ) -> Result<Self> {
-        let blocks = if vb.contains_tensor("weight_packed") {
+        Self::load_inner(in_dim, out_dim, vb, shard, load_bias, false)
+    }
+
+    /// Load with MLX NVFP4 format support. MLX stores weights as U32
+    /// (8 FP4 nibbles per U32) which we reinterpret as U8 bytes at load time.
+    pub fn load_mlx(
+        in_dim: usize,
+        out_dim: usize,
+        vb: VarBuilder,
+        shard: Shard,
+        load_bias: bool,
+    ) -> Result<Self> {
+        Self::load_inner(in_dim, out_dim, vb, shard, load_bias, true)
+    }
+
+    fn load_inner(
+        in_dim: usize,
+        out_dim: usize,
+        vb: VarBuilder,
+        shard: Shard,
+        load_bias: bool,
+        is_mlx: bool,
+    ) -> Result<Self> {
+        let blocks = if is_mlx {
+            // MLX stores weights as U32 [out_dim, in_dim/8] — 8 nibbles per U32.
+            // Load as U32 on GPU, then repack to U8 [out_dim, in_dim/2] using a
+            // GPU kernel (no CPU round-trip).
+            let w_u32 =
+                vb.get_with_hints_dtype((out_dim, in_dim / 8), "weight", shard, DType::U32)?;
+            attention_rs::nvfp4_linear::mlx_repack_u32_to_u8(&w_u32)?
+        } else if vb.contains_tensor("weight_packed") {
             vb.get_with_hints_dtype((out_dim, in_dim / 2), "weight_packed", shard, DType::U8)?
         } else if vb.contains_tensor("weight") {
             vb.get_with_hints_dtype((out_dim, in_dim / 2), "weight", shard, DType::U8)?
@@ -1227,7 +1275,10 @@ impl LnNvfp4 {
         };
 
         let no_shard = Shard::default();
-        let global_scale = if vb.contains_tensor("weight_global_scale") {
+        let global_scale = if is_mlx {
+            // MLX bakes the global scale into per-block FP8 E4M3 scales.
+            1.0f32
+        } else if vb.contains_tensor("weight_global_scale") {
             // compressed-tensors format: weight_global_scale is a divisor, invert it
             let t = match vb.get_with_hints_dtype((1,), "weight_global_scale", no_shard, DType::F32)
             {
@@ -1253,7 +1304,9 @@ impl LnNvfp4 {
             1.0f32
         };
 
-        let input_scale = if vb.contains_tensor("input_scale") {
+        let input_scale = if is_mlx {
+            1.0f32
+        } else if vb.contains_tensor("input_scale") {
             // modelopt format: input_scale is a per-tensor activation scale
             let t = match vb.get_with_hints_dtype((1,), "input_scale", no_shard, DType::F32) {
                 Ok(t) => t,

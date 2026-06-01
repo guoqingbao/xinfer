@@ -85,6 +85,11 @@ impl Qwen3_5MoEDecoderLayer {
         dtype: DType,
     ) -> Result<Self> {
         let is_qvar_builder = vb.is_qvar_builder();
+        let use_norm_offset = !is_qvar_builder
+            && !config
+                .quantization_config
+                .as_ref()
+                .is_some_and(|q| q.is_mlx_nvfp4);
 
         // Attention dispatch
         let attn = if layer_type == "full_attention" {
@@ -224,7 +229,7 @@ impl Qwen3_5MoEDecoderLayer {
                 vb.pp("input_layernorm")
             },
             norm_dtype,
-            !is_qvar_builder,
+            use_norm_offset,
         )?;
 
         let post_attention_layernorm = rms_norm(
@@ -236,7 +241,7 @@ impl Qwen3_5MoEDecoderLayer {
                 vb.pp("post_attention_layernorm")
             },
             norm_dtype,
-            !is_qvar_builder,
+            use_norm_offset,
         )?;
 
         let rotary = if layer_type == "full_attention" {
@@ -523,7 +528,11 @@ impl Qwen3_5MoEForCausalLM {
                 vb.pp(&format!("{}norm", prefix))
             },
             norm_dtype,
-            !is_qvar_builder,
+            !is_qvar_builder
+                && !config
+                    .quantization_config
+                    .as_ref()
+                    .is_some_and(|q| q.is_mlx_nvfp4),
         )?;
 
         let lm_head = ReplicatedLinear::load_no_bias(
@@ -568,7 +577,11 @@ impl Qwen3_5MoEForCausalLM {
         // Start small and let runner preallocate to the final engine capacity.
         let max_batch_size = 1;
 
-        let conv_cache_dtype = if is_qvar_builder || config.is_f16_mode {
+        let ssm_dtype_is_f32 = hybrid
+            .mamba_ssm_dtype
+            .as_deref()
+            .is_some_and(|dt| dt.eq_ignore_ascii_case("float32") || dt.eq_ignore_ascii_case("f32"));
+        let conv_cache_dtype = if is_qvar_builder || config.is_f16_mode || ssm_dtype_is_f32 {
             DType::F32
         } else {
             dtype

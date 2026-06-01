@@ -230,9 +230,11 @@ impl Downloader {
                             },
                             auxiliary_filenames: Vec::new(),
                             chat_template_filename: if Path::new(path)
-                                .join("chat_template.json")
+                                .join("chat_template.jinja")
                                 .exists()
                             {
+                                Some(Path::new(path).join("chat_template.jinja"))
+                            } else if Path::new(path).join("chat_template.json").exists() {
                                 Some(Path::new(path).join("chat_template.json"))
                             } else {
                                 None
@@ -428,10 +430,48 @@ impl Downloader {
             if !chat_template_filename.exists() {
                 chat_template_filename = cache_path.join("chat_template.jinja");
             }
-            let chat_template_filename = if !chat_template_filename.exists() {
+            let chat_template_filename = if chat_template_filename.exists() {
                 Some(chat_template_filename)
             } else {
-                None
+                let api = ApiBuilder::new()
+                    .with_progress(false)
+                    .with_token(Some(get_token(hf_token.clone(), hf_token_path.clone())?))
+                    .build()
+                    .ok()
+                    .map(|a| {
+                        let rev = revision.clone().unwrap_or("main".to_string());
+                        a.repo(Repo::with_revision(
+                            self.model_id.clone().unwrap(),
+                            RepoType::Model,
+                            rev,
+                        ))
+                    });
+                if let Some(api) = api {
+                    let remote_files: std::collections::HashSet<String> = api
+                        .info()
+                        .ok()
+                        .map(|info| info.siblings.iter().map(|s| s.rfilename.clone()).collect())
+                        .unwrap_or_default();
+                    if remote_files.contains("chat_template.jinja") {
+                        if let Ok(f) = api.get("chat_template.jinja") {
+                            crate::log_info!("Downloaded missing chat_template.jinja to cache");
+                            Some(f)
+                        } else {
+                            None
+                        }
+                    } else if remote_files.contains("chat_template.json") {
+                        if let Ok(f) = api.get("chat_template.json") {
+                            crate::log_info!("Downloaded missing chat_template.json to cache");
+                            Some(f)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
             };
             for entry in std::fs::read_dir(&cache_path)? {
                 let path = entry?.path();
@@ -479,16 +519,30 @@ impl Downloader {
             _ => "".into(),
         };
 
-        for rfilename in api
-            .info()
-            .map_err(candle_core::Error::wrap)?
+        let repo_info = api.info().map_err(candle_core::Error::wrap)?;
+        let remote_files: std::collections::HashSet<String> = repo_info
             .siblings
             .iter()
             .map(|x| x.rfilename.clone())
-            .filter(|x| x.ends_with(".safetensors"))
-        {
+            .collect();
+
+        let chat_template_filename = if remote_files.contains("chat_template.jinja") {
+            match api.get("chat_template.jinja") {
+                Ok(f) => Some(f),
+                _ => None,
+            }
+        } else if remote_files.contains("chat_template.json") {
+            match api.get("chat_template.json") {
+                Ok(f) => Some(f),
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        for rfilename in remote_files.iter().filter(|x| x.ends_with(".safetensors")) {
             let filename =
-                self.hf_get_with_retry(&api, &rfilename, 5, std::time::Duration::from_secs(5))?;
+                self.hf_get_with_retry(&api, rfilename, 5, std::time::Duration::from_secs(5))?;
             filenames.push(filename);
         }
 
@@ -499,7 +553,7 @@ impl Downloader {
             filenames,
             auxiliary_filenames: Vec::new(),
             generation_config_filename,
-            chat_template_filename: None,
+            chat_template_filename,
         })
     }
 
