@@ -1,4 +1,4 @@
-use crate::models::layers::distributed::{shard, Comm, ReplicatedLinear, TensorParallelRowLinear};
+use crate::models::layers::distributed::{shard, Comm, ReplicatedLinear};
 use crate::models::layers::others::{rms_norm, NormX};
 use crate::models::layers::rotary_emb::ApplyRotaryEmbedding;
 use crate::models::layers::VarBuilderX;
@@ -66,7 +66,7 @@ pub struct MlaAttention {
     kv_a_proj_with_mqa: ReplicatedLinear,
     kv_a_layernorm: NormX,
     kv_b_proj: ReplicatedLinear,
-    o_proj: TensorParallelRowLinear,
+    o_proj: ReplicatedLinear,
     w_uk: Tensor,
     w_uv_t: Tensor,
     num_heads: usize,
@@ -85,7 +85,7 @@ pub struct MlaAttention {
 impl MlaAttention {
     pub fn new(
         vb: VarBuilderX,
-        comm: Rc<Comm>,
+        _comm: Rc<Comm>,
         mla_cfg: &MlaConfig,
         config: &Config,
         dtype: DType,
@@ -172,11 +172,10 @@ impl MlaAttention {
             dtype,
         )?;
 
-        let o_proj = TensorParallelRowLinear::load_with_hints(
+        let o_proj = ReplicatedLinear::load_no_bias(
             num_heads * v_head_dim,
             hidden_size,
             vb.pp("o_proj"),
-            comm,
             &config.quantization_config,
             &config.quant,
             dtype,

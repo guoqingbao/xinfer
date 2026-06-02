@@ -625,13 +625,18 @@ impl ModelRunner {
                     continue;
                 }
                 let (_, page_size, num_kv_heads, head_dim) = k_cache.dims4()?;
+                let is_mla = matches!(model_type, ModelType::GLM4MoeLite | ModelType::DeepSeek);
                 params = Some(FlashInferKvParams {
                     kv_dtype: k_cache.dtype(),
                     out_dtype: dtype,
                     page_size,
                     num_kv_heads,
                     head_dim,
-                    num_qo_heads: config.num_attention_heads / comm.world_size(),
+                    num_qo_heads: if is_mla {
+                        config.num_attention_heads
+                    } else {
+                        config.num_attention_heads / comm.world_size()
+                    },
                 });
                 break;
             }
