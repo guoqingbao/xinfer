@@ -806,6 +806,13 @@ impl Qwen3_5MoEForCausalLM {
         self.mamba_cache.write().has_prefix_state(hash)
     }
 
+    pub fn remove_mamba_prefix_state(&self, hash: u64) -> bool {
+        let mut cache = self.mamba_cache.write();
+        let existed = cache.has_prefix_state(hash);
+        cache.remove_prefix_state(hash);
+        existed
+    }
+
     pub fn restore_mamba_prefix_state(&self, seq_id: usize, hash: u64) -> Result<bool> {
         self.mamba_cache.write().restore_prefix_state(seq_id, hash)
     }

@@ -519,14 +519,14 @@ impl KVCacheAllocator {
 
     pub fn plan(&self, device_ids: &[usize], econfig: &mut EngineConfig) -> Result<()> {
         match self.get_available_memory(device_ids) {
-            Ok(min_available) => {
+            Ok(available_before_reserve) => {
                 let workspace_budget = self.compute_workspace_budget();
-                workspace_budget.report(min_available);
+                workspace_budget.report(available_before_reserve);
                 let activation_reserve = workspace_budget
                     .total_bytes
-                    .min(min_available.saturating_sub(1));
-                let min_available = min_available.saturating_sub(activation_reserve);
-                let mut kv_budget = min_available;
+                    .min(available_before_reserve.saturating_sub(1));
+                let cache_available = available_before_reserve.saturating_sub(activation_reserve);
+                let mut kv_budget = cache_available;
                 let mut mamba_budget = 0u64;
                 let mut mamba_budget_slots = 0usize;
                 let mut mamba_budget_enabled = false;
@@ -541,7 +541,7 @@ impl KVCacheAllocator {
                         mamba_budget_enabled = true;
 
                         let mut target_budget =
-                            ((min_available as f64) * requested_fraction) as u64;
+                            ((available_before_reserve as f64) * requested_fraction) as u64;
                         let min_one_slot = slot_bytes as u64;
                         if target_budget > 0 && target_budget < min_one_slot {
                             crate::log_warn!(
@@ -551,15 +551,16 @@ impl KVCacheAllocator {
                             );
                             target_budget = min_one_slot;
                         }
-                        if target_budget >= min_available {
+                        if target_budget >= cache_available {
                             candle_core::bail!(
-                                "Hybrid mamba budget ({:.2} GB) leaves no memory for KV cache. Reduce mamba_fraction or max_model_len.",
-                                target_budget as f64 / SIZE_IN_GB
+                                "Hybrid mamba budget ({:.2} GB) plus workspace reserve ({:.2} GB) leaves no memory for KV cache. Reduce mamba_fraction or max_model_len.",
+                                target_budget as f64 / SIZE_IN_GB,
+                                activation_reserve as f64 / SIZE_IN_GB
                             );
                         }
 
                         mamba_budget = target_budget;
-                        kv_budget = min_available.saturating_sub(mamba_budget);
+                        kv_budget = cache_available.saturating_sub(mamba_budget);
                         mamba_budget_slots = if slot_bytes == 0 {
                             0
                         } else {

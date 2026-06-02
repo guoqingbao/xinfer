@@ -122,6 +122,10 @@ fn build_prefix_cache_config(econfig: &EngineConfig) -> PrefixCacheConfig {
 impl Scheduler {
     pub fn new(runners: Arc<RwLock<RunnerType>>, econfig: &EngineConfig, config: &Config) -> Self {
         let prefix_cache_cfg = build_prefix_cache_config(econfig);
+        let mamba_snapshot_default_stride_blocks = econfig
+            .effective_prefill_chunk_size()
+            .div_ceil(econfig.block_size)
+            .max(1);
         Self {
             waiting: VecDeque::new(),
             running: Vec::new(),
@@ -139,6 +143,7 @@ impl Scheduler {
                     .and_then(|arches| arches.first())
                     .map(|arch| crate::utils::is_qwen3_hybrid_arch_name(arch))
                     .unwrap_or(false),
+                mamba_snapshot_default_stride_blocks,
             ),
             next_seq_id: 0,
             finished_cached_tokens: HashMap::new(),
@@ -528,7 +533,8 @@ impl Scheduler {
                         if success {
                             // Insert into prefix cache so future requests can benefit
                             // LRU eviction will handle memory pressure automatically
-                            self.block_manager
+                            let _ = self
+                                .block_manager
                                 .capture_mamba_prefix_state(seq, seq.len());
                             self.block_manager.cache_sequence(seq);
                             // Maintain resources until client asks to release or cache eviction
@@ -585,7 +591,8 @@ impl Scheduler {
                     seq.is_tool_call_end = true;
                     // External tool mode: finish stream so client can handle tool calls
                     seq.status = SequenceStatus::Finished;
-                    self.block_manager
+                    let _ = self
+                        .block_manager
                         .capture_mamba_prefix_state(seq, seq.len());
                     self.block_manager.cache_sequence(seq);
                     self.block_manager.deallocate(seq);
@@ -619,14 +626,16 @@ impl Scheduler {
                     });
                 }
                 seq.status = SequenceStatus::Finished;
-                self.block_manager
+                let _ = self
+                    .block_manager
                     .capture_mamba_prefix_state(seq, seq.len());
                 self.block_manager.cache_sequence(seq);
                 self.block_manager.deallocate(seq);
             } else {
                 seq.append_token(token);
                 if seq.len() % self.cfg.block_size == 0 {
-                    self.block_manager
+                    let _ = self
+                        .block_manager
                         .capture_mamba_prefix_state(seq, seq.len());
                 }
             }
@@ -741,18 +750,25 @@ impl Scheduler {
             if *id < self.running.len() {
                 let seq = &self.running[*id];
                 if seq.len() < chunk_size || seq.num_cached_tokens + chunk_size >= seq.len() {
-                    self.block_manager
+                    let _ = self
+                        .block_manager
                         .capture_mamba_prefix_state(seq, seq.len());
                     if seq.len() > chunk_size {
                         chunk_finished_info.push((seq.id, seq.len()));
                     }
                     finished_seqs.push((i, seq.id));
                 } else {
-                    self.block_manager
+                    let _ = self
+                        .block_manager
                         .capture_mamba_prefix_state(seq, seq.num_cached_tokens + chunk_size);
                     remove_ids.push(seq.id);
                     let mut seq = seq.clone();
                     seq.num_cached_tokens += chunk_size;
+                    // The active mamba slot already contains the state at this
+                    // chunk boundary. Keep the captured snapshot available for
+                    // other requests, but do not force this in-progress request
+                    // to revalidate it on the next scheduling pass.
+                    seq.mamba_prefix_hash = None;
                     seq.status = SequenceStatus::Waiting;
                     chunked_info.push((
                         seq.id,

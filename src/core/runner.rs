@@ -832,6 +832,15 @@ impl ModelRunner {
         }
     }
 
+    pub fn remove_mamba_prefix_state(&self, hash: u64) -> Result<bool> {
+        match &self.model {
+            Model::Qwen3_5(model) => Ok(model.remove_mamba_prefix_state(hash)),
+            Model::Qwen3_5MoE(model) => Ok(model.remove_mamba_prefix_state(hash)),
+            Model::Qwen3VL(model) => Ok(model.remove_mamba_prefix_state(hash)),
+            _ => Ok(true),
+        }
+    }
+
     #[allow(unused)]
     pub fn run(&self, seqs: Seqs, is_prefill: bool) -> Result<Vec<u32>> {
         #[cfg(feature = "nvtx")]

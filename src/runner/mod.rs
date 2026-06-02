@@ -198,6 +198,8 @@ pub enum MessageType {
     CaptureMambaPrefixStateResponse(bool),
     HasMambaPrefixState(u64),
     HasMambaPrefixStateResponse(bool),
+    RemoveMambaPrefixState(u64),
+    RemoveMambaPrefixStateResponse(bool),
 
     /// Optional: runner can send back an error message.
     Error(String),
@@ -734,6 +736,17 @@ pub fn run_runner_process(args: Vec<String>) -> anyhow::Result<()> {
                 send_local(
                     &mut vec![stream.try_clone()?],
                     &MessageType::HasMambaPrefixStateResponse(ret.unwrap_or(false)),
+                    false,
+                )?;
+            }
+            Ok(MessageType::RemoveMambaPrefixState(hash)) => {
+                let ret = runner.remove_mamba_prefix_state(hash);
+                if ret.is_err() {
+                    crate::log_error!("RemoveMambaPrefixState failed for hash {}: {:?}", hash, ret);
+                }
+                send_local(
+                    &mut vec![stream.try_clone()?],
+                    &MessageType::RemoveMambaPrefixStateResponse(ret.unwrap_or(false)),
                     false,
                 )?;
             }

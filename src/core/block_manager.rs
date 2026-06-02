@@ -55,6 +55,7 @@ impl BlockManager {
         block_size: usize,
         prefix_cache: PrefixCacheConfig,
         mamba_prefix_enabled: bool,
+        mamba_snapshot_default_stride_blocks: usize,
     ) -> Self {
         let mut blocks = Vec::with_capacity(num_blocks);
         let mut free_block_ids = VecDeque::with_capacity(num_blocks);
@@ -82,10 +83,11 @@ impl BlockManager {
         } else {
             None
         };
-        let mamba_snapshot_block_stride_blocks = mamba_snapshot_block_stride_blocks();
+        let mamba_snapshot_block_stride_blocks =
+            mamba_snapshot_block_stride_blocks(mamba_snapshot_default_stride_blocks);
         if mamba_prefix_enabled {
             crate::log_info!(
-                "Hybrid mamba snapshot capture stride: {} block(s) ({} tokens), configured by {}.",
+                "Hybrid mamba snapshot capture stride: {} block(s) ({} tokens), default follows prefill chunk size and can be overridden by {}.",
                 mamba_snapshot_block_stride_blocks,
                 mamba_snapshot_block_stride_blocks.saturating_mul(block_size),
                 MAMBA_SNAPSHOT_BLOCK_STRIDE_ENV
@@ -379,6 +381,13 @@ impl BlockManager {
                     seq.id,
                     raw_matched_blocks
                 );
+            } else if raw_matched_blocks > matched_blocks {
+                crate::log_info!(
+                    "Prefix cache mamba-compatible partial hit seq {} (raw {} blocks, mamba {} blocks)",
+                    seq.id,
+                    raw_matched_blocks,
+                    matched_blocks
+                );
             }
             if matched_blocks > 0 {
                 let mut matched_hash = None;
@@ -441,29 +450,39 @@ impl BlockManager {
         Ok(())
     }
 
-    pub fn capture_mamba_prefix_state(&mut self, seq: &Sequence, processed_tokens: usize) {
+    pub fn capture_mamba_prefix_state(
+        &mut self,
+        seq: &Sequence,
+        processed_tokens: usize,
+    ) -> Option<u64> {
         if !self.mamba_prefix_enabled {
-            return;
+            return None;
         }
         let Some(prefix_cache) = self.prefix_cache.as_ref() else {
-            return;
+            return None;
         };
         if !prefix_cache.enabled() {
-            return;
+            return None;
         }
         let processed_tokens = processed_tokens.min(seq.token_ids.len());
         let full_blocks = processed_tokens / self.block_size;
         if full_blocks == 0 {
-            return;
+            return None;
         }
-        // Keep prompt/prefill captures dense, but sparsify decode-time captures.
-        // Decode tokens are reflected in output_ids, so this avoids overwriting
-        // useful prompt snapshots every block while preserving prompt reuse quality.
+        // Keep prompt/prefill captures dense. During decode, capture only at
+        // chunk-size boundaries plus the final response boundary so intermediate
+        // decode blocks do not churn useful prompt snapshots.
+        let final_decode_snapshot = !seq.output_ids.is_empty()
+            && matches!(
+                seq.status,
+                SequenceStatus::Finished | SequenceStatus::Cached | SequenceStatus::FinishSwapped
+            );
         if !seq.output_ids.is_empty()
+            && !final_decode_snapshot
             && self.mamba_snapshot_block_stride_blocks > 1
             && full_blocks % self.mamba_snapshot_block_stride_blocks != 0
         {
-            return;
+            return None;
         }
         let (seed, seed_block) = seq
             .images
@@ -473,7 +492,7 @@ impl BlockManager {
         let Some(hash) =
             prefix_cache.hash_for_blocks_with_seed(&seq.token_ids, full_blocks, seed, seed_block)
         else {
-            return;
+            return None;
         };
         let preserve_snapshot = seq.output_ids.is_empty();
         match self.try_capture_mamba_prefix_state(seq.id, hash, preserve_snapshot) {
@@ -500,6 +519,7 @@ impl BlockManager {
                         .or_default()
                         .insert(hash);
                 }
+                Some(hash)
             }
             Ok(false) => {
                 if processed_tokens == seq.token_ids.len() {
@@ -510,6 +530,7 @@ impl BlockManager {
                         hash
                     );
                 }
+                None
             }
             Err(e) => {
                 crate::log_warn!(
@@ -518,6 +539,7 @@ impl BlockManager {
                     hash,
                     e
                 );
+                None
             }
         }
     }
@@ -532,6 +554,13 @@ impl BlockManager {
                 }
             }
         }
+        if let Err(e) = self.try_remove_mamba_prefix_state(hash) {
+            crate::log_warn!(
+                "Failed to remove invalidated mamba prefix snapshot hash {}: {}",
+                hash,
+                e
+            );
+        }
     }
 
     fn handle_mamba_prefix_evicted_blocks(&mut self, evicted_block_ids: &[usize]) {
@@ -544,6 +573,14 @@ impl BlockManager {
                 for hash in hashes {
                     self.valid_mamba_prefix_hashes.remove(&hash);
                     self.mamba_prefix_block_by_hash.remove(&hash);
+                    if let Err(e) = self.try_remove_mamba_prefix_state(hash) {
+                        crate::log_warn!(
+                            "Failed to remove mamba prefix snapshot hash {} for evicted block {}: {}",
+                            hash,
+                            block_id,
+                            e
+                        );
+                    }
                 }
             }
         }
@@ -859,6 +896,16 @@ impl BlockManager {
         MessageType::HasMambaPrefixState,
         (hash),
         MessageType::HasMambaPrefixStateResponse,
+        bool
+    );
+    def_broadcast_message_to_runners!(
+        pub,
+        try_remove_mamba_prefix_state,
+        remove_mamba_prefix_state,
+        (hash: u64),
+        MessageType::RemoveMambaPrefixState,
+        (hash),
+        MessageType::RemoveMambaPrefixStateResponse,
         bool
     );
     // Zero specific blocks

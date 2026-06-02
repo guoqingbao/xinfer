@@ -559,6 +559,14 @@ impl Qwen3VLForConditionalGeneration {
         }
     }
 
+    pub fn remove_mamba_prefix_state(&self, hash: u64) -> bool {
+        match &self.text_model {
+            Qwen3TextModel::Dense35(m) => m.remove_mamba_prefix_state(hash),
+            Qwen3TextModel::MoE35(m) => m.remove_mamba_prefix_state(hash),
+            _ => true,
+        }
+    }
+
     pub fn restore_mamba_prefix_state(&self, seq_id: usize, hash: u64) -> Result<bool> {
         match &self.text_model {
             Qwen3TextModel::Dense35(m) => m.restore_mamba_prefix_state(seq_id, hash),

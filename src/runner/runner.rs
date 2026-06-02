@@ -345,6 +345,17 @@ pub fn run_runner() -> anyhow::Result<()> {
                     false,
                 )?;
             }
+            Ok(MessageType::RemoveMambaPrefixState(hash)) => {
+                let ret = runner.remove_mamba_prefix_state(hash);
+                if ret.is_err() {
+                    xinfer::log_error!("RemoveMambaPrefixState failed for hash {}: {:?}", hash, ret);
+                }
+                send_local(
+                    &mut vec![stream.try_clone()?],
+                    &MessageType::RemoveMambaPrefixStateResponse(ret.unwrap_or(false)),
+                    false,
+                )?;
+            }
             Ok(MessageType::TransferPrefill(sequence)) => {
                 let ret = runner.transfer_prefill(&sequence);
                 // if ret.is_err() {

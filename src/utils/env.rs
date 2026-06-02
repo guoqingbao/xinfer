@@ -2,7 +2,6 @@ use std::env;
 use std::sync::OnceLock;
 
 pub const MAMBA_SNAPSHOT_BLOCK_STRIDE_ENV: &str = "XINFER_MAMBA_SNAPSHOT_STRIDE_BLOCKS";
-pub const DEFAULT_MAMBA_SNAPSHOT_BLOCK_STRIDE: usize = 1;
 
 pub const STREAM_AS_REASONING_CONTENT_ENV: &str = "XINFER_STREAM_AS_REASONING_CONTENT";
 
@@ -16,8 +15,8 @@ pub fn stream_as_reasoning_content() -> bool {
     })
 }
 
-pub fn mamba_snapshot_block_stride_blocks() -> usize {
-    let default = DEFAULT_MAMBA_SNAPSHOT_BLOCK_STRIDE;
+pub fn mamba_snapshot_block_stride_blocks(default: usize) -> usize {
+    let default = default.max(1);
     let Ok(raw) = env::var(MAMBA_SNAPSHOT_BLOCK_STRIDE_ENV) else {
         return default;
     };
