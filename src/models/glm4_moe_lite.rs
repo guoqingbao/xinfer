@@ -1,4 +1,4 @@
-use crate::models::layers::distributed::{Comm, ReplicatedLinear};
+use crate::models::layers::distributed::{Comm, VocabParallelLinear};
 use crate::models::layers::mask::get_attention_causal_mask;
 use crate::models::layers::mla_attention::{MlaAttention, MlaConfig};
 use crate::models::layers::mlp::MLP;
@@ -256,7 +256,7 @@ pub struct GLM4MoeLiteForCausalLM {
     embed_tokens: candle_nn::Embedding,
     layers: Vec<GLM4MoeLiteDecoderLayer>,
     norm: NormX,
-    lm_head: ReplicatedLinear,
+    lm_head: VocabParallelLinear,
     device: Device,
     config: Config,
     dtype: DType,
@@ -344,7 +344,7 @@ impl GLM4MoeLiteForCausalLM {
         )?;
 
         let tie_word_embeddings = config.tie_word_embeddings;
-        let lm_head = ReplicatedLinear::load_no_bias(
+        let lm_head = VocabParallelLinear::load_no_bias(
             config.hidden_size,
             vocab_size,
             if tie_word_embeddings.is_some_and(|x| x) {
@@ -358,6 +358,7 @@ impl GLM4MoeLiteForCausalLM {
             } else {
                 vb.pp("lm_head")
             },
+            comm.clone(),
             &None,
             &None,
             dtype,

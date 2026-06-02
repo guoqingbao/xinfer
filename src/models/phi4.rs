@@ -1,8 +1,8 @@
 // src/models/phi4.rs
 // This implementation is adapted from Phi-3, using the local Candle layers.
 use crate::models::layers::distributed::{
-    kv_head_shard, shard, Comm, MergedParallelColumnLinear, ReplicatedLinear,
-    TensorParallelRowLinear,
+    kv_head_shard, shard, Comm, MergedParallelColumnLinear, TensorParallelRowLinear,
+    VocabParallelLinear,
 };
 use crate::models::layers::mask::get_attention_causal_mask;
 use crate::models::layers::mlp::MLP;
@@ -488,7 +488,7 @@ pub struct Phi4ForCausalLM {
     embed_tokens: candle_nn::Embedding,
     layers: Vec<Phi4DecoderLayer>,
     norm: NormX,
-    lm_head: ReplicatedLinear,
+    lm_head: VocabParallelLinear,
     device: Device,
     config: Config,
     dtype: DType,
@@ -569,7 +569,7 @@ impl Phi4ForCausalLM {
             DType::F32,
             false,
         )?;
-        let lm_head = ReplicatedLinear::load_no_bias(
+        let lm_head = VocabParallelLinear::load_no_bias(
             config.hidden_size,
             vocab_size,
             if config.tie_word_embeddings.is_some_and(|x| x) {
@@ -585,6 +585,7 @@ impl Phi4ForCausalLM {
                     vb.pp("lm_head")
                 }
             },
+            comm.clone(),
             &None,
             &None,
             dtype,

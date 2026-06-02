@@ -1,6 +1,6 @@
 // src/models/qwen3_moe.rs
 use crate::models::layers::attention::Attention;
-use crate::models::layers::distributed::{Comm, ReplicatedLinear};
+use crate::models::layers::distributed::{Comm, VocabParallelLinear};
 use crate::models::layers::linear::LinearX as Linear;
 use crate::models::layers::mask::get_attention_causal_mask;
 use crate::models::layers::mlp::MLP;
@@ -296,7 +296,7 @@ pub struct Qwen3MoEForCausalLM {
     embed_tokens: candle_nn::Embedding,
     layers: Vec<Qwen3DecoderLayer>,
     norm: NormX,
-    lm_head: ReplicatedLinear,
+    lm_head: VocabParallelLinear,
     device: Device,
     config: Config,
     dtype: DType,
@@ -428,7 +428,7 @@ impl Qwen3MoEForCausalLM {
             false,
         )?;
 
-        let lm_head = ReplicatedLinear::load_no_bias(
+        let lm_head = VocabParallelLinear::load_no_bias(
             config.hidden_size,
             vocab_size,
             if tie_word_embeddings.is_some_and(|x| x) {
@@ -444,6 +444,7 @@ impl Qwen3MoEForCausalLM {
                     vb.pp("lm_head")
                 }
             },
+            comm.clone(),
             &None,
             &None,
             dtype,

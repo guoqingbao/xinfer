@@ -1,7 +1,7 @@
 // src/models/gemma3.rs
 
 use crate::models::layers::attention::{Attention, NaiveAttention};
-use crate::models::layers::distributed::{Comm, ReplicatedLinear};
+use crate::models::layers::distributed::{Comm, VocabParallelLinear};
 use crate::models::layers::linear::LinearX;
 use crate::models::layers::mask::get_attention_causal_mask;
 use crate::models::layers::mlp::NaiveMLP;
@@ -495,7 +495,7 @@ pub struct Gemma3ForConditionalGeneration {
     embed_tokens: candle_nn::Embedding, // ScaledEmbedding logic needed inside
     layers: Vec<Gemma3DecoderLayer>,
     norm: NormX,
-    lm_head: ReplicatedLinear,
+    lm_head: VocabParallelLinear,
 
     // Metadata
     device: Device,
@@ -674,7 +674,7 @@ impl Gemma3ForConditionalGeneration {
             true,
         )?;
 
-        let lm_head = ReplicatedLinear::load_no_bias(
+        let lm_head = VocabParallelLinear::load_no_bias(
             text_cfg.hidden_size,
             vocab_size,
             if text_cfg.tie_word_embeddings {
@@ -682,6 +682,7 @@ impl Gemma3ForConditionalGeneration {
             } else {
                 vb.pp("lm_head")
             },
+            comm.clone(),
             &None,
             &None,
             dtype,

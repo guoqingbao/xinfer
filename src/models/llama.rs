@@ -1,6 +1,6 @@
 // src/models/llama.rs
 use crate::models::layers::attention::Attention;
-use crate::models::layers::distributed::{Comm, ReplicatedLinear};
+use crate::models::layers::distributed::{Comm, VocabParallelLinear};
 use crate::models::layers::mask::get_attention_causal_mask;
 use crate::models::layers::mlp::MLP;
 use crate::models::layers::others::{embedding, rms_norm, NormX};
@@ -141,7 +141,7 @@ pub struct LLaMaForCausalLM {
     embed_tokens: candle_nn::Embedding,
     layers: Vec<LLaMaDecoderLayer>,
     norm: NormX,
-    lm_head: ReplicatedLinear,
+    lm_head: VocabParallelLinear,
     device: Device,
     config: Config,
     dtype: DType,
@@ -234,7 +234,7 @@ impl LLaMaForCausalLM {
             false,
         )?;
 
-        let lm_head = ReplicatedLinear::load_no_bias(
+        let lm_head = VocabParallelLinear::load_no_bias(
             config.hidden_size,
             vocab_size,
             if config.tie_word_embeddings.is_some_and(|x| x) {
@@ -250,6 +250,7 @@ impl LLaMaForCausalLM {
                     vb.pp("lm_head").clone()
                 }
             },
+            comm.clone(),
             &None,
             &None,
             dtype,

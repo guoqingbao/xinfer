@@ -2,7 +2,7 @@
 // Qwen3.5 MoE variant with hybrid attention (full attention + GatedDeltaNet layers)
 use crate::models::layers::attention::Attention;
 use crate::models::layers::deltanet::GatedDeltaNet;
-use crate::models::layers::distributed::{Comm, ReplicatedLinear};
+use crate::models::layers::distributed::{Comm, VocabParallelLinear};
 use crate::models::layers::linear::LinearX as Linear;
 use crate::models::layers::mask::get_attention_causal_mask;
 use crate::models::layers::mlp::MLP;
@@ -326,7 +326,7 @@ pub struct Qwen3_5MoEForCausalLM {
     embed_tokens: candle_nn::Embedding,
     layers: Vec<Qwen3_5MoEDecoderLayer>,
     norm: NormX,
-    lm_head: ReplicatedLinear,
+    lm_head: VocabParallelLinear,
     mamba_cache: RwLock<MambaCache>,
     device: Device,
     config: Config,
@@ -535,7 +535,7 @@ impl Qwen3_5MoEForCausalLM {
                     .is_some_and(|q| q.is_mlx_nvfp4),
         )?;
 
-        let lm_head = ReplicatedLinear::load_no_bias(
+        let lm_head = VocabParallelLinear::load_no_bias(
             config.hidden_size,
             vocab_size,
             if tie_word_embeddings.is_some_and(|x| x) {
@@ -551,6 +551,7 @@ impl Qwen3_5MoEForCausalLM {
                     vb.pp("lm_head")
                 }
             },
+            comm.clone(),
             &None,
             &None,
             dtype,

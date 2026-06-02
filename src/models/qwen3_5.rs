@@ -2,7 +2,7 @@
 // Qwen3.5 dense model with hybrid attention (full attention + GatedDeltaNet layers)
 use crate::models::layers::attention::Attention;
 use crate::models::layers::deltanet::GatedDeltaNet;
-use crate::models::layers::distributed::{Comm, ReplicatedLinear};
+use crate::models::layers::distributed::{Comm, VocabParallelLinear};
 use crate::models::layers::mask::get_attention_causal_mask;
 use crate::models::layers::mlp::MLP;
 use crate::models::layers::others::{embedding, rms_norm, NormX};
@@ -187,7 +187,7 @@ pub struct Qwen3_5ForCausalLM {
     embed_tokens: candle_nn::Embedding,
     layers: Vec<Qwen3_5DecoderLayer>,
     norm: NormX,
-    lm_head: ReplicatedLinear,
+    lm_head: VocabParallelLinear,
     mamba_cache: RwLock<MambaCache>,
     device: Device,
     config: Config,
@@ -399,9 +399,15 @@ impl Qwen3_5ForCausalLM {
                 .as_ref()
                 .map_or(false, |q| q.is_mlx_nvfp4);
         let lm_head = if is_mlx_nvfp4_tied {
-            ReplicatedLinear::from_weight_bias(embed_tokens.embeddings().clone(), None)?
+            VocabParallelLinear::from_weight_bias(
+                embed_tokens.embeddings().clone(),
+                None,
+                comm.clone(),
+                vocab_size,
+                dtype,
+            )?
         } else {
-            ReplicatedLinear::load_no_bias(
+            VocabParallelLinear::load_no_bias(
                 config.hidden_size,
                 vocab_size,
                 if tie_word_embeddings.is_some_and(|x| x) {
@@ -417,6 +423,7 @@ impl Qwen3_5ForCausalLM {
                         vb.pp("lm_head")
                     }
                 },
+                comm.clone(),
                 &None,
                 &None,
                 dtype,

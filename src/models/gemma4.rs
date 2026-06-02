@@ -1,5 +1,5 @@
 use crate::models::layers::attention::Attention;
-use crate::models::layers::distributed::{Comm, ReplicatedLinear};
+use crate::models::layers::distributed::{Comm, ReplicatedLinear, VocabParallelLinear};
 use crate::models::layers::mask::get_attention_causal_mask;
 use crate::models::layers::mlp::MLP;
 use crate::models::layers::moe::{
@@ -583,7 +583,7 @@ pub struct Gemma4ForCausalLM {
     per_layer_projection_norm: Option<NormX>,
     layers: Vec<Gemma4DecoderLayer>,
     norm: NormX,
-    lm_head: ReplicatedLinear,
+    lm_head: VocabParallelLinear,
     device: Device,
     config: Config,
     dtype: DType,
@@ -933,7 +933,7 @@ impl Gemma4ForCausalLM {
         )?;
 
         let tie_word_embeddings = config.tie_word_embeddings.unwrap_or(true);
-        let lm_head = ReplicatedLinear::load_no_bias(
+        let lm_head = VocabParallelLinear::load_no_bias(
             config.hidden_size,
             vocab_size,
             if tie_word_embeddings {
@@ -943,6 +943,7 @@ impl Gemma4ForCausalLM {
             } else {
                 vb.pp("lm_head")
             },
+            comm.clone(),
             &None,
             &None,
             dtype,

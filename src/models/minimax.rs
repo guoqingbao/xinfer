@@ -1,5 +1,5 @@
 use crate::models::layers::attention::Attention;
-use crate::models::layers::distributed::{Comm, ReplicatedLinear};
+use crate::models::layers::distributed::{Comm, VocabParallelLinear};
 use crate::models::layers::mask::get_attention_causal_mask;
 use crate::models::layers::moe::{
     FusedMoe, FusedMoeFp8, FusedMoeGGUF, FusedMoeISQ, FusedMoeMxfp4, FusedMoeNvfp4,
@@ -209,7 +209,7 @@ pub struct MiniMaxForCausalLM {
     embed_tokens: candle_nn::Embedding,
     layers: Vec<MiniMaxDecoderLayer>,
     norm: NormX,
-    lm_head: ReplicatedLinear,
+    lm_head: VocabParallelLinear,
     device: Device,
     config: Config,
     dtype: DType,
@@ -299,7 +299,7 @@ impl MiniMaxForCausalLM {
             false,
         )?;
 
-        let lm_head = ReplicatedLinear::load_no_bias(
+        let lm_head = VocabParallelLinear::load_no_bias(
             config.hidden_size,
             vocab_size,
             if config.tie_word_embeddings.is_some_and(|x| x) {
@@ -315,6 +315,7 @@ impl MiniMaxForCausalLM {
                     vb.pp("lm_head")
                 }
             },
+            comm.clone(),
             &None,
             &None,
             dtype,
