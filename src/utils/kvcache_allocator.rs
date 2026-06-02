@@ -264,7 +264,7 @@ impl KVCacheAllocator {
             .unwrap_or(if cfg!(feature = "flashattn") {
                 0.7
             } else {
-                0.5
+                0.6
             }) as f64;
 
         let config_model_len = econfig
