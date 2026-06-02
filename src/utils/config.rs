@@ -1210,6 +1210,7 @@ mod tests {
             quant_algo: None,
             mode: None,
             quantized_layers: None,
+            is_mlx_nvfp4: false,
         };
         assert!(cfg.should_skip_module("model.layers.0.self_attn.q_proj"));
         assert!(cfg.should_skip_module("model.layers.5.linear_attn.out_proj"));

@@ -177,7 +177,28 @@ pub fn config_from_gguf<R: std::io::Seek + std::io::Read>(
             }
         })?;
     let context_length = md_get(format!("{arch}.context_length").as_str())?.to_u32()? as usize;
-    let block_count = md_get(format!("{arch}.block_count").as_str())?.to_u32()? as usize;
+    let mut block_count = md_get(format!("{arch}.block_count").as_str())?.to_u32()? as usize;
+    let nextn_predict_layers_key = format!("{arch}.nextn_predict_layers");
+    let nextn_predict_layers = ct
+        .metadata
+        .get(&nextn_predict_layers_key)
+        .map(|v| v.to_u32())
+        .transpose()?
+        .unwrap_or(0) as usize;
+    if nextn_predict_layers > 0 {
+        if nextn_predict_layers >= block_count {
+            candle_core::bail!(
+                "{nextn_predict_layers_key} ({nextn_predict_layers}) must be smaller than {arch}.block_count ({block_count})"
+            );
+        }
+        crate::log_info!(
+            "GGUF model declares {} MTP prediction layer(s); loading {} decoder layer(s) from {} total block(s).",
+            nextn_predict_layers,
+            block_count - nextn_predict_layers,
+            block_count
+        );
+        block_count -= nextn_predict_layers;
+    }
     let rms_norm_eps =
         md_get(format!("{arch}.attention.layer_norm_rms_epsilon").as_str())?.to_f32()? as f64;
     let rope_freq_base = md_get(format!("{arch}.rope.freq_base").as_str())
@@ -2249,9 +2270,15 @@ pub fn log_throughput(outputs: &[GenerationOutput]) {
 
 #[cfg(test)]
 mod tests {
-    use super::{gemma4_per_layer_cache_config, get_arch_rope, parse_fallback_moe_cfg, ModelType};
+    use super::{
+        config_from_gguf, gemma4_per_layer_cache_config, get_arch_rope, parse_fallback_moe_cfg,
+        ModelType,
+    };
     use crate::utils::config::Config;
+    use candle_core::quantized::gguf_file::{Content, Value, VersionedMagic};
     use candle_nn::Activation;
+    use std::collections::HashMap;
+    use std::io::Cursor;
     use tokenizers::{models::bpe::BPE, Tokenizer};
 
     fn empty_tokenizer() -> Tokenizer {
@@ -2273,6 +2300,49 @@ mod tests {
             get_arch_rope(&tokenizer, "qwen35moe".to_string()).unwrap();
         assert!(matches!(model_type, ModelType::Qwen3_5MoE));
         assert!(!is_rope_i);
+    }
+
+    #[test]
+    fn gguf_qwen35_nextn_layers_are_excluded_from_decoder_count() {
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            "general.architecture".to_string(),
+            Value::String("qwen35".to_string()),
+        );
+        metadata.insert("qwen35.attention.head_count".to_string(), Value::U32(16));
+        metadata.insert("qwen35.attention.head_count_kv".to_string(), Value::U32(4));
+        metadata.insert("qwen35.attention.key_length".to_string(), Value::U32(256));
+        metadata.insert("qwen35.embedding_length".to_string(), Value::U32(2560));
+        metadata.insert("qwen35.feed_forward_length".to_string(), Value::U32(9216));
+        metadata.insert("qwen35.context_length".to_string(), Value::U32(262144));
+        metadata.insert("qwen35.block_count".to_string(), Value::U32(33));
+        metadata.insert("qwen35.nextn_predict_layers".to_string(), Value::U32(1));
+        metadata.insert(
+            "qwen35.attention.layer_norm_rms_epsilon".to_string(),
+            Value::F32(1e-6),
+        );
+        metadata.insert(
+            "qwen35.rope.freq_base".to_string(),
+            Value::F32(10_000_000.0),
+        );
+        metadata.insert("qwen35.ssm.conv_kernel".to_string(), Value::U32(4));
+        metadata.insert("qwen35.ssm.group_count".to_string(), Value::U32(16));
+        metadata.insert("qwen35.ssm.time_step_rank".to_string(), Value::U32(32));
+        metadata.insert("qwen35.ssm.state_size".to_string(), Value::U32(128));
+        metadata.insert("qwen35.ssm.inner_size".to_string(), Value::U32(4096));
+        metadata.insert("qwen35.full_attention_interval".to_string(), Value::U32(4));
+
+        let content = Content {
+            magic: VersionedMagic::GgufV3,
+            metadata,
+            tensor_infos: HashMap::new(),
+            tensor_data_offset: 0,
+        };
+        let mut reader = Cursor::new(Vec::<u8>::new());
+
+        let config = config_from_gguf(&content, &mut reader).unwrap();
+
+        assert_eq!(config.num_hidden_layers, 32);
     }
 
     #[test]
