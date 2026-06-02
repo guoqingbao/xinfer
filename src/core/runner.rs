@@ -1848,7 +1848,27 @@ impl ModelRunner {
         let (guided_logits, guided_seq_ids) =
             self.apply_requested_guidance(&logits, &seqs, &seq_ids)?;
 
-        let tokens = self.sample_processed_logits(&guided_logits, &cached_params.sampling)?;
+        let mut tokens = self.sample_processed_logits(&guided_logits, &cached_params.sampling)?;
+
+        // For sequences with ff_tokens, use them instead of sampled tokens if mismatching
+        // TODO: use the fftokens as draft tokens
+        if let Some(factory) = &self.llg_factory {
+            let mut guidance_states = self.guidance_states.write();
+            for (i, seq_id) in seq_ids.iter().enumerate() {
+                if let Some(state) = guidance_states.get_mut(seq_id) {
+                    let ff_tokens = state.compute_ff_tokens();
+                    if !ff_tokens.is_empty() && ff_tokens[0] != tokens[i] {
+                        crate::log_warn!(
+                            "[Seq {}] Replacing sampled token {} with ff-token {}",
+                            seq_id,
+                            tokens[i],
+                            ff_tokens[0]
+                        );
+                        tokens[i] = ff_tokens[0];
+                    }
+                }
+            }
+        }
 
         self.commit_guided_tokens(&seq_ids, &tokens, guided_seq_ids);
 
