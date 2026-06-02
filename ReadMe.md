@@ -169,7 +169,7 @@ xinfer --m unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF \
   --f Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf --kvcache-dtype turbo4
 
 # Metal/MacOS
-xinfer --m AxionML/Qwen3.5-4B-NVFP4
+xinfer --m Qwen/Qwen3.5-4B --isq q6k
 ```
 
 ---
