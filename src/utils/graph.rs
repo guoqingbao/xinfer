@@ -626,6 +626,9 @@ impl<M: CudaGraphModule> GraphCapturer<M> {
                 }
                 if should_capture {
                     self.model.end_capture(!phase.is_warmup())?;
+                } else {
+                    // synchronize cuda stream for non graph capture path
+                    device.synchronize()?;
                 }
             }
         }
