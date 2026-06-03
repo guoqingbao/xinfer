@@ -11,7 +11,7 @@
 | | Feature | Details |
 |---|---|---|
 | **0️⃣** | Zero Python dependencies | Pure Rust backend — no PyTorch, no CUDA Python bindings |
-| **⚡** | Fast | Native Flash Attention, FlashInfer, CUDA Graphs, continuous batching, prefix caching, PD disaggregation. Up to **181 tok/s** decode for `30B+` models on consumer GPUs |
+| **⚡** | Fast | Native Flash Attention, FlashInfer, CUDA Graphs, continuous batching, prefix caching, PD disaggregation. Up to **197 tok/s** decode for `30B+` models on consumer GPUs |
 | **🪶** | Tiny footprint | Core scheduling + attention logic in **< 5 000 lines** of Rust |
 | **🌍** | Cross-platform | CUDA (Linux/Windows), Metal (macOS). Same binary, same API |
 | **🏭** | Production-ready | OpenAI/Anthropic-compatible APIs, built-in ChatGPT-style Web UI, MCP tool calling, structured outputs, embedding + tokenizer endpoints |
@@ -85,7 +85,7 @@ Add `--kvcache-dtype` to compress KV cache and extend context length:
 | DeepSeek-R1-0528-Qwen3-8B | Q4_K_M | 8B | **139.25** tokens/s |
 | GLM-4-9B-0414 | Q4_K_M | 9B | **77.48** tokens/s |
 | QwQ-32B | Q4_K_M | 32B | **46.02** tokens/s |
-| **Qwen3-30B-A3B** | NVFP4 | **30B (MoE)** | **181.59** tokens/s (**RTX 5090**) |
+| **Qwen3-30B-A3B** | NVFP4 | **30B (MoE)** | **197.29** tokens/s (**RTX 5090**) |
 | **Qwen3-30B-A3B** | NVFP4 | **30B (MoE)** | **72.86** tokens/s (**V100, Software FP4**) |
 | **Qwen3.5-27B** (**Multimodal**) | Q4_K_M | **27B (Dense)** | **49.33** tokens/s |
 | **Qwen3.5-27B/Qwen3.6-27B** | FP8 | **27B (Dense)** | **45** tokens/s (**Hopper**) |

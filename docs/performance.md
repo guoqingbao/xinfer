@@ -16,7 +16,7 @@ This document contains detailed performance benchmarks for xInfer across differe
 | DeepSeek-R1-0528-Qwen3-8B | Q4_K_M | 8B | A100| **139.25** tokens/s |
 | GLM-4-9B-0414 | Q4_K_M | 9B | A100| **77.48** tokens/s |
 | QwQ-32B | Q4_K_M | 32B | A100| **46.02** tokens/s |
-| **Qwen3-30B-A3B** | NVFP4 | **30B (MoE)** | RTX 5090 | **181.59** tokens/s|
+| **Qwen3-30B-A3B** | NVFP4 | **30B (MoE)** | RTX 5090 | **197.29** tokens/s|
 | **Qwen3-30B-A3B** | NVFP4 | **30B (MoE)** | V100 | **72.86** tokens/s (**Software FP4**) |
 | **Qwen3.5-27B** (**Multimodal**) | Q4_K_M | **27B (Dense)** | Hopper | **49.33** tokens/s |
 | **Qwen3.5-27B/Qwen3.6-27B** | FP8 | **27B (Dense)** | Hopper | **45** tokens/s|
