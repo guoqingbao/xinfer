@@ -15,6 +15,7 @@ use crate::utils::guidance::{GuidanceState, ParserFactory};
 use crate::utils::image::compute_image_slice;
 use crate::utils::logits_processor::{LogitsProcessor, Sampling};
 use crate::utils::progress::ProgressLike;
+use crate::utils::env::soft_mask_disabled;
 #[cfg(feature = "flashinfer")]
 use crate::utils::FlashInferKvParams;
 use crate::{
@@ -54,6 +55,30 @@ pub struct CachedSamplingParams {
     pub sampling: Sampling,
     pub frequency_penalty: Option<f32>,
     pub presence_penalty: Option<f32>,
+}
+
+/// Soft masking configuration for gradient smoothing
+/// Instead of hard masking to -inf, we shift logits by a configurable amount
+#[derive(Clone, Debug)]
+pub struct SoftMaskConfig {
+    /// Logit shift for disallowed tokens (default: -1000.0)
+    /// This value should be large enough to make softmax probability negligible
+    /// but small enough to avoid numerical overflow
+    pub mask_shift: f32,
+    /// Minimum logit value after applying mask_shift (default: -1e9)
+    pub min_logit: f32,
+    /// Whether to use soft masking (default: true)
+    pub enabled: bool,
+}
+
+impl Default for SoftMaskConfig {
+    fn default() -> Self {
+        Self {
+            mask_shift: -1000.0,
+            min_logit: -1e9,  // Prevent underflow to -inf while keeping gradient flow
+            enabled: !soft_mask_disabled(),
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -345,14 +370,29 @@ impl ModelRunner {
             }
 
             let apply_len = std::cmp::min(vocab_size, mask_len);
+            // Soft masking configuration for gradient smoothing
+            let soft_mask = SoftMaskConfig::default();
             for tok in 0..apply_len {
                 if !mask.is_allowed(tok as u32) {
-                    row[tok] = f32::NEG_INFINITY;
+                    if soft_mask.enabled {
+                        // Soft masking: shift logit by configured amount
+                        // This maintains gradient flow while still suppressing disallowed tokens
+                        row[tok] = (row[tok] + soft_mask.mask_shift).max(soft_mask.min_logit);
+                    } else {
+                        // Hard masking when soft mask is disabled
+                        row[tok] = f32::NEG_INFINITY;
+                    }
                 }
             }
             if mask_len < vocab_size {
                 for tok in mask_len..vocab_size {
-                    row[tok] = f32::NEG_INFINITY;
+                    if soft_mask.enabled {
+                        // Soft masking for out-of-range tokens
+                        row[tok] = (row[tok] + soft_mask.mask_shift).max(soft_mask.min_logit);
+                    } else {
+                        // Hard masking when soft mask is disabled
+                        row[tok] = f32::NEG_INFINITY;
+                    }
                 }
             }
         }
