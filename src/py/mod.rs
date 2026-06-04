@@ -75,23 +75,35 @@ impl Engine {
     ) -> PyResult<Vec<GenerationOutput>> {
         tokio::task::block_in_place(|| {
             GLOBAL_RT.block_on(async {
-                let (receivers, tokenizer) = {
-                    let mut engine = self.engine.write();
+                let (preprocessed, tokenizer_service) = {
+                    let engine = self.engine.read();
                     (
                         engine
-                            .generate_sync(&params, &message_list, None, &Vec::new(), &None)
+                            .preprocess(&params, &message_list, &Vec::new(), false)
                             .map_err(|e| {
-                                PyValueError::new_err(format!("generate_sync failed: {:?}", e))
+                                PyValueError::new_err(format!("preprocess failed: {:?}", e))
                             })?,
-                        Arc::new(engine.tokenizer.clone()),
+                        engine.tokenizer_service.clone(),
                     )
                 };
+                let receivers = {
+                    let mut engine = self.engine.write();
+                    engine
+                        .generate_sync_from_preprocessed(preprocessed, None, &None)
+                        .map_err(|e| {
+                            PyValueError::new_err(format!(
+                                "generate_sync_from_preprocessed failed: {:?}",
+                                e
+                            ))
+                        })?
+                };
 
-                let results = LLMEngine::collect_sync_results(receivers, tokenizer, None)
-                    .await
-                    .map_err(|e| {
-                        PyValueError::new_err(format!("collect_sync_results failed: {:?}", e))
-                    })?;
+                let results =
+                    LLMEngine::collect_sync_results(receivers, tokenizer_service, None)
+                        .await
+                        .map_err(|e| {
+                            PyValueError::new_err(format!("collect_sync_results failed: {:?}", e))
+                        })?;
 
                 // GenerationOutput is returned directly
                 let outputs: Vec<GenerationOutput> = results;
@@ -107,10 +119,22 @@ impl Engine {
         params: SamplingParams,
         messages: Vec<Message>,
     ) -> PyResult<(usize, usize, EngineStream)> {
+        let preprocessed = {
+            let engine = self.engine.read();
+            let mut p = engine
+                .preprocess(
+                    std::slice::from_ref(&params),
+                    std::slice::from_ref(&messages),
+                    &Vec::new(),
+                    false,
+                )
+                .map_err(|e| PyValueError::new_err(format!("preprocess error: {:?}", e)))?;
+            p.pop().ok_or_else(|| PyValueError::new_err("preprocess returned 0 items"))?
+        };
         let (seq_id, prompt_length, _prefilled_reasoning_end, stream) = {
             let mut engine = self.engine.write();
             engine
-                .generate_stream(&params, &messages, None, &Vec::new(), &None)
+                .generate_stream_from_preprocessed(preprocessed, None, &None)
                 .map_err(|e| PyValueError::new_err(format!("stream error: {:?}", e)))?
         };
 

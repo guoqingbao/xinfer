@@ -3,7 +3,6 @@ use clap::Parser;
 use colored::Colorize;
 use reedline::{DefaultPrompt, DefaultPromptSegment, Reedline, Signal};
 use serde_json;
-use std::sync::Arc;
 use tool_parser::ParserFactory;
 use xinfer::core::engine::StreamItem;
 use xinfer::core::engine::GLOBAL_RT;
@@ -345,15 +344,21 @@ async fn main() -> Result<()> {
 
         let mut outputs = {
             if interactive {
+                let preprocessed = {
+                    let e = engine.read();
+                    let mut p = e
+                        .preprocess(
+                            std::slice::from_ref(&request_params),
+                            std::slice::from_ref(&chat_history),
+                            &Vec::new(),
+                            false,
+                        )
+                        .expect("preprocess failed");
+                    p.pop().expect("preprocess returned 0 items for 1 input")
+                };
                 let (seq_id, prompt_length, _prefilled_reasoning_end, stream) = {
                     let mut e = engine.write();
-                    match e.generate_stream(
-                        &request_params,
-                        &chat_history,
-                        None,
-                        &Vec::new(),
-                        &None,
-                    ) {
+                    match e.generate_stream_from_preprocessed(preprocessed, None, &None) {
                         Ok((seq_id, prompt_length, prefilled_reasoning_end, stream)) => {
                             (seq_id, prompt_length, prefilled_reasoning_end, stream)
                         }
@@ -438,14 +443,20 @@ async fn main() -> Result<()> {
             } else {
                 xinfer::log_warn!("Starting the inference...");
 
-                let (receivers, tokenizer) = {
-                    let mut e = engine.write();
+                let (preprocessed, tokenizer_service) = {
+                    let e = engine.read();
                     (
-                        e.generate_sync(&params, &message_list, None, &Vec::new(), &None)?,
-                        Arc::new(e.tokenizer.clone()),
+                        e.preprocess(&params, &message_list, &Vec::new(), false)?,
+                        e.tokenizer_service.clone(),
                     )
                 };
-                let results = LLMEngine::collect_sync_results(receivers, tokenizer, None).await?;
+                let receivers = {
+                    let mut e = engine.write();
+                    e.generate_sync_from_preprocessed(preprocessed, None, &None)?
+                };
+                let results =
+                    LLMEngine::collect_sync_results(receivers, tokenizer_service, None)
+                        .await?;
                 // GenerationOutput is returned directly
                 results
             }

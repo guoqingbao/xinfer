@@ -99,3 +99,15 @@ assets = [
     ["target/release/xinfer", "usr/local/bin/", "755"],
     ["target/release/lib/*", "usr/local/lib/xinfer/", "644"],
 ]
+
+# `tok_detok_worker` is an opt-in companion binary spawned out-of-process
+# by the engine when `XINFER_TOK_DETOK_WORKER=1` is set; not built into
+# the main `xinfer` polymorphic-subcommand dispatch because the worker
+# carries its own message-handling main loop that doesn't share the
+# `xinfer` arg surface. The upstream `runner` binary was merged into
+# the polymorphic `xinfer <subcmd>` dispatch (see `src/main.rs`); the
+# pre-rename `[[bin]] runner` entry from the PR is obsolete and dropped
+# during the 2026-05 xinfer rebase.
+[[bin]]
+name = "tok_detok_worker"
+path = "src/runner/tok_detok_worker.rs"

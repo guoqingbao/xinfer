@@ -2165,9 +2165,33 @@ pub async fn messages(
     };
 
     if use_stream {
+        // Lock-hoist: preprocess (chat-template + tokenize) under engine.read().
+        let preprocessed = {
+            let e = data.engine.read();
+            match e.preprocess(
+                std::slice::from_ref(&params),
+                std::slice::from_ref(&messages),
+                &resolved_tools,
+                false,
+            ) {
+                Ok(mut p) => p.pop().expect("preprocess returned 0 items for 1 input"),
+                Err(err) => {
+                    return ClaudeResponder::Error(
+                        ClaudeErrorResponse {
+                            response_type: "error",
+                            error: ClaudeErrorBody {
+                                error_type: "invalid_request_error".to_string(),
+                                message: format!("Stream preprocess failed: {err:?}"),
+                            },
+                        },
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                    );
+                }
+            }
+        };
         let (seq_id, prompt_length, prefilled_reasoning_end, stream) = {
             let mut e = data.engine.write();
-            match e.generate_stream(&params, &messages, image_data, &resolved_tools, &logger) {
+            match e.generate_stream_from_preprocessed(preprocessed, image_data, &logger) {
                 Ok((seq_id, prompt_length, prefilled_reasoning_end, stream)) => {
                     (seq_id, prompt_length, prefilled_reasoning_end, stream)
                 }
@@ -3086,20 +3110,38 @@ pub async fn messages(
             ),
         )
     } else {
-        let tokenizer = {
+        let tokenizer_service = {
             let e = data.engine.read();
-            Arc::new(e.tokenizer.clone())
+            e.tokenizer_service.clone()
         };
 
+        // Lock-hoist: preprocess (chat-template + tokenize) under engine.read().
+        let preprocessed = {
+            let e = data.engine.read();
+            match e.preprocess(
+                std::slice::from_ref(&params),
+                std::slice::from_ref(&messages),
+                &resolved_tools,
+                false,
+            ) {
+                Ok(p) => p,
+                Err(err) => {
+                    return ClaudeResponder::Error(
+                        ClaudeErrorResponse {
+                            response_type: "error",
+                            error: ClaudeErrorBody {
+                                error_type: "server_error".to_string(),
+                                message: format!("Preprocess failed: {err:?}"),
+                            },
+                        },
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                    );
+                }
+            }
+        };
         let receivers = {
             let mut e = data.engine.write();
-            match e.generate_sync(
-                &vec![params],
-                &vec![messages],
-                image_data,
-                &resolved_tools,
-                &logger,
-            ) {
+            match e.generate_sync_from_preprocessed(preprocessed, image_data, &logger) {
                 Ok(receivers) => receivers,
                 Err(err) => {
                     return ClaudeResponder::Error(
@@ -3118,22 +3160,27 @@ pub async fn messages(
         if let Some(ref l) = logger {
             l.log_start_response();
         }
-        let results =
-            match LLMEngine::collect_sync_results(receivers, tokenizer, logger.clone()).await {
-                Ok(results) => results,
-                Err(err) => {
-                    return ClaudeResponder::Error(
-                        ClaudeErrorResponse {
-                            response_type: "error",
-                            error: ClaudeErrorBody {
-                                error_type: "server_error".to_string(),
-                                message: format!("Failed to collect results: {err:?}"),
-                            },
+        let results = match LLMEngine::collect_sync_results(
+            receivers,
+            tokenizer_service,
+            logger.clone(),
+        )
+        .await
+        {
+            Ok(results) => results,
+            Err(err) => {
+                return ClaudeResponder::Error(
+                    ClaudeErrorResponse {
+                        response_type: "error",
+                        error: ClaudeErrorBody {
+                            error_type: "server_error".to_string(),
+                            message: format!("Failed to collect results: {err:?}"),
                         },
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                    );
-                }
-            };
+                    },
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                );
+            }
+        };
 
         let output = match results.into_iter().next() {
             Some(output) => output,

@@ -75,6 +75,23 @@ pub enum RequestType {
     Completion,
 }
 
+/// Output of `LLMEngine::preprocess`. Encapsulates everything that's
+/// needed to register a request with the scheduler, computed up-front so
+/// the engine write lock is held only for the brief scheduler-add step.
+///
+/// Carrying the full `SamplingParams` (cloned) and the chat-templated
+/// `prompt` (owned `String`) lets the caller drop both the engine read
+/// lock and the original `messages: Vec<Message>` borrow before
+/// acquiring the engine write lock.
+#[derive(Debug, Clone)]
+pub struct PreprocessedRequest {
+    pub params: SamplingParams,
+    pub prompt: String,
+    pub image_idx: i32,
+    pub token_ids: Vec<u32>,
+    pub prompt_len: usize,
+}
+
 #[allow(dead_code)]
 pub struct LLMEngine {
     pub runners: Arc<RwLock<RunnerType>>,
@@ -101,6 +118,15 @@ pub struct LLMEngine {
     pub tool_config: ToolConfig,
     pub img_cfg: Option<ImageProcessConfig>,
     pub guidance_tokens: GuidanceTokens,
+    /// Dispatch for the engine's hot-path tokenize/detokenize calls.
+    /// `TokenizerService::Inline` is the default in-process tokenizer.
+    /// `TokenizerService::Worker` is the opt-in out-of-process worker
+    /// activated by `XINFER_TOK_DETOK_WORKER=1`. The enum shape mirrors
+    /// `RunnerType::{Thread, Process}` so future variants (inference
+    /// firewall, grammar-aware, remote multi-model) plug in by adding a
+    /// variant rather than threading another `Option<...>` through the
+    /// engine call sites.
+    pub tokenizer_service: crate::runner::tokenizer_service::TokenizerService,
 }
 
 impl LLMEngine {
@@ -474,6 +500,63 @@ impl LLMEngine {
 
         log_warn!("Model loaded.\n");
 
+        // Optional out-of-process tokenization + detokenization.
+        // Spawns a `tok_detok_worker` subprocess; the engine binds two
+        // `interprocess::local_socket` listeners (one for tokenize, one for
+        // detokenize) so the two directions don't head-of-line each other.
+        let tok_detok_ipc = if std::env::var("XINFER_TOK_DETOK_WORKER")
+            .ok()
+            .map(|s| matches!(s.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false)
+        {
+            use crate::runner::tok_detok_msgs::{MsgKind, TokDetokInit};
+            use crate::runner::tok_detok_socket::{TokDetokIpcPair, TokDetokSocketServer};
+            use crate::utils::get_tok_detok_worker_path;
+            let pid = std::process::id() % 100000;
+            let tok_sock = format!("xinfer-tokdetok-{}-tok", pid);
+            let det_sock = format!("xinfer-tokdetok-{}-det", pid);
+            let worker_path = get_tok_detok_worker_path().expect("tok_detok_worker path");
+            // Child lives for the engine lifetime; same `.map(|_| ())` pattern as
+            // `spawn_runner` in `src/utils/mod.rs` to silence `clippy::zombie_processes`.
+            std::process::Command::new(&worker_path)
+                .env("XINFER_TOK_DETOK_SOCKET_TOK", &tok_sock)
+                .env("XINFER_TOK_DETOK_SOCKET_DET", &det_sock)
+                .spawn()
+                .map(|_child| ())
+                .expect("spawn tok_detok_worker");
+            log_info!(
+                "[tok_detok_worker] spawned, awaiting connects on tok={} det={}",
+                tok_sock,
+                det_sock
+            );
+            // Worker connects to tok first, then det (same order as
+            // tok_detok_worker.rs main()).
+            let tok = TokDetokSocketServer::bind_and_accept(&tok_sock)
+                .expect("tok_detok tok socket bind");
+            let det = TokDetokSocketServer::bind_and_accept(&det_sock)
+                .expect("tok_detok det socket bind");
+            // Init is delivered on the tok socket; the worker shares the
+            // tokenizer between its two service threads.
+            let init = TokDetokInit {
+                model_paths: model_pathes.clone(),
+                is_gguf,
+            };
+            let bytes = bincode::serialize(&init).unwrap();
+            tok.send(&bytes, MsgKind::TokDetokInit);
+            log_info!("[tok_detok_worker] TokDetokInit sent on tok socket");
+            Some(TokDetokIpcPair { tok, det })
+        } else {
+            None
+        };
+        let tokenizer_arc = Arc::new(tokenizer.clone());
+        let tokenizer_service = match tok_detok_ipc {
+            Some(ipc) => crate::runner::tokenizer_service::TokenizerService::Worker {
+                ipc,
+                tokenizer: tokenizer_arc,
+            },
+            None => crate::runner::tokenizer_service::TokenizerService::Inline(tokenizer_arc),
+        };
+
         let engine = Arc::new(RwLock::new(Self {
             runners,
             scheduler,
@@ -499,6 +582,7 @@ impl LLMEngine {
             img_cfg,
             model_name,
             guidance_tokens,
+            tokenizer_service,
         }));
 
         Self::start_engine(engine.clone());
@@ -513,12 +597,38 @@ impl LLMEngine {
         images: &Option<ImageData>,
         image_idx: i32,
     ) -> Result<(usize, usize)> {
-        let tokens = self
-            .tokenizer
-            .encode_fast(prompt, true)
-            .expect("encode failed!");
-        let token_ids: Vec<u32> = tokens.get_ids().iter().map(|&x| x).collect();
-        let length = token_ids.len();
+        // Hot path: dispatch via TokenizerService — Inline (default) or Worker.
+        let (token_ids, length): (Vec<u32>, usize) = self
+            .tokenizer_service
+            .encode(prompt)
+            .map_err(|e| candle_core::Error::wrap(e))?;
+        self.add_request_pretokenized_(
+            params,
+            prompt,
+            token_ids,
+            length,
+            request_type,
+            images,
+            image_idx,
+        )
+    }
+
+    /// Same as `add_request_` but accepts a pre-computed `token_ids` /
+    /// `length` pair so the caller can tokenize *outside* the engine write
+    /// lock. Enables N concurrent server handlers to tokenize in parallel
+    /// (each under their own `engine.read()`) and only serialize on the
+    /// brief `engine.write()` needed to register the request with the
+    /// scheduler.
+    fn add_request_pretokenized_(
+        &mut self,
+        params: &SamplingParams,
+        prompt: &str,
+        token_ids: Vec<u32>,
+        length: usize,
+        request_type: &RequestType,
+        images: &Option<ImageData>,
+        image_idx: i32,
+    ) -> Result<(usize, usize)> {
         let raw_replay_token_ids = self.match_prompt_replay_candidate(&token_ids);
         if let Some(max_model_len) = self.econfig.max_model_len {
             if length > max_model_len - 1 {
@@ -710,6 +820,81 @@ impl LLMEngine {
             );
         }
         Ok((seq_id, prompt_length, rx))
+    }
+
+    /// Public pretokenized variant of `add_request`. Skips the in-lock
+    /// tokenize so the caller can run `tokenizer_service.encode` outside
+    /// the engine write lock (under `engine.read()` or no lock at all),
+    /// then take `engine.write()` only for the scheduler-add step.
+    pub fn add_request_pretokenized(
+        &mut self,
+        params: &SamplingParams,
+        prompt: &str,
+        token_ids: Vec<u32>,
+        prompt_len: usize,
+        request_type: RequestType,
+        images: &Option<ImageData>,
+        image_idx: i32,
+    ) -> Result<(usize, usize, Receiver<StreamItem>)> {
+        let (seq_id, prompt_length) = self.add_request_pretokenized_(
+            params,
+            prompt,
+            token_ids,
+            prompt_len,
+            &request_type,
+            images,
+            image_idx,
+        )?;
+        let (tx, rx) = channel(1024);
+        self.stream_senders.insert(seq_id, tx);
+        self.request_types.insert(seq_id, request_type.clone());
+        if self.econfig.server_mode.unwrap_or(true) && request_type != RequestType::Completion {
+            log_warn!(
+                "[{:?}] New request [Seq_id {}, {} tokens] received! (session_id: {:?})\n",
+                request_type,
+                seq_id,
+                prompt_length,
+                params.session_id,
+            );
+        }
+        Ok((seq_id, prompt_length, rx))
+    }
+
+    /// Chat-template + tokenize each `(params, messages)` pair. Pure read
+    /// of the engine (`&self`) so multiple concurrent server handlers can
+    /// run this in parallel under their own `engine.read()` guards. The
+    /// returned `Vec<PreprocessedRequest>` feeds `generate_sync_from_preprocessed`
+    /// / `generate_stream_from_preprocessed`, which acquire `engine.write()`
+    /// only briefly for the scheduler-add step.
+    pub fn preprocess(
+        &self,
+        params: &[SamplingParams],
+        message_list: &[Vec<Message>],
+        tools: &[Tool],
+        log: bool,
+    ) -> Result<Vec<PreprocessedRequest>> {
+        if params.len() != message_list.len() {
+            candle_core::bail!(
+                "size of sampling parameters is not match with size of prompts!"
+            );
+        }
+        let tools_vec: Vec<Tool> = tools.to_vec();
+        let mut out = Vec::with_capacity(params.len());
+        for (param, messages) in params.iter().zip(message_list.iter()) {
+            let (prompt, image_idx) = self.apply_chat_template(param, messages, &tools_vec, log);
+            let (token_ids, prompt_len) = self
+                .tokenizer_service
+                .encode(&prompt)
+                .map_err(|e| candle_core::Error::wrap(e))?;
+            out.push(PreprocessedRequest {
+                params: param.clone(),
+                prompt,
+                image_idx,
+                token_ids,
+                prompt_len,
+            });
+        }
+        Ok(out)
     }
 
     pub fn get_num_cached_tokens(&self) -> usize {
@@ -1230,8 +1415,8 @@ impl LLMEngine {
         has_requests_to_cancel
     }
 
-    fn apply_chat_template(
-        &mut self,
+    pub fn apply_chat_template(
+        &self,
         params: &SamplingParams,
         messages: &Vec<Message>,
         tools: &Vec<Tool>,
@@ -1318,13 +1503,47 @@ impl LLMEngine {
         Ok(receivers)
     }
 
+    /// Lock-hoisted equivalent of `generate_sync`. The caller has already
+    /// run `preprocess(...)` (chat template + tokenize) under a brief
+    /// `engine.read()` guard — only the scheduler-add step needs the
+    /// engine write lock, so this method holds it for milliseconds rather
+    /// than tens-to-hundreds of milliseconds.
+    pub fn generate_sync_from_preprocessed(
+        &mut self,
+        preprocessed: Vec<PreprocessedRequest>,
+        images: Option<ImageData>,
+        logger: &Option<Arc<ChatCompletionLogger>>,
+    ) -> Result<Vec<(usize, usize, mpsc::Receiver<StreamItem>)>> {
+        let mut receivers = Vec::with_capacity(preprocessed.len());
+        for pp in preprocessed {
+            if let Some(ref l) = logger {
+                l.log_prompt(&pp.prompt);
+            }
+            if let Ok((seq_id, prompt_length, rx)) = self.add_request_pretokenized(
+                &pp.params,
+                &pp.prompt,
+                pp.token_ids,
+                pp.prompt_len,
+                RequestType::Completion,
+                &images,
+                pp.image_idx,
+            ) {
+                receivers.push((seq_id, prompt_length, rx));
+            }
+        }
+        Ok(receivers)
+    }
+
     pub async fn collect_sync_results(
         receivers: Vec<(usize, usize, mpsc::Receiver<StreamItem>)>,
-        tokenizer: Arc<Tokenizer>,
+        tokenizer_service: crate::runner::tokenizer_service::TokenizerService,
         logger: Option<Arc<ChatCompletionLogger>>,
     ) -> Result<Vec<GenerationOutput>> {
         let decoded_tokens = Arc::new(AtomicUsize::new(0));
         let decode_start_time = Arc::new(AtomicUsize::new(0));
+        // Raw tokenizer for the in-process stream decoder (logger path);
+        // streaming decode is stateful and stays in-process by design.
+        let tokenizer: Arc<Tokenizer> = tokenizer_service.tokenizer().clone();
 
         // Create futures for each receiver (do NOT spawn detached tasks)
         let tasks = receivers
@@ -1334,6 +1553,7 @@ impl LLMEngine {
                 let decode_start_time_clone = decode_start_time.clone();
                 let tokenizer = Arc::clone(&tokenizer);
                 let logger = logger.clone();
+                let tokenizer_service = tokenizer_service.clone();
                 async move {
                     let mut output: Option<GenerationOutput> = None;
                     let mut collected_token_ids: Vec<u32> = Vec::new();
@@ -1362,7 +1582,7 @@ impl LLMEngine {
                                 stop_sequence,
                             )) => {
                                 let decoded_len = decoded_ids.len();
-                                let decode_output = tokenizer
+                                let decode_output = tokenizer_service
                                     .decode(&decoded_ids, true)
                                     .expect("unable to decode!");
 
@@ -1470,6 +1690,39 @@ impl LLMEngine {
             l.log_prompt(&prompt);
         }
         match self.add_request(params, &prompt, RequestType::Stream, &images, image_idx) {
+            Ok((seq_id, prompt_length, rx)) => {
+                let prefilled_reasoning_end = self.get_prefilled_reasoning_end_marker(seq_id);
+                Ok((seq_id, prompt_length, prefilled_reasoning_end, rx))
+            }
+            Err(e) => {
+                candle_core::bail!("{:?}", e)
+            }
+        }
+    }
+
+    /// Lock-hoisted equivalent of `generate_stream`. Takes a single
+    /// already-`preprocess`ed request and registers it with the scheduler
+    /// under the engine write lock. Caller is expected to have run
+    /// `preprocess(&[params], &[messages], ...)` under a brief
+    /// `engine.read()` and pulled the single element out.
+    pub fn generate_stream_from_preprocessed(
+        &mut self,
+        preprocessed: PreprocessedRequest,
+        images: Option<ImageData>,
+        logger: &Option<Arc<ChatCompletionLogger>>,
+    ) -> Result<(usize, usize, Option<String>, mpsc::Receiver<StreamItem>)> {
+        if let Some(ref l) = logger {
+            l.log_prompt(&preprocessed.prompt);
+        }
+        match self.add_request_pretokenized(
+            &preprocessed.params,
+            &preprocessed.prompt,
+            preprocessed.token_ids,
+            preprocessed.prompt_len,
+            RequestType::Stream,
+            &images,
+            preprocessed.image_idx,
+        ) {
             Ok((seq_id, prompt_length, rx)) => {
                 let prefilled_reasoning_end = self.get_prefilled_reasoning_end_marker(seq_id);
                 Ok((seq_id, prompt_length, prefilled_reasoning_end, rx))

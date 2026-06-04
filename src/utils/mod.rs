@@ -1657,6 +1657,35 @@ pub fn get_runner_path() -> Result<PathBuf> {
     }
 }
 
+/// Resolves the path to the `tok_detok_worker` companion binary.
+/// Mirrors `get_runner_path` so it works under pyo3 (where `current_exe()`
+/// returns the Python interpreter, not the package directory).
+pub fn get_tok_detok_worker_path() -> Result<PathBuf> {
+    #[cfg(feature = "python")]
+    {
+        Python::with_gil(|py| {
+            let module = PyModule::import(py, "xinfer").map_err(candle_core::Error::wrap)?;
+            let file: String = module
+                .getattr("__file__")
+                .map_err(candle_core::Error::wrap)?
+                .extract()
+                .map_err(candle_core::Error::wrap)?;
+            let module_path = Path::new(&file).parent().unwrap().join("tok_detok_worker");
+            Ok(module_path)
+        })
+    }
+
+    #[cfg(not(feature = "python"))]
+    {
+        let exe_path = std::env::current_exe()?;
+        let exe_dir = exe_path
+            .parent()
+            .ok_or("Failed to get exe directory")
+            .map_err(candle_core::Error::wrap)?;
+        Ok(exe_dir.join("tok_detok_worker"))
+    }
+}
+
 pub fn spawn_runner(
     #[cfg(feature = "python")] py: Python,
     runner_path: &str,

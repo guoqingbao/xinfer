@@ -14,5 +14,5 @@ classifiers = [
 
 [tool.maturin]
 python-source = "python"
-include = ["xinfer/xinfer", "xinfer/__init__.py", "xinfer/__init__.pyi", "py.typed"]
+include = ["xinfer/xinfer", "xinfer/tok_detok_worker", "xinfer/__init__.py", "xinfer/__init__.pyi", "py.typed"]
 sdist-include = ["ReadMe.md"]

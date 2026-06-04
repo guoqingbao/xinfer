@@ -85,6 +85,7 @@ if [[ "$INSTALL" == true ]]; then
 fi
 
 XINFER_BIN="$(bin_name xinfer)"
+TOK_DETOK_WORKER_BIN="$(bin_name tok_detok_worker)"
 
 HAS_PYTHON=false
 if [[ "$FEATURES" == *"python"* ]]; then
@@ -107,8 +108,8 @@ if [[ "$INSTALL" == true ]]; then
   echo "Binary-only install requested; skipping maturin and python package staging."
 
   FEATURES_NO_PY=$(echo "$FEATURES" | sed -E 's/\bpython\b//g' | xargs)
-  echo "Building xinfer binary..."
-  cargo build $RELEASE --bin xinfer --features "$FEATURES_NO_PY"
+  echo "Building xinfer + tok_detok_worker binaries..."
+  cargo build $RELEASE --bin xinfer --bin tok_detok_worker --features "$FEATURES_NO_PY"
 
   echo "Installing binary to: $DST"
   mkdir -p "$DST"
@@ -120,6 +121,13 @@ if [[ "$INSTALL" == true ]]; then
   fi
   install -m 755 "$XINFER_PATH" "$DST/xinfer"
 
+  TOK_DETOK_WORKER_PATH="target/$PROFILE/$TOK_DETOK_WORKER_BIN"
+  if [[ ! -f "$TOK_DETOK_WORKER_PATH" ]]; then
+    echo "Error: tok_detok_worker binary not found at $TOK_DETOK_WORKER_PATH"
+    exit 1
+  fi
+  install -m 755 "$TOK_DETOK_WORKER_PATH" "$DST/tok_detok_worker"
+
   echo "Build and install complete."
   exit 0
 fi
@@ -128,8 +136,8 @@ fi
 # NO PYTHON: build xinfer binary, done
 # -------------------------------------------------------------------
 if [[ "$HAS_PYTHON" != true ]]; then
-  echo "Building xinfer binary..."
-  cargo build $RELEASE --bin xinfer --features "$FEATURES"
+  echo "Building xinfer + tok_detok_worker binaries..."
+  cargo build $RELEASE --bin xinfer --bin tok_detok_worker --features "$FEATURES"
   echo "Build complete."
   exit 0
 fi
@@ -140,12 +148,15 @@ fi
 DEST_DIR="xinfer"
 mkdir -p "$DEST_DIR"
 
+FEATURES_NO_PY=$(echo "$FEATURES" | sed -E 's/\bpython\b//g' | xargs)
 if [[ "$IS_METAL" == true ]]; then
   echo "Metal feature detected. Skipping xinfer binary copy for python package."
+  echo "Building tok_detok_worker binary..."
+  cargo build $RELEASE --bin tok_detok_worker --features "$FEATURES_NO_PY"
 else
   FEATURES_BIN=$(echo "$FEATURES" | sed -E 's/\bpython\b//g' | xargs)
-  echo "Building xinfer binary..."
-  cargo build $RELEASE --bin xinfer --features "$FEATURES_BIN"
+  echo "Building xinfer + tok_detok_worker binaries..."
+  cargo build $RELEASE --bin xinfer --bin tok_detok_worker --features "$FEATURES_BIN"
 
   echo "Copying xinfer binary into $DEST_DIR/ ..."
   XINFER_BINARY="target/$PROFILE/$XINFER_BIN"
@@ -159,6 +170,16 @@ else
   fi
 fi
 
+echo "Copying tok_detok_worker binary into $DEST_DIR/ ..."
+TOK_DETOK_WORKER_BINARY="target/$PROFILE/$TOK_DETOK_WORKER_BIN"
+cp "$TOK_DETOK_WORKER_BINARY" "$DEST_DIR/tok_detok_worker"
+chmod 755 "$DEST_DIR/tok_detok_worker"
+if command -v patchelf >/dev/null 2>&1; then
+  echo "Patching tok_detok_worker rpath for bundled libs..."
+  patchelf --set-rpath '$ORIGIN:$ORIGIN/../xinfer.libs' "$DEST_DIR/tok_detok_worker"
+fi
+
+# Staging files for python package
 cp "xinfer.pyi" "$DEST_DIR/__init__.pyi"
 chmod 755 "$DEST_DIR/__init__.pyi"
 touch "$DEST_DIR/py.typed"
@@ -192,6 +213,7 @@ echo "Cleaning up temporary files..."
 if [[ "$IS_METAL" != true ]]; then
   rm -f "$DEST_DIR/xinfer"
 fi
+rm -f "$DEST_DIR/tok_detok_worker"
 rm -f "$DEST_DIR/__init__.py" \
       "$DEST_DIR/__init__.pyi" \
       "$DEST_DIR/py.typed" \

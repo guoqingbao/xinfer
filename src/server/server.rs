@@ -502,9 +502,30 @@ pub async fn chat_completion(
         if let Some(sid) = session_id {
             crate::log_warn!("Stream request has session_id {sid}");
         }
+        // Lock-hoist: chat-template + tokenize under engine.read() — multiple
+        // concurrent stream handlers can run this in parallel — then take
+        // engine.write() only for the brief scheduler-add step.
+        let preprocessed = {
+            let e = data.engine.read();
+            match e.preprocess(
+                std::slice::from_ref(&params),
+                std::slice::from_ref(&messages),
+                &resolved_tools,
+                false,
+            ) {
+                Ok(mut p) => p.pop().expect("preprocess returned 0 items for 1 input"),
+                Err(e) => {
+                    crate::log_error!("Stream preprocess failed: {:?}", e);
+                    return ChatResponder::ValidationError(format!(
+                        "Stream preprocess failed: {:?}",
+                        e
+                    ));
+                }
+            }
+        };
         let (seq_id, prompt_length, prefilled_reasoning_end, stream) = {
             let mut e = data.engine.write();
-            match e.generate_stream(&params, &messages, image_data, &resolved_tools, &logger) {
+            match e.generate_stream_from_preprocessed(preprocessed, image_data, &logger) {
                 Ok((seq_id, prompt_length, prefilled_reasoning_end, stream)) => {
                     (seq_id, prompt_length, prefilled_reasoning_end, stream)
                 }
@@ -1151,24 +1172,36 @@ pub async fn chat_completion(
         let mut total_prompt_time_taken = 0f32;
         let mut total_decoded_time_taken = 0f32;
         let mut choices = Vec::new();
-        let tokenizer = {
+        let tokenizer_service = {
             let e = data.engine.read();
-            Arc::new(e.tokenizer.clone())
+            e.tokenizer_service.clone()
         };
 
         crate::log_info!(
             "Received completion request with {} messages",
             messages.len()
         );
+        // Lock-hoist: chat-template + tokenize under engine.read() (multiple
+        // concurrent handlers can run this in parallel), then take
+        // engine.write() only for the brief scheduler-add step.
+        let preprocessed = {
+            let e = data.engine.read();
+            match e.preprocess(
+                std::slice::from_ref(&current_params),
+                std::slice::from_ref(&messages),
+                &resolved_tools,
+                false,
+            ) {
+                Ok(p) => p,
+                Err(e) => {
+                    crate::log_error!("Preprocess failed: {:?}", e);
+                    return ChatResponder::InternalError(format!("Internal server error {:?}", e));
+                }
+            }
+        };
         let receivers = {
             let mut e = data.engine.write();
-            match e.generate_sync(
-                &vec![current_params.clone()],
-                &vec![messages],
-                image_data,
-                &resolved_tools,
-                &logger,
-            ) {
+            match e.generate_sync_from_preprocessed(preprocessed, image_data, &logger) {
                 Ok(receivers) => receivers,
                 Err(e) => {
                     crate::log_error!("Completion generation failed: {:?}", e);
@@ -1179,16 +1212,19 @@ pub async fn chat_completion(
         if let Some(ref l) = logger {
             l.log_start_response();
         }
-        let results =
-            match LLMEngine::collect_sync_results(receivers, tokenizer.clone(), logger.clone())
-                .await
-            {
-                Ok(results) => results,
-                Err(e) => {
-                    crate::log_error!("Failed to collect completion results: {:?}", e);
-                    return ChatResponder::InternalError(format!("Internal server error {:?}", e));
-                }
-            };
+        let results = match LLMEngine::collect_sync_results(
+            receivers,
+            tokenizer_service,
+            logger.clone(),
+        )
+        .await
+        {
+            Ok(results) => results,
+            Err(e) => {
+                crate::log_error!("Failed to collect completion results: {:?}", e);
+                return ChatResponder::InternalError(format!("Internal server error {:?}", e));
+            }
+        };
 
         // Per-seq cached counts and decode_output snapshots read after the
         // loop, summed/scanned into single figures for the response Usage.
