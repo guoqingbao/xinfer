@@ -14,7 +14,7 @@
 | **⚡** | Fast | Native Flash Attention, FlashInfer, CUDA Graphs, continuous batching, prefix caching, PD disaggregation. Up to **197 tok/s** decode for `30B+` models on consumer GPUs |
 | **🪶** | Tiny footprint | Core scheduling + attention logic in **< 5 000 lines** of Rust |
 | **🌍** | Cross-platform | CUDA (Linux/Windows), Metal (macOS). Same binary, same API |
-| **🏭** | Production-ready | OpenAI/Anthropic-compatible APIs, built-in ChatGPT-style Web UI, MCP tool calling, structured outputs, embedding + tokenizer endpoints |
+| **🏭** | Production-ready | OpenAI/Anthropic-compatible APIs, built-in ChatGPT-style Web UI, MCP tool calling, structured outputs, embedding + tokenizer endpoints, multi-token prediction (MTP) |
 | **🗜️** | Aggressive KV compression | TurboQuant (`2–4 bit` KV cache) extends context up to **4.3×** with minimal quality loss. Run `30B+` MoE models with **millions of context** on single 24/32 GB GPUs |
 | **🔥** | V100 + NVFP4 | First-ever NVFP4 + low-bit KV cache on V100 — no hardware FP4 needed, coherent output on legacy GPUs |
 | **🐍** | Lightweight Python bindings | Optional PyO3 wheel when you need a Python entry point |
@@ -55,6 +55,11 @@ xinfer --m /home/Qwen3.6-35B-A3B --d 0,1 --ui-server
 python3 -m xinfer.server --m Qwen/Qwen3.6-27B-FP8 --kvcache-dtype turbo4 --ui-server
 ```
 
+**MTP**
+```bash
+xinfer --w /home/Qwen3.6-35B-A3B --d 0,1 --ui-server --mtp 2
+```
+
 > **Tip:** Open `http://IP:8001` for the built-in chat UI, or use `http://IP:8000/v1/` as your API `Base URL`.
 
 ---
@@ -77,7 +82,7 @@ Add `--kvcache-dtype` to compress KV cache and extend context length:
 
 > Tested on **V100-32G**, **A100-40G**, **Hopper-80G** and **RTX 5090**
 
-| Model | Format | Size | Decoding Speed |
+| Model | Format | Size | Decoding Speed (without MTP) |
 |---|---|---|---|
 | Ministral-3-3B (**Multimodal**) | ISQ (BF16→Q4K) | 3B | **193.67** tokens/s |
 | Qwen3-VL-8B-Instruct (**Multimodal**) | Q8_0 | 8B | **112.51** tokens/s |
@@ -480,6 +485,7 @@ Constraint-based generation via llguidance — Lark grammars, regex, JSON Schema
 | `--frequency-penalty` | Penalize frequent tokens (−2 to 2) |
 | `--mcp-config` | MCP servers JSON config |
 | `--mcp-command` / `--mcp-args` | Single MCP server command + args |
+| `--mtp`| Multi-token prediction, usage `--mtp 2` for two-token prediction per forward pass |
 
 ### Environment Variables
 
@@ -537,6 +543,7 @@ XINFER_NVFP4_FORCE_LUT=1 xinfer --m nvidia/Qwen3-30B-A3B-FP4 --ui-server
 * [x] **MXFP4/NVFP4 Model Support**
 * [x] **Support Turboquant (4-bit, 3-bit) KvCache**
 * [ ] TentorRT-LLM
+* [x] **Multi-token Prediciton (MTP)**
 
 ---
 

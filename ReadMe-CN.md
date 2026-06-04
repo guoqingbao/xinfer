@@ -14,7 +14,7 @@
 | **⚡** | 极致性能 | 原生 Flash Attention、FlashInfer、CUDA Graphs、持续批处理、前缀缓存、PD 分离。消费级 GPU 上 `30B+` 模型解码速度高达 **197 tok/s** |
 | **🪶** | 极简内核 | 核心调度 + 注意力逻辑仅 **< 5000 行** Rust 代码 |
 | **🌍** | 跨平台 | CUDA（Linux/Windows）、Metal（macOS），统一二进制，统一 API |
-| **🏭** | 生产就绪 | OpenAI/Anthropic 兼容 API、内置 ChatGPT 风格 Web UI、MCP 工具调用、结构化输出、Embedding + 分词器端点 |
+| **🏭** | 生产就绪 | OpenAI/Anthropic 兼容 API、内置 ChatGPT 风格 Web UI、MCP 工具调用、结构化输出、Embedding + 分词器端点、MTP |
 | **🗜️** | 极致 KV 压缩 | TurboQuant（`2–4 位` KV 缓存）以极小的质量损失将上下文扩展至 **4.3 倍**。单卡 24/32 GB GPU 即可运行 `30B+` MoE 模型并支持**百万级上下文** |
 | **🔥** | V100 + NVFP4 | 业界首创：V100 上运行 NVFP4 + 低位 KV 缓存推理 — 无需硬件 FP4，旧 GPU 重获新生 |
 | **🐍** | 轻量 Python 绑定 | 需要 Python 入口时可选 PyO3 wheel 包 |
@@ -55,6 +55,11 @@ xinfer --m /home/Qwen3.6-35B-A3B --d 0,1 --ui-server
 python3 -m xinfer.server --m Qwen/Qwen3.6-27B-FP8 --kvcache-dtype turbo4 --ui-server
 ```
 
+**MTP**
+```bash
+xinfer --w /home/Qwen3.6-35B-A3B --d 0,1 --ui-server --mtp 2
+```
+
 > **提示：** 浏览器打开 `http://IP:8001` 即可使用内置对话界面，或使用 `http://IP:8000/v1/` 作为 API 服务 `Base URL`。
 
 ---
@@ -77,7 +82,7 @@ python3 -m xinfer.server --m Qwen/Qwen3.6-27B-FP8 --kvcache-dtype turbo4 --ui-se
 
 > 测试平台：**V100-32G**、**A100-40G**、**Hopper-80G** 及 **RTX 5090**
 
-| 模型 | 格式 | 大小 | 输出速度 |
+| 模型 | 格式 | 大小 | 输出速度 (非MTP) |
 |---|---|---|---|
 | Ministral-3-3B (**多模态**) | ISQ (BF16→Q4K) | 3B | **193.67** tokens/s |
 | Qwen3-VL-8B-Instruct (**多模态**) | Q8_0 | 8B | **112.51** tokens/s |
@@ -479,6 +484,7 @@ xinfer --m unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF \
 | `--frequency-penalty` | 高频惩罚（−2 到 2） |
 | `--mcp-config` | MCP 服务器 JSON 配置 |
 | `--mcp-command` / `--mcp-args` | 单个 MCP 服务器命令及参数 |
+| `--mtp` | 启用MTP (只针对包含MTP层的模型) ，例如 `--mtp 2`，单次推理2个tokens |
 
 ### 环境变量
 
@@ -536,7 +542,7 @@ XINFER_NVFP4_FORCE_LUT=1 xinfer --m nvidia/Qwen3-30B-A3B-FP4 --ui-server
 * [x] **MXFP4/NVFP4 模型支持**
 * [x] **支持 Turboquant（4 位、3 位）KvCache**
 * [ ] TentorRT-LLM
-
+* [x] Multi-token Prediction (MTP)
 ---
 
 ## 📚 参考项目

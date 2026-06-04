@@ -915,6 +915,7 @@ impl<M: CudaGraphModule> GraphCapturer<M> {
         };
 
         let mut outputs = BTreeMap::<usize, Tensor>::new();
+        let _guard = candle_core::cuda_backend::cuda_param_cache_scope(true);
 
         for is_warmup in [true, false] {
             if !is_warmup || capture_in_warmup {

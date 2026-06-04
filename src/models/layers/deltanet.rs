@@ -869,6 +869,7 @@ impl GatedDeltaNet {
                     seq_slots,
                     &cu_seqlens,
                     self.scale as f32,
+                    recurrent_snapshots.as_ref(),
                 )?
             } else {
                 let q_scaled = (&q * self.scale)?;
@@ -945,6 +946,12 @@ impl GatedDeltaNet {
         let idx = keep_tokens - 1;
 
         let conv_snapshot = self.conv_mtp_state.narrow(0, idx, 1)?;
+        let conv_state_dtype = mamba_cache.conv_state(self.gdn_layer_idx).dtype();
+        let conv_snapshot = if conv_snapshot.dtype() != conv_state_dtype {
+            conv_snapshot.to_dtype(conv_state_dtype)?
+        } else {
+            conv_snapshot
+        };
         mamba_cache.set_batch_conv_state(self.gdn_layer_idx, seq_slots, &conv_snapshot)?;
 
         let rec_snapshot = self.recurrent_mtp_state.narrow(0, idx, 1)?;

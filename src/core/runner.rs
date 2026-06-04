@@ -919,7 +919,7 @@ impl ModelRunner {
                 || vb.pp("mtp").has_key("layers.0.mlp.gate_proj.weight")
                 || vb.pp("mtp").has_key("layers.0.mlp.gate.weight");
 
-            if is_mtp_model_type && has_mtp_config && has_mtp_weights {
+            if is_mtp_model_type && (has_mtp_config || has_mtp_weights) && has_mtp_weights {
                 match crate::models::qwen3_5_mtp::Qwen3_5MtpHead::new(
                     vb,
                     comm.clone(),
@@ -2358,33 +2358,28 @@ impl ModelRunner {
         let kv_cache_lock = self.gpu_kv_cache.lock().unwrap();
         self.decode_capturer
             .capture(&self.device, Some(&kv_cache_lock))?;
-        match &self.model {
-            Model::Qwen3_5(model) => model.reset_mamba_cache()?,
-            Model::Qwen3_5MoE(model) => model.reset_mamba_cache()?,
-            Model::Qwen3VL(model) => model.reset_mamba_cache()?,
-            _ => {}
-        }
 
         if self.mtp_num_speculative > 0 {
-            crate::log_info!(
-                "Capturing MTP verify graphs for up to {} draft tokens...",
-                self.mtp_num_speculative
-            );
+            // self.decode_capturer.model.sync()?;
             if let Some(mtp_cap) = &mut self.mtp_capturer {
+                crate::log_info!(
+                    "Capturing MTP verify graphs for up to {} draft tokens...",
+                    self.mtp_num_speculative
+                );
                 mtp_cap.capture_mtp(
                     &self.device,
                     Some(&kv_cache_lock),
                     self.mtp_num_speculative,
                 )?;
             }
-            match &self.model {
-                Model::Qwen3_5(model) => model.reset_mamba_cache()?,
-                Model::Qwen3_5MoE(model) => model.reset_mamba_cache()?,
-                Model::Qwen3VL(model) => model.reset_mamba_cache()?,
-                _ => {}
-            }
         }
 
+        match &self.model {
+            Model::Qwen3_5(model) => model.reset_mamba_cache()?,
+            Model::Qwen3_5MoE(model) => model.reset_mamba_cache()?,
+            Model::Qwen3VL(model) => model.reset_mamba_cache()?,
+            _ => {}
+        }
         self.restored_prefix_sequences.write().clear();
         Ok(())
     }
