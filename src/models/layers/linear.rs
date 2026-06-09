@@ -1064,8 +1064,9 @@ fn load_ln_fp8_with_hints(
     let sm_version = 0;
 
     #[cfg(feature = "cutlass")]
-    let weight_scale_cutlass = if sm_version >= 100 {
-        // SM100+: Column-major scale layout
+    let weight_scale_cutlass = if sm_version >= 100 && sm_version < 120 {
+        // SM100-103 Blackwell: Column-major scale layout
+        // PCIE cards and embedded chips fall back to sm90 path
         Some(weight_scale.t()?)
     } else if sm_version >= 90 {
         // SM90: CUTLASS expects scales_b as [K/128, N/128] row-major contiguous
