@@ -1755,8 +1755,13 @@ impl FusedMoeMxfp4 {
         let router_logits = self.gate.forward(&gate_input)?.to_dtype(DType::F32)?;
         let (topk_weights, topk_ids) = self.routing.route(&router_logits, is_prefill)?;
 
-        let xs = if xs.dtype() == DType::F32 {
-            xs.to_dtype(self.dtype)?
+        let moe_dtype = if self.dtype == DType::F32 {
+            DType::BF16
+        } else {
+            self.dtype
+        };
+        let xs = if xs.dtype() != moe_dtype {
+            xs.to_dtype(moe_dtype)?
         } else {
             xs.clone()
         };
@@ -1772,6 +1777,11 @@ impl FusedMoeMxfp4 {
         )?;
 
         let down_inputs = gated_activation(&gate_up, self.w_size_n, &self.act)?;
+        let down_inputs = if down_inputs.dtype() != moe_dtype {
+            down_inputs.to_dtype(moe_dtype)?
+        } else {
+            down_inputs
+        };
 
         let mut ys = moe::moe_gemm_mxfp4(
             &down_inputs,
