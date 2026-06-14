@@ -217,12 +217,21 @@ impl Engine {
         images: Option<crate::utils::image::ImageData>,
         tools: Vec<Tool>,
     ) -> Result<GenerationOutput> {
-        let (receivers, tokenizer) = {
-            let mut engine = self.engine.write();
+        let (preprocessed, tokenizer) = {
+            let engine = self.engine.read();
             (
-                engine.generate_sync(&vec![params], &vec![messages], images, &tools, &None)?,
+                engine.preprocess(
+                    std::slice::from_ref(&params),
+                    std::slice::from_ref(&messages),
+                    &tools,
+                    false,
+                )?,
                 Arc::new(engine.tokenizer.clone()),
             )
+        };
+        let receivers = {
+            let mut engine = self.engine.write();
+            engine.generate_sync_from_preprocessed(preprocessed, images, &None)?
         };
 
         let results = GLOBAL_RT.block_on(async {
@@ -246,9 +255,19 @@ impl Engine {
         let img_cfg = { self.engine.read().img_cfg.clone() };
         let (messages, image_data) = build_messages_and_images(&messages, img_cfg.as_ref())?;
 
+        let preprocessed = {
+            let engine = self.engine.read();
+            let mut p = engine.preprocess(
+                std::slice::from_ref(&params),
+                std::slice::from_ref(&messages),
+                &tools,
+                false,
+            )?;
+            p.pop().expect("preprocess returned 0 items for 1 input")
+        };
         let (seq_id, prompt_length, _prefilled_reasoning_end, stream) = {
             let mut engine = self.engine.write();
-            engine.generate_stream(&params, &messages, image_data, &tools, &None)?
+            engine.generate_stream_from_preprocessed(preprocessed, image_data, &None)?
         };
 
         Ok(EngineStream {

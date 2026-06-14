@@ -75,6 +75,18 @@ pub enum RequestType {
     Completion,
 }
 
+/// Output of `LLMEngine::preprocess`. Carries the per-request CPU work
+/// (chat-template render + tokenize) the caller has already done so the
+/// engine write lock can be acquired briefly, for the scheduler-add step
+/// only.
+#[derive(Debug, Clone)]
+pub struct PreprocessedRequest {
+    pub params: SamplingParams,
+    pub prompt: String,
+    pub image_idx: i32,
+    pub token_ids: Vec<u32>,
+}
+
 #[allow(dead_code)]
 pub struct LLMEngine {
     pub runners: Arc<RwLock<RunnerType>>,
@@ -517,7 +529,31 @@ impl LLMEngine {
             .tokenizer
             .encode_fast(prompt, true)
             .expect("encode failed!");
-        let token_ids: Vec<u32> = tokens.get_ids().iter().map(|&x| x).collect();
+        let token_ids: Vec<u32> = tokens.get_ids().to_vec();
+        self.add_request_pretokenized_(
+            params,
+            prompt,
+            token_ids,
+            request_type,
+            images,
+            image_idx,
+        )
+    }
+
+    /// Same body as `add_request_` but accepts a pre-computed `token_ids`
+    /// so the caller can run tokenize outside the engine write lock. Hot-path
+    /// serialization of concurrent server handlers gets cut by ~
+    /// chat-template + tokenize wall × concurrency in chat-template-heavy
+    /// workloads.
+    fn add_request_pretokenized_(
+        &mut self,
+        params: &SamplingParams,
+        prompt: &str,
+        token_ids: Vec<u32>,
+        request_type: &RequestType,
+        images: &Option<ImageData>,
+        image_idx: i32,
+    ) -> Result<(usize, usize)> {
         let length = token_ids.len();
         let raw_replay_token_ids = self.match_prompt_replay_candidate(&token_ids);
         if let Some(max_model_len) = self.econfig.max_model_len {
@@ -710,6 +746,76 @@ impl LLMEngine {
             );
         }
         Ok((seq_id, prompt_length, rx))
+    }
+
+    /// Pretokenized variant of `add_request`. Caller has already done
+    /// tokenize (typically via `preprocess`) outside the engine write
+    /// lock, so the only work that needs `&mut self` is the scheduler-add.
+    pub fn add_request_pretokenized(
+        &mut self,
+        params: &SamplingParams,
+        prompt: &str,
+        token_ids: Vec<u32>,
+        request_type: RequestType,
+        images: &Option<ImageData>,
+        image_idx: i32,
+    ) -> Result<(usize, usize, Receiver<StreamItem>)> {
+        let (seq_id, prompt_length) = self.add_request_pretokenized_(
+            params,
+            prompt,
+            token_ids,
+            &request_type,
+            images,
+            image_idx,
+        )?;
+        let (tx, rx) = channel(1024);
+        self.stream_senders.insert(seq_id, tx);
+        self.request_types.insert(seq_id, request_type.clone());
+        if self.econfig.server_mode.unwrap_or(true) && request_type != RequestType::Completion {
+            log_warn!(
+                "[{:?}] New request [Seq_id {}, {} tokens] received! (session_id: {:?})\n",
+                request_type,
+                seq_id,
+                prompt_length,
+                params.session_id,
+            );
+        }
+        Ok((seq_id, prompt_length, rx))
+    }
+
+    /// Apply chat template + tokenize each `(params, messages)` pair under
+    /// shared access (`&self`) so N concurrent server handlers can run this
+    /// in parallel under their own `engine.read()` guards. Returns a list
+    /// of `PreprocessedRequest`s that feed `generate_sync_from_preprocessed`
+    /// or `generate_stream_from_preprocessed`, which acquire `engine.write()`
+    /// only briefly for the scheduler-add step.
+    pub fn preprocess(
+        &self,
+        params: &[SamplingParams],
+        message_list: &[Vec<Message>],
+        tools: &[Tool],
+        log: bool,
+    ) -> Result<Vec<PreprocessedRequest>> {
+        if params.len() != message_list.len() {
+            candle_core::bail!("size of sampling parameters is not match with size of prompts!");
+        }
+        let tools_vec: Vec<Tool> = tools.to_vec();
+        let mut out = Vec::with_capacity(params.len());
+        for (param, messages) in params.iter().zip(message_list.iter()) {
+            let (prompt, image_idx) = self.apply_chat_template(param, messages, &tools_vec, log);
+            let tokens = self
+                .tokenizer
+                .encode_fast(prompt.as_str(), true)
+                .expect("encode failed!");
+            let token_ids: Vec<u32> = tokens.get_ids().to_vec();
+            out.push(PreprocessedRequest {
+                params: param.clone(),
+                prompt,
+                image_idx,
+                token_ids,
+            });
+        }
+        Ok(out)
     }
 
     pub fn get_num_cached_tokens(&self) -> usize {
@@ -1230,8 +1336,8 @@ impl LLMEngine {
         has_requests_to_cancel
     }
 
-    fn apply_chat_template(
-        &mut self,
+    pub fn apply_chat_template(
+        &self,
         params: &SamplingParams,
         messages: &Vec<Message>,
         tools: &Vec<Tool>,
@@ -1315,6 +1421,35 @@ impl LLMEngine {
             }
         }
 
+        Ok(receivers)
+    }
+
+    /// Lock-shrunk equivalent of `generate_sync`. The caller has already
+    /// run `preprocess(...)` (chat template + tokenize) under a brief
+    /// `engine.read()` guard, so this method only needs the engine write
+    /// lock for the scheduler-add step.
+    pub fn generate_sync_from_preprocessed(
+        &mut self,
+        preprocessed: Vec<PreprocessedRequest>,
+        images: Option<ImageData>,
+        logger: &Option<Arc<ChatCompletionLogger>>,
+    ) -> Result<Vec<(usize, usize, mpsc::Receiver<StreamItem>)>> {
+        let mut receivers = Vec::with_capacity(preprocessed.len());
+        for pp in preprocessed {
+            if let Some(ref l) = logger {
+                l.log_prompt(&pp.prompt);
+            }
+            if let Ok((seq_id, prompt_length, rx)) = self.add_request_pretokenized(
+                &pp.params,
+                &pp.prompt,
+                pp.token_ids,
+                RequestType::Completion,
+                &images,
+                pp.image_idx,
+            ) {
+                receivers.push((seq_id, prompt_length, rx));
+            }
+        }
         Ok(receivers)
     }
 
@@ -1480,6 +1615,36 @@ impl LLMEngine {
         }
     }
 
+    /// Lock-shrunk equivalent of `generate_stream`. Takes a single
+    /// already-preprocessed request and registers it under `engine.write()`
+    /// briefly for the scheduler-add step only.
+    pub fn generate_stream_from_preprocessed(
+        &mut self,
+        preprocessed: PreprocessedRequest,
+        images: Option<ImageData>,
+        logger: &Option<Arc<ChatCompletionLogger>>,
+    ) -> Result<(usize, usize, Option<String>, mpsc::Receiver<StreamItem>)> {
+        if let Some(ref l) = logger {
+            l.log_prompt(&preprocessed.prompt);
+        }
+        match self.add_request_pretokenized(
+            &preprocessed.params,
+            &preprocessed.prompt,
+            preprocessed.token_ids,
+            RequestType::Stream,
+            &images,
+            preprocessed.image_idx,
+        ) {
+            Ok((seq_id, prompt_length, rx)) => {
+                let prefilled_reasoning_end = self.get_prefilled_reasoning_end_marker(seq_id);
+                Ok((seq_id, prompt_length, prefilled_reasoning_end, rx))
+            }
+            Err(e) => {
+                candle_core::bail!("{:?}", e)
+            }
+        }
+    }
+
     pub fn get_usage_stats(&self, session_id: Option<String>) -> Result<UsageResponse> {
         match session_id {
             Some(sid) => {
@@ -1533,7 +1698,7 @@ impl LLMEngine {
                 .tokenizer
                 .encode_fast(input.as_str(), true)
                 .map_err(candle_core::Error::wrap)?;
-            let token_ids: Vec<u32> = tokens.get_ids().iter().copied().collect();
+            let token_ids: Vec<u32> = tokens.get_ids().to_vec();
             if token_ids.is_empty() {
                 candle_core::bail!("Embedding input cannot be empty");
             }
