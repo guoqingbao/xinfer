@@ -530,14 +530,7 @@ impl LLMEngine {
             .encode_fast(prompt, true)
             .expect("encode failed!");
         let token_ids: Vec<u32> = tokens.get_ids().to_vec();
-        self.add_request_pretokenized_(
-            params,
-            prompt,
-            token_ids,
-            request_type,
-            images,
-            image_idx,
-        )
+        self.add_request_pretokenized_(params, prompt, token_ids, request_type, images, image_idx)
     }
 
     /// Same body as `add_request_` but accepts a pre-computed `token_ids`
