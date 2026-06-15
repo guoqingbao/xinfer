@@ -7,6 +7,7 @@ use super::{
 };
 use crate::transfer::{PdConfig, PdRole};
 use crate::utils::config::{Config, EngineConfig, EosTokenId};
+use crate::utils::metrics;
 use candle_core::Result;
 use parking_lot::RwLock;
 use regex::Regex;
@@ -196,6 +197,11 @@ impl Scheduler {
         id
     }
 
+    /// Get the next sequence ID (count of sequences created so far)
+    pub fn get_sequence_count(&self) -> usize {
+        self.next_seq_id - 1
+    }
+
     pub fn is_finished(&self) -> bool {
         self.waiting.is_empty() && self.running.is_empty()
     }
@@ -206,6 +212,9 @@ impl Scheduler {
         let mut scheduled_ids = Vec::new();
         let mut num_tokens = 0;
         let chunk_size = self.cfg.effective_prefill_chunk_size();
+        // Record scheduler queue lengths
+        metrics::record_scheduler_waiting_length(self.waiting.len() as u64);
+        metrics::record_scheduler_running_length(self.running.len() as u64);
 
         // PD server: Check for new incoming prefill requests
         if self.is_pd_server() {
@@ -300,6 +309,11 @@ impl Scheduler {
             }
         }
 
+        // Record preemption metric
+        if !preempt_ids.is_empty() {
+            metrics::record_scheduler_preemption();
+        }
+
         // Client: Check for finished prefills
         if self.is_pd_mode() && !self.is_pd_server() {
             self.try_receive_kvcache()?;
@@ -337,6 +351,7 @@ impl Scheduler {
                             self.running[idx].id
                         );
                         self.try_swap_out(idx, true);
+                        metrics::record_scheduler_swap("out");
                     }
                 }
             }
@@ -545,14 +560,16 @@ impl Scheduler {
                                 .as_millis() as usize;
                             let time_costs = cur_time - seq.created_time();
                             if time_costs / 100 > 0 && seq.len() > 0 {
-                                crate::log_info!(
-                                    "PD Prefilling [seq_id {}]: {} tokens in {:.2}s ({:.2} tokens/s)",
-                                    seq_id,
-                                    seq.len(),
-                                    time_costs as f32 / 1000f32,
-                                    seq.len() as f32 / (time_costs as f32 * 1.0f32 / 1000f32),
-                                )
-                            }
+                                    let pd_prefill_throughput = seq.len() as f64 / (time_costs as f64 * 1.0f64 / 1000.0f64);
+                                    metrics::record_pd_prefill_throughput(pd_prefill_throughput);
+                                    crate::log_info!(
+                                        "PD Prefilling [seq_id {}]: {} tokens in {:.2}s ({:.2} tokens/s)",
+                                        seq_id,
+                                        seq.len(),
+                                        time_costs as f32 / 1000f32,
+                                        pd_prefill_throughput as f32,
+                                    )
+                                }
                         } else {
                             // release resources immediately if failed
                             seq.status = SequenceStatus::Finished;
@@ -918,6 +935,7 @@ impl Scheduler {
                 Ok(_) => {
                     seq.status = SequenceStatus::Running;
                     crate::log_warn!("Seq {} is swapped in for execution!", seq.id);
+                    metrics::record_scheduler_swap("in");
                 }
                 Err(e) => {
                     seq.status = SequenceStatus::Finished;
@@ -1109,12 +1127,14 @@ impl Scheduler {
                         if transfer_duration > 10000 {
                             // Log a warning when a sequence takes an unusually long time to receive and swap-in.
                             // Possible causes: insufficient KV cache on server or client, or low communication bandwidth.
+                            metrics::record_kvcache_transfer_duration(transfer_duration as f64 / 1000.0);
                             crate::log_warn!(
                                 "KvCache Transfer: Seq {} prefill finished, but receive (with swap-in) time was unexpectedly long ({} s).",
                                 seq.id,
                                 transfer_duration / 1000
                             );
                         } else {
+                            metrics::record_kvcache_transfer_duration(transfer_duration as f64 / 1000.0);
                             crate::log_info!(
                                 "KvCache Transfer: Seq {} prefill finished and received in {} ms!",
                                 seq.id,
@@ -1263,11 +1283,15 @@ impl Scheduler {
                     + self.waiting.len()
                     + self.cached.len()
                     + self.transferred.len())
-                .min(capacity);
+                    .min(capacity);
                 let active_percent = active_slots as f32 * 100.0f32 / capacity as f32;
                 let slot_mb = self.cfg.mamba_slot_bytes as f32 / 1024.0f32 / 1024.0f32;
                 let used_gb = (active_slots * self.cfg.mamba_slot_bytes) as f32 / SIZE_IN_GB as f32;
                 let budget_gb = self.cfg.mamba_memory_bytes as f32 / SIZE_IN_GB as f32;
+                // Note: mamba slot usage and memory metrics should include sequence_id
+                // For now, we record them without sequence_id as aggregate metrics
+                metrics::record_mamba_slot_usage_percent_aggregate(active_percent as f64);
+                metrics::record_mamba_memory_used_bytes_aggregate((used_gb * SIZE_IN_GB as f32) as u64);
                 crate::log_info!(
                     "GPU MambaState: {} / {} slots used ({:.1}%), approx {:.2}GB/{:.2}GB (slot {:.2}MB)",
                     active_slots,
@@ -1284,7 +1308,10 @@ impl Scheduler {
     pub fn kv_cache_usage_percent(&self) -> f32 {
         let total_blocks = self.block_manager.get_num_total_blocks();
         let free_blocks = self.block_manager.get_num_free_blocks();
-        1.0f32 - (free_blocks as f32 * 1.0f32 / total_blocks as f32)
+        let usage = 1.0f32 - (free_blocks as f32 * 1.0f32 / total_blocks as f32);
+        // Record KV cache usage metric
+        metrics::record_kv_cache_usage_percent("gpu", (usage * 100.0) as f64);
+        usage
     }
 
     /// Check if the given token is a tool call end token
@@ -1367,5 +1394,65 @@ impl Scheduler {
         }
 
         None
+    }
+}
+
+// ============================================================================//
+// METRICS COLLECTION - NO AUTO-TUNING
+// ============================================================================//
+
+// Re-export metrics types for convenience
+pub use crate::utils::metrics::performance_curve::BinarySearchOptimizer;
+pub use crate::utils::metrics::performance_curve::PerformancePoint;
+pub use crate::utils::metrics::performance_curve::WorkloadType;
+pub use crate::utils::metrics::performance_curve::BottleneckType;
+
+// Integration functions for scheduler
+pub fn scheduler_init_binary_search_optimizer(lower_bound: usize, upper_bound: usize, convergence_threshold: f64) {
+    crate::utils::metrics::init_binary_search_optimizer(lower_bound, upper_bound, convergence_threshold);
+}
+
+pub fn scheduler_get_binary_search_optimal_batch_size() -> Option<usize> {
+    crate::utils::metrics::get_binary_search_optimal_batch_size()
+}
+
+pub fn scheduler_binary_search_has_converged() -> bool {
+    crate::utils::metrics::binary_search_has_converged()
+}
+
+pub fn scheduler_reset_binary_search_optimizer() {
+    crate::utils::metrics::reset_binary_search_optimizer()
+}
+
+// ============================================================================//
+// TESTS
+// ============================================================================//
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_scheduler_workload_classification() {
+        // Test that workload classification works correctly
+        use crate::utils::metrics::WorkloadType;
+        
+        // Compute-bound: high SM, low memory
+        assert_eq!(
+            crate::utils::metrics::PerformanceCurveManager::classify_workload(95.0, 50.0),
+            WorkloadType::ComputeBound
+        );
+        
+        // Memory-bound: low SM, high memory
+        assert_eq!(
+            crate::utils::metrics::PerformanceCurveManager::classify_workload(50.0, 95.0),
+            WorkloadType::MemoryBound
+        );
+        
+        // Balanced: both medium
+        assert_eq!(
+            crate::utils::metrics::PerformanceCurveManager::classify_workload(70.0, 70.0),
+            WorkloadType::Balanced
+        );
     }
 }

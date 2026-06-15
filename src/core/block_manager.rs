@@ -3,6 +3,7 @@ use super::prefix_cache::{PrefixCache, PrefixCacheConfig, PrefixCacheUpdate};
 use super::runner::RunnerType;
 use super::sequence::{Sequence, SequenceStatus};
 use crate::def_broadcast_message_to_runners;
+use crate::utils::metrics;
 use crate::runner::{receive_local, send_local, MessageType};
 use crate::utils::env::{mamba_snapshot_block_stride_blocks, MAMBA_SNAPSHOT_BLOCK_STRIDE_ENV};
 use crate::utils::image::ImageData;
@@ -135,6 +136,8 @@ impl BlockManager {
         if let Some(last_block_id) = seq.block_table.last() {
             self.clear_blocks_guard(vec![*last_block_id], "allocate_fresh/last_block");
         }
+        // Record block allocation metric
+        metrics::record_block_allocation(seq.id as u64);
         Ok(())
     }
 
@@ -143,6 +146,10 @@ impl BlockManager {
         if self.used_block_ids.remove(&block_id) {
             self.free_block_ids.push_back(block_id);
         }
+        // Record block deallocation metric
+        // Using system-level metric since block_id doesn't have sequence_id
+        // This records to both block_manager_deallocations_total_system and block_manager_deallocations_total
+        metrics::record_block_deallocation_system();
     }
 
     fn image_prefix_seed(images: &ImageData) -> u64 {
@@ -376,6 +383,7 @@ impl BlockManager {
         seq.mamba_prefix_hash = None;
         if self.mamba_prefix_enabled {
             if raw_matched_blocks > 0 && matched_blocks == 0 {
+                metrics::record_mamba_snapshot_miss(seq.id as u64);
                 crate::log_info!(
                     "Prefix cache mamba-state miss seq {} (raw {} blocks matched, but no compatible mamba snapshot)",
                     seq.id,
@@ -407,6 +415,7 @@ impl BlockManager {
 
         let cached_tokens = matched_blocks * self.block_size;
         if matched_blocks > 0 {
+            metrics::record_prefix_cache_hit(seq.id as u64);
             crate::log_info!(
                 "Prefix cache hit seq {} ({} cached tokens, {} blocks)",
                 seq.id,
@@ -422,6 +431,7 @@ impl BlockManager {
                 }
             }
         } else if prefix_cache.enabled() && tokens.len() >= self.block_size {
+            metrics::record_prefix_cache_miss(seq.id as u64);
             crate::log_info!(
                 "Prefix cache miss seq {} ({} tokens, {} cached blocks, raw_match={} blocks)",
                 seq.id,
@@ -495,6 +505,7 @@ impl BlockManager {
             return None;
         };
         let preserve_snapshot = seq.output_ids.is_empty();
+        metrics::record_mamba_snapshot_capture(seq.id as u64);
         match self.try_capture_mamba_prefix_state(seq.id, hash, preserve_snapshot) {
             Ok(true) => {
                 if let Some(&block_id_u32) = seq.block_table.get(full_blocks.saturating_sub(1)) {
@@ -1044,6 +1055,94 @@ impl BlockManager {
                 cpu_block.ref_count = 0;
                 self.free_cpu_block_ids.push_back(cpu_bid);
             }
+        }
+    }
+
+    // ============================================================================//
+    // CACHE COHERENCY METRICS
+    // ============================================================================//
+
+    /// Record block-level cache utilization
+    pub fn record_block_cache_utilization(&self, device: &str) {
+        let total_blocks = self.blocks.len();
+        let used_blocks = self.used_block_ids.len();
+        let utilization = if total_blocks > 0 {
+            used_blocks as f64 / total_blocks as f64 * 100.0
+        } else {
+            0.0
+        };
+        metrics::record_block_cache_utilization(device, utilization);
+    }
+
+    /// Analyze prefix cache hit patterns
+    pub fn analyze_prefix_cache_hits(&mut self, seq_id: u64) -> f64 {
+        let hit_ratio = self.prefix_cache.as_ref().map_or(0.0, |cache| {
+            let total = cache.cached_blocks();
+            if total > 0 {
+                // Calculate hit ratio based on actual cached blocks vs total
+                let cached_tokens = cache.cached_blocks() * cache.block_size();
+                if cached_tokens > 0 {
+                    // Get sequence's cached tokens from prefix cache
+                    let seq_len = total as usize * cache.block_size();
+                    let hit_ratio = (cached_tokens as f64 / seq_len as f64).min(1.0);
+                    hit_ratio
+                } else {
+                    0.0
+                }
+            } else {
+                0.0
+            }
+        });
+        metrics::record_prefix_cache_hit_pattern(seq_id, hit_ratio);
+        hit_ratio
+    }
+
+    /// Track eviction efficiency
+    pub fn record_eviction_efficiency(&self, device: &str, evicted: usize, freed: usize) {
+        let efficiency = if evicted > 0 {
+            freed as f64 / evicted as f64
+        } else {
+            0.0
+        };
+        metrics::record_eviction_efficiency(device, efficiency);
+    }
+
+    /// Get block-level cache utilization
+    pub fn get_block_cache_utilization(&self) -> f64 {
+        let total_blocks = self.blocks.len();
+        let used_blocks = self.used_block_ids.len();
+        if total_blocks > 0 {
+            used_blocks as f64 / total_blocks as f64 * 100.0
+        } else {
+            0.0
+        }
+    }
+
+    /// Get prefix cache hit ratio
+    pub fn get_prefix_cache_hit_ratio(&self) -> f64 {
+        self.prefix_cache.as_ref().map_or(0.0, |cache| {
+            let total = cache.cached_blocks();
+            if total > 0 {
+                // Calculate hit ratio based on actual cached blocks vs total
+                let cached_tokens = cache.cached_blocks() * cache.block_size();
+                if cached_tokens > 0 {
+                    let seq_len = total as usize * cache.block_size();
+                    (cached_tokens as f64 / seq_len as f64).min(1.0)
+                } else {
+                    0.0
+                }
+            } else {
+                0.0
+            }
+        })
+    }
+
+    /// Get eviction efficiency
+    pub fn get_eviction_efficiency(&self, evicted: usize, freed: usize) -> f64 {
+        if evicted > 0 {
+            freed as f64 / evicted as f64
+        } else {
+            0.0
         }
     }
 }

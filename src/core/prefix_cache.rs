@@ -65,6 +65,10 @@ impl PrefixCache {
         self.entries.len()
     }
 
+    pub fn block_size(&self) -> usize {
+        self.block_size
+    }
+
     pub fn match_prefix(&mut self, tokens: &[u32]) -> PrefixMatch {
         self.match_prefix_with_seed(tokens, None, None)
     }

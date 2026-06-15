@@ -35,6 +35,9 @@ use tokio::sync::watch;
 use tokio::task;
 use uuid::Uuid;
 
+// Instrumentation is always enabled - metrics are available
+use crate::utils::metrics;
+
 /// Helper struct to manage streaming response chunks
 /// Provides clean API for sending tokens, errors, and status notifications
 struct StreamingContext {
@@ -352,6 +355,16 @@ pub async fn chat_completion(
     State(data): State<Arc<ServerData>>,
     request: Json<ChatCompletionRequest>,
 ) -> ChatResponder {
+    // Instrumentation: record HTTP request start
+    {
+        let endpoint = "/v1/chat/completions";
+        let method = "POST";
+        metrics::record_http_request_total(endpoint, method, "pending");
+        // Note: sequence_added metric should be called with actual sequence_id when available
+        // For now, we record it without sequence_id as a counter of requests
+        metrics::record_sequence_added_request();
+    }
+
     // Create logger for this request (None if XINFER_CHAT_LOGGER not set to true)
     let logger = ChatCompletionLogger::new();
     if let Some(ref l) = logger {
@@ -370,6 +383,12 @@ pub async fn chat_completion(
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(600),
     );
+
+    // Instrumentation: record request parsing complete
+    {
+        let model = request.model.clone().unwrap_or("default".to_string());
+        metrics::record_http_request_size(&model, "POST", 0);
+    }
 
     let model_id = request.model.clone().unwrap_or("default".to_string());
     let max_tokens = request
@@ -588,6 +607,10 @@ pub async fn chat_completion(
 
             let reasoning_router =
                 ReasoningContentRouter::new(crate::utils::env::stream_as_reasoning_content());
+            // Record reasoning enabled metric
+            // Note: reasoning_enabled is a request-level metric, not per-sequence
+            // This should be removed or changed to a request-level counter without sequence_id
+            metrics::record_reasoning_enabled_request();
 
             let mut current_stream = stream;
             let current_seq_id = seq_id;
@@ -773,6 +796,10 @@ pub async fn chat_completion(
                                     buffering_since = None;
                                     buffering_cancel_requested = false;
                                     buffering_warned = false;
+                                    // Record tool call metrics before extending
+                                    for tool in &tools {
+                                        metrics::record_tool_call(&tool.function.name, current_seq_id as u64);
+                                    }
                                     pending_tool_calls.extend(tools);
                                 }
                             }
@@ -924,6 +951,14 @@ pub async fn chat_completion(
 
                         let (validated_calls, invalid_calls) =
                             filter_tool_calls(&pending_tool_calls, stream_tool_schemas.as_ref());
+
+                        // Record tool call metrics
+                        for invalid_call in &invalid_calls {
+                            metrics::record_tool_call_invalid(&invalid_call.function.name, current_seq_id as u64);
+                        }
+                        for validated_call in &validated_calls {
+                            metrics::record_tool_call_parsed(&validated_call.function.name, current_seq_id as u64);
+                        }
 
                         if !invalid_calls.is_empty() {
                             crate::log_error!(
@@ -1415,6 +1450,15 @@ pub async fn chat_completion(
         if let Some(ref l) = logger {
             l.log_response(&response);
         }
+        // Record completion metrics
+
+        record_completion_metrics(&model_id, total_prompt_tokens, total_decoded_tokens, "200");
+
+        // Record HTTP request duration
+        let endpoint = "/v1/chat/completions";
+        let method = "POST";
+        metrics::record_http_request_duration(endpoint, method, 0.0);
+
         ChatResponder::Completion(response)
     }
 }
@@ -1631,6 +1675,23 @@ pub async fn detokenize(
     );
 
     ChatResponder::Detokenize(DetokenizeResponse { prompt })
+}
+
+// Instrumentation hooks for completion response
+
+fn record_completion_metrics(
+    model: &str,
+    prompt_tokens: usize,
+    completion_tokens: usize,
+    status: &str,
+) {
+    let total_tokens = (prompt_tokens + completion_tokens) as u64;
+    metrics::record_http_response_size(model, status, total_tokens);
+    // Note: record_sequence_completed requires a sequence_id, not model name
+    // This is a request-level metric, so we'll record it without sequence_id
+    metrics::record_sequence_completed_request(status);
+    metrics::record_prompt_tokens_total(prompt_tokens as u64);
+    metrics::record_completion_tokens_total(completion_tokens as u64);
 }
 
 #[cfg(test)]

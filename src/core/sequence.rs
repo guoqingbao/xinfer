@@ -32,6 +32,8 @@ impl fmt::Display for SequenceStatus {
 pub struct Sequence {
     pub id: usize,
     pub created_time: usize,
+    pub request_arrival_time: usize,
+    pub first_token_time: Option<usize>,
     pub swapped_time: Option<usize>,
     pub status: SequenceStatus,
     pub token_ids: Vec<u32>,
@@ -164,6 +166,11 @@ impl Sequence {
                 .duration_since(UNIX_EPOCH)
                 .expect("Time went backwards")
                 .as_millis() as usize,
+            request_arrival_time: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("Time went backwards")
+                .as_millis() as usize,
+            first_token_time: None,
             swapped_time: None,
             status: SequenceStatus::Waiting,
             token_ids: token_ids.clone(),
@@ -226,6 +233,30 @@ impl Sequence {
 
     pub fn created_time(&self) -> usize {
         self.created_time
+    }
+
+    pub fn request_arrival_time(&self) -> usize {
+        self.request_arrival_time
+    }
+
+    pub fn set_request_arrival_time(&mut self, time: usize) {
+        self.request_arrival_time = time;
+    }
+
+    pub fn first_token_time(&self) -> Option<usize> {
+        self.first_token_time
+    }
+
+    pub fn set_first_token_time(&mut self, time: usize) {
+        self.first_token_time = Some(time);
+    }
+
+    pub fn ttft(&self) -> Option<f64> {
+        if let Some(first_token_time) = self.first_token_time {
+            Some((first_token_time - self.request_arrival_time) as f64 / 1000.0)
+        } else {
+            None
+        }
     }
 
     pub fn swapped_time(&self) -> Option<usize> {
