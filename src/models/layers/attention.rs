@@ -4,7 +4,7 @@ use crate::models::layers::distributed::{
 };
 use crate::models::layers::others::{rms_norm, rms_norm_sharded, NormX};
 use crate::models::layers::rotary_emb::ApplyRotaryEmbedding;
-use crate::models::layers::VarBuilderX;
+use crate::models::layers::{isq_high_precision_quant, VarBuilderX};
 use crate::utils::config::Config;
 use attention_rs::{InputMetadata, PagedAttention};
 use candle_core::{DType, Result, Tensor, D};
@@ -494,7 +494,10 @@ impl Attention {
                 &config.quant,
                 dtype,
             )?;
-            let q8_0_qunat = Some("q8_0".to_string());
+            let high_precision_quant = config
+                .quant
+                .as_deref()
+                .map(|quant| isq_high_precision_quant(quant).to_string());
             let v_proj = TensorParallelColumnLinear::load_with_shard(
                 hidden_size,
                 num_kv_heads * head_dim,
@@ -507,7 +510,7 @@ impl Attention {
                 kv_shard,
                 &config.quantization_config,
                 if config.quant.is_some() && config.quantization_config.is_none() {
-                    &q8_0_qunat
+                    &high_precision_quant
                 } else {
                     &None
                 },

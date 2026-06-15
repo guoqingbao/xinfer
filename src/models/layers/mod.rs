@@ -12,6 +12,7 @@ pub mod rotary_emb;
 pub mod wna16;
 use crate::utils::downloader::ModelPaths;
 use crate::utils::gguf_varbuilder::VarBuilder as QVarBuilder;
+use candle_core::quantized::GgmlDType;
 use candle_core::DType;
 use candle_core::{Device, Result, Tensor};
 use candle_nn::var_builder::ShardedVarBuilder as VarBuilder;
@@ -30,17 +31,32 @@ pub fn collect_key_map<'a, const N: usize>(
     }
 }
 
+pub fn isq_high_precision_quant(quant: &str) -> &'static str {
+    match quant {
+        "q8" | "q80" | "q8_0" => "q8_0",
+        _ => "q6k",
+    }
+}
+
+pub fn isq_high_precision_dtype(quant: Option<&str>) -> GgmlDType {
+    match quant {
+        Some("q8" | "q80" | "q8_0") => GgmlDType::Q8_0,
+        _ => GgmlDType::Q6K,
+    }
+}
+
 #[derive(Clone)]
 pub struct VarBuilderX<'a>(
     pub Either<VarBuilder<'a>, QVarBuilder>,
     pub String,
     pub Option<Either<VarBuilder<'a>, QVarBuilder>>,
+    pub Option<VarBuilder<'a>>,
 );
 
 impl VarBuilderX<'_> {
     pub fn from_gguf_file<P: AsRef<Path>>(path: P, device: &Device) -> Result<Self> {
         let vb = crate::utils::gguf_varbuilder::VarBuilder::from_gguf(path, device)?;
-        Ok(Self(Either::Right(vb), String::new(), None))
+        Ok(Self(Either::Right(vb), String::new(), None, None))
     }
 
     pub fn new(
@@ -65,7 +81,7 @@ impl VarBuilderX<'_> {
                 .map(|path| crate::utils::gguf_varbuilder::VarBuilder::from_gguf(path, device))
                 .transpose()?
                 .map(Either::Right);
-            Ok(Self(Either::Right(vb), String::new(), auxiliary_vb))
+            Ok(Self(Either::Right(vb), String::new(), auxiliary_vb, None))
         } else {
             let vb = unsafe {
                 candle_nn::var_builder::ShardedSafeTensors::var_builder(
@@ -74,7 +90,18 @@ impl VarBuilderX<'_> {
                     device,
                 )?
             };
-            Ok(Self(Either::Left(vb), String::new(), None))
+            let cpu_vb = if matches!(device, Device::Cpu) {
+                None
+            } else {
+                Some(unsafe {
+                    candle_nn::var_builder::ShardedSafeTensors::var_builder(
+                        &weight_files,
+                        dtype,
+                        &Device::Cpu,
+                    )?
+                })
+            };
+            Ok(Self(Either::Left(vb), String::new(), None, cpu_vb))
         }
     }
 
@@ -99,9 +126,17 @@ impl VarBuilderX<'_> {
         } else {
             format!("{}.{}", self.1, name)
         };
+        let cpu_vb = self.3.as_ref().map(|vb| vb.pp(name));
         match &self.0 {
-            Either::Left(vb) => VarBuilderX(Either::Left(vb.pp(name)), next_path, self.2.clone()),
-            Either::Right(vb) => VarBuilderX(Either::Right(vb.pp(name)), next_path, self.2.clone()),
+            Either::Left(vb) => {
+                VarBuilderX(Either::Left(vb.pp(name)), next_path, self.2.clone(), cpu_vb)
+            }
+            Either::Right(vb) => VarBuilderX(
+                Either::Right(vb.pp(name)),
+                next_path,
+                self.2.clone(),
+                cpu_vb,
+            ),
         }
     }
 
@@ -109,7 +144,11 @@ impl VarBuilderX<'_> {
         self.2
             .as_ref()
             .cloned()
-            .map(|vb| VarBuilderX(vb, String::new(), None))
+            .map(|vb| VarBuilderX(vb, String::new(), None, None))
+    }
+
+    pub fn cpu_var_builder(&self) -> Option<VarBuilder<'_>> {
+        self.3.clone()
     }
 
     pub fn module_path(&self) -> &str {

@@ -85,12 +85,62 @@ impl VarBuilder {
         Ok(tensor)
     }
 
+    pub fn get_sharded<S: Into<Shape>>(
+        &self,
+        s: S,
+        name: &str,
+        dim: usize,
+        rank: usize,
+        world_size: usize,
+    ) -> Result<Option<Arc<QTensor>>> {
+        if world_size <= 1 {
+            return self.get(s, name).map(Some);
+        }
+
+        let path = self.path(name);
+        let shape = s.into();
+        if dim >= shape.dims().len() {
+            candle::bail!(
+                "cannot shard tensor {path} with shape {:?} on dim {dim}",
+                shape
+            );
+        }
+        if shape.dims()[dim] % world_size != 0 {
+            candle::bail!(
+                "cannot shard tensor {path} dim {dim} size {} into {world_size} parts",
+                shape.dims()[dim]
+            );
+        }
+        let mut shard_shape = shape.dims().to_vec();
+        shard_shape[dim] /= world_size;
+
+        let mut file = self.file.lock().unwrap();
+        let Some(tensor) =
+            self.content
+                .tensor_shard(&mut *file, &path, dim, rank, world_size, &self.device)?
+        else {
+            return Ok(None);
+        };
+        if tensor.shape().dims() != shard_shape.as_slice() {
+            candle::bail!(
+                "shape mismatch for sharded {name}, got {:?}, expected {:?}",
+                tensor.shape(),
+                shard_shape
+            );
+        }
+        Ok(Some(Arc::new(tensor)))
+    }
+
     pub fn get_no_shape(&self, name: &str) -> Result<Arc<QTensor>> {
         let mut file = self.file.lock().unwrap();
         let tensor = self
             .content
             .tensor(&mut *file, &self.path(name), &self.device)?;
         Ok(Arc::new(tensor))
+    }
+
+    pub fn clear_cache(&self) {
+        *self.cache.lock().unwrap() = None;
     }
 
     pub fn device(&self) -> &Device {

@@ -4,12 +4,11 @@ use crate::models::layers::VarBuilderX;
 use crate::utils::config::QuantConfig;
 use crate::utils::should_skip_fp8_for_module;
 use crate::utils::should_skip_quant_for_module;
-use candle_core::quantized;
 use candle_core::quantized::GgmlDType;
 use candle_core::Module;
 use candle_core::{
     quantized::{QMatMul, QTensor},
-    DType, Result, Tensor,
+    DType, Device, Result, Tensor,
 };
 use candle_nn::var_builder::Shard;
 use candle_nn::var_builder::ShardedVarBuilder as VarBuilder;
@@ -218,6 +217,67 @@ pub struct QLinear {
 }
 
 impl QLinear {
+    fn ggml_dtype_from_str(quant: &str) -> GgmlDType {
+        match quant {
+            "q40" | "q4_0" => GgmlDType::Q4_0,
+            "q4" | "q41" | "q4_1" => GgmlDType::Q4_1,
+            "q50" | "q5_0" => GgmlDType::Q5_0,
+            "q5" | "q51" | "q5_1" => GgmlDType::Q5_1,
+            "q8" | "q80" | "q8_0" => GgmlDType::Q8_0,
+            "q2k" | "q2_k" => GgmlDType::Q2K,
+            "q3k" | "q3_k" => GgmlDType::Q3K,
+            "q4k" | "q4_k" => GgmlDType::Q4K,
+            "q5k" | "q5_k" => GgmlDType::Q5K,
+            "q6k" | "q6_k" => GgmlDType::Q6K,
+            _ => panic!("Unsupported GGML data type!"),
+        }
+    }
+
+    fn compatible_ggml_dtype(weight: &Tensor, ggml_dtype: GgmlDType) -> Result<Option<GgmlDType>> {
+        let last_dim = weight.dim(candle_core::D::Minus1)?;
+        if last_dim % ggml_dtype.block_size() == 0 {
+            Ok(Some(ggml_dtype))
+        } else if last_dim % GgmlDType::Q8_0.block_size() == 0 {
+            crate::log_warn!(
+                "ISQ: weight {:?} incompatible with {:?} (block_size {}), \
+                falling back to Q8_0 (block_size {})",
+                weight.shape(),
+                ggml_dtype,
+                ggml_dtype.block_size(),
+                GgmlDType::Q8_0.block_size()
+            );
+            Ok(Some(GgmlDType::Q8_0))
+        } else {
+            crate::log_warn!(
+                "ISQ: weight {:?} incompatible with any GGUF dtype, keeping unquantized",
+                weight.shape()
+            );
+            Ok(None)
+        }
+    }
+
+    fn native_quantize_supported(last_dim: usize, quant: &str, device: &Device) -> Result<bool> {
+        let ggml_dtype = Self::ggml_dtype_from_str(quant);
+        let actual_ggml_dtype = if last_dim % ggml_dtype.block_size() == 0 {
+            Some(ggml_dtype)
+        } else if last_dim % GgmlDType::Q8_0.block_size() == 0 {
+            Some(GgmlDType::Q8_0)
+        } else {
+            None
+        };
+        Ok(actual_ggml_dtype
+            .map(|dtype| QTensor::supports_native_quantize(device, dtype))
+            .unwrap_or(false))
+    }
+
+    fn local_last_dim(in_dim: usize, shards: Shard) -> usize {
+        if shards.world_size > 1 && shards.dim == 1 {
+            in_dim / shards.world_size
+        } else {
+            in_dim
+        }
+    }
+
     pub fn new(
         in_dim: usize,
         out_dim: usize,
@@ -225,29 +285,40 @@ impl QLinear {
         shards: Shard,
         dtype: DType,
     ) -> Result<Self> {
-        let ws = vb.get((out_dim, in_dim), "weight")?;
-        let mut wdtype = ws.dtype();
         let ws = if shards.world_size > 1 {
-            let ws = ws.dequantize_f16(&vb.device())?;
-            let chunk_size = ws.shape().dims()[shards.dim] / shards.world_size;
-            if chunk_size % wdtype.block_size() != 0 {
-                // crate::log_warn!(
-                //     "Invalid dim_size to chunk {} (start {}, size {}) for block_size {}, switching to Q8_0 format!",
-                //     ws.shape().dims()[shards.dim],
-                //     shards.rank * chunk_size,
-                //     chunk_size,
-                //     wdtype.block_size()
-                // );
-                wdtype = GgmlDType::Q8_0;
-            }
+            if let Some(ws) = vb.get_sharded(
+                (out_dim, in_dim),
+                "weight",
+                shards.dim,
+                shards.rank,
+                shards.world_size,
+            )? {
+                ws
+            } else {
+                let ws = vb.get((out_dim, in_dim), "weight")?;
+                let mut wdtype = ws.dtype();
+                let ws = ws.dequantize_f16(&vb.device())?;
+                vb.clear_cache();
+                let chunk_size = ws.shape().dims()[shards.dim] / shards.world_size;
+                if chunk_size % wdtype.block_size() != 0 {
+                    // crate::log_warn!(
+                    //     "Invalid dim_size to chunk {} (start {}, size {}) for block_size {}, switching to Q8_0 format!",
+                    //     ws.shape().dims()[shards.dim],
+                    //     shards.rank * chunk_size,
+                    //     chunk_size,
+                    //     wdtype.block_size()
+                    // );
+                    wdtype = GgmlDType::Q8_0;
+                }
 
-            let ws = ws
-                .narrow(shards.dim, shards.rank * chunk_size, chunk_size)?
-                .contiguous()?;
-            let qtensor = QTensor::quantize(&ws, wdtype)?;
-            Arc::new(qtensor)
+                let ws = ws
+                    .narrow(shards.dim, shards.rank * chunk_size, chunk_size)?
+                    .contiguous()?;
+                let qtensor = QTensor::quantize_owned(ws, wdtype)?;
+                Arc::new(qtensor)
+            }
         } else {
-            ws.to_owned()
+            vb.get((out_dim, in_dim), "weight")?
         };
         let inner = candle_core::quantized::QMatMul::from_arc(ws)?;
         let b = vb.get(out_dim, "bias");
@@ -281,25 +352,36 @@ impl QLinear {
         shards: Shard,
         dtype: DType,
     ) -> Result<Self> {
-        let ws = vb.get((num_experts, out_dim, in_dim), "weight")?;
-        let wdtype = ws.dtype();
         let ws = if shards.world_size > 1 {
-            let ws = ws.dequantize_f16(&vb.device())?;
-            let chunk_size = ws.shape().dims()[shards.dim + 1] / shards.world_size;
-            assert!(
-                chunk_size % wdtype.block_size() == 0,
-                "chunk position invalid dim {}, start {}, size {}",
-                ws.shape().dims()[shards.dim],
-                shards.rank * chunk_size,
-                chunk_size
-            );
-            let ws = ws
-                .narrow(shards.dim + 1, shards.rank * chunk_size, chunk_size)?
-                .contiguous()?;
-            let qtensor = QTensor::quantize(&ws, wdtype)?;
-            Arc::new(qtensor)
+            if let Some(ws) = vb.get_sharded(
+                (num_experts, out_dim, in_dim),
+                "weight",
+                shards.dim + 1,
+                shards.rank,
+                shards.world_size,
+            )? {
+                ws
+            } else {
+                let ws = vb.get((num_experts, out_dim, in_dim), "weight")?;
+                let wdtype = ws.dtype();
+                let ws = ws.dequantize_f16(&vb.device())?;
+                vb.clear_cache();
+                let chunk_size = ws.shape().dims()[shards.dim + 1] / shards.world_size;
+                assert!(
+                    chunk_size % wdtype.block_size() == 0,
+                    "chunk position invalid dim {}, start {}, size {}",
+                    ws.shape().dims()[shards.dim],
+                    shards.rank * chunk_size,
+                    chunk_size
+                );
+                let ws = ws
+                    .narrow(shards.dim + 1, shards.rank * chunk_size, chunk_size)?
+                    .contiguous()?;
+                let qtensor = QTensor::quantize_owned(ws, wdtype)?;
+                Arc::new(qtensor)
+            }
         } else {
-            ws.to_owned()
+            vb.get((num_experts, out_dim, in_dim), "weight")?
         };
 
         let inner = candle_core::quantized::QMatMul::from_arc(ws)?;
@@ -350,51 +432,44 @@ impl QLinear {
     }
     //in-situ quantization
     pub fn from_linear_x(linear: Linear, quant: String, dtype: DType) -> Result<Self> {
-        use quantized::GgmlDType;
-        let ggml_dtype = match quant.as_str() {
-            "q40" | "q4_0" => GgmlDType::Q4_0,
-            "q4" | "q41" | "q4_1" => GgmlDType::Q4_1,
-            "q50" | "q5_0" => GgmlDType::Q5_0,
-            "q5" | "q51" | "q5_1" => GgmlDType::Q5_1,
-            "q8" | "q80" | "q8_0" => GgmlDType::Q8_0,
-            "q2k" | "q2_k" => GgmlDType::Q2K,
-            "q3k" | "q3_k" => GgmlDType::Q3K,
-            "q4k" | "q4_k" => GgmlDType::Q4K,
-            "q5k" | "q5_k" => GgmlDType::Q5K,
-            "q6k" | "q6_k" => GgmlDType::Q6K,
-            _ => panic!("Unsupported GGML data type!"),
+        let ggml_dtype = Self::ggml_dtype_from_str(quant.as_str());
+        let Linear { weight, bias } = linear;
+        let qbias = bias;
+        let Some(actual_ggml_dtype) = Self::compatible_ggml_dtype(&weight, ggml_dtype)? else {
+            let inner = QMatMul::Tensor(weight);
+            return Ok(QLinear {
+                inner: Some(inner),
+                bias: qbias,
+                wna16: None,
+                dtype,
+            });
         };
+        let qtensor = QTensor::quantize_owned(weight, actual_ggml_dtype)?;
+        QLinear::from_qparts_x(qtensor, qbias, dtype)
+    }
+
+    pub fn from_linear_x_on_device(
+        linear: Linear,
+        quant: String,
+        dtype: DType,
+        device: &Device,
+    ) -> Result<Self> {
+        let ggml_dtype = Self::ggml_dtype_from_str(quant.as_str());
         let weight = linear.weight();
-        let qbias = linear.bias().cloned();
-        let last_dim = weight.dim(candle_core::D::Minus1)?;
-        let actual_ggml_dtype = if last_dim % ggml_dtype.block_size() != 0 {
-            if last_dim % GgmlDType::Q8_0.block_size() == 0 {
-                crate::log_warn!(
-                    "ISQ: weight {:?} incompatible with {:?} (block_size {}), \
-                    falling back to Q8_0 (block_size {})",
-                    weight.shape(),
-                    ggml_dtype,
-                    ggml_dtype.block_size(),
-                    GgmlDType::Q8_0.block_size()
-                );
-                GgmlDType::Q8_0
-            } else {
-                crate::log_warn!(
-                    "ISQ: weight {:?} incompatible with any GGUF dtype, keeping unquantized",
-                    weight.shape()
-                );
-                let inner = QMatMul::Tensor(weight.clone());
-                return Ok(QLinear {
-                    inner: Some(inner),
-                    bias: qbias,
-                    wna16: None,
-                    dtype,
-                });
-            }
-        } else {
-            ggml_dtype
+        let qbias = linear
+            .bias()
+            .map(|b| b.to_device(device)?.to_dtype(DType::F32))
+            .transpose()?;
+        let Some(actual_ggml_dtype) = Self::compatible_ggml_dtype(weight, ggml_dtype)? else {
+            let inner = QMatMul::Tensor(weight.to_device(device)?);
+            return Ok(QLinear {
+                inner: Some(inner),
+                bias: qbias,
+                wna16: None,
+                dtype,
+            });
         };
-        let qtensor = QTensor::quantize(weight, actual_ggml_dtype)?;
+        let qtensor = QTensor::quantize_on_device(weight, actual_ggml_dtype, device)?;
         QLinear::from_qparts_x(qtensor, qbias, dtype)
     }
 
@@ -538,14 +613,15 @@ fn has_fp8_tensors(vb: &VarBuilder) -> bool {
 pub fn linear_x(
     in_dim: usize,
     out_dim: usize,
-    vb: VarBuilderX,
+    vbx: VarBuilderX,
     shards: Shard,
     quant_cfg: &Option<QuantConfig>,
     quant: &Option<String>,
     dtype: DType,
 ) -> Result<LinearX> {
-    let module_path = vb.module_path().to_string();
-    match &vb.0 {
+    let module_path = vbx.module_path().to_string();
+    let target_device = vbx.device();
+    match &vbx.0 {
         Either::Left(vb) => {
             if let Some(cfg) = quant_cfg {
                 if cfg.quant_method == "fp8" {
@@ -630,14 +706,31 @@ pub fn linear_x(
                 };
                 Ok(LinearX::QLinear(ln))
             } else {
-                let ln = linear(in_dim, out_dim, vb.clone(), shards, dtype)?;
                 if let Some(quantized_type) = quant {
-                    Ok(LinearX::QLinear(QLinear::from_linear_x(
-                        ln,
-                        quantized_type.clone(),
-                        dtype,
-                    )?))
+                    let use_native = QLinear::native_quantize_supported(
+                        QLinear::local_last_dim(in_dim, shards),
+                        quantized_type,
+                        &target_device,
+                    )?;
+                    let load_vb = if use_native {
+                        vb.clone()
+                    } else {
+                        vbx.cpu_var_builder().unwrap_or_else(|| vb.clone())
+                    };
+                    let ln = linear(in_dim, out_dim, load_vb, shards, dtype)?;
+                    let qlinear = if use_native {
+                        QLinear::from_linear_x(ln, quantized_type.clone(), dtype)?
+                    } else {
+                        QLinear::from_linear_x_on_device(
+                            ln,
+                            quantized_type.clone(),
+                            dtype,
+                            &target_device,
+                        )?
+                    };
+                    Ok(LinearX::QLinear(qlinear))
                 } else {
+                    let ln = linear(in_dim, out_dim, vb.clone(), shards, dtype)?;
                     Ok(LinearX::Linear(ln))
                 }
             }
@@ -655,14 +748,15 @@ pub fn linear_x(
 pub fn linear_no_bias_x(
     in_dim: usize,
     out_dim: usize,
-    vb: VarBuilderX,
+    vbx: VarBuilderX,
     shards: Shard,
     quant_cfg: &Option<QuantConfig>,
     quant: &Option<String>,
     dtype: DType,
 ) -> Result<LinearX> {
-    let module_path = vb.module_path().to_string();
-    match &vb.0 {
+    let module_path = vbx.module_path().to_string();
+    let target_device = vbx.device();
+    match &vbx.0 {
         Either::Left(vb) => {
             if let Some(cfg) = quant_cfg {
                 if cfg.quant_method == "fp8" {
@@ -754,14 +848,31 @@ pub fn linear_no_bias_x(
                 };
                 Ok(LinearX::QLinear(ln))
             } else {
-                let ln = linear_no_bias(in_dim, out_dim, vb.clone(), shards, dtype)?;
                 if let Some(quantized_type) = quant {
-                    Ok(LinearX::QLinear(QLinear::from_linear_x(
-                        ln,
-                        quantized_type.clone(),
-                        dtype,
-                    )?))
+                    let use_native = QLinear::native_quantize_supported(
+                        QLinear::local_last_dim(in_dim, shards),
+                        quantized_type,
+                        &target_device,
+                    )?;
+                    let load_vb = if use_native {
+                        vb.clone()
+                    } else {
+                        vbx.cpu_var_builder().unwrap_or_else(|| vb.clone())
+                    };
+                    let ln = linear_no_bias(in_dim, out_dim, load_vb, shards, dtype)?;
+                    let qlinear = if use_native {
+                        QLinear::from_linear_x(ln, quantized_type.clone(), dtype)?
+                    } else {
+                        QLinear::from_linear_x_on_device(
+                            ln,
+                            quantized_type.clone(),
+                            dtype,
+                            &target_device,
+                        )?
+                    };
+                    Ok(LinearX::QLinear(qlinear))
                 } else {
+                    let ln = linear_no_bias(in_dim, out_dim, vb.clone(), shards, dtype)?;
                     Ok(LinearX::Linear(ln))
                 }
             }
@@ -780,23 +891,42 @@ pub fn linear_no_bias_merged_x(
     num_experts: usize,
     in_dim: usize,
     out_dim: usize,
-    vb: VarBuilderX,
+    vbx: VarBuilderX,
     shards: Shard,
     _: &Option<QuantConfig>,
     quant: &Option<String>,
     dtype: DType,
 ) -> Result<LinearX> {
-    match &vb.0 {
+    let target_device = vbx.device();
+    match &vbx.0 {
         Either::Left(vb) => {
-            let ln =
-                linear_no_bias_merged(num_experts, in_dim, out_dim, vb.clone(), shards, dtype)?;
             if let Some(quantized_type) = quant {
-                Ok(LinearX::QLinear(QLinear::from_linear_x(
-                    ln,
-                    quantized_type.clone(),
-                    dtype,
-                )?))
+                let use_native = QLinear::native_quantize_supported(
+                    QLinear::local_last_dim(in_dim, shards),
+                    quantized_type,
+                    &target_device,
+                )?;
+                let load_vb = if use_native {
+                    vb.clone()
+                } else {
+                    vbx.cpu_var_builder().unwrap_or_else(|| vb.clone())
+                };
+                let ln =
+                    linear_no_bias_merged(num_experts, in_dim, out_dim, load_vb, shards, dtype)?;
+                let qlinear = if use_native {
+                    QLinear::from_linear_x(ln, quantized_type.clone(), dtype)?
+                } else {
+                    QLinear::from_linear_x_on_device(
+                        ln,
+                        quantized_type.clone(),
+                        dtype,
+                        &target_device,
+                    )?
+                };
+                Ok(LinearX::QLinear(qlinear))
             } else {
+                let ln =
+                    linear_no_bias_merged(num_experts, in_dim, out_dim, vb.clone(), shards, dtype)?;
                 Ok(LinearX::Linear(ln))
             }
         }

@@ -1,7 +1,7 @@
 // src/models/layers/moe.rs
 use crate::models::layers::distributed::{shard, AllReduce, Comm};
 use crate::models::layers::linear::{linear_no_bias_x as linear_no_bias, LinearX as Linear};
-use crate::models::layers::VarBuilderX;
+use crate::models::layers::{isq_high_precision_dtype, VarBuilderX};
 use crate::utils::config::Config;
 use crate::utils::config::QuantConfig;
 use attention_rs::moe;
@@ -677,6 +677,7 @@ impl FusedMoeGGUF {
         };
 
         let (ggml_dtype, block_size) = (GgmlDType::Q4K, GgmlDType::Q4K.block_size());
+        let high_precision_dtype = isq_high_precision_dtype(cfg.quant.as_deref());
 
         let moe_intermediate_chunk =
             if moe_cfg.moe_intermediate_size / comm.world_size() % block_size != 0 {
@@ -715,7 +716,7 @@ impl FusedMoeGGUF {
         );
         let gate_experts = Arc::new(QTensor::quantize(&gate_experts, ggml_dtype)?);
         let up_experts = Arc::new(QTensor::quantize(&up_experts, ggml_dtype)?);
-        let down_experts = Arc::new(QTensor::quantize(&down_experts, GgmlDType::Q8_0)?);
+        let down_experts = Arc::new(QTensor::quantize(&down_experts, high_precision_dtype)?);
 
         let world_size = comm.world_size();
 
@@ -1095,7 +1096,10 @@ impl FusedMoeISQ {
 
         let gate_experts = QTensor::quantize(&gate_experts, quant_type)?;
         let up_experts = QTensor::quantize(&up_experts, quant_type)?;
-        let down_experts = QTensor::quantize(&down_experts, GgmlDType::Q8_0)?;
+        let down_experts = QTensor::quantize(
+            &down_experts,
+            isq_high_precision_dtype(cfg.quant.as_deref()),
+        )?;
         let world_size = comm.world_size();
 
         Ok(Self {
@@ -1161,7 +1165,10 @@ impl FusedMoeISQ {
 
         let gate_experts = QTensor::quantize(&gate_experts, quant_type)?;
         let up_experts = QTensor::quantize(&up_experts, quant_type)?;
-        let down_experts = QTensor::quantize(&down_experts, GgmlDType::Q8_0)?;
+        let down_experts = QTensor::quantize(
+            &down_experts,
+            isq_high_precision_dtype(cfg.quant.as_deref()),
+        )?;
         let world_size = comm.world_size();
 
         Ok(Self {
