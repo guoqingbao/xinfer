@@ -91,10 +91,7 @@ impl Engine {
                     engine
                         .generate_sync(preprocessed, None, &None)
                         .map_err(|e| {
-                            PyValueError::new_err(format!(
-                                "generate_sync failed: {:?}",
-                                e
-                            ))
+                            PyValueError::new_err(format!("generate_sync failed: {:?}", e))
                         })?
                 };
 
