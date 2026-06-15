@@ -89,10 +89,10 @@ impl Engine {
                 let receivers = {
                     let mut engine = self.engine.write();
                     engine
-                        .generate_sync_from_preprocessed(preprocessed, None, &None)
+                        .generate_sync(preprocessed, None, &None)
                         .map_err(|e| {
                             PyValueError::new_err(format!(
-                                "generate_sync_from_preprocessed failed: {:?}",
+                                "generate_sync failed: {:?}",
                                 e
                             ))
                         })?
@@ -134,7 +134,7 @@ impl Engine {
         let (seq_id, prompt_length, _prefilled_reasoning_end, stream) = {
             let mut engine = self.engine.write();
             engine
-                .generate_stream_from_preprocessed(preprocessed, None, &None)
+                .generate_stream(preprocessed, None, &None)
                 .map_err(|e| PyValueError::new_err(format!("stream error: {:?}", e)))?
         };
 

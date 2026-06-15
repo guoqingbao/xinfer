@@ -359,7 +359,7 @@ async fn main() -> Result<()> {
                 };
                 let (seq_id, prompt_length, _prefilled_reasoning_end, stream) = {
                     let mut e = engine.write();
-                    match e.generate_stream_from_preprocessed(preprocessed, None, &None) {
+                    match e.generate_stream(preprocessed, None, &None) {
                         Ok((seq_id, prompt_length, prefilled_reasoning_end, stream)) => {
                             (seq_id, prompt_length, prefilled_reasoning_end, stream)
                         }
@@ -453,7 +453,7 @@ async fn main() -> Result<()> {
                 };
                 let receivers = {
                     let mut e = engine.write();
-                    e.generate_sync_from_preprocessed(preprocessed, None, &None)?
+                    e.generate_sync(preprocessed, None, &None)?
                 };
                 let results = LLMEngine::collect_sync_results(receivers, tokenizer, None).await?;
                 // GenerationOutput is returned directly

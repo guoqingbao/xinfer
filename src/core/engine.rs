@@ -779,8 +779,8 @@ impl LLMEngine {
     /// Apply chat template + tokenize each `(params, messages)` pair under
     /// shared access (`&self`) so N concurrent server handlers can run this
     /// in parallel under their own `engine.read()` guards. Returns a list
-    /// of `PreprocessedRequest`s that feed `generate_sync_from_preprocessed`
-    /// or `generate_stream_from_preprocessed`, which acquire `engine.write()`
+    /// of `PreprocessedRequest`s that feed `generate_sync`
+    /// or `generate_stream`, which acquire `engine.write()`
     /// only briefly for the scheduler-add step.
     pub fn preprocess(
         &self,
@@ -1390,38 +1390,10 @@ impl LLMEngine {
         }
     }
 
+    /// Registers preprocessed completion requests. Callers should run
+    /// `preprocess(...)` under `engine.read()` first, then call this under
+    /// `engine.write()` so the write lock is held only for request admission.
     pub fn generate_sync(
-        &mut self,
-        params: &Vec<SamplingParams>,
-        message_list: &Vec<Vec<Message>>,
-        images: Option<ImageData>,
-        tools: &Vec<Tool>,
-        logger: &Option<Arc<ChatCompletionLogger>>,
-    ) -> Result<Vec<(usize, usize, mpsc::Receiver<StreamItem>)>> {
-        if params.len() != message_list.len() {
-            candle_core::bail!("size of sampling parameters is not match with size of prompts!");
-        }
-        let mut receivers = Vec::new();
-        for (param, messages) in params.iter().zip(message_list.iter()) {
-            let (prompt, image_idx) = self.apply_chat_template(param, messages, tools, false);
-            if let Some(ref l) = logger {
-                l.log_prompt(&prompt);
-            }
-            if let Ok((seq_id, prompt_length, rx)) =
-                self.add_request(param, &prompt, RequestType::Completion, &images, image_idx)
-            {
-                receivers.push((seq_id, prompt_length, rx));
-            }
-        }
-
-        Ok(receivers)
-    }
-
-    /// Lock-shrunk equivalent of `generate_sync`. The caller has already
-    /// run `preprocess(...)` (chat template + tokenize) under a brief
-    /// `engine.read()` guard, so this method only needs the engine write
-    /// lock for the scheduler-add step.
-    pub fn generate_sync_from_preprocessed(
         &mut self,
         preprocessed: Vec<PreprocessedRequest>,
         images: Option<ImageData>,
@@ -1585,33 +1557,10 @@ impl LLMEngine {
         self.seq_prefilled_reasoning_end.get(&seq_id).cloned()
     }
 
+    /// Registers a preprocessed streaming request. Callers should run
+    /// `preprocess(...)` under `engine.read()` first, then call this under
+    /// `engine.write()` so the write lock is held only for request admission.
     pub fn generate_stream(
-        &mut self,
-        params: &SamplingParams,
-        messages: &Vec<Message>,
-        images: Option<ImageData>, //collection of images of the full conversation
-        tools: &Vec<Tool>,
-        logger: &Option<Arc<ChatCompletionLogger>>,
-    ) -> Result<(usize, usize, Option<String>, mpsc::Receiver<StreamItem>)> {
-        let (prompt, image_idx) = self.apply_chat_template(params, messages, tools, false);
-        if let Some(ref l) = logger {
-            l.log_prompt(&prompt);
-        }
-        match self.add_request(params, &prompt, RequestType::Stream, &images, image_idx) {
-            Ok((seq_id, prompt_length, rx)) => {
-                let prefilled_reasoning_end = self.get_prefilled_reasoning_end_marker(seq_id);
-                Ok((seq_id, prompt_length, prefilled_reasoning_end, rx))
-            }
-            Err(e) => {
-                candle_core::bail!("{:?}", e)
-            }
-        }
-    }
-
-    /// Lock-shrunk equivalent of `generate_stream`. Takes a single
-    /// already-preprocessed request and registers it under `engine.write()`
-    /// briefly for the scheduler-add step only.
-    pub fn generate_stream_from_preprocessed(
         &mut self,
         preprocessed: PreprocessedRequest,
         images: Option<ImageData>,

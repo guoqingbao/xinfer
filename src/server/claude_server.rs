@@ -2190,7 +2190,7 @@ pub async fn messages(
         };
         let (seq_id, prompt_length, prefilled_reasoning_end, stream) = {
             let mut e = data.engine.write();
-            match e.generate_stream_from_preprocessed(preprocessed, image_data, &logger) {
+            match e.generate_stream(preprocessed, image_data, &logger) {
                 Ok((seq_id, prompt_length, prefilled_reasoning_end, stream)) => {
                     (seq_id, prompt_length, prefilled_reasoning_end, stream)
                 }
@@ -3139,7 +3139,7 @@ pub async fn messages(
         };
         let receivers = {
             let mut e = data.engine.write();
-            match e.generate_sync_from_preprocessed(preprocessed, image_data, &logger) {
+            match e.generate_sync(preprocessed, image_data, &logger) {
                 Ok(receivers) => receivers,
                 Err(err) => {
                     return ClaudeResponder::Error(

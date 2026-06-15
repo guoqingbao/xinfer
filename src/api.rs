@@ -231,7 +231,7 @@ impl Engine {
         };
         let receivers = {
             let mut engine = self.engine.write();
-            engine.generate_sync_from_preprocessed(preprocessed, images, &None)?
+            engine.generate_sync(preprocessed, images, &None)?
         };
 
         let results = GLOBAL_RT.block_on(async {
@@ -267,7 +267,7 @@ impl Engine {
         };
         let (seq_id, prompt_length, _prefilled_reasoning_end, stream) = {
             let mut engine = self.engine.write();
-            engine.generate_stream_from_preprocessed(preprocessed, image_data, &None)?
+            engine.generate_stream(preprocessed, image_data, &None)?
         };
 
         Ok(EngineStream {
