@@ -633,12 +633,13 @@ document.querySelectorAll('.cb').forEach(function(bl){
 var XINFER_VER='0.13.2';
 var DL='https://github.com/guoqingbao/xinfer/releases/download/v'+XINFER_VER+'/';
 var archs=[
-  {sm:'sm70',n:'70',name:'SM70',gpu:'V100',cuda:'CUDA 12',d:0},
-  {sm:'sm75',n:'75',name:'SM75',gpu:'T4 / Turing',cuda:'CUDA 12',d:50},
-  {sm:'sm80',n:'80',name:'SM80',gpu:'A100 / A10',cuda:'CUDA 13',d:100},
-  {sm:'sm89',n:'89',name:'SM89',gpu:'RTX 4090 / L40',cuda:'CUDA 13',d:150},
-  {sm:'sm90',n:'90',name:'SM90',gpu:'H800 / H200',cuda:'CUDA 13',d:200},
-  {sm:'sm120',n:'120',name:'SM120',gpu:'RTX 5090 / B200',cuda:'CUDA 13',d:250}
+  {sm:'sm70',n:'70',name:'SM70',gpu:'V100',cuda:'CUDA 12',arch:'x64',d:0},
+  {sm:'sm75',n:'75',name:'SM75',gpu:'T4 / Turing',cuda:'CUDA 12',arch:'x64',d:50},
+  {sm:'sm80',n:'80',name:'SM80',gpu:'A100 / A10',cuda:'CUDA 13',arch:'x64',d:100},
+  {sm:'sm89',n:'89',name:'SM89',gpu:'RTX 4090 / L40',cuda:'CUDA 13',arch:'x64',d:150},
+  {sm:'sm90',n:'90',name:'SM90',gpu:'H800 / H200',cuda:'CUDA 13',arch:'x64',d:200},
+  {sm:'sm120',n:'120',name:'SM120',gpu:'RTX 5090 / B200',cuda:'CUDA 13',arch:'x64',d:250},
+  {sm:'sm121',n:'121',name:'SM121',gpu:'Spark / GB10',cuda:'CUDA 13',arch:'arm64',d:300}
 ];
 var metalA={sm:'metal',n:'metal',name:'Metal',gpu:'macOS Apple Silicon',cuda:'',d:300};
 var dcards=document.getElementById('dcards');
@@ -648,18 +649,20 @@ function renderDCards(type){
   var items=archs.slice();
   if(type!=='deb')items.push(metalA);
   items.forEach(function(a){
-    var fname;
+    var fname,cpuArch=a.arch||'x64';
     if(type==='deb'){
-      fname='xinfer-linux-x64-'+a.sm+'.deb';
+      fname='xinfer-linux-'+cpuArch+'-'+a.sm+'.deb';
     }else if(type==='tar'){
-      fname=a.sm==='metal'?'xinfer-'+XINFER_VER+'-darwin-arm64-metal.tar.gz':'xinfer-'+XINFER_VER+'-linux-x64-'+a.sm+'.tar.gz';
+      fname=a.sm==='metal'?'xinfer-'+XINFER_VER+'-darwin-arm64-metal.tar.gz':'xinfer-'+XINFER_VER+'-linux-'+cpuArch+'-'+a.sm+'.tar.gz';
     }else{
-      fname=a.sm==='metal'?'xinfer-'+XINFER_VER+'-metal-cp38-abi3-macosx_11_0_arm64.whl':'xinfer-'+XINFER_VER+'-'+a.n+'-cp38-abi3-manylinux_2_34_x86_64.whl';
+      var platTag=cpuArch==='arm64'?'manylinux_2_34_aarch64':'manylinux_2_34_x86_64';
+      fname=a.sm==='metal'?'xinfer-'+XINFER_VER+'-metal-cp38-abi3-macosx_11_0_arm64.whl':'xinfer-'+XINFER_VER+'-'+a.n+'-cp38-abi3-'+platTag+'.whl';
     }
     var el=document.createElement('a');
     el.href=DL+fname;el.target='_blank';el.className='dcard';el.dataset.d=a.d;
+    var archLabel=a.arch==='arm64'?' (ARM64)':'';
     el.innerHTML='<h4>'+a.name+' — '+a.gpu+'</h4>'
-      +(a.cuda?'<p>'+a.cuda+'</p>':'<p>Apple Silicon</p>')
+      +(a.cuda?'<p>'+a.cuda+archLabel+'</p>':'<p>Apple Silicon</p>')
       +'<span class="dl-file">'+fname+'</span>'
       +'<span class="dl" data-i="d.go">'+(I[lang]['d.go']||'Download →')+'</span>';
     dcards.appendChild(el);
@@ -677,7 +680,7 @@ document.querySelectorAll('.dtabs .tbtn').forEach(function(b){
 });
 
 /* ═══ Pip grid ═══ */
-var sms=['sm70','sm75','sm80','sm89','sm90','sm120','metal'];
+var sms=['sm70','sm75','sm80','sm89','sm90','sm120','sm121','metal'];
 var pg=document.getElementById('pgrid');
 sms.forEach(function(v){
   var cmd='pip install xinfer --index-url https://guoqingbao.github.io/xinfer/'+v+'/';

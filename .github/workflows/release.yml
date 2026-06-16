@@ -335,6 +335,7 @@ jobs:
   #   pip install xinfer --index-url https://guoqingbao.github.io/xinfer/sm70/  (V100)
   #   pip install xinfer --index-url https://guoqingbao.github.io/xinfer/sm90/  (Hopper)
   #   pip install xinfer --index-url https://guoqingbao.github.io/xinfer/sm120/ (Blackwell)
+  #   pip install xinfer --index-url https://guoqingbao.github.io/xinfer/sm121/ (Spark/GB10 ARM)
   #   pip install xinfer --index-url https://guoqingbao.github.io/xinfer/metal/ (macOS)
   # The root index (no arch) defaults to SM80.
   # ---------------------------------------------------------------------------
@@ -349,6 +350,9 @@ jobs:
     environment:
       name: github-pages
       url: ${{ steps.deploy.outputs.page_url }}
+    concurrency:
+      group: pages
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
         with:
@@ -369,10 +373,12 @@ jobs:
 
           generate_index() {
             local dir="$1" orig_name="$2" std_name="$3" sha="$4"
+            local href="${RELEASE_BASE}/${orig_name}"
+            if [ -n "$sha" ]; then href="${href}#sha256=${sha}"; fi
             mkdir -p "site/${dir}/xinfer"
             {
               echo '<!DOCTYPE html><html><body>'
-              echo "<a href=\"${RELEASE_BASE}/${orig_name}#sha256=${sha}\">${std_name}</a><br/>"
+              echo "<a href=\"${href}\">${std_name}</a><br/>"
               echo '</body></html>'
             } > "site/${dir}/xinfer/index.html"
             echo "<!DOCTYPE html><html><body><a href=\"xinfer/\">xinfer</a></body></html>" \
@@ -398,6 +404,12 @@ jobs:
               generate_index "metal" "$orig_name" "$std_name" "$sha"
             fi
           done
+
+          # SM121 pip index — wheel is built by separate release-sm121.yml workflow,
+          # generate index with expected filename (no sha256 since wheel not available yet)
+          SM121_WHL="xinfer-${VERSION}-121-cp38-abi3-manylinux_2_34_aarch64.whl"
+          SM121_STD="xinfer-${VERSION}-cp38-abi3-manylinux_2_34_aarch64.whl"
+          generate_index "sm121" "$SM121_WHL" "$SM121_STD" ""
 
           sed "s|var XINFER_VER='[^']*';|var XINFER_VER='${VERSION}';|" pages/index.html > site/index.html
 
@@ -428,7 +440,8 @@ jobs:
               80|86) echo "sm80" ;;
               89)    echo "sm89" ;;
               90|90a) echo "sm90" ;;
-              100|120) echo "sm${cc}" ;;
+              100|120) echo "sm120" ;;
+              121) echo "sm121" ;;
               *) echo "sm80" ;;
             esac
           }
@@ -467,7 +480,9 @@ jobs:
 
           install_deb() {
             local variant="$1"
-            local deb="xinfer-linux-x64-${variant}.deb"
+            local cpu_arch="x64"
+            if [ "$variant" = "sm121" ]; then cpu_arch="arm64"; fi
+            local deb="xinfer-linux-${cpu_arch}-${variant}.deb"
             local url="${RELEASE_BASE}/${deb}"
             local tmp
             tmp="$(mktemp -d)"
@@ -559,6 +574,13 @@ jobs:
             echo "Install options:"
             echo "  1) binary  — installs 'xinfer' to /usr/local/bin"
             echo "  2) pip     — installs 'python3 -m xinfer.server'"
+            echo ""
+          elif [ "$PLATFORM" = "sm121" ]; then
+            TARBALL="xinfer-${VERSION}-linux-arm64-sm121.tar.gz"
+            echo "Install options:"
+            echo "  1) deb package  — installs 'xinfer' system-wide (Linux)"
+            echo "  2) pip package  — installs 'python3 -m xinfer.server'"
+            echo "  3) binary       — installs 'xinfer' to /usr/local/bin"
             echo ""
           else
             TARBALL="xinfer-${VERSION}-linux-x64-${PLATFORM}.tar.gz"
