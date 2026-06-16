@@ -9,14 +9,16 @@ use std::sync::Mutex;
 #[derive(Clone)]
 pub struct VarBuilder {
     content: Arc<candle_core::quantized::gguf_file::Content>,
-    file: Arc<std::sync::Mutex<File>>, // Keep file open for lazy loading
-    cache: Arc<Mutex<Option<(String, Arc<QTensor>)>>>, // last cached tensor
+    file: Arc<std::sync::Mutex<File>>,
+    cache: Arc<Mutex<Option<(String, Arc<QTensor>)>>>,
     path: Vec<String>,
     device: Device,
+    file_path: Arc<String>,
 }
 
 impl VarBuilder {
     pub fn from_gguf<P: AsRef<std::path::Path>>(p: P, device: &Device) -> Result<Self> {
+        let file_path = p.as_ref().to_string_lossy().to_string();
         let mut file = File::open(&p)?;
         let content = candle_core::quantized::gguf_file::Content::read(&mut file)?;
         Ok(Self {
@@ -25,7 +27,12 @@ impl VarBuilder {
             cache: Arc::new(Mutex::new(None)),
             path: Vec::new(),
             device: device.clone(),
+            file_path: Arc::new(file_path),
         })
+    }
+
+    pub fn gguf_path(&self) -> &str {
+        &self.file_path
     }
 
     pub fn pp<S: ToString>(&self, s: S) -> Self {
@@ -37,6 +44,7 @@ impl VarBuilder {
             cache: self.cache.clone(),
             path,
             device: self.device.clone(),
+            file_path: self.file_path.clone(),
         }
     }
 

@@ -51,12 +51,20 @@ pub struct VarBuilderX<'a>(
     pub String,
     pub Option<Either<VarBuilder<'a>, QVarBuilder>>,
     pub Option<VarBuilder<'a>>,
+    pub Option<Vec<std::path::PathBuf>>,
 );
 
 impl VarBuilderX<'_> {
     pub fn from_gguf_file<P: AsRef<Path>>(path: P, device: &Device) -> Result<Self> {
+        let file_path = path.as_ref().to_path_buf();
         let vb = crate::utils::gguf_varbuilder::VarBuilder::from_gguf(path, device)?;
-        Ok(Self(Either::Right(vb), String::new(), None, None))
+        Ok(Self(
+            Either::Right(vb),
+            String::new(),
+            None,
+            None,
+            Some(vec![file_path]),
+        ))
     }
 
     pub fn new(
@@ -81,7 +89,13 @@ impl VarBuilderX<'_> {
                 .map(|path| crate::utils::gguf_varbuilder::VarBuilder::from_gguf(path, device))
                 .transpose()?
                 .map(Either::Right);
-            Ok(Self(Either::Right(vb), String::new(), auxiliary_vb, None))
+            Ok(Self(
+                Either::Right(vb),
+                String::new(),
+                auxiliary_vb,
+                None,
+                Some(weight_files.clone()),
+            ))
         } else {
             let vb = unsafe {
                 candle_nn::var_builder::ShardedSafeTensors::var_builder(
@@ -101,7 +115,13 @@ impl VarBuilderX<'_> {
                     )?
                 })
             };
-            Ok(Self(Either::Left(vb), String::new(), None, cpu_vb))
+            Ok(Self(
+                Either::Left(vb),
+                String::new(),
+                None,
+                cpu_vb,
+                Some(weight_files),
+            ))
         }
     }
 
@@ -128,14 +148,19 @@ impl VarBuilderX<'_> {
         };
         let cpu_vb = self.3.as_ref().map(|vb| vb.pp(name));
         match &self.0 {
-            Either::Left(vb) => {
-                VarBuilderX(Either::Left(vb.pp(name)), next_path, self.2.clone(), cpu_vb)
-            }
+            Either::Left(vb) => VarBuilderX(
+                Either::Left(vb.pp(name)),
+                next_path,
+                self.2.clone(),
+                cpu_vb,
+                self.4.clone(),
+            ),
             Either::Right(vb) => VarBuilderX(
                 Either::Right(vb.pp(name)),
                 next_path,
                 self.2.clone(),
                 cpu_vb,
+                self.4.clone(),
             ),
         }
     }
@@ -144,7 +169,18 @@ impl VarBuilderX<'_> {
         self.2
             .as_ref()
             .cloned()
-            .map(|vb| VarBuilderX(vb, String::new(), None, None))
+            .map(|vb| VarBuilderX(vb, String::new(), None, None, None))
+    }
+
+    pub fn gguf_path(&self) -> Option<&str> {
+        match &self.0 {
+            Either::Right(vb) => Some(vb.gguf_path()),
+            _ => None,
+        }
+    }
+
+    pub fn weight_paths(&self) -> Option<Vec<std::path::PathBuf>> {
+        self.4.clone()
     }
 
     pub fn cpu_var_builder(&self) -> Option<VarBuilder<'_>> {

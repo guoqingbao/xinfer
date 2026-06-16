@@ -602,6 +602,46 @@ pub struct FusedMoeGGUF {
     dtype: DType,
 }
 
+fn can_quantize_to(dtype: GgmlDType) -> bool {
+    matches!(
+        dtype,
+        GgmlDType::Q4_0
+            | GgmlDType::Q4_1
+            | GgmlDType::Q5_0
+            | GgmlDType::Q5_1
+            | GgmlDType::Q8_0
+            | GgmlDType::Q8_1
+            | GgmlDType::Q2K
+            | GgmlDType::Q3K
+            | GgmlDType::Q4K
+            | GgmlDType::Q5K
+            | GgmlDType::Q6K
+            | GgmlDType::Q8K
+    )
+}
+
+fn closest_quantizable_dtype(orig: GgmlDType) -> GgmlDType {
+    if can_quantize_to(orig) {
+        return orig;
+    }
+    let bpw = orig.type_size() as f64 * 8.0 / orig.block_size() as f64;
+    let candidates = [
+        (GgmlDType::Q2K, 2.5625),
+        (GgmlDType::Q3K, 3.4375),
+        (GgmlDType::Q4_0, 4.5),
+        (GgmlDType::Q4K, 4.5),
+        (GgmlDType::Q5_0, 5.5),
+        (GgmlDType::Q5K, 5.5),
+        (GgmlDType::Q6K, 6.5625),
+        (GgmlDType::Q8_0, 8.5),
+    ];
+    candidates
+        .iter()
+        .min_by(|a, b| (a.1 - bpw).abs().partial_cmp(&(b.1 - bpw).abs()).unwrap())
+        .map(|c| c.0)
+        .unwrap_or(GgmlDType::Q4K)
+}
+
 impl FusedMoeGGUF {
     pub fn new_repack(cfg: &Config, vb: VarBuilderX, comm: Rc<Comm>, dtype: DType) -> Result<Self> {
         let moe_cfg = cfg.moe_cfg.as_ref().expect("MoE config is not available!");
@@ -618,7 +658,8 @@ impl FusedMoeGGUF {
 
         let gate = Linear::new(gate_ws, None, &None)?;
 
-        let (gate_experts, up_experts, down_experts) = match &vb.0 {
+        let (gate_experts, up_experts, down_experts, orig_gate_dtype, orig_down_dtype) = match &vb.0
+        {
             Either::Right(v) => {
                 let packed_result = v.pp("ffn_gate_up_exps").get(
                     (
@@ -629,6 +670,7 @@ impl FusedMoeGGUF {
                     "weight",
                 );
                 if let Ok(packed) = packed_result {
+                    let orig_dtype = packed.dtype();
                     let deq = packed.dequantize_f16(&v.device())?;
                     let gate_exp = deq
                         .narrow(1, 0, moe_cfg.moe_intermediate_size)?
@@ -640,34 +682,40 @@ impl FusedMoeGGUF {
                             moe_cfg.moe_intermediate_size,
                         )?
                         .contiguous()?;
-                    let down = v
-                        .pp("ffn_down_exps")
-                        .get(
-                            (num_experts, cfg.hidden_size, moe_cfg.moe_intermediate_size),
-                            "weight",
-                        )?
-                        .dequantize_f16(&v.device())?;
-                    (gate_exp, up_exp, down)
-                } else {
+                    let down_qt = v.pp("ffn_down_exps").get(
+                        (num_experts, cfg.hidden_size, moe_cfg.moe_intermediate_size),
+                        "weight",
+                    )?;
+                    let down_dtype = down_qt.dtype();
                     (
-                        v.pp("ffn_gate_exps")
-                            .get(
-                                (num_experts, moe_cfg.moe_intermediate_size, cfg.hidden_size),
-                                "weight",
-                            )?
-                            .dequantize_f16(&v.device())?,
+                        gate_exp,
+                        up_exp,
+                        down_qt.dequantize_f16(&v.device())?,
+                        orig_dtype,
+                        down_dtype,
+                    )
+                } else {
+                    let gate_qt = v.pp("ffn_gate_exps").get(
+                        (num_experts, moe_cfg.moe_intermediate_size, cfg.hidden_size),
+                        "weight",
+                    )?;
+                    let orig_dtype = gate_qt.dtype();
+                    let down_qt = v.pp("ffn_down_exps").get(
+                        (num_experts, cfg.hidden_size, moe_cfg.moe_intermediate_size),
+                        "weight",
+                    )?;
+                    let down_dtype = down_qt.dtype();
+                    (
+                        gate_qt.dequantize_f16(&v.device())?,
                         v.pp("ffn_up_exps")
                             .get(
                                 (num_experts, moe_cfg.moe_intermediate_size, cfg.hidden_size),
                                 "weight",
                             )?
                             .dequantize_f16(&v.device())?,
-                        v.pp("ffn_down_exps")
-                            .get(
-                                (num_experts, cfg.hidden_size, moe_cfg.moe_intermediate_size),
-                                "weight",
-                            )?
-                            .dequantize_f16(&v.device())?,
+                        down_qt.dequantize_f16(&v.device())?,
+                        orig_dtype,
+                        down_dtype,
                     )
                 }
             }
@@ -676,8 +724,24 @@ impl FusedMoeGGUF {
             }
         };
 
-        let (ggml_dtype, block_size) = (GgmlDType::Q4K, GgmlDType::Q4K.block_size());
-        let high_precision_dtype = isq_high_precision_dtype(cfg.quant.as_deref());
+        let chunk_base = moe_cfg.moe_intermediate_size / comm.world_size();
+        let target_gate_dtype = closest_quantizable_dtype(orig_gate_dtype);
+        let ggml_dtype = if chunk_base % target_gate_dtype.block_size() == 0 {
+            target_gate_dtype
+        } else if chunk_base % GgmlDType::Q4K.block_size() == 0 {
+            GgmlDType::Q4K
+        } else {
+            GgmlDType::Q8_0
+        };
+        let block_size = ggml_dtype.block_size();
+        let target_down_dtype = closest_quantizable_dtype(orig_down_dtype);
+        let high_precision_dtype = if chunk_base % target_down_dtype.block_size() == 0 {
+            target_down_dtype
+        } else if chunk_base % isq_high_precision_dtype(cfg.quant.as_deref()).block_size() == 0 {
+            isq_high_precision_dtype(cfg.quant.as_deref())
+        } else {
+            ggml_dtype
+        };
 
         let moe_intermediate_chunk =
             if moe_cfg.moe_intermediate_size / comm.world_size() % block_size != 0 {

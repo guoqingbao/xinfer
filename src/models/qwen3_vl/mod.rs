@@ -1,5 +1,5 @@
-use parking_lot::RwLock;
-use parking_lot::RwLockWriteGuard;
+use parking_lot::{Mutex, RwLock, RwLockWriteGuard};
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 pub mod config;
@@ -17,7 +17,7 @@ use crate::{models::layers::distributed::Comm, utils::image::ImageData};
 use attention_rs::mamba_cache::MambaCache;
 use attention_rs::InputMetadata;
 use candle_core::{DType, Device, Result, Tensor, D};
-use config::Qwen3VLConfig;
+use config::{Qwen3VLConfig, VisionConfig};
 use vision::Qwen3VLVisionModel;
 
 pub enum Qwen3TextModel {
@@ -27,10 +27,21 @@ pub enum Qwen3TextModel {
     MoE35(Qwen3_5MoEForCausalLM),
 }
 
+struct LazyVisionInit {
+    auxiliary_gguf_path: Option<PathBuf>,
+    safetensors_paths: Option<Vec<PathBuf>>,
+    safetensors_prefix: Option<String>,
+    vision_config: VisionConfig,
+    dtype: DType,
+    device: Device,
+    is_gguf: bool,
+}
+
 #[allow(dead_code)]
 pub struct Qwen3VLForConditionalGeneration {
     text_model: Qwen3TextModel,
-    vision_model: Option<Qwen3VLVisionModel>,
+    vision_model: Mutex<Option<Qwen3VLVisionModel>>,
+    lazy_vision_init: Option<LazyVisionInit>,
     spatial_merge_size: usize,
     image_token_id: Option<u32>,
     vision_start_token_id: u32,
@@ -62,7 +73,7 @@ impl Qwen3VLForConditionalGeneration {
         progress_reporter: Arc<RwLock<Box<dyn ProgressLike>>>,
     ) -> Result<Self> {
         let mut config_text = config.clone();
-        let mut vision_model = None;
+        let mut lazy_vision_init = None;
         let mut spatial_merge_size = 0;
         let mut image_token_id = None;
         let mut vision_start_token_id = 0;
@@ -79,26 +90,76 @@ impl Qwen3VLForConditionalGeneration {
             vision_start_token_id = cfg.vision_start_token_id;
             vision_end_token_id = cfg.vision_end_token_id;
 
-            let vision_vb = if vb.is_qvar_builder() {
-                vb.aux()
-            } else if vb.has_key("vision_tower.patch_embed.proj.weight") {
-                // MLX-style prefix: vision_tower.*
-                Some(vb.pp("vision_tower"))
+            if vb.is_qvar_builder() {
+                let auxiliary_path = vb.aux().and_then(|a| a.gguf_path().map(PathBuf::from));
+                if auxiliary_path.is_some() {
+                    crate::log_info!(
+                        "Vision tower will be loaded on demand (lazy init from auxiliary GGUF)."
+                    );
+                    lazy_vision_init = Some(LazyVisionInit {
+                        auxiliary_gguf_path: auxiliary_path,
+                        safetensors_paths: None,
+                        safetensors_prefix: None,
+                        vision_config: cfg.vision_config.clone(),
+                        dtype,
+                        device: device.clone(),
+                        is_gguf: true,
+                    });
+                } else {
+                    crate::log_error!(
+                        "Vision tower is disabled because no auxiliary GGUF mmproj file was found."
+                    );
+                }
             } else {
-                Some(vb.pp("model.visual"))
-            };
-            if let Some(vision_vb) = vision_vb {
-                crate::log_info!("Loading vision tower...");
-                vision_model = Some(Qwen3VLVisionModel::new(
-                    &cfg.vision_config,
-                    &vision_vb,
-                    dtype,
-                    device,
-                )?);
-            } else {
-                crate::log_error!(
-                    "Vision tower is disabled because no auxiliary GGUF mmproj file was found."
-                );
+                let has_vision_weights = vb.has_key("vision_tower.patch_embed.proj.weight")
+                    || vb.has_key("model.visual.patch_embed.proj.weight");
+                if has_vision_weights {
+                    let prefix = if vb.has_key("vision_tower.patch_embed.proj.weight") {
+                        "vision_tower"
+                    } else {
+                        "model.visual"
+                    };
+                    let safetensors_paths = vb.weight_paths();
+                    if let Some(paths) = safetensors_paths {
+                        crate::log_info!(
+                            "Vision tower will be loaded on demand (lazy init from safetensors)."
+                        );
+                        lazy_vision_init = Some(LazyVisionInit {
+                            auxiliary_gguf_path: None,
+                            safetensors_paths: Some(paths),
+                            safetensors_prefix: Some(prefix.to_string()),
+                            vision_config: cfg.vision_config.clone(),
+                            dtype,
+                            device: device.clone(),
+                            is_gguf: false,
+                        });
+                    } else {
+                        crate::log_info!("Loading vision tower...");
+                        let vision_vb = vb.pp(prefix);
+                        let vision_model =
+                            Qwen3VLVisionModel::new(&cfg.vision_config, &vision_vb, dtype, device)?;
+                        return Self::finish_new(
+                            config_text,
+                            config,
+                            vb,
+                            comm,
+                            dtype,
+                            is_rope_i,
+                            device,
+                            progress_reporter,
+                            Some(vision_model),
+                            None,
+                            spatial_merge_size,
+                            image_token_id,
+                            vision_start_token_id,
+                            vision_end_token_id,
+                        );
+                    }
+                } else {
+                    crate::log_error!(
+                        "Vision tower is disabled because no vision weights were found."
+                    );
+                }
             }
         } else {
             crate::log_error!(
@@ -106,6 +167,41 @@ impl Qwen3VLForConditionalGeneration {
             );
         }
 
+        Self::finish_new(
+            config_text,
+            config,
+            vb,
+            comm,
+            dtype,
+            is_rope_i,
+            device,
+            progress_reporter,
+            None,
+            lazy_vision_init,
+            spatial_merge_size,
+            image_token_id,
+            vision_start_token_id,
+            vision_end_token_id,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finish_new(
+        config_text: Config,
+        config: &Config,
+        vb: &VarBuilderX,
+        comm: Rc<Comm>,
+        dtype: DType,
+        is_rope_i: bool,
+        device: &Device,
+        progress_reporter: Arc<RwLock<Box<dyn ProgressLike>>>,
+        eager_vision_model: Option<Qwen3VLVisionModel>,
+        lazy_vision_init: Option<LazyVisionInit>,
+        spatial_merge_size: usize,
+        image_token_id: Option<u32>,
+        vision_start_token_id: u32,
+        vision_end_token_id: u32,
+    ) -> Result<Self> {
         let arch = config
             .architectures
             .as_ref()
@@ -125,7 +221,6 @@ impl Qwen3VLForConditionalGeneration {
         } else if vb.has_key("language_model.model.embed_tokens.weight")
             || vb.has_key("language_model.model.embed_tokens.scales")
         {
-            // MLX-style prefix: language_model.model.*
             Some("language_model.model.".to_string())
         } else {
             Some("model.language_model.".to_string())
@@ -134,7 +229,7 @@ impl Qwen3VLForConditionalGeneration {
         let text_model = match arch {
             "Qwen3VLMoeForConditionalGeneration" => {
                 Qwen3TextModel::MoE(Qwen3MoEForCausalLM::new_with_prefix(
-                    &vb,
+                    vb,
                     comm.clone(),
                     &config_text,
                     dtype,
@@ -146,7 +241,7 @@ impl Qwen3VLForConditionalGeneration {
             }
             "Qwen3_5MoeForConditionalGeneration" => {
                 Qwen3TextModel::MoE35(Qwen3_5MoEForCausalLM::new_with_prefix(
-                    &vb,
+                    vb,
                     comm.clone(),
                     &config_text,
                     dtype,
@@ -158,7 +253,7 @@ impl Qwen3VLForConditionalGeneration {
             }
             "Qwen3_5ForConditionalGeneration" => {
                 Qwen3TextModel::Dense35(Qwen3_5ForCausalLM::new_with_prefix(
-                    &vb,
+                    vb,
                     comm.clone(),
                     &config_text,
                     dtype,
@@ -170,7 +265,7 @@ impl Qwen3VLForConditionalGeneration {
             }
             "Qwen3NextForConditionalGeneration" if next_is_moe => {
                 Qwen3TextModel::MoE35(Qwen3_5MoEForCausalLM::new_with_prefix(
-                    &vb,
+                    vb,
                     comm.clone(),
                     &config_text,
                     dtype,
@@ -182,7 +277,7 @@ impl Qwen3VLForConditionalGeneration {
             }
             "Qwen3NextForConditionalGeneration" => {
                 Qwen3TextModel::Dense35(Qwen3_5ForCausalLM::new_with_prefix(
-                    &vb,
+                    vb,
                     comm.clone(),
                     &config_text,
                     dtype,
@@ -193,7 +288,7 @@ impl Qwen3VLForConditionalGeneration {
                 )?)
             }
             _ => Qwen3TextModel::Dense(Qwen3ForCausalLM::new_with_prefix(
-                &vb,
+                vb,
                 comm.clone(),
                 &config_text,
                 dtype,
@@ -206,12 +301,61 @@ impl Qwen3VLForConditionalGeneration {
 
         Ok(Self {
             text_model,
-            vision_model,
+            vision_model: Mutex::new(eager_vision_model),
+            lazy_vision_init,
             spatial_merge_size,
             image_token_id,
             vision_start_token_id,
             vision_end_token_id,
         })
+    }
+
+    fn ensure_vision_model(&self) -> Result<()> {
+        let mut guard = self.vision_model.lock();
+        if guard.is_some() {
+            return Ok(());
+        }
+        let Some(init) = &self.lazy_vision_init else {
+            return Ok(());
+        };
+        if init.is_gguf {
+            let Some(path) = &init.auxiliary_gguf_path else {
+                return Ok(());
+            };
+            crate::log_info!("Loading vision tower on demand from {}...", path.display());
+            let aux_vb = VarBuilderX::from_gguf_file(path, &init.device)?;
+            let model =
+                Qwen3VLVisionModel::new(&init.vision_config, &aux_vb, init.dtype, &init.device)?;
+            *guard = Some(model);
+        } else {
+            let Some(paths) = &init.safetensors_paths else {
+                return Ok(());
+            };
+            let prefix = init.safetensors_prefix.as_deref().unwrap_or("model.visual");
+            crate::log_info!(
+                "Loading vision tower on demand from safetensors (prefix={})...",
+                prefix
+            );
+            let vb = unsafe {
+                candle_nn::var_builder::ShardedSafeTensors::var_builder(
+                    paths,
+                    init.dtype,
+                    &init.device,
+                )?
+            };
+            let vision_vb = VarBuilderX(
+                either::Either::Left(vb.pp(prefix)),
+                String::new(),
+                None,
+                None,
+                None,
+            );
+            let model =
+                Qwen3VLVisionModel::new(&init.vision_config, &vision_vb, init.dtype, &init.device)?;
+            *guard = Some(model);
+        }
+        crate::log_info!("Vision tower loaded successfully.");
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -234,7 +378,9 @@ impl Qwen3VLForConditionalGeneration {
         let mut deepstack_visual_embeds: Option<Vec<Tensor>> = None;
 
         if let Some(images) = images {
-            let Some(vision_model) = self.vision_model.as_ref() else {
+            self.ensure_vision_model()?;
+            let vision_guard = self.vision_model.lock();
+            let Some(vision_model) = vision_guard.as_ref() else {
                 crate::log_warn!("Ignoring image inputs because the vision tower is disabled.");
                 return match &self.text_model {
                     Qwen3TextModel::Dense(m) => m.forward_with_deepstack(
