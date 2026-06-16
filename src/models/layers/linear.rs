@@ -218,7 +218,7 @@ pub struct QLinear {
 
 impl QLinear {
     fn ggml_dtype_from_str(quant: &str) -> GgmlDType {
-        match quant {
+        match quant.to_lowercase().as_str() {
             "q40" | "q4_0" => GgmlDType::Q4_0,
             "q4" | "q41" | "q4_1" => GgmlDType::Q4_1,
             "q50" | "q5_0" => GgmlDType::Q5_0,
@@ -229,7 +229,10 @@ impl QLinear {
             "q4k" | "q4_k" => GgmlDType::Q4K,
             "q5k" | "q5_k" => GgmlDType::Q5K,
             "q6k" | "q6_k" => GgmlDType::Q6K,
-            _ => panic!("Unsupported GGML data type!"),
+            _ => {
+                crate::log_warn!("ISQ: unknown quant type '{}', defaulting to Q4K", quant);
+                GgmlDType::Q4K
+            }
         }
     }
 
@@ -256,7 +259,11 @@ impl QLinear {
         }
     }
 
-    fn native_quantize_supported(last_dim: usize, quant: &str, device: &Device) -> Result<bool> {
+    pub fn native_quantize_supported(
+        last_dim: usize,
+        quant: &str,
+        device: &Device,
+    ) -> Result<bool> {
         let ggml_dtype = Self::ggml_dtype_from_str(quant);
         let actual_ggml_dtype = if last_dim % ggml_dtype.block_size() == 0 {
             Some(ggml_dtype)
@@ -300,20 +307,13 @@ impl QLinear {
                 let ws = ws.dequantize_f16(&vb.device())?;
                 vb.clear_cache();
                 let chunk_size = ws.shape().dims()[shards.dim] / shards.world_size;
-                if chunk_size % wdtype.block_size() != 0 {
-                    // crate::log_warn!(
-                    //     "Invalid dim_size to chunk {} (start {}, size {}) for block_size {}, switching to Q8_0 format!",
-                    //     ws.shape().dims()[shards.dim],
-                    //     shards.rank * chunk_size,
-                    //     chunk_size,
-                    //     wdtype.block_size()
-                    // );
-                    wdtype = GgmlDType::Q8_0;
-                }
-
                 let ws = ws
                     .narrow(shards.dim, shards.rank * chunk_size, chunk_size)?
                     .contiguous()?;
+                let local_last_dim = ws.dim(candle_core::D::Minus1)?;
+                if local_last_dim % wdtype.block_size() != 0 {
+                    wdtype = GgmlDType::Q8_0;
+                }
                 let qtensor = QTensor::quantize_owned(ws, wdtype)?;
                 Arc::new(qtensor)
             }
@@ -363,17 +363,24 @@ impl QLinear {
                 ws
             } else {
                 let ws = vb.get((num_experts, out_dim, in_dim), "weight")?;
-                let wdtype = ws.dtype();
+                let mut wdtype = ws.dtype();
                 let ws = ws.dequantize_f16(&vb.device())?;
                 vb.clear_cache();
                 let chunk_size = ws.shape().dims()[shards.dim + 1] / shards.world_size;
-                assert!(
-                    chunk_size % wdtype.block_size() == 0,
-                    "chunk position invalid dim {}, start {}, size {}",
-                    ws.shape().dims()[shards.dim],
-                    shards.rank * chunk_size,
-                    chunk_size
-                );
+                if chunk_size % wdtype.block_size() != 0 {
+                    if chunk_size % GgmlDType::Q8_0.block_size() == 0 {
+                        wdtype = GgmlDType::Q8_0;
+                    } else {
+                        candle_core::bail!(
+                            "new_fused: chunk_size {} incompatible with {:?} (block_size {}) \
+                            and Q8_0 (block_size {})",
+                            chunk_size,
+                            wdtype,
+                            wdtype.block_size(),
+                            GgmlDType::Q8_0.block_size()
+                        );
+                    }
+                }
                 let ws = ws
                     .narrow(shards.dim + 1, shards.rank * chunk_size, chunk_size)?
                     .contiguous()?;

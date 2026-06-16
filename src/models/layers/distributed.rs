@@ -109,7 +109,8 @@ pub fn load_restored_gguf_column_linear(
     drop(ws);
     let local_weight = tensor_parallel_chunk(&weight, 0, comm.rank(), comm.world_size(), name)?;
     drop(weight);
-    if local_weight.dim(0)? % wdtype.block_size() != 0 {
+    let last_dim = local_weight.dim(candle_core::D::Minus1)?;
+    if last_dim % wdtype.block_size() != 0 {
         wdtype = GgmlDType::Q8_0;
     }
     let qtensor = QTensor::quantize_owned(local_weight, wdtype)?;
@@ -283,7 +284,8 @@ pub fn load_restored_gguf_merged_qkv_linear(
             comm.world_size(),
             &format!("{name}[{chunk_idx}]"),
         )?;
-        if local_chunk.dim(0)? % wdtype.block_size() != 0 {
+        let chunk_last_dim = local_chunk.dim(candle_core::D::Minus1)?;
+        if chunk_last_dim % wdtype.block_size() != 0 {
             wdtype = GgmlDType::Q8_0;
         }
         local_chunks.push(local_chunk);
@@ -698,7 +700,7 @@ impl MergedParallelColumnLinear {
         let mut output_splits: Option<Vec<usize>> = None;
         use crate::models::layers::linear::{LinearX, LnFp8, QLinear};
         match vb.0 {
-            Either::Left(v) => {
+            Either::Left(ref v) => {
                 if is_fp8_quant {
                     if chunk_dim != 0 {
                         candle_core::bail!(
@@ -1108,7 +1110,27 @@ impl MergedParallelColumnLinear {
                     vec_linear.push(ln);
                     output_splits = Some(local_output_splits);
                 } else {
-                    let weight = v.get((out_dim, in_dim), "weight")?;
+                    let target_device = v.device().clone();
+                    let use_native = if let Some(quantized_type) = quant {
+                        let sample_last_dim = if chunk_dim == 0 {
+                            in_dim
+                        } else {
+                            chunks[0] / comm.world_size()
+                        };
+                        QLinear::native_quantize_supported(
+                            sample_last_dim,
+                            quantized_type,
+                            &target_device,
+                        )?
+                    } else {
+                        true
+                    };
+                    let load_vb = if use_native {
+                        v.clone()
+                    } else {
+                        vb.cpu_var_builder().unwrap_or_else(|| v.clone())
+                    };
+                    let weight = load_vb.get((out_dim, in_dim), "weight")?;
                     let weight = if weight.dtype() != dtype {
                         weight.to_dtype(dtype)?
                     } else {
@@ -1153,7 +1175,16 @@ impl MergedParallelColumnLinear {
                             } else {
                                 quantized_type.clone()
                             };
-                            LinearX::QLinear(QLinear::from_linear_x(ln, quantized_type, dtype)?)
+                            if use_native {
+                                LinearX::QLinear(QLinear::from_linear_x(ln, quantized_type, dtype)?)
+                            } else {
+                                LinearX::QLinear(QLinear::from_linear_x_on_device(
+                                    ln,
+                                    quantized_type,
+                                    dtype,
+                                    &target_device,
+                                )?)
+                            }
                         } else {
                             LinearX::Linear(ln)
                         };

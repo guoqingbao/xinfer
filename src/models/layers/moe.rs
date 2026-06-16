@@ -602,21 +602,16 @@ pub struct FusedMoeGGUF {
     dtype: DType,
 }
 
+/// Dtypes supported by `moe_gemm_gguf` kernel and `QTensor::quantize`.
 fn can_quantize_to(dtype: GgmlDType) -> bool {
     matches!(
         dtype,
-        GgmlDType::Q4_0
-            | GgmlDType::Q4_1
-            | GgmlDType::Q5_0
-            | GgmlDType::Q5_1
-            | GgmlDType::Q8_0
-            | GgmlDType::Q8_1
-            | GgmlDType::Q2K
+        GgmlDType::Q2K
             | GgmlDType::Q3K
             | GgmlDType::Q4K
             | GgmlDType::Q5K
             | GgmlDType::Q6K
-            | GgmlDType::Q8K
+            | GgmlDType::Q8_0
     )
 }
 
@@ -626,11 +621,9 @@ fn closest_quantizable_dtype(orig: GgmlDType) -> GgmlDType {
     }
     let bpw = orig.type_size() as f64 * 8.0 / orig.block_size() as f64;
     let candidates = [
-        (GgmlDType::Q2K, 2.5625),
+        (GgmlDType::Q2K, 2.625),
         (GgmlDType::Q3K, 3.4375),
-        (GgmlDType::Q4_0, 4.5),
         (GgmlDType::Q4K, 4.5),
-        (GgmlDType::Q5_0, 5.5),
         (GgmlDType::Q5K, 5.5),
         (GgmlDType::Q6K, 6.5625),
         (GgmlDType::Q8_0, 8.5),
@@ -752,20 +745,36 @@ impl FusedMoeGGUF {
             };
 
         let cur_chunk_size = if comm.rank() * moe_intermediate_chunk + moe_intermediate_chunk
-            < moe_cfg.moe_intermediate_size
+            <= moe_cfg.moe_intermediate_size
         {
             moe_intermediate_chunk
         } else {
             moe_cfg.moe_intermediate_size - comm.rank() * moe_intermediate_chunk
         };
 
-        assert!(cur_chunk_size > 0 && cur_chunk_size % block_size == 0,
-            "Unable to split moe_intermediate_size {} into {} ranks under block_size of {}! \n \
-            \t*****Tips: you may try these gglm types: `q8_0` (recommend), `q4_0`, `q4_1`, `q5_0`, `q5_1` (with smaller block_size 32)",
-            moe_cfg.moe_intermediate_size,
-            comm.world_size(),
-            block_size
-        );
+        let (ggml_dtype, high_precision_dtype, cur_chunk_size) = if cur_chunk_size == 0
+            || cur_chunk_size % block_size != 0
+        {
+            let fb = GgmlDType::Q8_0;
+            let fb_bs = fb.block_size();
+            let fb_chunk = moe_cfg.moe_intermediate_size / comm.world_size();
+            let fb_cur = if comm.rank() * fb_chunk + fb_chunk <= moe_cfg.moe_intermediate_size {
+                fb_chunk
+            } else {
+                moe_cfg.moe_intermediate_size - comm.rank() * fb_chunk
+            };
+            assert!(
+                    fb_cur > 0 && fb_cur % fb_bs == 0,
+                    "Unable to split moe_intermediate_size {} into {} ranks under block_size of {}! \n \
+                    \t*****Tips: you may try these gglm types: `q8_0` (recommend), `q4_0`, `q4_1`, `q5_0`, `q5_1` (with smaller block_size 32)",
+                    moe_cfg.moe_intermediate_size,
+                    comm.world_size(),
+                    fb_bs
+                );
+            (fb, fb, fb_cur)
+        } else {
+            (ggml_dtype, high_precision_dtype, cur_chunk_size)
+        };
 
         let (gate_experts, up_experts, down_experts) = (
             gate_experts
@@ -1158,12 +1167,34 @@ impl FusedMoeISQ {
             (gate_experts, up_experts, down_experts)
         };
 
-        let gate_experts = QTensor::quantize(&gate_experts, quant_type)?;
-        let up_experts = QTensor::quantize(&up_experts, quant_type)?;
-        let down_experts = QTensor::quantize(
-            &down_experts,
-            isq_high_precision_dtype(cfg.quant.as_deref()),
-        )?;
+        let gate_last_dim = gate_experts.dim(candle_core::D::Minus1)?;
+        let gate_up_quant_type = if gate_last_dim % quant_type.block_size() == 0 {
+            quant_type
+        } else if gate_last_dim % GgmlDType::Q8_0.block_size() == 0 {
+            GgmlDType::Q8_0
+        } else {
+            candle_core::bail!(
+                "ISQ MoE gate/up last dim {} incompatible with any GGUF block size",
+                gate_last_dim
+            );
+        };
+        let down_last_dim = down_experts.dim(candle_core::D::Minus1)?;
+        let hp_dtype = isq_high_precision_dtype(cfg.quant.as_deref());
+        let down_quant_type = if down_last_dim % hp_dtype.block_size() == 0 {
+            hp_dtype
+        } else if down_last_dim % quant_type.block_size() == 0 {
+            quant_type
+        } else if down_last_dim % GgmlDType::Q8_0.block_size() == 0 {
+            GgmlDType::Q8_0
+        } else {
+            candle_core::bail!(
+                "ISQ MoE down_experts last dim {} incompatible with any GGUF block size",
+                down_last_dim
+            );
+        };
+        let gate_experts = QTensor::quantize(&gate_experts, gate_up_quant_type)?;
+        let up_experts = QTensor::quantize(&up_experts, gate_up_quant_type)?;
+        let down_experts = QTensor::quantize(&down_experts, down_quant_type)?;
         let world_size = comm.world_size();
 
         Ok(Self {
@@ -1227,12 +1258,34 @@ impl FusedMoeISQ {
         let (gate_experts, up_experts, down_experts) =
             FusedMoe::load_packed(cfg, experts_vb, comm.clone())?;
 
-        let gate_experts = QTensor::quantize(&gate_experts, quant_type)?;
-        let up_experts = QTensor::quantize(&up_experts, quant_type)?;
-        let down_experts = QTensor::quantize(
-            &down_experts,
-            isq_high_precision_dtype(cfg.quant.as_deref()),
-        )?;
+        let gate_last_dim = gate_experts.dim(candle_core::D::Minus1)?;
+        let gate_up_quant_type = if gate_last_dim % quant_type.block_size() == 0 {
+            quant_type
+        } else if gate_last_dim % GgmlDType::Q8_0.block_size() == 0 {
+            GgmlDType::Q8_0
+        } else {
+            candle_core::bail!(
+                "ISQ MoE gate/up last dim {} incompatible with any GGUF block size",
+                gate_last_dim
+            );
+        };
+        let down_last_dim = down_experts.dim(candle_core::D::Minus1)?;
+        let hp_dtype = isq_high_precision_dtype(cfg.quant.as_deref());
+        let down_quant_type = if down_last_dim % hp_dtype.block_size() == 0 {
+            hp_dtype
+        } else if down_last_dim % quant_type.block_size() == 0 {
+            quant_type
+        } else if down_last_dim % GgmlDType::Q8_0.block_size() == 0 {
+            GgmlDType::Q8_0
+        } else {
+            candle_core::bail!(
+                "ISQ MoE down_experts last dim {} incompatible with any GGUF block size",
+                down_last_dim
+            );
+        };
+        let gate_experts = QTensor::quantize(&gate_experts, gate_up_quant_type)?;
+        let up_experts = QTensor::quantize(&up_experts, gate_up_quant_type)?;
+        let down_experts = QTensor::quantize(&down_experts, down_quant_type)?;
         let world_size = comm.world_size();
 
         Ok(Self {
