@@ -389,9 +389,27 @@ impl CustomOp1 for AllReduce {
                         full_len
                     );
                 }
-                // Slice to only the valid elements (handles narrow/view tensors)
                 let src_slice = full_slice.slice(start_offset..end_offset);
                 let mut dst = unsafe { dev.alloc::<f16>(elem_count) }.w()?;
+                self.comm
+                    .all_reduce(&src_slice, &mut dst, &ReduceOp::Sum)
+                    .map_err(candle_core::Error::debug)?;
+                candle_core::CudaStorage::wrap_cuda_slice(dst, dev)
+            }
+            DType::F32 => {
+                let full_slice = s.as_cuda_slice::<f32>()?;
+                let full_len = full_slice.len();
+                let end_offset = start_offset.saturating_add(elem_count);
+                if end_offset > full_len {
+                    candle_core::bail!(
+                        "all_reduce F32 slice out of bounds: start={}, elem_count={}, len={}",
+                        start_offset,
+                        elem_count,
+                        full_len
+                    );
+                }
+                let src_slice = full_slice.slice(start_offset..end_offset);
+                let mut dst = unsafe { dev.alloc::<f32>(elem_count) }.w()?;
                 self.comm
                     .all_reduce(&src_slice, &mut dst, &ReduceOp::Sum)
                     .map_err(candle_core::Error::debug)?;
