@@ -652,20 +652,9 @@ impl<M: CudaGraphModule> GraphCapturer<M> {
                 if should_capture {
                     self.model.end_capture(!phase.is_warmup())?;
                 }
-
-                // Synchronize after each warmup forward pass. Without this,
-                // async kernels from one batch-size iteration may still be
-                // using shared workspace buffers (FlashInfer decode plan/run)
-                // when the next iteration overwrites them, causing
-                // CUDA_ERROR_ILLEGAL_ADDRESS during graph capture.
-                // This only runs during warmup phases (CachePrewarm + Warmup),
-                // not during the final Capture phase where kernels are
-                // recorded into the graph and ordering is guaranteed.
-                #[cfg(feature = "cuda")]
-                if phase.is_warmup() {
-                    device.synchronize()?;
-                }
             }
+            #[cfg(feature = "cuda")]
+            device.synchronize()?;
         }
         let _ = self.model.report_graph_pool_usage();
         crate::log_warn!("Captured batches {:?}", outputs.keys());
