@@ -140,6 +140,7 @@ Add `--kvcache-dtype` to compress KV cache and extend context length:
 * ✅ GLM4 (0414, **Not ChatGLM**)
 * ✅ GLM4 MoE (4.6/4.7)
 * ✅ GLM4.7 Flash
+* ✅ GLM 5.2 (DeepSeek V3.2 DSA architecture)
 * ✅ DeepSeek V3/R1/V3.2
 * ✅ Phi3 / Phi4 (Phi-3, Phi-4, Phi-4-mini, etc.)
 * ✅ Gemma3/**Gemma4** (Multimodal model)
@@ -226,6 +227,9 @@ xinfer --m unsloth/gemma-4-26b-a4b-it-NVFP4
 
 # MLA model (GLM4.7 Flash)
 xinfer --m GadflyII/GLM-4.7-Flash-NVFP4
+
+# GLM 5.2 (DeepSeek V3.2 architecture, FP8)
+xinfer --d 0,1,2,3 --m zai-org/GLM-5.2-FP8 --kvcache-dtype fp8
 
 # Interactive CLI chat
 xinfer --i --m unsloth/Qwen3.5-27B-GGUF --f Qwen3.5-27B-Q4_K_M.gguf
@@ -535,7 +539,8 @@ XINFER_NVFP4_FORCE_LUT=1 xinfer --m nvidia/Qwen3-30B-A3B-FP4 --ui-server
 * [x] FP8 KV Cache (with FlashInfer, SM80+)
 * [x] TurboQuant KV Cache (2-4 bit compression with WHT rotation)
 * [x] FP8 Models (CUDA: MoE, Dense; Metal: Dense)
-* [ ] Additional model support (Kimi K2, GLM 5.1 etc.)
+* [x] GLM 5.2 (DeepSeek V3.2 + DSA)
+* [ ] Additional model support (Kimi K2, etc.)
 * [x] CPU KV Cache Offloading
 * [x] Prefill-decode Disaggregation (CUDA)
 * [x] Prefill-decode Disaggregation (Metal)

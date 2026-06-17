@@ -139,6 +139,7 @@ xinfer --w /home/Qwen3.6-35B-A3B --d 0,1 --ui-server --mtp 2
 * ✅ GLM4（0414 版本，**非 ChatGLM**）
 * ✅ GLM4 MoE（4.6/4.7）
 * ✅ GLM4.7 Flash
+* ✅ GLM 5.2（DeepSeek V3.2 DSA 架构）
 * ✅ DeepSeek V3/R1/V3.2
 * ✅ Phi3 / Phi4（Phi-3、Phi-4、Phi-4-mini 等）
 * ✅ Gemma3/**Gemma4**（多模态）
@@ -225,6 +226,9 @@ xinfer --m unsloth/gemma-4-26b-a4b-it-NVFP4
 
 # MLA 模型（GLM4.7 Flash）
 xinfer --m GadflyII/GLM-4.7-Flash-NVFP4
+
+# GLM 5.2（DeepSeek V3.2 架构，FP8）
+xinfer --d 0,1,2,3 --m zai-org/GLM-5.2-FP8
 
 # 交互式 CLI 对话
 xinfer --i --m unsloth/Qwen3.5-27B-GGUF --f Qwen3.5-27B-Q4_K_M.gguf
@@ -533,7 +537,8 @@ XINFER_NVFP4_FORCE_LUT=1 xinfer --m nvidia/Qwen3-30B-A3B-FP4 --ui-server
 * [x] FP8 KV Cache（FlashInfer，SM80+）
 * [x] TurboQuant KV Cache（2-4 位压缩，WHT 旋转量化）
 * [x] FP8 模型（CUDA: MoE, Dense; Metal: Dense）
-* [ ] 支持更多模型类型（Kimi K2、GLM 5.1 等）
+* [x] **GLM 5.2（DeepSeek V3.2 + DSA）**
+* [ ] 支持更多模型类型（Kimi K2 等）
 * [x] CPU KV Cache 卸载
 * [x] PD（Prefill/Decode）分离（CUDA）
 * [x] PD（Prefill/Decode）分离（Metal）
