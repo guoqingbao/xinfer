@@ -1,4 +1,5 @@
 use crate::models::layers::distributed::{shard, Comm, ReplicatedLinear};
+use crate::models::layers::indexer::{DsaIndexer, IndexerConfig};
 use crate::models::layers::others::{rms_norm, NormX};
 use crate::models::layers::rotary_emb::ApplyRotaryEmbedding;
 use crate::models::layers::VarBuilderX;
@@ -18,6 +19,10 @@ pub struct MlaConfig {
     pub v_head_dim: usize,
     pub rms_norm_eps: f64,
     pub attention_bias: bool,
+    pub index_head_dim: Option<usize>,
+    pub index_n_heads: Option<usize>,
+    pub index_topk: Option<usize>,
+    pub index_skip_topk_offset: Option<usize>,
 }
 
 impl MlaConfig {
@@ -53,6 +58,22 @@ impl MlaConfig {
                 .unwrap_or(128) as usize,
             rms_norm_eps: config.rms_norm_eps,
             attention_bias: config.attention_bias.unwrap_or(false),
+            index_head_dim: extra
+                .get("index_head_dim")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize),
+            index_n_heads: extra
+                .get("index_n_heads")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize),
+            index_topk: extra
+                .get("index_topk")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize),
+            index_skip_topk_offset: extra
+                .get("index_skip_topk_offset")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize),
         }
     }
 }
@@ -80,6 +101,7 @@ pub struct MlaAttention {
     rope_theta: f32,
     promote_qk_to_f32: bool,
     dtype: DType,
+    indexer: Option<DsaIndexer>,
 }
 
 impl MlaAttention {
@@ -222,6 +244,23 @@ impl MlaAttention {
             }
         }
 
+        // Load DSA indexer if present
+        let indexer = if mla_cfg.index_head_dim.is_some() && vb.pp("indexer").has_key("wq_b.weight")
+        {
+            let idx_cfg = IndexerConfig {
+                index_head_dim: mla_cfg.index_head_dim.unwrap(),
+                index_n_heads: mla_cfg.index_n_heads.unwrap_or(4),
+                index_topk: mla_cfg.index_topk.unwrap_or(2048),
+                index_skip_topk_offset: mla_cfg.index_skip_topk_offset.unwrap_or(1),
+                qk_rope_head_dim,
+                q_lora_rank: mla_cfg.q_lora_rank.unwrap_or(256),
+                hidden_size,
+            };
+            Some(DsaIndexer::new(vb.pp("indexer"), config, idx_cfg, dtype)?)
+        } else {
+            None
+        };
+
         Ok(Self {
             q_a_proj,
             q_a_layernorm,
@@ -244,6 +283,7 @@ impl MlaAttention {
             rope_theta: config.rope_theta.unwrap_or(10000.0) as f32,
             promote_qk_to_f32: is_qvar_builder || config.higher_precision_required(),
             dtype,
+            indexer,
         })
     }
 
@@ -278,15 +318,16 @@ impl MlaAttention {
     ) -> Result<Tensor> {
         let (seq_len, _) = xs.dims2()?;
 
-        // Q projection
-        let q = if let (Some(q_a), Some(q_a_ln), Some(q_b)) =
+        // Q projection — keep q_resid for DSA indexer
+        let (q, q_resid) = if let (Some(q_a), Some(q_a_ln), Some(q_b)) =
             (&self.q_a_proj, &self.q_a_layernorm, &self.q_b_proj)
         {
             let q_a_out = q_a.forward(xs)?;
             let q_a_normed = q_a_ln.forward(&q_a_out)?;
-            q_b.forward(&q_a_normed)?
+            let q = q_b.forward(&q_a_normed)?;
+            (q, Some(q_a_normed))
         } else {
-            self.q_proj.as_ref().unwrap().forward(xs)?
+            (self.q_proj.as_ref().unwrap().forward(xs)?, None)
         };
 
         let q = q.reshape((seq_len, self.num_heads, self.q_head_dim))?;
@@ -352,6 +393,46 @@ impl MlaAttention {
                 let q_pe = q_pe.to_dtype(self.dtype)?;
 
                 let page_size = ckv_cache.dim(1)?;
+
+                // Returns None when seq_len <= topk (dense is equivalent).
+                // Decode always uses the dense FlashInfer path.
+                if input_metadata.is_prefill {
+                    if let (Some(indexer), Some(q_res)) = (&self.indexer, &q_resid) {
+                        if let Some(block_tables) = &input_metadata.block_tables {
+                            if let Some(context_lens) = &input_metadata.context_lens {
+                                if let Some(topk_idxs) =
+                                    indexer.forward(xs, q_res, rotary_emb, positions)?
+                                {
+                                    let ckv_cache_3d = ckv_cache.squeeze(2)?;
+                                    let kpe_cache_3d = kpe_cache.squeeze(2)?;
+
+                                    let cu_seqlens_q =
+                                        input_metadata.cu_seqlens_q.as_ref().ok_or_else(|| {
+                                            candle_core::Error::msg(
+                                                "MLA sparse prefill requires cu_seqlens_q",
+                                            )
+                                        })?;
+
+                                    // All tensors are already U32 from the scheduler —
+                                    // no dtype conversion needed.
+                                    let attn_out = attention_rs::mla::mla_sparse_paged_prefill(
+                                        &q_nope_absorbed,
+                                        &q_pe,
+                                        &ckv_cache_3d,
+                                        &kpe_cache_3d,
+                                        block_tables,
+                                        context_lens,
+                                        cu_seqlens_q,
+                                        &topk_idxs,
+                                        self.sm_scale,
+                                    )?;
+
+                                    return self.project_mla_output(&attn_out, seq_len, xs.dtype());
+                                }
+                            }
+                        }
+                    }
+                }
 
                 let attn_out = if input_metadata.is_prefill {
                     let plan_info = fm.mla_prefill_plan_info.as_ref().ok_or_else(|| {
@@ -433,36 +514,54 @@ impl MlaAttention {
             if let (Some(block_tables), Some(context_lens)) =
                 (&input_metadata.block_tables, &input_metadata.context_lens)
             {
-                let block_tables_i32 = block_tables.to_dtype(DType::I64)?.to_dtype(DType::U32)?;
-                let context_lens_i32 = context_lens.to_dtype(DType::I64)?.to_dtype(DType::U32)?;
+                // block_tables, context_lens, cu_seqlens_q are already U32 from
+                // the scheduler — pass directly to CUDA kernels without conversion.
 
                 if input_metadata.is_prefill {
                     let cu_seqlens_q = input_metadata.cu_seqlens_q.as_ref().ok_or_else(|| {
                         candle_core::Error::msg("MLA fused prefill requires cu_seqlens_q")
                     })?;
-                    let cu_seqlens_i32 = cu_seqlens_q.to_dtype(DType::I64)?.to_dtype(DType::U32)?;
+
+                    if let (Some(indexer), Some(q_res)) = (&self.indexer, &q_resid) {
+                        if let Some(topk_idxs) =
+                            indexer.forward(xs, q_res, rotary_emb, positions)?
+                        {
+                            let attn_out = attention_rs::mla::mla_sparse_paged_prefill(
+                                &q_absorbed,
+                                &q_pe,
+                                &ckv_cache_3d,
+                                &kpe_cache_3d,
+                                block_tables,
+                                context_lens,
+                                cu_seqlens_q,
+                                &topk_idxs,
+                                self.sm_scale,
+                            )?;
+                            return self.project_mla_output(&attn_out, seq_len, xs.dtype());
+                        }
+                    }
 
                     let attn_out = attention_rs::mla::mla_paged_prefill(
                         &q_absorbed,
                         &q_pe,
                         &ckv_cache_3d,
                         &kpe_cache_3d,
-                        &block_tables_i32,
-                        &context_lens_i32,
-                        &cu_seqlens_i32,
+                        block_tables,
+                        context_lens,
+                        cu_seqlens_q,
                         self.sm_scale,
                     )?;
                     return self.project_mla_output(&attn_out, seq_len, xs.dtype());
                 }
 
-                // Decode path
+                // Decode: always dense MLA (DSA sparse is prefill-only)
                 let attn_out = attention_rs::mla::mla_paged_decode(
                     &q_absorbed,
                     &q_pe,
                     &ckv_cache_3d,
                     &kpe_cache_3d,
-                    &block_tables_i32,
-                    &context_lens_i32,
+                    block_tables,
+                    context_lens,
                     self.sm_scale,
                 )?;
                 return self.project_mla_output(&attn_out, seq_len, xs.dtype());
@@ -470,8 +569,22 @@ impl MlaAttention {
 
             // Pure prefill without block_tables (first prefill, no cached prefix)
             if input_metadata.is_prefill {
-                let attn_out =
-                    self.mla_sdp_prefill(&q_absorbed, &q_pe, &ckv, &k_pe, input_metadata)?;
+                // DSA indexer for sparse SDP attention
+                let dsa_topk_indices =
+                    if let (Some(indexer), Some(q_res)) = (&self.indexer, &q_resid) {
+                        indexer.forward(xs, q_res, rotary_emb, positions)?
+                    } else {
+                        None
+                    };
+
+                let attn_out = self.mla_sdp_prefill(
+                    &q_absorbed,
+                    &q_pe,
+                    &ckv,
+                    &k_pe,
+                    input_metadata,
+                    dsa_topk_indices.as_ref(),
+                )?;
                 let y = attn_out.to_dtype(xs.dtype())?;
                 return self.o_proj.forward(&y);
             }
@@ -479,7 +592,8 @@ impl MlaAttention {
         candle_core::bail!("MLA attention requires CUDA platform!")
     }
 
-    /// SDP prefill in absorbed compressed space (no paged cache, first prefill).
+    /// SDP prefill in absorbed compressed space.
+    /// When `dsa_topk_indices` is provided, applies DSA sparse mask.
     #[cfg(feature = "cuda")]
     fn mla_sdp_prefill(
         &self,
@@ -488,6 +602,7 @@ impl MlaAttention {
         ckv: &Tensor,
         k_pe: &Tensor,
         input_metadata: &InputMetadata,
+        dsa_topk_indices: Option<&Tensor>,
     ) -> Result<Tensor> {
         let cu_seqlens = input_metadata
             .cu_seqlens_q
@@ -527,15 +642,22 @@ impl MlaAttention {
 
             let dev = scores.device().clone();
             let scores_dtype = scores.dtype();
-            let mut mask_data = vec![0.0f32; slen * slen];
-            for qi in 0..slen {
-                for ki in (qi + 1)..slen {
-                    mask_data[qi * slen + ki] = f32::NEG_INFINITY;
-                }
-            }
-            let causal_mask =
-                Tensor::from_vec(mask_data, (1, slen, slen), &dev)?.to_dtype(scores_dtype)?;
-            let scores = scores.broadcast_add(&causal_mask)?;
+
+            let mask = if let Some(topk_idxs) = dsa_topk_indices {
+                DsaIndexer::build_sparse_mask(
+                    &topk_idxs.narrow(0, start, slen)?,
+                    slen,
+                    slen,
+                    scores_dtype,
+                )?
+            } else {
+                // GPU causal mask
+                let causal = Tensor::zeros((slen, slen), scores_dtype, &dev)?;
+                attention_rs::mask::causal_mask(&causal, None)?;
+                causal.unsqueeze(0)?
+            };
+
+            let scores = scores.broadcast_add(&mask)?;
 
             let attn_weights = candle_nn::ops::softmax_last_dim(&scores.to_dtype(DType::F32)?)?
                 .to_dtype(self.dtype)?;

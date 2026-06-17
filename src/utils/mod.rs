@@ -1365,6 +1365,19 @@ pub fn init_config_tokenizer(
             }
         }
 
+        // Extract rope_theta from rope_parameters for models that use that format (e.g. GlmMoeDsa)
+        if config.rope_theta.is_none() {
+            if let Some(ref extra) = config.extra_config_json {
+                if let Ok(root) = serde_json::from_str::<serde_json::Value>(extra) {
+                    if let Some(rp) = root.get("rope_parameters") {
+                        if let Some(theta) = rp.get("rope_theta").and_then(|v| v.as_f64()) {
+                            config.rope_theta = Some(theta);
+                        }
+                    }
+                }
+            }
+        }
+
         if let Some(qcfg) = &mut config.quantization_config {
             qcfg.normalize_compressed_tensors();
             if let Some(mode) = &qcfg.mode {
@@ -1408,6 +1421,7 @@ pub fn init_config_tokenizer(
                     | "DeepseekV3ForCausalLM"
                     | "DeepseekV32ForCausalLM"
                     | "DeepseekForCausalLM"
+                    | "GlmMoeDsaForCausalLM"
                     | "Qwen3_5MoeForCausalLM"
                     | "Qwen3_5MoeForConditionalGeneration"
                     | "Qwen3NextForCausalLM"
@@ -1824,7 +1838,11 @@ pub fn is_no_cuda_graph_supprt(architectures: String) -> bool {
 
     #[cfg(not(feature = "flashinfer"))]
     {
-        black_list.extend(vec!["Glm4MoeLiteForCausalLM", "DeepseekV3ForCausalLM"]);
+        black_list.extend(vec![
+            "Glm4MoeLiteForCausalLM",
+            "DeepseekV3ForCausalLM",
+            "GlmMoeDsaForCausalLM",
+        ]);
     }
 
     black_list.contains(&architectures.as_str())
@@ -1845,6 +1863,7 @@ pub fn get_arch_rope(
         ("DeepseekV3ForCausalLM", false),
         ("DeepseekV32ForCausalLM", false),
         ("DeepseekForCausalLM", false),
+        ("GlmMoeDsaForCausalLM", true),
         ("Phi3ForCausalLM", false),
         ("Phi4ForCausalLM", false),
         ("MistralForCausalLM", false),
@@ -1964,8 +1983,16 @@ pub fn get_arch_rope(
         "DeepseekV3ForCausalLM"
         | "DeepseekV32ForCausalLM"
         | "DeepseekForCausalLM"
+        | "GlmMoeDsaForCausalLM"
         | "deepseek3"
-        | "deepseek" => (ModelType::DeepSeek, "<|User|>{}<|Assistant|>".to_string()),
+        | "deepseek" => {
+            let chat_tmpl = if arch == "GlmMoeDsaForCausalLM" {
+                "[gMASK]<sop><|user|>{}<|assistant|>".to_string()
+            } else {
+                "<|User|>{}<|Assistant|>".to_string()
+            };
+            (ModelType::DeepSeek, chat_tmpl)
+        }
         "Phi3ForCausalLM" | "Phi4ForCausalLM" | "phi3" | "phi4" => {
             (ModelType::Phi4, "<|user|>\n{}<|assistant|>".to_string())
         }
