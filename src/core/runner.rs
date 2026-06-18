@@ -1506,15 +1506,34 @@ impl ModelRunner {
         let mut context_lens = Vec::new();
 
         let seq_refs: Vec<&'a S> = seqs.into_iter().collect(); // only references, no clone
+        let mut active_block_tables = Vec::with_capacity(seq_refs.len());
 
         for seq in &seq_refs {
+            let seq_len = seq.len();
+            if seq_len == 0 {
+                candle_core::bail!("Cannot decode an empty sequence");
+            }
+            let active_num_blocks = seq_len.div_ceil(self.config.block_size);
+            let block_table = seq.block_table();
+            if active_num_blocks > block_table.len() {
+                candle_core::bail!(
+                    "Decode sequence {} needs {} KV blocks for {} tokens, but only {} are allocated",
+                    seq.id(),
+                    active_num_blocks,
+                    seq_len,
+                    block_table.len()
+                );
+            }
+            let active_block_table = block_table[..active_num_blocks].to_vec();
+            let last_block_tokens = (seq_len - 1) % self.config.block_size + 1;
+            let last_block = active_block_table[active_num_blocks - 1];
+
             input_ids.push(seq.last_token());
-            positions.push((seq.len() - 1) as i64);
-            context_lens.push(seq.len() as u32);
-            let slot = seq.block_table_last() * self.config.block_size as u32
-                + seq.last_block_tokens() as u32
-                - 1;
+            positions.push((seq_len - 1) as i64);
+            context_lens.push(seq_len as u32);
+            let slot = last_block * self.config.block_size as u32 + last_block_tokens as u32 - 1;
             slot_mapping.push(slot as i64);
+            active_block_tables.push(active_block_table);
         }
 
         // Create tensors
@@ -1527,7 +1546,20 @@ impl ModelRunner {
 
         let slot_mapping = Tensor::from_vec(slot_mapping, (s_len,), &self.device)?;
         let context_lens = Tensor::from_vec(context_lens, (c_len,), &self.device)?;
-        let block_tables = self.prepare_block_tables(seq_refs.clone())?;
+        let max_active_blocks = active_block_tables.iter().map(Vec::len).max().unwrap_or(0);
+        let mut flat_block_tables = Vec::with_capacity(seq_refs.len() * max_active_blocks);
+        for block_table in &active_block_tables {
+            flat_block_tables.extend_from_slice(block_table);
+            flat_block_tables.resize(
+                flat_block_tables.len() + max_active_blocks - block_table.len(),
+                0,
+            );
+        }
+        let block_tables = Tensor::from_vec(
+            flat_block_tables,
+            (seq_refs.len(), max_active_blocks),
+            &self.device,
+        )?;
 
         #[cfg(feature = "flashinfer")]
         let flashinfer_metadata = if self.flashinfer_kv_params.is_some() {
@@ -1550,8 +1582,7 @@ impl ModelRunner {
             let mut indptr = vec![0u32];
             let mut indices = Vec::new();
             let mut last_len = Vec::new();
-            for seq in &seq_refs {
-                let bt = seq.block_table();
+            for (seq, bt) in seq_refs.iter().zip(active_block_tables.iter()) {
                 indices.extend(bt.iter().map(|&x| x as u32));
                 indptr.push(indices.len() as u32);
                 let len = seq.len();

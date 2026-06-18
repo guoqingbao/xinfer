@@ -205,14 +205,31 @@ impl ModelRunner {
 
         #[cfg(feature = "flashinfer")]
         let flashinfer_metadata = if let Some(params) = self.flashinfer_kv_params() {
-            let num_pages = seq_info.block_table.len();
+            let num_pages = (total_kv_len as usize).div_ceil(params.page_size);
+            if num_pages > seq_info.block_table.len() {
+                candle_core::bail!(
+                    "MTP verify needs {} KV pages for {} tokens, but only {} pages are allocated",
+                    num_pages,
+                    total_kv_len,
+                    seq_info.block_table.len()
+                );
+            }
             let indptr_host = vec![0u32, num_pages as u32];
-            let indices_vec: Vec<u32> = seq_info.block_table.clone();
-            let last_page_tokens =
-                total_kv_len as usize - (num_pages.saturating_sub(1)) * params.page_size;
+            let indices_vec = seq_info.block_table[..num_pages].to_vec();
+            let last_page_tokens = if total_kv_len == 0 {
+                0
+            } else {
+                (total_kv_len as usize - 1) % params.page_size + 1
+            };
             let last_len_host = vec![last_page_tokens as u32];
             let kv_len_arr_host = vec![total_kv_len];
             let q_cu_seqlens_host = vec![0u32, q_len as u32];
+            let batch_indices = Tensor::zeros((q_len,), candle_core::DType::U32, self.device())?;
+            let append_positions = Tensor::from_vec(
+                (seq_info.len as u32..total_kv_len).collect::<Vec<_>>(),
+                (q_len,),
+                self.device(),
+            )?;
 
             #[cfg(all(feature = "cuda", feature = "graph"))]
             let use_graph = self
@@ -251,8 +268,11 @@ impl ModelRunner {
                 last_len_host: Some(last_len_host),
                 kv_len_arr_host: Some(kv_len_arr_host),
                 total_num_rows: Some(q_len as u32),
-                batch_indices: None,
-                positions: None,
+                // FlashInfer's multi-token append path is selected only when both
+                // tensors are present. Without them it falls back to decode append,
+                // which writes one KV row per sequence instead of all verify rows.
+                batch_indices: Some(batch_indices),
+                positions: Some(append_positions),
                 use_cuda_graph: use_graph,
                 decode_plan_info: None,
                 prefill_plan_info,
@@ -627,9 +647,10 @@ impl ModelRunner {
 
         if verify_result.num_accepted < verify_result.num_proposed {
             let commit_len = 1 + verify_result.num_accepted;
-            // KV cache does not need explicit rollback because the next decode writes
-            // the continuation token at the first rejected slot and stale later slots
-            // are outside the sequence length.
+            // Full-attention KV cache does not need explicit rollback: the next cycle's
+            // verify will overwrite rejected positions via append_kv_cache before the
+            // attention kernel reads them, and FlashInfer uses kCausal masking.
+            // GDN/Mamba state, however, is mutated in-place and must be rolled back.
             let restored = self.mtp_rollback_mamba(seq_info.id, commit_len)?;
             if !restored {
                 candle_core::bail!(

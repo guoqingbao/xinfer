@@ -31,7 +31,6 @@ use crate::utils::{get_runner_path, init_config_tokenizer, spawn_runner};
 use crate::{log_info, log_warn};
 use candle_core::{DType, Result};
 use colored::Colorize;
-use either::Either;
 use futures::future::join_all;
 use interprocess::local_socket::traits::Listener;
 use interprocess::local_socket::{GenericNamespaced, ToNsName};
@@ -1240,40 +1239,71 @@ impl LLMEngine {
         is_prefill: bool,
         multi_output_ids: Vec<Vec<u32>>,
     ) -> Result<usize> {
-        pub struct DecodedIds(Either<Vec<usize>, Vec<usize>>);
+        if scheduled_ids.len() != multi_output_ids.len() {
+            candle_core::bail!(
+                "Forward output count mismatch: {} scheduled sequence(s), {} output row(s)",
+                scheduled_ids.len(),
+                multi_output_ids.len()
+            );
+        }
 
-        let decoded_ids = if is_prefill {
+        // `scheduled_ids` are indexes into scheduler.running, while
+        // `multi_output_ids` is dense and ordered by position in scheduled_ids.
+        // Keep that association explicit; a running index is not an output index.
+        let (indices, output_by_running_index) = if is_prefill {
             let (indices, finished_indices) =
                 self.scheduler.filter_prefill_finished(&scheduled_ids);
             if indices.is_empty() {
                 self.check_canceled(None);
                 return Ok(0);
             } else {
+                if indices.len() != finished_indices.len() {
+                    candle_core::bail!(
+                        "Prefill result mapping mismatch: {} output position(s), {} running sequence(s)",
+                        indices.len(),
+                        finished_indices.len()
+                    );
+                }
                 let wrapped: Vec<Vec<u32>> = indices
                     .iter()
-                    .map(|&i| multi_output_ids[i].clone())
-                    .collect();
+                    .map(|&output_idx| {
+                        multi_output_ids.get(output_idx).cloned().ok_or_else(|| {
+                            candle_core::Error::msg(format!(
+                                "Prefill output index {} out of range for {} output row(s)",
+                                output_idx,
+                                multi_output_ids.len()
+                            ))
+                        })
+                    })
+                    .collect::<Result<_>>()?;
                 self.scheduler.postprocess(&finished_indices, &wrapped);
-                DecodedIds(Either::Left(finished_indices))
+                let output_map = finished_indices
+                    .iter()
+                    .copied()
+                    .zip(wrapped)
+                    .collect::<HashMap<_, _>>();
+                (finished_indices, output_map)
             }
         } else {
             self.scheduler
                 .postprocess(&scheduled_ids, &multi_output_ids);
-            DecodedIds(Either::Left(scheduled_ids))
-        };
-
-        let (indices, is_running): (&Vec<usize>, bool) = match &decoded_ids.0 {
-            Either::Left(indices) => (indices, true),
-            Either::Right(indices) => (indices, false),
+            let output_map = scheduled_ids
+                .iter()
+                .copied()
+                .zip(multi_output_ids)
+                .collect::<HashMap<_, _>>();
+            (scheduled_ids, output_map)
         };
 
         let mut prefill_batch: Vec<(usize, usize, f32, bool)> = Vec::new();
-        for &idx in indices {
-            let sq = if is_running {
-                self.scheduler.get_running(idx)
-            } else {
-                self.scheduler.get_waiting(idx)
-            };
+        for &idx in &indices {
+            let step_tokens = output_by_running_index.get(&idx).ok_or_else(|| {
+                candle_core::Error::msg(format!(
+                    "Missing forward output for running sequence index {}",
+                    idx
+                ))
+            })?;
+            let sq = self.scheduler.get_running(idx);
             if let Some(s) = sq {
                 let seq_id = s.id;
                 if s.is_finished() {
@@ -1310,8 +1340,8 @@ impl LLMEngine {
                             if *request_type == RequestType::Stream {
                                 let num_appended = s.output_ids.len()
                                     - self.decode_length.get(&seq_id).copied().unwrap_or(0);
-                                let tokens_to_stream = &multi_output_ids[idx]
-                                    [..num_appended.min(multi_output_ids[idx].len())];
+                                let tokens_to_stream =
+                                    &step_tokens[..num_appended.min(step_tokens.len())];
                                 for &tok in tokens_to_stream {
                                     if let Some(decoder) = self.stream_decoders.get_mut(&seq_id) {
                                         if let Some(text) = decoder.step(tok)? {
@@ -1375,9 +1405,8 @@ impl LLMEngine {
                         *length = s.output_len();
                     }
 
-                    let tokens = &multi_output_ids[idx];
-                    let mut token_ids = if tokens.len() > 1 {
-                        tokens.to_vec()
+                    let mut token_ids = if step_tokens.len() > 1 {
+                        step_tokens.to_vec()
                     } else if self.is_pd_mode() && s.pd_first_token.is_some() && s.output_len() == 2
                     {
                         vec![s.pd_first_token.unwrap_or(s.last_token), s.last_token]
@@ -1468,7 +1497,7 @@ impl LLMEngine {
         } else {
             self.check_canceled(None);
         }
-        if self.econfig.server_mode.unwrap_or(true) && is_running {
+        if self.econfig.server_mode.unwrap_or(true) {
             self.may_print_decoding_throughput(&indices);
         }
         Ok(indices.len())

@@ -389,6 +389,10 @@ pub struct MtpGraphCaptureVars {
     pub flashinfer_indices: Tensor,
     #[cfg(feature = "flashinfer")]
     pub flashinfer_last_len: Tensor,
+    #[cfg(feature = "flashinfer")]
+    pub flashinfer_batch_indices: Tensor,
+    #[cfg(feature = "flashinfer")]
+    pub flashinfer_positions: Tensor,
     pub outputs: BTreeMap<usize, Tensor>,
 }
 
@@ -844,6 +848,10 @@ impl<M: CudaGraphModule> GraphCapturer<M> {
         let flashinfer_indices = Tensor::zeros((max_num_blocks,), DType::U32, device)?;
         #[cfg(feature = "flashinfer")]
         let flashinfer_last_len = Tensor::zeros((1,), DType::U32, device)?;
+        #[cfg(feature = "flashinfer")]
+        let flashinfer_batch_indices = Tensor::zeros((verify_len,), DType::U32, device)?;
+        #[cfg(feature = "flashinfer")]
+        let flashinfer_positions = Tensor::zeros((verify_len,), DType::U32, device)?;
 
         #[cfg(feature = "flashinfer")]
         let use_flashinfer = self.flashinfer_kv_params.is_some();
@@ -882,8 +890,8 @@ impl<M: CudaGraphModule> GraphCapturer<M> {
                 last_len_host: Some(vec![self.max_model_len as u32]),
                 kv_len_arr_host: Some(kv_len_arr_host),
                 total_num_rows: Some(verify_len as u32),
-                batch_indices: None,
-                positions: None,
+                batch_indices: Some(flashinfer_batch_indices.clone()),
+                positions: Some(flashinfer_positions.clone()),
                 use_cuda_graph: true,
                 decode_plan_info: None,
                 prefill_plan_info: Some(prefill_plan_info),
@@ -965,6 +973,10 @@ impl<M: CudaGraphModule> GraphCapturer<M> {
             flashinfer_indices,
             #[cfg(feature = "flashinfer")]
             flashinfer_last_len,
+            #[cfg(feature = "flashinfer")]
+            flashinfer_batch_indices,
+            #[cfg(feature = "flashinfer")]
+            flashinfer_positions,
             outputs,
         });
         Ok(())
@@ -1037,6 +1049,16 @@ impl<M: CudaGraphModule> GraphCapturer<M> {
             mtp_vars.flashinfer_indices.copy_(&fm.indices, 0)?;
             mtp_vars.flashinfer_last_len.zero_()?;
             mtp_vars.flashinfer_last_len.copy_(&fm.last_len, 0)?;
+            let batch_indices = fm.batch_indices.as_ref().ok_or_else(|| {
+                candle_core::Error::msg("mtp replay requires flashinfer batch_indices")
+            })?;
+            let positions = fm.positions.as_ref().ok_or_else(|| {
+                candle_core::Error::msg("mtp replay requires flashinfer positions")
+            })?;
+            mtp_vars.flashinfer_batch_indices.zero_()?;
+            mtp_vars.flashinfer_batch_indices.copy_(batch_indices, 0)?;
+            mtp_vars.flashinfer_positions.zero_()?;
+            mtp_vars.flashinfer_positions.copy_(positions, 0)?;
 
             if let Some(params) = self.flashinfer_kv_params {
                 let dev = self
