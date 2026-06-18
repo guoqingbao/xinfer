@@ -506,166 +506,86 @@ impl Scheduler {
             .map(|seq| (seq.id, seq.status))
     }
 
-    /// Postprocess output tokens and modify sequences by indexes
-    pub fn postprocess(&mut self, ids: &[usize], output_ids: &[u32]) {
-        for (i, &idx) in ids.iter().enumerate() {
-            // Sequence may swapped out
-            if idx >= self.running.len() {
-                continue;
-            }
-            let seq_id = self.running[idx].id;
-            let token = output_ids[i];
-
-            // Since all reqeusts in PD server are prefill request, we need to finish and transfer
-            // the kvcache in the first postprocess for each request.
-            if self.is_pd_server() {
-                match self
-                    .block_manager
-                    .try_send_kvcache(&self.running[idx], token)
-                {
-                    Ok(success) => {
-                        crate::log_warn!(
-                            "PD Server: transferred KV cache for seq {} ({})",
-                            seq_id,
-                            if success { "success" } else { "faild" }
-                        );
-                        let seq = &mut self.running[idx];
-                        if success {
-                            // Insert into prefix cache so future requests can benefit
-                            // LRU eviction will handle memory pressure automatically
-                            let _ = self
-                                .block_manager
-                                .capture_mamba_prefix_state(seq, seq.len());
-                            self.block_manager.cache_sequence(seq);
-                            // Maintain resources until client asks to release or cache eviction
-                            seq.status = SequenceStatus::Cached;
-                            let cur_time = SystemTime::now()
-                                .duration_since(UNIX_EPOCH)
-                                .expect("Time went backwards")
-                                .as_millis() as usize;
-                            let time_costs = cur_time - seq.created_time();
-                            if time_costs / 100 > 0 && seq.len() > 0 {
-                                crate::log_info!(
-                                    "PD Prefilling [seq_id {}]: {} tokens in {:.2}s ({:.2} tokens/s)",
-                                    seq_id,
-                                    seq.len(),
-                                    time_costs as f32 / 1000f32,
-                                    seq.len() as f32 / (time_costs as f32 * 1.0f32 / 1000f32),
-                                )
-                            }
-                        } else {
-                            // release resources immediately if failed
-                            seq.status = SequenceStatus::Finished;
-                            self.block_manager.deallocate(seq);
-                        }
-                    }
-                    Err(e) => {
-                        crate::log_error!(
-                            "PD Server: failed to transfer KV cache for seq {}: {}",
-                            seq_id,
-                            e
-                        );
-                        let seq = &mut self.running[idx];
-                        seq.status = SequenceStatus::Finished;
-                        self.block_manager.deallocate(seq);
-                    }
-                }
-
-                continue; // Go to next sequence in postprocess
-            }
-
-            // Check for tool call end token BEFORE checking EOS
-            // When tools are enabled (mcp_mode.is_some()), finish stream at </tool_call>
-            if self.running[idx].sampling_params.mcp_mode.is_some() {
-                // Check if this is a tool call end (supports both XML </tool_call> and JSON } patterns)
-                // We check BEFORE borrowing seq mutably
-                let is_end = self.is_tool_call_end(token, idx);
-                if is_end {
-                    crate::log_info!(
-                        "[Seq {}] Detected </tool_call> token {}, finishing for external handling",
-                        seq_id,
-                        token
-                    );
-                    let seq = &mut self.running[idx];
-                    seq.append_token(token);
-                    seq.is_tool_call_end = true;
-                    // External tool mode: finish stream so client can handle tool calls
-                    seq.status = SequenceStatus::Finished;
-                    let _ = self
-                        .block_manager
-                        .capture_mamba_prefix_state(seq, seq.len());
-                    self.block_manager.cache_sequence(seq);
-                    self.block_manager.deallocate(seq);
-                    continue;
-                }
-            }
-
-            let matched_stop_sequence_idx =
-                self.stop_sequence_match_index(token, &self.running[idx]);
-            let hit_stop_sequence = matched_stop_sequence_idx.is_some();
-            let seq = &mut self.running[idx];
-
-            if hit_stop_sequence
-                || self.eos_token_id.contains(&token)
-                || seq.output_len() >= seq.sampling_params.max_tokens.unwrap_or(16384)
-                || seq.len() > self.cfg.max_num_batched_tokens
-            {
-                if hit_stop_sequence {
-                    crate::log_info!(
-                        "[Seq {}] Detected stop sequence token {}, finishing",
-                        seq_id,
-                        token
-                    );
-                    seq.hit_stop_sequence = true;
-                    seq.stop_sequence = matched_stop_sequence_idx.and_then(|stop_idx| {
-                        seq.sampling_params
-                            .stop_sequences
-                            .as_ref()
-                            .and_then(|stops| stops.get(stop_idx))
-                            .cloned()
-                    });
-                }
-                seq.status = SequenceStatus::Finished;
-                let _ = self
-                    .block_manager
-                    .capture_mamba_prefix_state(seq, seq.len());
-                self.block_manager.cache_sequence(seq);
-                self.block_manager.deallocate(seq);
-            } else {
-                seq.append_token(token);
-                if seq.len() % self.cfg.block_size == 0 {
-                    let _ = self
-                        .block_manager
-                        .capture_mamba_prefix_state(seq, seq.len());
-                }
-            }
-        }
-    }
-
-    /// MTP-aware postprocess: accepts multiple tokens per sequence.
-    /// For each sequence in `ids`, `multi_output_ids[i]` contains all accepted tokens
-    /// (anchor + drafts + continuation). Each token is appended and checked for EOS/stop.
-    pub fn postprocess_multi(&mut self, ids: &[usize], multi_output_ids: &[Vec<u32>]) {
+    /// Postprocess output tokens for each sequence. Handles both single-token (normal decode)
+    /// and multi-token (MTP speculative decode) outputs uniformly.
+    pub fn postprocess(&mut self, ids: &[usize], multi_output_ids: &[Vec<u32>]) {
         for (i, &idx) in ids.iter().enumerate() {
             if idx >= self.running.len() {
                 continue;
             }
             let tokens = &multi_output_ids[i];
-            for &token in tokens {
-                let _seq_id = self.running[idx].id;
+            let seq_id = self.running[idx].id;
 
-                if self.is_pd_server() {
-                    break;
+            // PD server: transfer KV cache on first token, then move to next sequence.
+            if self.is_pd_server() {
+                if let Some(&first_token) = tokens.first() {
+                    match self
+                        .block_manager
+                        .try_send_kvcache(&self.running[idx], first_token)
+                    {
+                        Ok(success) => {
+                            crate::log_warn!(
+                                "PD Server: transferred KV cache for seq {} ({})",
+                                seq_id,
+                                if success { "success" } else { "faild" }
+                            );
+                            let seq = &mut self.running[idx];
+                            if success {
+                                let _ = self
+                                    .block_manager
+                                    .capture_mamba_prefix_state(seq, seq.len());
+                                self.block_manager.cache_sequence(seq);
+                                seq.status = SequenceStatus::Cached;
+                                let cur_time = SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .expect("Time went backwards")
+                                    .as_millis()
+                                    as usize;
+                                let time_costs = cur_time - seq.created_time();
+                                if time_costs / 100 > 0 && seq.len() > 0 {
+                                    crate::log_info!(
+                                        "PD Prefilling [seq_id {}]: {} tokens in {:.2}s ({:.2} tokens/s)",
+                                        seq_id,
+                                        seq.len(),
+                                        time_costs as f32 / 1000f32,
+                                        seq.len() as f32 / (time_costs as f32 * 1.0f32 / 1000f32),
+                                    )
+                                }
+                            } else {
+                                seq.status = SequenceStatus::Finished;
+                                self.block_manager.deallocate(seq);
+                            }
+                        }
+                        Err(e) => {
+                            crate::log_error!(
+                                "PD Server: failed to transfer KV cache for seq {}: {}",
+                                seq_id,
+                                e
+                            );
+                            let seq = &mut self.running[idx];
+                            seq.status = SequenceStatus::Finished;
+                            self.block_manager.deallocate(seq);
+                        }
+                    }
                 }
+                continue;
+            }
 
+            for &token in tokens {
                 if self.running[idx].sampling_params.mcp_mode.is_some() {
                     let is_end = self.is_tool_call_end(token, idx);
                     if is_end {
+                        crate::log_info!(
+                            "[Seq {}] Detected </tool_call> token {}, finishing for external handling",
+                            seq_id,
+                            token
+                        );
                         let seq = &mut self.running[idx];
                         seq.append_token(token);
                         seq.is_tool_call_end = true;
                         seq.status = SequenceStatus::Finished;
-                        self.block_manager
+                        let _ = self
+                            .block_manager
                             .capture_mamba_prefix_state(seq, seq.len());
                         self.block_manager.cache_sequence(seq);
                         self.block_manager.deallocate(seq);
@@ -684,6 +604,11 @@ impl Scheduler {
                     || seq.len() > self.cfg.max_num_batched_tokens
                 {
                     if hit_stop_sequence {
+                        crate::log_info!(
+                            "[Seq {}] Detected stop sequence token {}, finishing",
+                            seq_id,
+                            token
+                        );
                         seq.hit_stop_sequence = true;
                         seq.stop_sequence = matched_stop_sequence_idx.and_then(|stop_idx| {
                             seq.sampling_params
@@ -694,7 +619,8 @@ impl Scheduler {
                         });
                     }
                     seq.status = SequenceStatus::Finished;
-                    self.block_manager
+                    let _ = self
+                        .block_manager
                         .capture_mamba_prefix_state(seq, seq.len());
                     self.block_manager.cache_sequence(seq);
                     self.block_manager.deallocate(seq);
@@ -705,7 +631,8 @@ impl Scheduler {
                         let _ = self.block_manager.may_append(seq);
                     }
                     if seq.len() % self.cfg.block_size == 0 {
-                        self.block_manager
+                        let _ = self
+                            .block_manager
                             .capture_mamba_prefix_state(seq, seq.len());
                     }
                 }
