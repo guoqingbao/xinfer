@@ -460,6 +460,17 @@ Constraint-based generation via llguidance — Lark grammars, regex, JSON Schema
 | `--mcp-config` | MCP servers JSON config |
 | `--mcp-command` / `--mcp-args` | Single MCP server command + args |
 
+### Environment Variables
+
+| Variable | Description |
+|---|---|
+| `XINFER_NVFP4_FORCE_LUT=1` | Force software NVFP4 decode to use the LUT-based dequantization path (higher precision) instead of hardware FP4 intrinsics on Blackwell (SM100+). Useful when decode precision matters more than peak throughput. |
+
+**Example (Blackwell with high-precision NVFP4 decode):**
+```bash
+XINFER_NVFP4_FORCE_LUT=1 xinfer --m nvidia/Qwen3-30B-A3B-FP4 --ui-server
+```
+
 ---
 
 ## 📽️ Demo

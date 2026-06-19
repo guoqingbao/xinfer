@@ -455,6 +455,17 @@ xinfer --m unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF \
 | `--mcp-config` | MCP 服务器 JSON 配置 |
 | `--mcp-command` / `--mcp-args` | 单个 MCP 服务器命令及参数 |
 
+### 环境变量
+
+| 变量 | 描述 |
+|---|---|
+| `XINFER_NVFP4_FORCE_LUT=1` | 强制 NVFP4 软件解码使用 LUT（查找表）路径替代 Blackwell (SM100+) 硬件 FP4 指令。精度更高，适用于对解码精度有要求的场景。 |
+
+**示例（Blackwell 高精度 NVFP4 解码）：**
+```bash
+XINFER_NVFP4_FORCE_LUT=1 xinfer --m nvidia/Qwen3-30B-A3B-FP4 --ui-server
+```
+
 ---
 
 ## 📽️ 演示
