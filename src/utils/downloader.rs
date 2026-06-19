@@ -11,7 +11,7 @@ pub struct Downloader {
     weight_file: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct ModelPaths {
     pub tokenizer_filename: PathBuf,
     pub tokenizer_config_filename: PathBuf,
@@ -20,6 +20,22 @@ pub struct ModelPaths {
     pub filenames: Vec<PathBuf>,
     pub auxiliary_filenames: Vec<PathBuf>,
     pub chat_template_filename: Option<PathBuf>,
+}
+
+impl std::fmt::Debug for ModelPaths {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ModelPaths")
+            .field("tokenizer_filename", &self.tokenizer_filename)
+            .field("tokenizer_config_filename", &self.tokenizer_config_filename)
+            .field("config_filename", &self.config_filename)
+            .field(
+                "generation_config_filename",
+                &self.generation_config_filename,
+            )
+            .field("auxiliary_filenames", &self.auxiliary_filenames)
+            .field("chat_template_filename", &self.chat_template_filename)
+            .finish()
+    }
 }
 
 impl ModelPaths {

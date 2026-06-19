@@ -263,7 +263,7 @@ impl RopeScalingValue {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct Config {
     pub architectures: Option<Vec<String>>,
     pub head_dim: Option<usize>,
@@ -303,6 +303,31 @@ pub struct Config {
     pub extra_config_json: Option<String>,
     #[serde(default)]
     pub is_f16_mode: bool,
+}
+
+impl fmt::Debug for Config {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Config")
+            .field("architectures", &self.architectures)
+            .field("head_dim", &self.head_dim)
+            .field("num_attention_heads", &self.num_attention_heads)
+            .field("num_key_value_heads", &self.num_key_value_heads)
+            .field("max_position_embeddings", &self.max_position_embeddings)
+            .field("hidden_size", &self.hidden_size)
+            .field("num_hidden_layers", &self.num_hidden_layers)
+            .field("max_model_len", &self.max_model_len)
+            .field("intermediate_size", &self.intermediate_size)
+            .field("vocab_size", &self.vocab_size)
+            .field("rope_theta", &self.rope_theta)
+            .field("hidden_act", &self.hidden_act)
+            .field("quant", &self.quant)
+            .field("moe_cfg", &self.moe_cfg)
+            .field("kvcache_dtype", &self.kvcache_dtype)
+            .field("quantization_config", &self.quantization_config)
+            .field("is_multi_model", &self.is_multi_model)
+            .field("is_f16_mode", &self.is_f16_mode)
+            .finish()
+    }
 }
 
 impl Config {
@@ -1112,7 +1137,6 @@ impl fmt::Debug for QuantConfig {
             .field("fmt", &self.fmt)
             .field("format", &self.format)
             .field("weight_block_size", &self.weight_block_size)
-            .field("modules_to_not_convert", &self.modules_to_not_convert)
             .field("is_mlx_nvfp4", &self.is_mlx_nvfp4)
             .finish()
     }
