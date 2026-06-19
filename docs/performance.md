@@ -50,7 +50,7 @@ xinfer --m AxionML/Qwen3.5-4B-NVFP4 --kvcache-dtype turbo4 --ui-server
 
 ## 📊 Performance Notes
 
-- **HW NVFP4**: Hardware-accelerated FP4 on Blackwell (SM120, RTX 5090/B200)
+- **HW NVFP4**: Hardware-accelerated FP4 on Blackwell: SM100 (B100/B200), SM120 (RTX 5090/RTX PRO 6000), and SM121 (DGX Spark)
 - **HW FP8**: Hardware-accelerated FP8 on Hopper (SM90, H800/H200)
 - **SW FP4/NVFP4**: Software-emulated FP4 on Hopper (SM90) and V100 (SM70)
 - V100 + NVFP4 + TurboQuant is a first-ever combination — no other engine has achieved this

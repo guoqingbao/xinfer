@@ -175,6 +175,10 @@ jobs:
             sm_name: sm90
             features: "cuda,nccl,flashinfer,cutlass"
             python_features: "cuda,nccl,flashinfer,cutlass,python"
+          - sm: "100"
+            sm_name: sm100
+            features: "cuda,nccl,flashinfer,cutlass"
+            python_features: "cuda,nccl,flashinfer,cutlass,python"
           - sm: "120"
             sm_name: sm120
             features: "cuda,nccl,flashinfer,cutlass"
@@ -334,7 +338,8 @@ jobs:
   #   pip install xinfer --index-url https://guoqingbao.github.io/xinfer/sm80/  (default)
   #   pip install xinfer --index-url https://guoqingbao.github.io/xinfer/sm70/  (V100)
   #   pip install xinfer --index-url https://guoqingbao.github.io/xinfer/sm90/  (Hopper)
-  #   pip install xinfer --index-url https://guoqingbao.github.io/xinfer/sm120/ (Blackwell)
+  #   pip install xinfer --index-url https://guoqingbao.github.io/xinfer/sm100/ (B100/B200)
+  #   pip install xinfer --index-url https://guoqingbao.github.io/xinfer/sm120/ (RTX 5090/RTX PRO 6000)
   #   pip install xinfer --index-url https://guoqingbao.github.io/xinfer/sm121/ (Spark/GB10 ARM)
   #   pip install xinfer --index-url https://guoqingbao.github.io/xinfer/metal/ (macOS)
   # The root index (no arch) defaults to SM80.
@@ -429,7 +434,7 @@ jobs:
             fi
             if ! command -v nvidia-smi &>/dev/null; then
               echo "ERROR: No NVIDIA GPU detected and no platform specified." >&2
-              echo "  Set XINFER_PLATFORM=sm80 (or sm70/sm75/sm89/sm90/sm120) and re-run." >&2
+              echo "  Set XINFER_PLATFORM=sm80 (or sm70/sm75/sm89/sm90/sm100/sm120/sm121) and re-run." >&2
               exit 1
             fi
             local cc
@@ -440,8 +445,9 @@ jobs:
               80|86) echo "sm80" ;;
               89)    echo "sm89" ;;
               90|90a) echo "sm90" ;;
-              100|120) echo "sm120" ;;
-              121) echo "sm121" ;;
+              100|100a) echo "sm100" ;;
+              120|120a) echo "sm120" ;;
+              121|121a) echo "sm121" ;;
               *) echo "sm80" ;;
             esac
           }

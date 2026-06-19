@@ -75,11 +75,14 @@ function detectCudaComputeCap() {
 
 /**
  * Map detected SM version to the build variant name.
- * Build variants match CI matrix: sm70, sm75, sm80, sm89, sm90, sm120
+ * Build variants match CI matrix: sm70, sm75, sm80, sm89, sm90, sm100,
+ * sm120, and sm121 (GB10/DGX Spark).
  */
 function smToVariant(sm) {
   const n = parseInt(sm, 10);
+  if (n >= 121) return "sm121";
   if (n >= 120) return "sm120";
+  if (n >= 100) return "sm100";
   if (n >= 90) return "sm90";
   if (n >= 89) return "sm89";
   if (n >= 80) return "sm80";

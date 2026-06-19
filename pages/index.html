@@ -293,7 +293,7 @@ footer{padding:56px 0 28px;border-top:1px solid var(--c-border);position:relativ
         </tbody>
       </table>
     </div>
-    <p class="sdesc rv" style="margin-top:16px;font-size:.8rem;max-width:none" data-i="p.fn">* HW = hardware-accelerated. Hopper (SM90) supports HW FP8 but not HW NVFP4; Blackwell (SM120) supports both. NVFP4 on Hopper uses software emulation.</p>
+    <p class="sdesc rv" style="margin-top:16px;font-size:.8rem;max-width:none" data-i="p.fn">* HW = hardware-accelerated. Hopper (SM90) supports HW FP8 but not HW NVFP4. Blackwell datacenter GPUs use SM100 (B100/B200); consumer/workstation GPUs use SM120 (RTX 5090/RTX PRO 6000). Both support HW FP8 and NVFP4.</p>
   </div>
 </section>
 
@@ -518,7 +518,7 @@ en:{
 'p.label':'Performance','p.title':'Real-World Benchmarks','p.desc':'Tested on V100, A100, Hopper H800, and RTX 5090.',
 'p.m':'Model','p.fmt':'Format','p.sz':'Size','p.hw':'Hardware','p.sp':'Speed','p.note':'Note',
 'p.n1':'HW NVFP4','p.n2':'HW FP8','p.n3':'SW quant','p.n4':'SW NVFP4 (no HW)','p.n5':'SW FP4',
-'p.fn':'* HW = hardware-accelerated. Hopper (SM90) supports HW FP8 but not HW NVFP4; Blackwell (SM120) supports both. NVFP4 on Hopper/V100 uses software emulation.',
+'p.fn':'* HW = hardware-accelerated. Hopper (SM90) supports HW FP8 but not HW NVFP4. Blackwell SM100 (B100/B200); SM120 (RTX 5090/RTX PRO 6000). Both support HW FP8 and NVFP4.',
 'm.label':'Models','m.title':'Supported Models & Formats',
 'm.desc':'From 3B to 397B — dense, MoE, and multimodal architectures.','m.fmts':'Supported Formats',
 'i.label':'Quick Start','i.title':'Install & Run','i.desc':'Get up and running in minutes.',
@@ -557,7 +557,7 @@ cn:{
 'p.label':'性能','p.title':'真实基准测试','p.desc':'在 V100、A100、Hopper H800 和 RTX 5090 上测试。',
 'p.m':'模型','p.fmt':'格式','p.sz':'大小','p.hw':'硬件','p.sp':'速度','p.note':'说明',
 'p.n1':'硬件 NVFP4','p.n2':'硬件 FP8','p.n3':'软件量化','p.n4':'软件 NVFP4 (无硬件加速)','p.n5':'软件 FP4',
-'p.fn':'* HW = 硬件加速。Hopper (SM90) 支持硬件 FP8 但不支持硬件 NVFP4；Blackwell (SM120) 两者均支持。V100/Hopper 上的 NVFP4 为软件模拟。',
+'p.fn':'* HW = 硬件加速。Hopper (SM90) 支持硬件 FP8 但不支持硬件 NVFP4。Blackwell SM100（B100/B200）；SM120（RTX 5090/RTX PRO 6000）。两者均支持硬件 FP8 和 NVFP4。',
 'm.label':'模型','m.title':'支持的模型与格式',
 'm.desc':'从 3B 到 397B — 稠密、MoE 和多模态架构。','m.fmts':'支持的格式',
 'i.label':'快速开始','i.title':'安装与运行','i.desc':'几分钟内即可运行。',
@@ -630,7 +630,7 @@ document.querySelectorAll('.cb').forEach(function(bl){
 });
 
 /* ═══ Download cards ═══ */
-var XINFER_VER='0.13.2';
+var XINFER_VER='0.13.3';
 var DL='https://github.com/guoqingbao/xinfer/releases/download/v'+XINFER_VER+'/';
 var archs=[
   {sm:'sm70',n:'70',name:'SM70',gpu:'V100',cuda:'CUDA 12',arch:'x64',d:0},
@@ -638,8 +638,9 @@ var archs=[
   {sm:'sm80',n:'80',name:'SM80',gpu:'A100 / A10',cuda:'CUDA 13',arch:'x64',d:100},
   {sm:'sm89',n:'89',name:'SM89',gpu:'RTX 4090 / L40',cuda:'CUDA 13',arch:'x64',d:150},
   {sm:'sm90',n:'90',name:'SM90',gpu:'H800 / H200',cuda:'CUDA 13',arch:'x64',d:200},
-  {sm:'sm120',n:'120',name:'SM120',gpu:'RTX 5090 / B200',cuda:'CUDA 13',arch:'x64',d:250},
-  {sm:'sm121',n:'121',name:'SM121',gpu:'Spark / GB10',cuda:'CUDA 13',arch:'arm64',d:300}
+  {sm:'sm100',n:'100',name:'SM100',gpu:'B100 / B200',cuda:'CUDA 13',arch:'x64',d:250},
+  {sm:'sm120',n:'120',name:'SM120',gpu:'RTX 5090 / RTX PRO 6000',cuda:'CUDA 13',arch:'x64',d:300},
+  {sm:'sm121',n:'121',name:'SM121',gpu:'DGX Spark / GB10',cuda:'CUDA 13',arch:'arm64',d:350}
 ];
 var metalA={sm:'metal',n:'metal',name:'Metal',gpu:'macOS Apple Silicon',cuda:'',d:300};
 var dcards=document.getElementById('dcards');
@@ -680,7 +681,7 @@ document.querySelectorAll('.dtabs .tbtn').forEach(function(b){
 });
 
 /* ═══ Pip grid ═══ */
-var sms=['sm70','sm75','sm80','sm89','sm90','sm120','sm121','metal'];
+var sms=['sm70','sm75','sm80','sm89','sm90','sm100','sm120','sm121','metal'];
 var pg=document.getElementById('pgrid');
 sms.forEach(function(v){
   var cmd='pip install xinfer --index-url https://guoqingbao.github.io/xinfer/'+v+'/';
