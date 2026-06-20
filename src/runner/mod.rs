@@ -135,7 +135,7 @@ pub enum SerializableDType {
 impl From<DType> for SerializableDType {
     fn from(dt: DType) -> Self {
         match dt {
-            DType::U8 => Self::U8,
+            DType::U8 | DType::F8E8M0 | DType::F8E4M3 => Self::U8,
             DType::U32 => Self::U32,
             DType::I64 => Self::I64,
             DType::BF16 => Self::BF16,
