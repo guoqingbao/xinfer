@@ -639,6 +639,10 @@ impl<M: CudaGraphModule> GraphCapturer<M> {
                         &input_metadata,
                         false,
                     )?;
+                    #[cfg(feature = "cuda")]
+                    if !should_capture {
+                        device.synchronize()?;
+                    }
                 } else {
                     let out = self.model.forward(
                         &input_ids_bs,

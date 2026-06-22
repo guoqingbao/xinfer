@@ -34,10 +34,11 @@ pub struct DsaIndexer {
 
 impl DsaIndexer {
     pub fn new(vb: VarBuilderX, config: &Config, cfg: IndexerConfig, dtype: DType) -> Result<Self> {
+        let is_gguf = vb.is_qvar_builder();
         let wq_b = ReplicatedLinear::load_no_bias(
             cfg.q_lora_rank,
             cfg.index_n_heads * cfg.index_head_dim,
-            vb.pp("wq_b"),
+            vb.pp(if is_gguf { "attn_q_b" } else { "wq_b" }),
             &config.quantization_config,
             &config.quant,
             dtype,
@@ -45,7 +46,7 @@ impl DsaIndexer {
         let wk = ReplicatedLinear::load_no_bias(
             cfg.hidden_size,
             cfg.index_head_dim,
-            vb.pp("wk"),
+            vb.pp(if is_gguf { "attn_k" } else { "wk" }),
             &config.quantization_config,
             &config.quant,
             dtype,
@@ -54,7 +55,7 @@ impl DsaIndexer {
         let weights_proj = ReplicatedLinear::load_no_bias(
             cfg.hidden_size,
             cfg.index_n_heads,
-            vb.pp("weights_proj"),
+            vb.pp(if is_gguf { "proj" } else { "weights_proj" }),
             &None,
             &config.quant,
             dtype,

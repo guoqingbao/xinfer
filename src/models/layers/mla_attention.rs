@@ -6,6 +6,7 @@ use crate::models::layers::VarBuilderX;
 use crate::utils::config::Config;
 use attention_rs::InputMetadata;
 use candle_core::{DType, Result, Tensor, D};
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -86,7 +87,8 @@ pub struct MlaAttention {
     q_proj: Option<ReplicatedLinear>,
     kv_a_proj_with_mqa: ReplicatedLinear,
     kv_a_layernorm: NormX,
-    kv_b_proj: ReplicatedLinear,
+    #[allow(dead_code)]
+    kv_b_proj: Option<ReplicatedLinear>,
     o_proj: ReplicatedLinear,
     w_uk: Tensor,
     w_uv_t: Tensor,
@@ -125,13 +127,39 @@ impl MlaAttention {
         } else {
             dtype
         };
+
+        let key_map: HashMap<&str, &str> = [
+            ("q_a_proj", "attn_q_a"),
+            ("q_a_layernorm", "attn_q_a_norm"),
+            ("q_b_proj", "attn_q_b"),
+            ("kv_a_proj_with_mqa", "attn_kv_a_mqa"),
+            ("kv_a_layernorm", "attn_kv_a_norm"),
+            ("kv_b_proj", "attn_k_b"),
+            ("o_proj", "attn_output"),
+        ]
+        .iter()
+        .cloned()
+        .collect();
+
+        let pp = |name: &str| -> VarBuilderX {
+            if is_qvar_builder {
+                if let Some(gguf_name) = key_map.get(name) {
+                    vb.pp(gguf_name)
+                } else {
+                    vb.pp(name)
+                }
+            } else {
+                vb.pp(name)
+            }
+        };
+
         let (q_a_proj, q_a_layernorm, q_b_proj, q_proj) =
             if let Some(q_lora_rank) = mla_cfg.q_lora_rank {
                 let q_a = ReplicatedLinear::load_b(
                     hidden_size,
                     q_lora_rank,
                     mla_cfg.attention_bias,
-                    vb.pp("q_a_proj"),
+                    pp("q_a_proj"),
                     &config.quantization_config,
                     &config.quant,
                     dtype,
@@ -139,7 +167,7 @@ impl MlaAttention {
                 let q_a_ln = rms_norm(
                     q_lora_rank,
                     mla_cfg.rms_norm_eps,
-                    vb.pp("q_a_layernorm"),
+                    pp("q_a_layernorm"),
                     norm_dtype,
                     false,
                 )?;
@@ -147,7 +175,7 @@ impl MlaAttention {
                     q_lora_rank,
                     num_heads * q_head_dim,
                     false,
-                    vb.pp("q_b_proj"),
+                    pp("q_b_proj"),
                     &config.quantization_config,
                     &config.quant,
                     dtype,
@@ -170,7 +198,7 @@ impl MlaAttention {
             hidden_size,
             kv_lora_rank + qk_rope_head_dim,
             mla_cfg.attention_bias,
-            vb.pp("kv_a_proj_with_mqa"),
+            pp("kv_a_proj_with_mqa"),
             &config.quantization_config,
             &config.quant,
             dtype,
@@ -179,41 +207,106 @@ impl MlaAttention {
         let kv_a_layernorm = rms_norm(
             kv_lora_rank,
             mla_cfg.rms_norm_eps,
-            vb.pp("kv_a_layernorm"),
+            pp("kv_a_layernorm"),
             norm_dtype,
             false,
         )?;
 
-        let kv_b_proj = ReplicatedLinear::load_b(
-            kv_lora_rank,
-            num_heads * (qk_nope_head_dim + v_head_dim),
-            false,
-            vb.pp("kv_b_proj"),
-            &config.quantization_config,
-            &config.quant,
-            dtype,
-        )?;
+        let has_separate_kv_b = is_qvar_builder && vb.pp("attn_k_b").has_key("weight");
+
+        let kv_b_proj = if !has_separate_kv_b {
+            Some(ReplicatedLinear::load_b(
+                kv_lora_rank,
+                num_heads * (qk_nope_head_dim + v_head_dim),
+                false,
+                pp("kv_b_proj"),
+                &config.quantization_config,
+                &config.quant,
+                dtype,
+            )?)
+        } else {
+            None
+        };
 
         let o_proj = ReplicatedLinear::load_no_bias(
             num_heads * v_head_dim,
             hidden_size,
-            vb.pp("o_proj"),
+            pp("o_proj"),
             &config.quantization_config,
             &config.quant,
             dtype,
         )?;
 
-        // Pre-compute absorbed MLA weights from kv_b_proj
-        let kv_b_weight = vb.pp("kv_b_proj").get_with_hints_dtype(
-            (num_heads * (qk_nope_head_dim + v_head_dim), kv_lora_rank),
-            "weight",
-            shard(0, 0, 1),
-            dtype,
-        )?;
-        let w = kv_b_weight.reshape((num_heads, qk_nope_head_dim + v_head_dim, kv_lora_rank))?;
-        let w_uk = w.narrow(1, 0, qk_nope_head_dim)?.contiguous()?;
-        let w_uv = w.narrow(1, qk_nope_head_dim, v_head_dim)?.contiguous()?;
-        let w_uv_t = w_uv.transpose(1, 2)?.contiguous()?;
+        let (w_uk, w_uv_t) = if has_separate_kv_b {
+            let k_b_weight = vb.pp("attn_k_b").get_with_hints_dtype(
+                (qk_nope_head_dim, kv_lora_rank, num_heads),
+                "weight",
+                shard(0, 0, 1),
+                dtype,
+            )?;
+
+            // attn_v_b layout varies between GGUF converters:
+            //   GLM-5.2 (glm-dsa): [v_head_dim, kv_lora_rank, num_heads]
+            //   DeepSeek V3.2 (deepseek2): [num_heads, v_head_dim, kv_lora_rank]
+            // (Candle reverses GGUF ne[] so these are Candle logical shapes.)
+            // llama.cpp's DeepSeek converter transposes k_b but NOT v_b,
+            // producing v_b = (num_heads, v_head_dim, kv_lora_rank) in PyTorch
+            // row-major, which becomes [num_heads, v_head_dim, kv_lora_rank]
+            // after Candle's double-reversal.
+            let v_b_vb = vb.pp("attn_v_b");
+            let v_b_shape = v_b_vb.tensor_shape("weight");
+            let v_b_kv_last = v_b_shape
+                .as_ref()
+                .is_some_and(|s| s.len() == 3 && s[2] == kv_lora_rank && s[1] != kv_lora_rank);
+            let v_b_weight = if v_b_kv_last {
+                v_b_vb.get_with_hints_dtype(
+                    (num_heads, v_head_dim, kv_lora_rank),
+                    "weight",
+                    shard(0, 0, 1),
+                    dtype,
+                )?
+            } else {
+                v_b_vb.get_with_hints_dtype(
+                    (v_head_dim, kv_lora_rank, num_heads),
+                    "weight",
+                    shard(0, 0, 1),
+                    dtype,
+                )?
+            };
+
+            // w_uk: [num_heads, qk_nope_head_dim, kv_lora_rank]
+            let w_uk = k_b_weight
+                .permute((2, 0, 1))?
+                .contiguous()?
+                .to_dtype(dtype)?;
+            // w_uv_t target: [num_heads, kv_lora_rank, v_head_dim]
+            let w_uv_t = if v_b_kv_last {
+                // (num_heads, v_head_dim, kv_lora_rank) → transpose(1,2)
+                v_b_weight.transpose(1, 2)?.contiguous()?.to_dtype(dtype)?
+            } else {
+                // (v_head_dim, kv_lora_rank, num_heads) → permute(2,0,1)
+                // → (num_heads, v_head_dim, kv_lora_rank) → transpose(1,2)
+                let w_uv = v_b_weight.permute((2, 0, 1))?.contiguous()?;
+                w_uv.transpose(1, 2)?.contiguous()?.to_dtype(dtype)?
+            };
+            (w_uk, w_uv_t)
+        } else {
+            let kv_b_weight = vb.pp("kv_b_proj").get_with_hints_dtype(
+                (num_heads * (qk_nope_head_dim + v_head_dim), kv_lora_rank),
+                "weight",
+                shard(0, 0, 1),
+                dtype,
+            )?;
+            let w =
+                kv_b_weight.reshape((num_heads, qk_nope_head_dim + v_head_dim, kv_lora_rank))?;
+            let w_uk = w
+                .narrow(1, 0, qk_nope_head_dim)?
+                .contiguous()?
+                .to_dtype(dtype)?;
+            let w_uv = w.narrow(1, qk_nope_head_dim, v_head_dim)?.contiguous()?;
+            let w_uv_t = w_uv.transpose(1, 2)?.contiguous()?.to_dtype(dtype)?;
+            (w_uk, w_uv_t)
+        };
 
         let mut sm_scale = 1.0 / (q_head_dim as f32).sqrt();
         let mut rope_scale = 1.0f32;
@@ -244,9 +337,10 @@ impl MlaAttention {
             }
         }
 
-        // Load DSA indexer if present
-        let indexer = if mla_cfg.index_head_dim.is_some() && vb.pp("indexer").has_key("wq_b.weight")
-        {
+        let has_indexer = mla_cfg.index_head_dim.is_some()
+            && (vb.pp("indexer").has_key("wq_b.weight")
+                || vb.pp("indexer").has_key("attn_q_b.weight"));
+        let indexer = if has_indexer {
             let idx_cfg = IndexerConfig {
                 index_head_dim: mla_cfg.index_head_dim.unwrap(),
                 index_n_heads: mla_cfg.index_n_heads.unwrap_or(4),

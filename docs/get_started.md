@@ -47,7 +47,7 @@ cargo build --release --features metal
   ```
 - **GGUF quantized (folder with auto-detection)**  
   ```bash
-  target/release/xinfer --m /path/model-GGUF/ --ui-server
+  target/release/xinfer --m /path/GLM-5.2-GGUF/ --ui-server
   ```
 - **Remote GGUF quantized (multi-shard subfolder)**  
   ```bash

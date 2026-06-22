@@ -218,6 +218,9 @@ xinfer --m olka-fi/Qwen3.5-4B-MXFP4
 # GGUF 模型（4 位 KV 缓存）
 xinfer --m unsloth/Qwen3.5-27B-GGUF --f Qwen3.5-27B-Q4_K_M.gguf --kvcache-dtype turbo4
 
+# GLM 5.2 GGUF（多分片，自动检测 HF 子文件夹）
+xinfer --d 0,1,2,3 --m unsloth/GLM-5.2-GGUF --f UD-Q2_K_XL --kvcache-dtype fp8
+
 # FP8 Metal
 xinfer --m Qwen/Qwen3.5-4B-FP8
 
@@ -228,7 +231,7 @@ xinfer --m unsloth/gemma-4-26b-a4b-it-NVFP4
 xinfer --m GadflyII/GLM-4.7-Flash-NVFP4
 
 # GLM 5.2（DeepSeek V3.2 架构，FP8）
-xinfer --d 0,1,2,3 --m zai-org/GLM-5.2-FP8
+xinfer --d 0,1,2,3 --m zai-org/GLM-5.2-FP8 --kvcache-dtype fp8
 
 # 交互式 CLI 对话
 xinfer --i --m unsloth/Qwen3.5-27B-GGUF --f Qwen3.5-27B-Q4_K_M.gguf
@@ -255,7 +258,7 @@ xinfer --m /path/Qwen3-4B --isq q6k
 
 ```bash
 # 多卡 GGUF（模型 ID + 子文件夹）
-xinfer --d 0,1,2,3 --m unsloth/Qwen3.5-122B-A10B-GGUF --f Q3_K_M
+xinfer --d 0,1,2,3 --m unsloth/GLM-5.2-GGUF --f UD-Q2_K_XL
 
 # 远程 GGUF — 单文件模型
 xinfer --m unsloth/Qwen3.5-27B-GGUF --f Qwen3.5-27B-Q4_K_M.gguf
@@ -264,7 +267,7 @@ xinfer --m unsloth/Qwen3.5-27B-GGUF --f Qwen3.5-27B-Q4_K_M.gguf
 xinfer --d 0,1 --m /path/Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf
 
 # 本地 GGUF 文件夹
-xinfer --d 0,1,2,3 --m /path/to/model-GGUF/
+xinfer --d 0,1,2,3 --m /path/to/GLM-5.2-GGUF/
 ```
 
 </details>
