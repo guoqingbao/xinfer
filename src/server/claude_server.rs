@@ -15,7 +15,7 @@ use axum::{
     extract::{Json, State},
     http::StatusCode,
     response::{
-        sse::{Event, KeepAlive},
+        sse::{Event, KeepAlive, KeepAliveStream},
         IntoResponse, Sse,
     },
 };
@@ -368,7 +368,7 @@ pub struct ClaudeErrorBody {
 }
 
 pub enum ClaudeResponder {
-    Streamer(Sse<ClaudeStreamer>),
+    Streamer(Sse<KeepAliveStream<ClaudeStreamer>>),
     Message(ClaudeMessageResponse),
     TokenCount(ClaudeTokenCountResponse),
     Error(ClaudeErrorResponse, StatusCode),

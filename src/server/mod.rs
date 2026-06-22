@@ -20,7 +20,7 @@ use crate::utils::image::{
 };
 use crate::utils::reasoning::ReasoningEffort;
 use axum::http::{self, StatusCode};
-use axum::response::{IntoResponse, Sse};
+use axum::response::{sse::KeepAliveStream, IntoResponse, Sse};
 use axum::routing::{get, post};
 use axum::Json;
 use axum::Router;
@@ -820,7 +820,7 @@ impl JsonError {
 impl ErrorToResponse for JsonError {}
 
 pub enum ChatResponder {
-    Streamer(Sse<Streamer>),
+    Streamer(Sse<KeepAliveStream<Streamer>>),
     Completion(ChatCompletionResponse),
     Usage(UsageResponse),
     Embedding(EmbeddingResponse),
