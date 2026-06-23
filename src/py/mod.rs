@@ -53,7 +53,9 @@ impl Engine {
             run_server(
                 self.engine.clone(),
                 self.econfig.clone(),
-                port,
+                crate::server::ServerAddr::Tcp(
+                    (std::net::Ipv4Addr::UNSPECIFIED, port as u16).into(),
+                ),
                 with_ui_server,
             )
             .await

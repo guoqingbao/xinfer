@@ -2460,17 +2460,16 @@ mod tests {
     }
 }
 
-/// Fail fast if `host:port` is already bound, before spending minutes loading
-/// model weights.  Prints a user-friendly error and exits the process when the
-/// port is occupied.
-pub fn ensure_port_free(host: &str, port: u16) {
-    let addr = format!("{host}:{port}");
-    match std::net::TcpListener::bind(&addr) {
+/// Fail fast if `addr` (e.g. `0.0.0.0:8000` or `[::1]:8080`) is already bound,
+/// before spending minutes loading model weights.
+/// Prints a user-friendly error and exits the process when the port is occupied.
+pub fn ensure_port_free(addr: &str) {
+    match std::net::TcpListener::bind(addr) {
         Ok(_listener) => { /* port is free; drop the listener immediately */ }
         Err(e) => {
             eprintln!(
-                "\n❌ Port {port} is already in use ({e}).\n   \
-                 Free the port or choose a different one with --port <port>.\n"
+                "\n❌ Address {addr} is already in use ({e}).\n   \
+                 Free the address or choose a different one with --server host:port.\n"
             );
             std::process::exit(1);
         }

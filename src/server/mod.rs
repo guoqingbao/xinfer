@@ -26,14 +26,17 @@ use axum::Json;
 use axum::Router;
 use candle_core::{Result, Tensor};
 use colored::*;
-use local_ip_address::local_ip;
+use local_ip_address::{local_ip, local_ipv6};
 use parking_lot::RwLock;
 use rustchatui::start_ui_server;
 use serde_json::json;
+use regex::Regex;
 use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::path::Path;
 use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
+use url::Url;
 
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
@@ -946,9 +949,20 @@ pub struct Args {
     #[arg(long, default_value = None)]
     pub prefix_cache_max_tokens: Option<usize>,
 
-    #[arg(long, default_value_t = false)]
-    pub server: bool, //server mode
+    /// Enable server mode. Optionally specify a bind address.
+    ///
+    /// Without a value, binds to 0.0.0.0:8000 (TCP).
+    ///
+    /// With a value, accepts one of:
+    ///   - `host:port`         → TCP (e.g. 127.0.0.1:8080)
+    ///   - `file:///path`      → Unix socket at /path
+    ///   - `socket:///path`    → Unix socket at /path
+    ///   - `unix:///path`      → Unix socket at /path
+    #[arg(long, num_args = 0..=1, default_value = "", default_missing_value = "0.0.0.0")]
+    pub server: String,
 
+    /// TCP port for server mode. Ignored when --server specifies a host:port value.
+    /// Deprecated: use `--server host:port` instead.
     #[arg(long, visible_alias = "p")]
     pub port: Option<usize>,
 
@@ -1409,10 +1423,79 @@ pub fn build_messages_and_images(
     Ok((messages, image_data))
 }
 
+/// Represents either a TCP socket address or a Unix socket path for the API server.
+pub enum ServerAddr {
+    Tcp(SocketAddr),
+    Unix(std::path::PathBuf),
+}
+
+/// Convert raw `--server` and `--port` values into a `ServerAddr`.
+pub fn resolve_server_addr(server: &str, port: Option<usize>) -> candle_core::Result<ServerAddr> {
+    // Unix socket URIs → extract path
+    if ["file://", "socket://", "unix://"].iter().any(|p| server.starts_with(*p)) {
+        let Ok(srv_url) = Url::parse(server) else {
+            candle_core::bail!("Cannot parse --server socket path.");
+        };
+        return Ok(ServerAddr::Unix(std::path::PathBuf::from(srv_url.path())));
+    }
+
+    // Url::parse doesn't handle bare ip6 addresses
+    let is_bare_ip6 = !server.contains('[')
+        && server.matches(':').count() - server.matches("://").count() > 1;
+
+    // bare ip6 cannot contain port
+    let brc_ip = if !is_bare_ip6 {server.to_string()} else {
+        let shr = Regex::new(r"^(?<s>(?:\w+://)?)(?<h>.*)$").unwrap();
+        shr.replace(server, "$s[$h]").to_string()
+    };
+
+    let srv_addr_str = if brc_ip.is_empty() {
+        "tcp://0.0.0.0".to_string()
+    } else if brc_ip.contains("://") {
+        brc_ip.to_string()
+    } else {
+        format!("tcp://{brc_ip}")
+    };
+
+    let Ok(srv_addr_url) = Url::parse(&srv_addr_str) else {
+        candle_core::bail!("Cannot parse --server value as address.");
+    };
+
+    let Some(h) = srv_addr_url.host_str().map(|s| s.trim_start_matches('[').trim_end_matches(']')) else {
+        candle_core::bail!("No host in --server value.");
+    };
+
+    let p = srv_addr_url.port().map(|p| p as u16).unwrap_or(port.unwrap_or(8000) as u16);
+
+    if port.is_some_and(|po| p != po as u16) {
+        candle_core::bail!("--server host:{p} and --port {} are both given and don't agree.", port.unwrap());
+    }
+
+    // Resolve hostname to a socket address.
+    let sock_addr = (h, p)
+        .to_socket_addrs()
+        .map_err(|e| {
+            candle_core::Error::Msg(format!("Failed to resolve '{h}': {e}"))
+        })?
+        .next()
+        .ok_or_else(|| {
+            candle_core::Error::Msg(format!("No addresses resolved for '{h}'"))
+        })?;
+
+    Ok(ServerAddr::Tcp(sock_addr))
+}
+
+/// Start the API server.
+///
+/// `addr` determines how the server listens:
+///   - `ServerAddr::Tcp(sock_addr)`  → TCP at `sock_addr`
+///   - `ServerAddr::Unix(path)`      → Unix socket at `path`
+///
+/// When `--pd-server` is active the address is ignored (binds `0.0.0.0:0` instead).
 pub async fn run_server(
     engine: Arc<RwLock<LLMEngine>>,
     econfig: EngineConfig,
-    port: usize,
+    addr: ServerAddr,
     with_ui_server: bool,
 ) -> Result<()> {
     use axum::extract::DefaultBodyLimit;
@@ -1514,61 +1597,98 @@ pub async fn run_server(
         .layer(cors)
         .with_state(Arc::new(server_data));
 
-    let addr = if is_pd_server {
+    // ── PD server ───────────────────────────────────────────────────────
+    if is_pd_server {
         crate::log_warn!("🚀 PD server started, waiting for prefill request(s)...",);
-        format!("0.0.0.0:{}", 0)
-    } else {
-        let ip = local_ip().unwrap_or("127.0.0.1".parse().unwrap());
-        let local_url = format!("http://localhost:{port}/v1/");
-        let lan_url = format!("http://{ip}:{port}/v1/");
-
-        let api_server_url = format!(
-            "🧠 API server running at:\n   -  {} (Local Access) \n   -  {} (Remote Access, IP may not correct under Docker)",
-            local_url, lan_url
-        );
-        println!("{}", api_server_url.cyan());
-
-        println!(
-            "{}",
-            format!("📡 Supported endpoints (OpenAI/Claude):").yellow()
-        );
-        println!("{}", format!("   - POST /v1/chat/completions").yellow());
-        println!("{}", format!("   - POST /v1/messages").yellow());
-        println!(
-            "{}",
-            format!("   - POST /v1/messages/count_tokens").yellow()
-        );
-        println!("{}", format!("   - POST /v1/embeddings").yellow());
-        println!("{}", format!("   - GET  /v1/models").yellow());
-        println!("{}", format!("   - GET  /v1/usage").yellow());
-        println!("{}", format!("   - POST /tokenize").yellow());
-        println!("{}", format!("   - POST /detokenize").yellow());
-        println!("");
-        println!(
-            "🛑 {}",
-            format!("EXIT: Ctrl+C to quit. If unresponsive: Ctrl+P → Ctrl+Q (last resort).")
-                .bold()
-                .red()
-        );
-        println!("");
-        format!("0.0.0.0:{}", port)
-    };
-
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    let mut tasks = Vec::new();
-    tasks.push(tokio::spawn(async move {
+        let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await?;
         if let Err(e) = axum::serve(listener, app).await {
             eprintln!("API server error: {e:?}");
         }
-    }));
-
-    if with_ui_server {
-        tasks.push(tokio::spawn(async move {
-            start_ui_server((port + 1) as u16, Some(port as u16), None, None)
-                .await
-                .unwrap();
-        }));
+        return Ok(());
     }
+
+    // ── Normal server: bind the appropriate listener ────────────────────
+    let mut tasks = Vec::new();
+
+    match addr {
+        ServerAddr::Tcp(sock_addr) => {
+            let listener = tokio::net::TcpListener::bind(sock_addr).await?;
+
+            // Display
+            let display_url = format!("http://{}/v1/", sock_addr);
+            if sock_addr.ip().is_unspecified() {
+                // local_ip returns one address but the machine may have multiple.
+                let example_ip = if sock_addr.is_ipv4() {
+                    local_ip().unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST))
+                } else {
+                    local_ipv6().unwrap_or(IpAddr::V6(Ipv6Addr::LOCALHOST))
+                };
+                let example_sock = SocketAddr::new(example_ip, sock_addr.port());
+                let example_url = format!("http://{example_sock}/v1/");
+                println!(
+                    "{}",
+                    format!("🧠 API server running at:\n   -  {display_url} (Bind Address) \n   -  {example_url}")
+                        .cyan()
+                );
+            } else {
+                println!(
+                    "{}",
+                    format!("🧠 API server running at:\n   -  {display_url} (Bind Address)")
+                        .cyan()
+                );
+            }
+
+            tasks.push(tokio::spawn(async move {
+                if let Err(e) = axum::serve(listener, app).await {
+                    eprintln!("API server error: {e:?}");
+                }
+            }));
+
+            if with_ui_server {
+                tasks.push(tokio::spawn(async move {
+                    start_ui_server(sock_addr.port() + 1, Some(sock_addr.port()), None, None).await.unwrap();
+                }));
+            }
+        }
+        ServerAddr::Unix(path) => {
+            if with_ui_server {
+                candle_core::bail!("--ui-server is not supported with Unix sockets.");
+            }
+            let listener = tokio::net::UnixListener::bind(&path)?;
+
+            println!(
+                "{}",
+                format!("🧠 API server running at: http+unix://{}", path.display()).cyan()
+            );
+
+            tasks.push(tokio::spawn(async move {
+                if let Err(e) = axum::serve(listener, app).await {
+                    eprintln!("API server error: {e:?}");
+                }
+            }));
+        }
+    }
+
+    println!(
+        "{}",
+        format!("📡 Supported endpoints (OpenAI/Claude):").yellow()
+    );
+    println!("{}", format!("   - POST /v1/chat/completions").yellow());
+    println!("{}", format!("   - POST /v1/messages").yellow());
+    println!("{}", format!("   - POST /v1/messages/count_tokens").yellow());
+    println!("{}", format!("   - POST /v1/embeddings").yellow());
+    println!("{}", format!("   - GET  /v1/models").yellow());
+    println!("{}", format!("   - GET  /v1/usage").yellow());
+    println!("{}", format!("   - POST /tokenize").yellow());
+    println!("{}", format!("   - POST /detokenize").yellow());
+    println!("");
+    println!(
+        "🛑 {}",
+        format!("EXIT: Ctrl+C to quit. If unresponsive: Ctrl+P → Ctrl+Q (last resort).")
+            .bold()
+            .red()
+    );
+    println!("");
 
     futures::future::try_join_all(tasks)
         .await
@@ -2175,5 +2295,141 @@ mod tests {
             Some(192),
             "reasoning_tokens should round-trip under completion_tokens_details, got: {value}",
         );
+    }
+
+    #[test]
+    fn test_server_flag_accepts_no_value() {
+        let args = Args::try_parse_from(["xinfer", "--m", "test", "--server"]).unwrap();
+        assert_eq!(args.server, "0.0.0.0");
+    }
+
+    #[test]
+    fn test_server_flag_accepts_hostport_value() {
+        let args =
+            Args::try_parse_from(["xinfer", "--m", "test", "--server", "127.0.0.1:8080"])
+                .unwrap();
+        assert_eq!(args.server, "127.0.0.1:8080");
+    }
+
+    #[test]
+    fn test_server_flag_accepts_ipv6_value() {
+        let args =
+            Args::try_parse_from(["xinfer", "--m", "test", "--server", "[::1]:8080"]).unwrap();
+        assert_eq!(args.server, "[::1]:8080");
+    }
+
+    #[test]
+    fn test_server_flag_optional_with_port_fallback() {
+        // --port alone still works
+        let args = Args::try_parse_from(["xinfer", "--m", "test", "--port", "9000"]).unwrap();
+        assert_eq!(args.server, "");
+        assert_eq!(args.port, Some(9000));
+    }
+
+    #[test]
+    fn test_server_prefers_value_over_port() {
+        // Both --server value and --port; --server value takes precedence in main.rs logic
+        let args = Args::try_parse_from([
+            "xinfer",
+            "--m",
+            "test",
+            "--server",
+            "0.0.0.0:8080",
+            "--port",
+            "9000",
+        ])
+        .unwrap();
+        assert_eq!(args.server, "0.0.0.0:8080");
+        assert_eq!(args.port, Some(9000));
+    }
+
+    #[test]
+    fn test_resolve_server_addr_defaults_to_unspecified() {
+        for (input, port, expected_port) in [
+            ("", None, 8000),
+            ("0.0.0.0", None, 8000),
+            ("", Some(9000), 9000),
+            ("0.0.0.0", Some(9000), 9000),
+        ] {
+            let addr = resolve_server_addr(input, port).unwrap();
+            assert!(matches!(addr, ServerAddr::Tcp(_)));
+            if let ServerAddr::Tcp(sa) = addr {
+                assert_eq!(sa.port(), expected_port);
+                assert!(sa.ip().is_unspecified());
+            }
+        }
+    }
+
+    #[test]
+    fn test_resolve_server_addr_ipv4() {
+        for (input, port, expected_port) in [
+            ("127.0.0.1:8080", None, 8080),
+            ("127.0.0.1", None, 8000),
+            ("127.0.0.1", Some(7000), 7000),
+        ] {
+            let addr = resolve_server_addr(input, port).unwrap();
+            if let ServerAddr::Tcp(sa) = addr {
+                assert_eq!(sa.port(), expected_port);
+                assert!(sa.ip().is_loopback());
+            }
+        }
+    }
+
+    #[test]
+    fn test_resolve_server_addr_hostname() {
+        for (input, port, expected_port) in [
+            ("localhost", None, 8000),
+            ("localhost:9000", None, 9000),
+        ] {
+            let addr = resolve_server_addr(input, port).unwrap();
+            if let ServerAddr::Tcp(sa) = addr {
+                assert_eq!(sa.port(), expected_port);
+            }
+        }
+    }
+
+    #[test]
+    fn test_resolve_server_addr_ipv6_loopback() {
+        for (input, port, expected_port) in [
+            ("[::1]:9090", None, 9090),
+            ("[::1]", None, 8000),
+            ("::1", None, 8000),   // bare — url can't parse natively
+            ("::1", Some(7070), 7070),
+            ("[::1]:6060", None, 6060),
+        ] {
+            let addr = match resolve_server_addr(input, port) {
+                Ok(a) => a,
+                Err(_) => return, // skip entire test if IPv6 unavailable
+            };
+            if let ServerAddr::Tcp(sa) = addr {
+                assert_eq!(sa.port(), expected_port);
+                assert!(sa.ip().is_loopback());
+            }
+        }
+    }
+
+    #[test]
+    fn test_resolve_server_addr_ipv6_unspecified() {
+        for input in ["::", "[::]"] {
+            let addr = resolve_server_addr(input, None).unwrap();
+            if let ServerAddr::Tcp(sa) = addr {
+                assert_eq!(sa.port(), 8000);
+                assert!(sa.ip().is_unspecified());
+            }
+        }
+    }
+
+    #[test]
+    fn test_resolve_server_addr_unix_socket() {
+        for scheme in ["file", "socket", "unix"] {
+            let addr = resolve_server_addr(&format!("{scheme}:///tmp/xinfer.sock"), None).unwrap();
+            assert!(matches!(addr, ServerAddr::Unix(_)));
+        }
+    }
+
+    #[test]
+    fn test_resolve_server_addr_port_mismatch_errors() {
+        let result = resolve_server_addr("0.0.0.0:8080", Some(9000));
+        assert!(result.is_err());
     }
 }
