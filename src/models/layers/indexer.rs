@@ -140,40 +140,26 @@ impl DsaIndexer {
         let idx_k = Tensor::cat(&[&idx_k_rope, &idx_k_pass.contiguous()?], D::Minus1)?;
         let idx_k = idx_k.squeeze(1)?;
 
-        let idx_q_f32 = idx_q.to_dtype(DType::F32)?;
-        let idx_k_f32 = idx_k.to_dtype(DType::F32)?;
+        // Ensure BF16 for the fused CUDA kernel
+        let idx_q = idx_q.to_dtype(DType::BF16)?.contiguous()?;
+        let idx_k = idx_k.to_dtype(DType::BF16)?.contiguous()?;
 
-        // [n_heads, seq_len, head_dim] @ [head_dim, seq_len] -> [n_heads, seq_len, seq_len]
-        let idx_q_t = idx_q_f32.transpose(0, 1)?.contiguous()?;
-        let idx_k_t = idx_k_f32.t()?.contiguous()?;
-        let idx_k_t = idx_k_t
-            .unsqueeze(0)?
-            .broadcast_as((self.cfg.index_n_heads, self.cfg.index_head_dim, seq_len))?
-            .contiguous()?;
-        let scores = idx_q_t.matmul(&idx_k_t)?;
-        let scores = (scores * (self.softmax_scale as f64))?;
-        let scores = scores.relu()?;
-
-        // Per-head weights
+        // Per-head weights: [seq_len, n_heads] F32
         let weights = self.weights_proj.forward(xs)?;
         let weights = weights.to_dtype(DType::F32)?;
         let head_scale = (self.cfg.index_n_heads as f32).powf(-0.5);
-        let weights = (weights * (head_scale as f64))?;
+        let weights = (weights * (head_scale as f64))?.contiguous()?;
 
-        // Weighted sum: [seq_len, 1, n_heads] @ [n_heads, seq_len, seq_len] -> [seq_len, seq_len]
-        let weights_t = weights.unsqueeze(1)?;
-        let scores_t = scores.permute((1, 0, 2))?.contiguous()?;
-        let index_scores = weights_t.matmul(&scores_t)?.squeeze(1)?;
-
-        // GPU causal mask: create zeros then apply causal_mask kernel (all GPU)
-        let causal = Tensor::zeros((seq_len, seq_len), DType::F32, xs.device())?;
-        attention_rs::mask::causal_mask(&causal, None)?;
-        let index_scores = (index_scores + causal)?;
-
-        // Top-k selection (GPU-only, returns U32 indices)
+        // Fused CUDA kernel: score computation + causal mask + top-k selection
+        // Avoids materializing O(n²) intermediate tensors.
         let topk = self.cfg.index_topk.min(seq_len);
-        let index_scores = index_scores.contiguous()?;
-        let (_topk_values, topk_indices) = attention_rs::topk::topk_select(&index_scores, topk)?;
+        let topk_indices = attention_rs::mla::dsa_lightning_indexer_prefill(
+            &idx_q,
+            &idx_k,
+            &weights,
+            topk,
+            self.softmax_scale,
+        )?;
         Ok(Some(topk_indices))
     }
 }
