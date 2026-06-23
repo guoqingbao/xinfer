@@ -113,6 +113,7 @@ impl MlaAttention {
         mla_cfg: &MlaConfig,
         config: &Config,
         dtype: DType,
+        layer_idx: usize,
     ) -> Result<Self> {
         let hidden_size = mla_cfg.hidden_size;
         let num_heads = mla_cfg.num_attention_heads;
@@ -337,7 +338,9 @@ impl MlaAttention {
             }
         }
 
+        let skip_offset = mla_cfg.index_skip_topk_offset.unwrap_or(1);
         let has_indexer = mla_cfg.index_head_dim.is_some()
+            && layer_idx >= skip_offset
             && (vb.pp("indexer").has_key("wq_b.weight")
                 || vb.pp("indexer").has_key("attn_q_b.weight"));
         let indexer = if has_indexer {
@@ -489,7 +492,6 @@ impl MlaAttention {
                 let page_size = ckv_cache.dim(1)?;
 
                 // Returns None when seq_len <= topk (dense is equivalent).
-                // Decode always uses the dense FlashInfer path.
                 if input_metadata.is_prefill {
                     if let (Some(indexer), Some(q_res)) = (&self.indexer, &q_resid) {
                         if let Some(block_tables) = &input_metadata.block_tables {
@@ -527,6 +529,10 @@ impl MlaAttention {
                         }
                     }
                 }
+
+                // DSA is prefill-only: sparse decode adds per-layer scoring overhead that exceeds
+                // the attention savings. Dense MLA decode with FlashInfer is faster at all
+                // practical context lengths. Indexer K cache is populated during prefill.
 
                 let attn_out = if input_metadata.is_prefill {
                     let plan_info = fm.mla_prefill_plan_info.as_ref().ok_or_else(|| {
@@ -648,7 +654,7 @@ impl MlaAttention {
                     return self.project_mla_output(&attn_out, seq_len, xs.dtype());
                 }
 
-                // Decode: always dense MLA (DSA sparse is prefill-only)
+                // DSA is prefill-only: dense MLA decode is faster at all practical context lengths.
                 let attn_out = attention_rs::mla::mla_paged_decode(
                     &q_absorbed,
                     &q_pe,

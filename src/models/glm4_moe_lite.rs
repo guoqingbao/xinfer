@@ -72,6 +72,7 @@ impl GLM4MoeLiteDecoderLayer {
             mla_cfg,
             config,
             dtype,
+            layer_idx,
         )?;
 
         let moe_cfg = config

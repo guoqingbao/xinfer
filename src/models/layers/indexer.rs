@@ -16,11 +16,14 @@ pub struct IndexerConfig {
     pub hidden_size: usize,
 }
 
-/// DSA (DeepSeek Sparse Attention) lightning indexer.
+/// DSA (DeepSeek Sparse Attention) lightning indexer (prefill-only).
 ///
 /// Selects the top-k most relevant tokens for each query position,
-/// producing sparse indices used to mask the main MLA attention.
-/// All operations are GPU-only — no CPU↔GPU sync — compatible with CUDA graph capture.
+/// producing sparse indices used to mask the main MLA attention during prefill.
+/// All operations are GPU-only — no CPU↔GPU sync.
+///
+/// For decode, dense MLA with FlashInfer is used (faster than sparse scoring
+/// at all practical context lengths due to per-layer indexer overhead).
 ///
 /// Reference: HuggingFace transformers `DeepseekV32Indexer`
 pub struct DsaIndexer {
@@ -29,7 +32,7 @@ pub struct DsaIndexer {
     k_norm: NormX,
     weights_proj: ReplicatedLinear,
     cfg: IndexerConfig,
-    softmax_scale: f32,
+    score_scale: f32,
 }
 
 impl DsaIndexer {
@@ -61,7 +64,11 @@ impl DsaIndexer {
             dtype,
         )?;
 
+        // Combine softmax_scale (head_dim^-0.5) and head_scale (n_heads^-0.5)
+        // into a single constant, eliminating a per-token tensor multiplication.
         let softmax_scale = 1.0 / (cfg.index_head_dim as f32).sqrt();
+        let head_scale = (cfg.index_n_heads as f32).powf(-0.5);
+        let score_scale = softmax_scale * head_scale;
 
         Ok(Self {
             wq_b,
@@ -69,7 +76,7 @@ impl DsaIndexer {
             k_norm,
             weights_proj,
             cfg,
-            softmax_scale,
+            score_scale,
         })
     }
 
@@ -77,17 +84,10 @@ impl DsaIndexer {
         self.cfg.index_topk
     }
 
-    /// Run the indexer to produce top-k token indices for sparse attention.
-    /// All operations are GPU-only — no CPU↔GPU sync. Compatible with CUDA graph capture.
+    /// Run the indexer to produce top-k token indices for sparse attention (prefill).
     ///
     /// Returns `[seq_len, topk]` U32 indices, or None when seq_len <= topk
     /// (dense attention is equivalent in that case).
-    ///
-    /// # Arguments
-    /// * `xs` - hidden states `[seq_len, hidden_size]`
-    /// * `q_resid` - query latent from `q_a_layernorm(q_a_proj(x))`, shape `[seq_len, q_lora_rank]`
-    /// * `rotary_emb` - rotary embedding (shared with main attention)
-    /// * `positions` - position tensor
     #[cfg(feature = "cuda")]
     pub fn forward(
         &self,
@@ -146,19 +146,17 @@ impl DsaIndexer {
 
         // Per-head weights: [seq_len, n_heads] F32
         let weights = self.weights_proj.forward(xs)?;
-        let weights = weights.to_dtype(DType::F32)?;
-        let head_scale = (self.cfg.index_n_heads as f32).powf(-0.5);
-        let weights = (weights * (head_scale as f64))?.contiguous()?;
+        let weights = weights.to_dtype(DType::F32)?.contiguous()?;
 
         // Fused CUDA kernel: score computation + causal mask + top-k selection
-        // Avoids materializing O(n²) intermediate tensors.
+        // score_scale already includes both softmax_scale and head_scale
         let topk = self.cfg.index_topk.min(seq_len);
         let topk_indices = attention_rs::mla::dsa_lightning_indexer_prefill(
             &idx_q,
             &idx_k,
             &weights,
             topk,
-            self.softmax_scale,
+            self.score_scale,
         )?;
         Ok(Some(topk_indices))
     }
