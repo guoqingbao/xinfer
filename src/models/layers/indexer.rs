@@ -162,7 +162,7 @@ impl DsaIndexer {
 
         // Weighted sum: [seq_len, 1, n_heads] @ [n_heads, seq_len, seq_len] -> [seq_len, seq_len]
         let weights_t = weights.unsqueeze(1)?;
-        let scores_t = scores.permute((1, 0, 2))?;
+        let scores_t = scores.permute((1, 0, 2))?.contiguous()?;
         let index_scores = weights_t.matmul(&scores_t)?.squeeze(1)?;
 
         // GPU causal mask: create zeros then apply causal_mask kernel (all GPU)
