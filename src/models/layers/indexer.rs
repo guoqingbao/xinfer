@@ -63,14 +63,6 @@ impl DsaIndexer {
 
         let softmax_scale = 1.0 / (cfg.index_head_dim as f32).sqrt();
 
-        tracing::info!(
-            "DSA indexer loaded (index_head_dim={}, index_n_heads={}, index_topk={}, skip_offset={})",
-            cfg.index_head_dim,
-            cfg.index_n_heads,
-            cfg.index_topk,
-            cfg.index_skip_topk_offset,
-        );
-
         Ok(Self {
             wq_b,
             wk,
@@ -183,32 +175,5 @@ impl DsaIndexer {
         let index_scores = index_scores.contiguous()?;
         let (_topk_values, topk_indices) = attention_rs::topk::topk_select(&index_scores, topk)?;
         Ok(Some(topk_indices))
-    }
-
-    /// Build a sparse attention mask from top-k indices (GPU-only).
-    /// Uses scatter-like approach on GPU without CPU↔GPU sync.
-    ///
-    /// Returns `[1, seq_len, context_len]` mask with 0 at selected positions,
-    /// -inf elsewhere.
-    #[cfg(feature = "cuda")]
-    pub fn build_sparse_mask(
-        topk_indices: &Tensor,
-        seq_len: usize,
-        context_len: usize,
-        dtype: DType,
-    ) -> Result<Tensor> {
-        let topk_vec = topk_indices.to_vec2::<u32>()?;
-
-        let mut mask_data = vec![f32::NEG_INFINITY; seq_len * context_len];
-        for qi in 0..seq_len {
-            for &idx in &topk_vec[qi] {
-                let idx = idx as usize;
-                if idx < context_len {
-                    mask_data[qi * context_len + idx] = 0.0;
-                }
-            }
-        }
-        let dev = topk_indices.device().clone();
-        Tensor::from_vec(mask_data, (1, seq_len, context_len), &dev)?.to_dtype(dtype)
     }
 }

@@ -606,15 +606,10 @@ pub fn config_from_gguf<R: std::io::Seek + std::io::Read>(
         let key_length_mla = md_opt_usize(format!("{arch}.attention.key_length_mla").as_str());
         let v_head_dim = md_opt_usize(format!("{arch}.attention.value_length_mla").as_str());
         let qk_rope_head_dim = md_opt_usize(format!("{arch}.rope.dimension_count").as_str());
-        // For glm-dsa: key_length_mla == qk_nope_head_dim directly.
-        // For deepseek2: key_length_mla == qk_nope_head_dim + qk_rope_head_dim.
-        let qk_nope_head_dim = if arch == "deepseek2" {
-            match (key_length_mla, qk_rope_head_dim) {
-                (Some(kl), Some(rd)) => Some(kl - rd),
-                _ => key_length_mla,
-            }
-        } else {
-            key_length_mla
+        // key_length_mla == qk_nope_head_dim + qk_rope_head_dim for both glm-dsa and deepseek2
+        let qk_nope_head_dim = match (key_length_mla, qk_rope_head_dim) {
+            (Some(kl), Some(rd)) => Some(kl - rd),
+            _ => key_length_mla,
         };
 
         let index_head_dim = md_opt_usize(format!("{arch}.attention.indexer.key_length").as_str());
