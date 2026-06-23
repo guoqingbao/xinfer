@@ -437,7 +437,7 @@ Constraint-based generation via llguidance — Lark grammars, regex, JSON Schema
 | `--f` | Local GGUF file when used alone; remote GGUF filename when paired with `--m <model_id>` |
 | `--d` | Device IDs (e.g. `--d 0,1`) |
 | `--ui-server` | API server + built-in ChatGPT-style web UI |
-| `--server` | API server only (no web UI) |
+| `--server` | API server. Bare: `0.0.0.0:8000`; or `host[:port]`, `file:///path`, `socket:///path`, `unix:///path` |
 | `--i` | Interactive CLI chat |
 | `--isq` | On-the-fly quantization: `q2k`, `q3k`, `q4k`, `q5k`, `q6k`, `q8_0` |
 | `--kvcache-dtype` | KV cache quantization: `fp8`, `turbo8`, `turbo4`, `turbo3` |

@@ -432,7 +432,7 @@ xinfer --m unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF \
 | `--f` | 单独使用时为本地 GGUF 文件；配合 `--m <model_id>` 时为远程 GGUF 文件名 |
 | `--d` | 设备 ID（如 `--d 0,1`） |
 | `--ui-server` | API 服务 + ChatGPT 风格内置 Web UI |
-| `--server` | 仅 API 服务（无 Web UI） |
+| `--server` | API 服务器。无参数：`0.0.0.0:8000`；或 `host[:port]`、`file:///path`、`socket:///path`、`unix:///path` |
 | `--i` | 交互式 CLI 对话 |
 | `--isq` | 即时量化：`q2k`、`q3k`、`q4k`、`q5k`、`q6k`、`q8_0` |
 | `--kvcache-dtype` | KV 缓存量化：`fp8`、`turbo8`、`turbo4`、`turbo3` |
