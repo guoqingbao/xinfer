@@ -1814,11 +1814,7 @@ impl LLMEngine {
                 let chunk_tokens = std::cmp::min(chunk_size, remaining);
                 let embedding_result = match &mut *self.runners.write() {
                     RunnerType::Thread(model_runner) => model_runner.embed(&[&seq], &strategy),
-                    RunnerType::Process(ref mut runner_streams)
-                    | RunnerType::MultiNodeMaster {
-                        local_streams: ref mut runner_streams,
-                        ..
-                    } => {
+                    RunnerType::Process(ref mut runner_streams) => {
                         let request = MessageType::RunEmbed((vec![seq.clone()], strategy.clone()));
                         let cloned_streams: Vec<LocalStream> = runner_streams
                             .iter_mut()
@@ -1848,6 +1844,78 @@ impl LLMEngine {
                             .collect();
                         let all_outputs = all_outputs.map_err(candle_core::Error::wrap)?;
                         if let Some(output_embed) = all_outputs.first() {
+                            Ok(output_embed.clone())
+                        } else {
+                            candle_core::bail!(
+                                "No output embedding states received from model runners"
+                            );
+                        }
+                    }
+                    RunnerType::MultiNodeMaster {
+                        local_streams: ref mut runner_streams,
+                        ref mut remote_streams,
+                    } => {
+                        let request = MessageType::RunEmbed((vec![seq.clone()], strategy.clone()));
+                        let serialized =
+                            bincode::serialize(&request).expect("Bincode serialization failed");
+
+                        for tcp_stream in remote_streams.iter_mut() {
+                            crate::utils::multi_node::send_tcp(tcp_stream, &serialized)?;
+                        }
+
+                        let cloned_streams: Vec<LocalStream> = runner_streams
+                            .iter_mut()
+                            .map(|s| s.try_clone().expect("clone failed"))
+                            .collect();
+
+                        let all_outputs: Result<Vec<Vec<Vec<f32>>>> = cloned_streams
+                            .into_par_iter()
+                            .map(|mut stream| {
+                                let msg = request.clone();
+                                send_local(&mut vec![stream.try_clone()?], &msg, false)?;
+                                let response = receive_local(&mut stream, false)?;
+
+                                match response {
+                                    MessageType::RunResponseEmbed(output_embed) => {
+                                        if output_embed.is_empty() {
+                                            candle_core::bail!("Runner step error, no response!")
+                                        } else {
+                                            Ok(output_embed)
+                                        }
+                                    }
+                                    other => {
+                                        candle_core::bail!("Unexpected response type: {:?}", other)
+                                    }
+                                }
+                            })
+                            .collect();
+                        let all_outputs = all_outputs.map_err(candle_core::Error::wrap);
+
+                        for tcp_stream in remote_streams.iter_mut() {
+                            let data = crate::utils::multi_node::recv_tcp(tcp_stream)?;
+                            let response: MessageType = bincode::deserialize(&data)
+                                .expect("Failed to deserialize remote worker response");
+                            match response {
+                                MessageType::RunResponseEmbed(output_embed) => {
+                                    if output_embed.is_empty() {
+                                        candle_core::bail!(
+                                            "Remote worker returned empty embedding response"
+                                        );
+                                    }
+                                }
+                                MessageType::Error(err) => {
+                                    candle_core::bail!("Remote worker embedding failed: {}", err);
+                                }
+                                other => {
+                                    candle_core::bail!(
+                                        "Unexpected remote embedding response: {:?}",
+                                        other
+                                    );
+                                }
+                            }
+                        }
+
+                        if let Some(output_embed) = all_outputs?.first() {
                             Ok(output_embed.clone())
                         } else {
                             candle_core::bail!(

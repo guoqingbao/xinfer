@@ -349,9 +349,8 @@ macro_rules! def_broadcast_message_to_runners {
                     // Thread Mode: Call the method directly.
                     model_runner.$thread_fn_name($($arg_name),*)
                 }
-                RunnerType::Process(ref mut runner_streams)
-                | RunnerType::MultiNodeMaster { local_streams: ref mut runner_streams, .. } => {
-                    // Process Mode: Broadcast to all local subprocess runners.
+                RunnerType::Process(ref mut runner_streams) => {
+                    // Process Mode: Broadcast to all subprocess runners.
                     let cloned_streams: Vec<LocalStream> = runner_streams
                         .iter_mut()
                         .map(|s| s.try_clone().expect("Failed to clone runner stream"))
@@ -394,6 +393,59 @@ macro_rules! def_broadcast_message_to_runners {
                         }
                         Err(e) => Err(e),
                     }
+                }
+                RunnerType::MultiNodeMaster {
+                    local_streams: ref mut runner_streams,
+                    remote_streams: ref mut remote_streams,
+                } => {
+                    let request = $msg_variant($($msg_arg),*);
+                    let cloned_streams: Vec<LocalStream> = runner_streams
+                        .iter_mut()
+                        .map(|s| s.try_clone().expect("Failed to clone runner stream"))
+                        .collect();
+
+                    let local_results: Result<Vec<$return_ty>> = cloned_streams
+                        .into_par_iter()
+                        .map(|mut stream| {
+                            let msg = request.clone();
+                            send_local(&mut vec![stream.try_clone()?], &msg, false)?;
+
+                            let response = receive_local(&mut stream, false)?;
+                            match response {
+                                $resp_variant(value) => Ok(value),
+                                other => {
+                                    candle_core::bail!("Unexpected local response for {}: {:?}", stringify!($fn_name), other)
+                                }
+                            }
+                        })
+                        .collect();
+
+                    let mut values = local_results?;
+                    let serialized = bincode::serialize(&request).expect("Bincode serialization failed");
+
+                    for tcp_stream in remote_streams.iter_mut() {
+                        crate::utils::multi_node::send_tcp(tcp_stream, &serialized)?;
+                    }
+
+                    for tcp_stream in remote_streams.iter_mut() {
+                        let data = crate::utils::multi_node::recv_tcp(tcp_stream)?;
+                        let response: MessageType = bincode::deserialize(&data)
+                            .expect("Bincode deserialization failed");
+                        match response {
+                            $resp_variant(value) => values.push(value),
+                            MessageType::Error(err) => {
+                                candle_core::bail!("Remote worker failed for {}: {}", stringify!($fn_name), err)
+                            }
+                            other => {
+                                candle_core::bail!("Unexpected remote response for {}: {:?}", stringify!($fn_name), other)
+                            }
+                        }
+                    }
+
+                    if values.is_empty() {
+                        candle_core::bail!("No values received from runners for {}", stringify!($fn_name));
+                    }
+                    Ok(values.remove(0))
                 }
             }
         }

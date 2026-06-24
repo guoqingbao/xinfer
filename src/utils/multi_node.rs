@@ -1,6 +1,8 @@
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 
+const MAX_TCP_MESSAGE_BYTES: usize = 1024 * 1024 * 1024;
+
 #[cfg(feature = "nccl")]
 use crate::models::layers::distributed::Id;
 
@@ -175,15 +177,20 @@ impl MultiNodeConfig {
 
     /// Port used for forward-pass coordination TCP connections.
     /// Offset from master_port by 1 to avoid collision with NCCL ID exchange.
-    pub fn forward_coord_port(&self) -> u16 {
-        self.master_port + 1
+    pub fn forward_coord_port(&self) -> std::io::Result<u16> {
+        self.master_port.checked_add(1).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "--master-port must be less than 65535 for multi-node coordination",
+            )
+        })
     }
 }
 
 /// On the master node: accept TCP connections from worker nodes for
 /// forward-pass coordination. Returns one TcpStream per worker node.
 pub fn master_accept_worker_streams(config: &MultiNodeConfig) -> std::io::Result<Vec<TcpStream>> {
-    let bind_addr = format!("{}:{}", config.master_addr, config.forward_coord_port());
+    let bind_addr = format!("{}:{}", config.master_addr, config.forward_coord_port()?);
     crate::log_info!(
         "[Multi-Node] Master listening for forward coordination on {}...",
         bind_addr
@@ -211,7 +218,7 @@ pub fn master_accept_worker_streams(config: &MultiNodeConfig) -> std::io::Result
 
 /// On worker nodes: connect to master for forward-pass coordination.
 pub fn worker_connect_to_master(config: &MultiNodeConfig) -> std::io::Result<TcpStream> {
-    let addr = format!("{}:{}", config.master_addr, config.forward_coord_port());
+    let addr = format!("{}:{}", config.master_addr, config.forward_coord_port()?);
     crate::log_info!(
         "[Multi-Node] Worker node {} connecting to master for forward coordination at {}...",
         config.node_rank,
@@ -249,7 +256,12 @@ pub fn worker_connect_to_master(config: &MultiNodeConfig) -> std::io::Result<Tcp
 
 /// Send a length-prefixed bincode message over a TcpStream.
 pub fn send_tcp(stream: &mut TcpStream, data: &[u8]) -> std::io::Result<()> {
-    let len = data.len() as u32;
+    let len = u32::try_from(data.len()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("TCP message too large: {} bytes", data.len()),
+        )
+    })?;
     stream.write_all(&len.to_le_bytes())?;
     stream.write_all(data)?;
     stream.flush()?;
@@ -261,9 +273,44 @@ pub fn recv_tcp(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf)?;
     let len = u32::from_le_bytes(len_buf) as usize;
+    if len > MAX_TCP_MESSAGE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("TCP message length {} exceeds limit", len),
+        ));
+    }
     let mut buf = vec![0u8; len];
     stream.read_exact(&mut buf)?;
     Ok(buf)
+}
+
+#[cfg(feature = "nccl")]
+fn forward_to_local_runners(
+    runner_streams: &mut Vec<interprocess::local_socket::Stream>,
+    msg: &crate::runner::MessageType,
+) -> candle_core::Result<crate::runner::MessageType> {
+    use crate::runner::{receive_local, send_local, MessageType};
+    use interprocess::local_socket::Stream as LocalStream;
+    use interprocess::TryClone;
+    use rayon::iter::{IntoParallelIterator, ParallelIterator};
+
+    let cloned_streams: Vec<LocalStream> = runner_streams
+        .iter_mut()
+        .map(|s| s.try_clone().expect("clone failed"))
+        .collect();
+
+    let responses: candle_core::Result<Vec<MessageType>> = cloned_streams
+        .into_par_iter()
+        .map(|mut stream| {
+            send_local(&mut vec![stream.try_clone()?], msg, false)?;
+            receive_local(&mut stream, false).map_err(candle_core::Error::wrap)
+        })
+        .collect();
+
+    responses?
+        .into_iter()
+        .next()
+        .ok_or_else(|| candle_core::Error::Msg("No response from local runners".to_string()))
 }
 
 /// Run the worker daemon on non-master nodes.
@@ -280,10 +327,7 @@ pub fn run_worker_daemon(
 ) -> candle_core::Result<()> {
     use crate::core::engine::LLMEngine;
     use crate::core::runner::RunnerType;
-    use crate::runner::{receive_local, send_local, MessageType};
-    use interprocess::local_socket::Stream as LocalStream;
-    use interprocess::TryClone;
-    use rayon::iter::{IntoParallelIterator, ParallelIterator};
+    use crate::runner::MessageType;
 
     crate::log_info!(
         "[Multi-Node Worker] Starting daemon on node {} with {} local GPUs",
@@ -328,47 +372,34 @@ pub fn run_worker_daemon(
         };
 
         match msg {
-            MessageType::RunPrefill(_) | MessageType::RunDecode(_) => {
-                // Forward the command to all local runners and collect the first result
+            MessageType::RunPrefill(_)
+            | MessageType::RunDecode(_)
+            | MessageType::RunEmbed(_)
+            | MessageType::KVCacheSwap(_)
+            | MessageType::CaptureMambaPrefixState(_)
+            | MessageType::HasMambaPrefixState(_)
+            | MessageType::RemoveMambaPrefixState(_)
+            | MessageType::TransferPrefill(_)
+            | MessageType::ReceivePrefill(_)
+            | MessageType::CheckPrefillStatus(_)
+            | MessageType::KvCacheSend(_)
+            | MessageType::KvCacheReceive(_)
+            | MessageType::KvCacheRelease(_)
+            | MessageType::CheckKvCacheRelease(_)
+            | MessageType::ClearBlocks(_) => {
                 let runners = engine.read().runners.clone();
                 let response = {
                     let mut guard = runners.write();
                     match &mut *guard {
                         RunnerType::Process(ref mut runner_streams) => {
-                            let cloned_streams: Vec<LocalStream> = runner_streams
-                                .iter_mut()
-                                .map(|s| s.try_clone().expect("clone failed"))
-                                .collect();
-
-                            let all_outputs: candle_core::Result<Vec<Vec<u32>>> = cloned_streams
-                                .into_par_iter()
-                                .map(|mut stream| {
-                                    let msg_clone = msg.clone();
-                                    send_local(&mut vec![stream.try_clone()?], &msg_clone, false)?;
-                                    let response = receive_local(&mut stream, false)?;
-                                    match response {
-                                        MessageType::RunResponse(output_ids) => Ok(output_ids),
-                                        other => {
-                                            candle_core::bail!("Unexpected response: {:?}", other)
-                                        }
-                                    }
-                                })
-                                .collect();
-
-                            match all_outputs {
-                                Ok(outputs) => {
-                                    let ids = outputs.into_iter().next().unwrap_or_default();
-                                    MessageType::RunResponse(ids)
-                                }
-                                Err(e) => {
-                                    crate::log_error!("[Multi-Node Worker] Forward error: {:?}", e);
-                                    MessageType::RunResponse(vec![])
-                                }
+                            match forward_to_local_runners(runner_streams, &msg) {
+                                Ok(response) => response,
+                                Err(e) => MessageType::Error(format!("{:?}", e)),
                             }
                         }
                         _ => {
                             crate::log_error!("[Multi-Node Worker] Expected Process runner type");
-                            MessageType::RunResponse(vec![])
+                            MessageType::Error("Expected Process runner type".to_string())
                         }
                     }
                 };
