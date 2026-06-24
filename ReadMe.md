@@ -338,6 +338,24 @@ See [more Python examples →](python/ReadMe.md)
 
 ---
 
+## 🌐 Multi-Node Tensor Parallelism
+
+Distribute inference across multiple machines using TCP-based NCCL bootstrap. No MPI required.
+
+```bash
+# Node 0 (master, 192.168.1.100): scheduler + API
+xinfer --d 0,1,2,3 --m /data/DeepSeek-R1/ \
+  --num-nodes 2 --node-rank 0 --master-addr 192.168.1.100 --ui-server
+
+# Node 1 (worker, 192.168.1.101): forward-only daemon
+xinfer --d 0,1,2,3 --m /data/DeepSeek-R1/ \
+  --num-nodes 2 --node-rank 1 --master-addr 192.168.1.100
+```
+
+All nodes must have model weights locally and be TCP-reachable on `--master-port` (default 29500). See [Get Started](docs/get_started.md) for details.
+
+---
+
 ## 🔀 Prefill-Decode Disaggregation
 
 Split prefill (prompt processing) and decode (token generation) across GPUs or machines. Eliminates decode stalls during long-context prefilling. PD Server and PD Client must use **same** KvCache type (`--kvcache-dtype`). API request(s) must send to PD Client and the PD Server only process internal prefill requests sent from PD Client.
@@ -488,6 +506,7 @@ XINFER_NVFP4_FORCE_LUT=1 xinfer --m nvidia/Qwen3-30B-A3B-FP4 --ui-server
 * [x] OpenAI-compatible API (streaming support)
 * [x] Continuous batching
 * [x] Multi-gpu inference (Safetensors, GPTQ, AWQ, GGUF)
+* [x] Multi-node tensor parallelism (TCP-based NCCL bootstrap, no MPI required)
 * [x] Speedup prompt processing on Metal/macOS
 * [x] Chunked Prefill
 * [x] Prefix cache (available on `CUDA` when `prefix-cache` enabled)

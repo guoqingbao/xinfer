@@ -422,6 +422,20 @@ pub struct EngineConfig {
     pub disable_cuda_graph: bool,
     #[serde(default = "default_prefill_chunk_size")]
     pub prefill_chunk_size: usize,
+    #[serde(default = "default_num_nodes")]
+    pub num_nodes: usize,
+    #[serde(default)]
+    pub node_rank: usize,
+    pub master_addr: Option<String>,
+    #[serde(default = "default_master_port")]
+    pub master_port: u16,
+}
+
+fn default_num_nodes() -> usize {
+    1
+}
+fn default_master_port() -> u16 {
+    29500
 }
 
 #[cfg(feature = "python")]
@@ -508,6 +522,17 @@ pub struct EngineConfig {
     #[pyo3(get, set)]
     #[serde(default = "default_prefill_chunk_size")]
     pub prefill_chunk_size: usize,
+    #[pyo3(get, set)]
+    #[serde(default = "default_num_nodes")]
+    pub num_nodes: usize,
+    #[pyo3(get, set)]
+    #[serde(default)]
+    pub node_rank: usize,
+    #[pyo3(get, set)]
+    pub master_addr: Option<String>,
+    #[pyo3(get, set)]
+    #[serde(default = "default_master_port")]
+    pub master_port: u16,
 }
 
 impl EngineConfig {
@@ -559,6 +584,10 @@ impl EngineConfig {
         disable_reasoning: bool,
         disable_cuda_graph: bool,
         prefill_chunk_size: Option<usize>,
+        num_nodes: usize,
+        node_rank: usize,
+        master_addr: Option<String>,
+        master_port: u16,
     ) -> Self {
         let mut device_ids = device_ids.unwrap_or_default();
         if device_ids.is_empty() {
@@ -612,6 +641,10 @@ impl EngineConfig {
             prefill_chunk_size: normalize_prefill_chunk_size(
                 prefill_chunk_size.unwrap_or(DEFAULT_PREFILL_CHUNK_SIZE),
             ),
+            num_nodes,
+            node_rank,
+            master_addr,
+            master_port,
         }
     }
 }

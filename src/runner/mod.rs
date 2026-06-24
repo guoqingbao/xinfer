@@ -349,8 +349,9 @@ macro_rules! def_broadcast_message_to_runners {
                     // Thread Mode: Call the method directly.
                     model_runner.$thread_fn_name($($arg_name),*)
                 }
-                RunnerType::Process(ref mut runner_streams) => {
-                    // Process Mode: Broadcast to all subprocess runners.
+                RunnerType::Process(ref mut runner_streams)
+                | RunnerType::MultiNodeMaster { local_streams: ref mut runner_streams, .. } => {
+                    // Process Mode: Broadcast to all local subprocess runners.
                     let cloned_streams: Vec<LocalStream> = runner_streams
                         .iter_mut()
                         .map(|s| s.try_clone().expect("Failed to clone runner stream"))

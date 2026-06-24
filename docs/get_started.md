@@ -65,6 +65,52 @@ Reasoning defaults to enabled when a request omits `thinking` / `enable_thinking
   ```
 - **Graph capture**: CUDA graph is auto-enabled with `cuda` feature. Use `--disable-cuda-graph` at runtime to skip graph capture.
 
+## 4.1) Multi-node tensor parallelism
+
+Distribute tensor-parallel inference across multiple machines via TCP-based NCCL bootstrap. Node 0 is the coordinator (runs scheduler + API); worker nodes run forward-only daemon loops.
+
+**Requirements:**
+- All nodes must have the same model weights available locally (same path or HuggingFace cache).
+- All nodes must be reachable via TCP on the `--master-port` (default 29500) and `--master-port + 1` (forward coordination).
+- Build with `--features cuda,nccl,flashinfer,cutlass` on all nodes.
+
+**Example: 2 nodes × 4 GPUs = 8-way tensor parallelism**
+
+```bash
+# Node 0 (master, at 192.168.1.100): runs scheduler + API server
+xinfer --m /data/DeepSeek-R1/ --d 0,1,2,3 \
+  --num-nodes 2 --node-rank 0 \
+  --master-addr 192.168.1.100 --master-port 29500 \
+  --ui-server
+
+# Node 1 (worker, at 192.168.1.101): runs forward-only daemon
+xinfer --m /data/DeepSeek-R1/ --d 0,1,2,3 \
+  --num-nodes 2 --node-rank 1 \
+  --master-addr 192.168.1.100 --master-port 29500
+```
+
+**How it works:**
+1. Node 0 generates a NCCL unique ID and distributes it to worker nodes via TCP.
+2. Each node spawns local runner subprocesses with global NCCL ranks (`node_rank × local_gpus + local_rank`).
+3. All ranks join a single global NCCL communicator for all-reduce / all-gather operations.
+4. Node 0 broadcasts forward-pass commands to worker nodes via TCP; NCCL synchronizes the actual tensor computations.
+5. Only node 0 runs the scheduler and API server; worker nodes are stateless forward engines.
+
+**CLI flags:**
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--num-nodes` | 1 | Total number of nodes |
+| `--node-rank` | 0 | This node's rank (0 = master) |
+| `--master-addr` | _(required)_ | Master node's IP address |
+| `--master-port` | 29500 | TCP port for NCCL bootstrap |
+
+**NCCL environment variables** (optional tuning):
+```bash
+export NCCL_IB_DISABLE=1      # Disable InfiniBand if unavailable
+export NCCL_SOCKET_IFNAME=eth0 # Specify network interface
+export NCCL_DEBUG=INFO          # Enable NCCL debug logging
+```
+
 ## 5) PD Disaggregation (prefill/decoding split)
 - **PD server (prefill host, usually memory-rich)**  
   ```bash

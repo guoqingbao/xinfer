@@ -1021,6 +1021,24 @@ pub struct Args {
     /// Metal uses half of this value after rounding.
     #[arg(long, default_value_t = crate::utils::config::DEFAULT_PREFILL_CHUNK_SIZE)]
     pub prefill_chunk_size: usize,
+
+    /// Total number of nodes for multi-node tensor-parallel inference.
+    /// Each node runs local GPU workers; NCCL is bootstrapped across nodes via TCP.
+    #[arg(long, default_value_t = 1)]
+    pub num_nodes: usize,
+
+    /// This node's rank (0-indexed). Node 0 is the coordinator (runs scheduler + API).
+    #[arg(long, default_value_t = 0)]
+    pub node_rank: usize,
+
+    /// Master node address for multi-node NCCL bootstrap (e.g., 192.168.1.100).
+    /// Required on all nodes when --num-nodes > 1.
+    #[arg(long, default_value = None)]
+    pub master_addr: Option<String>,
+
+    /// Master node port for multi-node NCCL bootstrap and forward-pass coordination.
+    #[arg(long, default_value_t = 29500)]
+    pub master_port: u16,
 }
 
 impl Args {

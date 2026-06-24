@@ -195,6 +195,19 @@ async fn main() -> Result<()> {
             )
         });
     }
+    if args.num_nodes > 1 {
+        if args.master_addr.is_none() {
+            candle_core::bail!("--master-addr is required when --num-nodes > 1");
+        }
+        if args.node_rank >= args.num_nodes {
+            candle_core::bail!(
+                "--node-rank {} must be less than --num-nodes {}",
+                args.node_rank,
+                args.num_nodes
+            );
+        }
+    }
+
     let econfig = EngineConfig::new(
         args.model_id,
         args.weight_path,
@@ -229,7 +242,22 @@ async fn main() -> Result<()> {
         args.disable_reasoning,
         args.disable_cuda_graph,
         Some(args.prefill_chunk_size),
+        args.num_nodes,
+        args.node_rank,
+        args.master_addr.clone(),
+        args.master_port,
     );
+
+    // Multi-node worker nodes run a daemon loop instead of the full engine
+    if econfig.num_nodes > 1 && econfig.node_rank > 0 {
+        tracing::info!(
+            "Starting multi-node worker daemon (node_rank={}, num_nodes={})",
+            econfig.node_rank,
+            econfig.num_nodes
+        );
+        xinfer::utils::multi_node::run_worker_daemon(&econfig, dtype)?;
+        return Ok(());
+    }
 
     let engine = LLMEngine::new(&econfig, dtype)?;
     if let Some(addr) = server_addr {

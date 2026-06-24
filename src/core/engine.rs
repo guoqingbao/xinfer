@@ -273,8 +273,30 @@ impl LLMEngine {
         } else {
             log_info!("Loading model with runner(s)...");
 
+            let is_multi_node = econfig.num_nodes > 1;
+            let node_rank = econfig.node_rank;
+            let num_nodes = econfig.num_nodes;
+            let local_num_gpus = device_ids.len();
+            let global_rank_offset = node_rank * local_num_gpus;
+
             #[cfg(feature = "nccl")]
-            let nccl_id = Id::new().unwrap();
+            let nccl_id = if is_multi_node {
+                let master_addr = econfig
+                    .master_addr
+                    .as_ref()
+                    .expect("master_addr required for multi-node");
+                crate::utils::multi_node::coordinate_nccl_id(
+                    num_nodes,
+                    node_rank,
+                    master_addr,
+                    econfig.master_port,
+                )
+                .map_err(|e| {
+                    candle_core::Error::Msg(format!("Multi-node NCCL ID exchange failed: {}", e))
+                })?
+            } else {
+                Id::new().unwrap()
+            };
 
             let runner_path = get_runner_path()?;
 
@@ -303,11 +325,8 @@ impl LLMEngine {
             }
 
             let progress_sock_name = format!("{}@xinfer-progress", unique_id);
-            let progress_handle = spawn_progress_thread(
-                econfig.num_shards.unwrap_or(1),
-                config.num_hidden_layers,
-                progress_sock_name,
-            );
+            let progress_handle =
+                spawn_progress_thread(local_num_gpus, config.num_hidden_layers, progress_sock_name);
             heartbeat_worker(Some(device_ids.len()), false, stop_flag.clone(), unique_id);
             use rayon::iter::IndexedParallelIterator;
             use rayon::iter::IntoParallelRefIterator;
@@ -316,9 +335,10 @@ impl LLMEngine {
             let runner_streams: Result<Vec<LocalStream>> = device_ids
                 .par_iter()
                 .enumerate()
-                .map(|(rank, dev_id)| {
+                .map(|(local_rank, dev_id)| {
+                    let global_rank = global_rank_offset + local_rank;
                     let model_type = model_type.clone();
-                    let sock_name = format!("{}@xinfer-runner-{}", unique_id, rank);
+                    let sock_name = format!("{}@xinfer-runner-{}", unique_id, local_rank);
                     let listener = ListenerOptions::new()
                         .name(
                             sock_name
@@ -329,11 +349,19 @@ impl LLMEngine {
                         .create_sync()
                         .expect("Failed to create listener");
 
-                    crate::log_info!("listener starting accepting runner {}", rank);
+                    crate::log_info!(
+                        "listener starting accepting runner {} (global rank {})",
+                        local_rank,
+                        global_rank
+                    );
 
                     // Accept one connection
                     let mut stream = listener.accept()?;
-                    crate::log_info!("Accepted runner {}", rank);
+                    crate::log_info!(
+                        "Accepted runner {} (global rank {})",
+                        local_rank,
+                        global_rank
+                    );
 
                     // Wait for "ready"
                     let mut reader = BufReader::new(&mut stream);
@@ -342,15 +370,15 @@ impl LLMEngine {
                     if message.trim() != "ready" {
                         return Err(candle_core::Error::Msg(format!(
                             "Runner {} did not send ready",
-                            rank
+                            local_rank
                         )));
                     }
 
-                    // Build init message
+                    // Build init message with global rank for NCCL
                     let mut econfig_rank = econfig.clone();
                     econfig_rank.device_ids = Some(vec![*dev_id]);
                     let init_msg = MessageType::Init(RunnerInitRequest {
-                        rank,
+                        rank: global_rank,
                         dev_id: *dev_id,
                         num_shards: econfig.num_shards.unwrap_or(1),
                         model_type,
@@ -364,12 +392,11 @@ impl LLMEngine {
                         nccl_id: crate::runner::NcclId(nccl_id.clone()),
                     });
 
-                    send_and_expect_ack(&mut stream, &init_msg, "initialize", rank)?;
+                    send_and_expect_ack(&mut stream, &init_msg, "initialize", global_rank)?;
 
                     // Always validate/plan allocation after model loading for accurate memory readings
                     let ecfg = engine_config.get_or_init(|| {
                         let mut econfig = econfig.clone();
-                        // Use new KVCacheAllocator for multi-rank negotiation
                         let allocator = KVCacheAllocator::new(&econfig, &config, dtype);
                         econfig.kvcache_dtype = allocator.resolved_kvcache_dtype();
                         let device_ids = econfig.device_ids.clone().unwrap_or(vec![0]);
@@ -389,10 +416,14 @@ impl LLMEngine {
                         &mut stream,
                         &MessageType::UsableMemoryLeft(ecfg.clone()),
                         "init kvcache",
-                        rank,
+                        global_rank,
                     )?;
 
-                    crate::log_info!("Runner {} started!", rank);
+                    crate::log_info!(
+                        "Runner {} (global rank {}) started!",
+                        local_rank,
+                        global_rank
+                    );
                     Ok(stream)
                 })
                 .collect();
@@ -403,7 +434,31 @@ impl LLMEngine {
             if let Some(cfg) = engine_config.get() {
                 econfig = cfg.clone();
             }
-            RunnerType::Process(runner_streams?)
+
+            let local_streams = runner_streams?;
+
+            // Multi-node forward coordination setup
+            if is_multi_node && node_rank == 0 {
+                let mn_config = crate::utils::multi_node::MultiNodeConfig {
+                    num_nodes,
+                    node_rank,
+                    master_addr: econfig.master_addr.clone().unwrap_or_default(),
+                    master_port: econfig.master_port,
+                    local_num_gpus,
+                };
+                let worker_tcp_streams = crate::utils::multi_node::master_accept_worker_streams(
+                    &mn_config,
+                )
+                .map_err(|e| {
+                    candle_core::Error::Msg(format!("Multi-node forward coord failed: {}", e))
+                })?;
+                RunnerType::MultiNodeMaster {
+                    local_streams,
+                    remote_streams: worker_tcp_streams,
+                }
+            } else {
+                RunnerType::Process(local_streams)
+            }
         };
 
         if econfig.max_model_len.is_none() {
@@ -906,6 +961,20 @@ impl LLMEngine {
                 }
                 Ok(())
             }
+            RunnerType::MultiNodeMaster {
+                ref mut local_streams,
+                ref mut remote_streams,
+            } => {
+                let msg = MessageType::FinishDecode(id);
+                for stream in local_streams.iter_mut() {
+                    send_local(&mut vec![stream.try_clone()?], &msg, false)?;
+                }
+                let serialized = bincode::serialize(&msg).expect("Bincode serialization failed");
+                for tcp_stream in remote_streams.iter_mut() {
+                    crate::utils::multi_node::send_tcp(tcp_stream, &serialized)?;
+                }
+                Ok(())
+            }
         }
     }
 
@@ -949,6 +1018,12 @@ impl LLMEngine {
                 model_runner.run(Seqs::SeqRefs(&seq_refs), is_prefill)
             }
             RunnerType::Process(ref mut runner_streams) => {
+                Self::run_forward_on_local_streams(runner_streams, owned_seqs, is_prefill)
+            }
+            RunnerType::MultiNodeMaster {
+                ref mut local_streams,
+                ref mut remote_streams,
+            } => {
                 let request = if is_prefill {
                     MessageType::RunPrefill((owned_seqs.to_vec(), true))
                 } else {
@@ -958,41 +1033,95 @@ impl LLMEngine {
                         .collect::<Vec<_>>();
                     MessageType::RunDecode((sequences, false))
                 };
+                let serialized =
+                    bincode::serialize(&request).expect("Bincode serialization failed");
 
-                let cloned_streams: Vec<LocalStream> = runner_streams
-                    .iter_mut()
-                    .map(|s| s.try_clone().expect("clone failed"))
-                    .collect();
+                // Send to remote worker nodes via TCP (fire-and-forget the responses;
+                // NCCL all-reduce synchronizes the actual computation)
+                for tcp_stream in remote_streams.iter_mut() {
+                    if let Err(e) = crate::utils::multi_node::send_tcp(tcp_stream, &serialized) {
+                        candle_core::bail!("Failed to send forward to remote worker: {}", e);
+                    }
+                }
 
-                let all_outputs: Result<Vec<Vec<u32>>> = cloned_streams
-                    .into_par_iter()
-                    .map(|mut stream| {
-                        let msg = request.clone();
-                        send_local(&mut vec![stream.try_clone()?], &msg, false)?;
-                        let response = receive_local(&mut stream, false)?;
+                // Run on local runners (which also participate in the NCCL collective)
+                let result =
+                    Self::run_forward_on_local_streams(local_streams, owned_seqs, is_prefill);
 
-                        match response {
-                            MessageType::RunResponse(output_ids) => {
-                                if output_ids.len() == 0 {
-                                    candle_core::bail!("Runner step error, no response!")
-                                } else {
-                                    Ok(output_ids)
+                // Collect acks from remote workers
+                for tcp_stream in remote_streams.iter_mut() {
+                    match crate::utils::multi_node::recv_tcp(tcp_stream) {
+                        Ok(data) => {
+                            let resp: MessageType = bincode::deserialize(&data)
+                                .expect("Failed to deserialize remote worker response");
+                            match resp {
+                                MessageType::RunResponse(ref ids) if ids.is_empty() => {
+                                    candle_core::bail!("Remote worker returned empty response");
+                                }
+                                MessageType::RunResponse(_) => {} // OK
+                                other => {
+                                    candle_core::bail!("Unexpected remote response: {:?}", other);
                                 }
                             }
-                            other => {
-                                candle_core::bail!("Unexpected response type: {:?}", other)
-                            }
                         }
-                    })
-                    .collect();
-
-                let all_outputs = all_outputs.map_err(candle_core::Error::wrap)?;
-                if let Some(output_ids) = all_outputs.first() {
-                    Ok(output_ids.clone())
-                } else {
-                    candle_core::bail!("No output ids received from model runners");
+                        Err(e) => {
+                            candle_core::bail!("Failed to receive from remote worker: {}", e);
+                        }
+                    }
                 }
+
+                result
             }
+        }
+    }
+
+    fn run_forward_on_local_streams(
+        runner_streams: &mut Vec<LocalStream>,
+        owned_seqs: &[Sequence],
+        is_prefill: bool,
+    ) -> Result<Vec<u32>> {
+        let request = if is_prefill {
+            MessageType::RunPrefill((owned_seqs.to_vec(), true))
+        } else {
+            let sequences = owned_seqs
+                .iter()
+                .map(|s| DecodeSequence::new(s))
+                .collect::<Vec<_>>();
+            MessageType::RunDecode((sequences, false))
+        };
+
+        let cloned_streams: Vec<LocalStream> = runner_streams
+            .iter_mut()
+            .map(|s| s.try_clone().expect("clone failed"))
+            .collect();
+
+        let all_outputs: Result<Vec<Vec<u32>>> = cloned_streams
+            .into_par_iter()
+            .map(|mut stream| {
+                let msg = request.clone();
+                send_local(&mut vec![stream.try_clone()?], &msg, false)?;
+                let response = receive_local(&mut stream, false)?;
+
+                match response {
+                    MessageType::RunResponse(output_ids) => {
+                        if output_ids.len() == 0 {
+                            candle_core::bail!("Runner step error, no response!")
+                        } else {
+                            Ok(output_ids)
+                        }
+                    }
+                    other => {
+                        candle_core::bail!("Unexpected response type: {:?}", other)
+                    }
+                }
+            })
+            .collect();
+
+        let all_outputs = all_outputs.map_err(candle_core::Error::wrap)?;
+        if let Some(output_ids) = all_outputs.first() {
+            Ok(output_ids.clone())
+        } else {
+            candle_core::bail!("No output ids received from model runners");
         }
     }
 
@@ -1685,7 +1814,11 @@ impl LLMEngine {
                 let chunk_tokens = std::cmp::min(chunk_size, remaining);
                 let embedding_result = match &mut *self.runners.write() {
                     RunnerType::Thread(model_runner) => model_runner.embed(&[&seq], &strategy),
-                    RunnerType::Process(ref mut runner_streams) => {
+                    RunnerType::Process(ref mut runner_streams)
+                    | RunnerType::MultiNodeMaster {
+                        local_streams: ref mut runner_streams,
+                        ..
+                    } => {
                         let request = MessageType::RunEmbed((vec![seq.clone()], strategy.clone()));
                         let cloned_streams: Vec<LocalStream> = runner_streams
                             .iter_mut()

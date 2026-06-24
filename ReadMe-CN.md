@@ -333,6 +333,24 @@ pip install target/wheels/xinfer_ai-*.whl --force-reinstall
 
 ---
 
+## 🌐 多机张量并行推理
+
+跨多台机器分布式推理，基于 TCP 的 NCCL 引导，无需 MPI。
+
+```bash
+# 节点 0（主节点，192.168.1.100）：调度器 + API 服务
+xinfer --d 0,1,2,3 --m /data/DeepSeek-R1/ \
+  --num-nodes 2 --node-rank 0 --master-addr 192.168.1.100 --ui-server
+
+# 节点 1（工作节点，192.168.1.101）：仅执行前向推理
+xinfer --d 0,1,2,3 --m /data/DeepSeek-R1/ \
+  --num-nodes 2 --node-rank 1 --master-addr 192.168.1.100
+```
+
+所有节点需本地存放模型权重，并通过 TCP 连接 `--master-port`（默认 29500）。详见 [Get Started](docs/get_started.md)。
+
+---
+
 ## 🔀 Prefill-Decode 分离（PD 分离）
 
 将预填充（prompt 处理）和解码（token 生成）拆分到不同 GPU 或机器。消除长上下文预填充时的解码卡顿。PD 服务器与 PD 客户端必须使用相同 KvCache 数据类型（`--kvcache-dtype`）。对话请求需发送至 PD 客户端，PD 服务端只处理 PD 客户端发来的预填充请求。
@@ -446,6 +464,10 @@ xinfer --m unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF \
 | `--disable-prefix-cache` | 禁用前缀缓存 |
 | `--prefix-cache-max-tokens` | 前缀缓存大小上限 |
 | `--prefill-chunk-size` | 预填充分块大小 (默认: CUDA 8K, Metal: 4k) |
+| `--num-nodes` | 多机推理节点总数（默认 1） |
+| `--node-rank` | 当前节点编号（0 = 主节点） |
+| `--master-addr` | 主节点 IP（多机推理必填） |
+| `--master-port` | NCCL 引导端口（默认 29500） |
 | `--disable-cuda-graph` | 禁用 CUDA 图捕获 |
 | `--yarn-scaling-factor` | YARN RoPE 上下文扩展因子 |
 | `--temperature` | 采样温度（0–1） |
@@ -483,6 +505,7 @@ XINFER_NVFP4_FORCE_LUT=1 xinfer --m nvidia/Qwen3-30B-A3B-FP4 --ui-server
 * [x] OpenAI API 兼容服务器（支持流式输出）
 * [x] 持续批处理
 * [x] 多卡并行推理（Safetensors 模型、GPTQ/AWQ 及 GGUF 量化模型）
+* [x] 多机张量并行推理（基于 TCP 的 NCCL 引导，无需 MPI）
 * [x] Metal/macOS 平台 Prompt 处理加速
 * [x] 分块预填充（Chunked Prefill）
 * [x] 前缀缓存（使用 `prefix-cache` 参数）

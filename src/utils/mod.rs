@@ -13,6 +13,7 @@ pub mod heartbeat;
 pub mod image;
 pub mod kvcache_allocator;
 pub mod logits_processor;
+pub mod multi_node;
 pub mod progress;
 pub mod reasoning;
 pub mod special_tokens;
@@ -2096,9 +2097,19 @@ pub fn prepare_engine_config(
     if device_ids.is_empty() {
         device_ids.push(0);
     }
-    let num_shards = device_ids.len();
+    let local_num_gpus = device_ids.len();
+    let num_shards = local_num_gpus * econfig.num_nodes;
     econfig.device_ids = Some(device_ids);
     econfig.num_shards = Some(num_shards);
+    if econfig.num_nodes > 1 {
+        crate::log_warn!(
+            "Multi-node: {} nodes x {} local GPUs = {} global shards (node_rank={})",
+            econfig.num_nodes,
+            local_num_gpus,
+            num_shards,
+            econfig.node_rank
+        );
+    }
 
     #[cfg(not(feature = "nccl"))]
     assert!(

@@ -69,6 +69,10 @@ fn build_econfig() -> EngineConfig {
         true,                                // disable_reasoning — deterministic prompt
         false,                               // disable_cuda_graph
         None,                                // prefill_chunk_size — default
+        1,                                   // num_nodes
+        0,                                   // node_rank
+        None,                                // master_addr
+        29500,                               // master_port
     )
 }
 
