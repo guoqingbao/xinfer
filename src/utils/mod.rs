@@ -449,9 +449,7 @@ pub fn config_from_gguf<R: std::io::Seek + std::io::Read>(
             md_get(format!("{arch}.expert_shared_feed_forward_length").as_str());
         let expert_shared_feed_forward_length = if expert_shared_feed_forward_length.is_ok() {
             Some(expert_shared_feed_forward_length.unwrap().to_u32()? as usize)
-        } else if arch == "glm-dsa" || arch == "deepseek2" {
-            Some(feed_forward_length)
-        } else if arch == "glm4moe" {
+        } else if arch == "glm4moe" || arch == "glm-dsa" || arch == "deepseek2" {
             Some(expert_feed_forward_length)
         } else {
             None
