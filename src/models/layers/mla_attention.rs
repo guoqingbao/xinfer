@@ -312,12 +312,37 @@ impl MlaAttention {
             };
             (w_uk, w_uv_t)
         } else {
-            let kv_b_weight = vb.pp("kv_b_proj").get_with_hints_dtype(
-                (num_heads * (qk_nope_head_dim + v_head_dim), kv_lora_rank),
-                "weight",
-                shard(0, 0, 1),
-                dtype,
-            )?;
+            // For FP8 models, kv_b_proj.weight is stored as F8_E4M3 with block-wise
+            // weight_scale_inv. We must dequantize before splitting into W_UK / W_UV.
+            // Use the already-loaded kv_b_proj (which properly handles FP8 via LnFp8)
+            // to dequantize by applying it to an identity matrix.
+            let kv_b_out_dim = num_heads * (qk_nope_head_dim + v_head_dim);
+            let is_fp8 = config
+                .quantization_config
+                .as_ref()
+                .is_some_and(|c| c.quant_method == "fp8");
+            let kv_b_weight = if is_fp8 {
+                if let Some(ref kv_b) = kv_b_proj {
+                    let identity = Tensor::eye(kv_lora_rank, dtype, &vb.device())?;
+                    let dequantized = kv_b.forward(&identity)?;
+                    // dequantized: [kv_lora_rank, kv_b_out_dim] = I @ W^T
+                    dequantized.t()?.contiguous()?
+                } else {
+                    vb.pp("kv_b_proj").get_with_hints_dtype(
+                        (kv_b_out_dim, kv_lora_rank),
+                        "weight",
+                        shard(0, 0, 1),
+                        dtype,
+                    )?
+                }
+            } else {
+                vb.pp("kv_b_proj").get_with_hints_dtype(
+                    (kv_b_out_dim, kv_lora_rank),
+                    "weight",
+                    shard(0, 0, 1),
+                    dtype,
+                )?
+            };
             let w =
                 kv_b_weight.reshape((num_heads, qk_nope_head_dim + v_head_dim, kv_lora_rank))?;
             let w_uk = w
