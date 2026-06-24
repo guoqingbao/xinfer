@@ -239,21 +239,35 @@ impl MlaAttention {
         )?;
 
         let (w_uk, w_uv_t) = if has_separate_kv_b {
-            let k_b_weight = vb.pp("attn_k_b").get_with_hints_dtype(
-                (qk_nope_head_dim, kv_lora_rank, num_heads),
-                "weight",
-                shard(0, 0, 1),
-                dtype,
-            )?;
+            // attn_k_b layout varies between GGUF converters:
+            //   Variant A: [qk_nope_head_dim, kv_lora_rank, num_heads] (transposed by converter)
+            //   Variant B: [num_heads, kv_lora_rank, qk_nope_head_dim] (natural order)
+            // Target: w_uk = [num_heads, qk_nope_head_dim, kv_lora_rank]
+            let k_b_vb = vb.pp("attn_k_b");
+            let k_b_shape = k_b_vb.tensor_shape("weight");
+            let k_b_heads_first = k_b_shape
+                .as_ref()
+                .is_some_and(|s| s.len() == 3 && s[0] == num_heads && s[2] != num_heads);
+            let k_b_weight = if k_b_heads_first {
+                k_b_vb.get_with_hints_dtype(
+                    (num_heads, kv_lora_rank, qk_nope_head_dim),
+                    "weight",
+                    shard(0, 0, 1),
+                    dtype,
+                )?
+            } else {
+                k_b_vb.get_with_hints_dtype(
+                    (qk_nope_head_dim, kv_lora_rank, num_heads),
+                    "weight",
+                    shard(0, 0, 1),
+                    dtype,
+                )?
+            };
 
             // attn_v_b layout varies between GGUF converters:
-            //   GLM-5.2 (glm-dsa): [v_head_dim, kv_lora_rank, num_heads]
-            //   DeepSeek V3.2 (deepseek2): [num_heads, v_head_dim, kv_lora_rank]
-            // (Candle reverses GGUF ne[] so these are Candle logical shapes.)
-            // llama.cpp's DeepSeek converter transposes k_b but NOT v_b,
-            // producing v_b = (num_heads, v_head_dim, kv_lora_rank) in PyTorch
-            // row-major, which becomes [num_heads, v_head_dim, kv_lora_rank]
-            // after Candle's double-reversal.
+            //   Variant A: [v_head_dim, kv_lora_rank, num_heads] (transposed by converter)
+            //   Variant B: [num_heads, v_head_dim, kv_lora_rank] (natural order)
+            // Target: w_uv_t = [num_heads, kv_lora_rank, v_head_dim]
             let v_b_vb = vb.pp("attn_v_b");
             let v_b_shape = v_b_vb.tensor_shape("weight");
             let v_b_kv_last = v_b_shape
@@ -276,10 +290,16 @@ impl MlaAttention {
             };
 
             // w_uk: [num_heads, qk_nope_head_dim, kv_lora_rank]
-            let w_uk = k_b_weight
-                .permute((2, 0, 1))?
-                .contiguous()?
-                .to_dtype(dtype)?;
+            let w_uk = if k_b_heads_first {
+                // (num_heads, kv_lora_rank, qk_nope_head_dim) → transpose(1,2)
+                k_b_weight.transpose(1, 2)?.contiguous()?.to_dtype(dtype)?
+            } else {
+                // (qk_nope_head_dim, kv_lora_rank, num_heads) → permute(2,0,1)
+                k_b_weight
+                    .permute((2, 0, 1))?
+                    .contiguous()?
+                    .to_dtype(dtype)?
+            };
             // w_uv_t target: [num_heads, kv_lora_rank, v_head_dim]
             let w_uv_t = if v_b_kv_last {
                 // (num_heads, v_head_dim, kv_lora_rank) → transpose(1,2)
