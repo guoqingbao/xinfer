@@ -90,20 +90,18 @@ fn parse_fallback_moe_cfg(arch_name: &str, raw_cfg: &[u8]) -> Option<MoEConfig> 
 pub fn hub_load_local_safetensors(path: &String, json_file: &str) -> Result<Vec<PathBuf>> {
     crate::log_info!("{:}", Path::new(path).join(json_file).display());
     let jsfile = std::fs::File::open(Path::new(path).join(json_file))?;
-    let json: serde_json::Value =
-        serde_json::from_reader(&jsfile).map_err(candle_core::Error::wrap)?;
-    let weight_map = match json.get("weight_map") {
-        None => panic!("no weight map in {json_file:?}"),
-        Some(serde_json::Value::Object(map)) => map,
-        Some(_) => panic!("weight map in {json_file:?} is not a map"),
-    };
-    let mut safetensors_files = std::collections::HashSet::new();
-    for value in weight_map.values() {
-        if let Some(file) = value.as_str() {
-            safetensors_files.insert(file);
-        }
+    let reader = std::io::BufReader::new(jsfile);
+
+    #[derive(serde::Deserialize)]
+    struct IndexFile {
+        weight_map: std::collections::HashMap<String, String>,
     }
-    let safetensors_files: Vec<_> = safetensors_files
+
+    let index: IndexFile = serde_json::from_reader(reader).map_err(candle_core::Error::wrap)?;
+    let safetensors_files: Vec<_> = index
+        .weight_map
+        .into_values()
+        .collect::<std::collections::HashSet<_>>()
         .into_iter()
         .map(|v| Path::new(path).join(v))
         .collect();
