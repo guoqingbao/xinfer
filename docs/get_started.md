@@ -22,8 +22,13 @@ cargo build --release --features metal
 ## Model formats
 - **Safetensors (HF layout)**: `--m <hf_id>` for cached download, or `--m <local_dir>` for offline weights + configs. `--w <local_dir>` still works as a legacy alias.
 - **Safetensors (HF layout) + ISQ**: in-situ quantize into GGUF with args `--isq <q4k|q2k|q6k|...>`.
-- **GGUF**: `--m <local.gguf>` or `--f <local.gguf>` for a local file. Use `--m <hf_id> --f <remote_file.gguf>` for a GGUF file hosted in a Hugging Face repo.
-- **Vision-Language** (Qwen3-VL, Gemma3, Mistral3-VL): require image tokens; use `--ui-server` for uploads or send image_url/base64 in the request.
+- **GGUF**: multiple loading modes:
+  - `--m <local.gguf>` — load a single local GGUF file.
+  - `--m <local_dir>` — auto-detect the main GGUF file in a directory (picks the largest non-mmproj `.gguf`). Multi-shard files (`*-00001-of-00007.gguf`) and auxiliary files (`mmproj-*.gguf` for vision towers) are auto-discovered.
+  - `--f <local.gguf>` — load a single local GGUF file (alternative syntax).
+  - `--m <hf_id> --f <remote_file.gguf>` — download a GGUF file from a Hugging Face repo.
+  - `--m <hf_id> --f <subfolder>` — auto-detect all GGUF files in a HuggingFace repo subfolder (e.g. `--m unsloth/GLM-5.2-GGUF --f UD-Q2_K_XL`).
+- **Vision-Language** (Qwen3-VL, Qwen3.5-VL, Gemma3, Gemma4, Mistral3-VL): require image tokens; use `--ui-server` for uploads or send image_url/base64 in the request. For GGUF multimodal models, place the `mmproj-*.gguf` vision tower file in the same directory as the main model file — it will be auto-detected.
 
 
 ## 3) Run patterns (single host)
@@ -36,11 +41,19 @@ cargo build --release --features metal
   ```bash
   target/release/xinfer --m meta-llama/Llama-3-8b --max-model-len 32768 --ui-server
   ```
-- **GGUF quantized**  
+- **GGUF quantized (single file)**  
   ```bash
   target/release/xinfer --m /path/model-Q4_K_M.gguf --max-model-len 65536
   ```
-- **Remote GGUF quantized**  
+- **GGUF quantized (folder with auto-detection)**  
+  ```bash
+  target/release/xinfer --m /path/model-GGUF/ --ui-server
+  ```
+- **Remote GGUF quantized (multi-shard subfolder)**  
+  ```bash
+  target/release/xinfer --d 0,1,2,3 --m unsloth/GLM-5.2-GGUF --f UD-Q2_K_XL --ui-server
+  ```
+- **Remote GGUF quantized (single file)**  
   ```bash
   target/release/xinfer --m unsloth/Qwen3-0.6B-GGUF --f Qwen3-0.6B-Q4_K_M.gguf --ui-server
   ```

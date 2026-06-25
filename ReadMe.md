@@ -251,11 +251,17 @@ xinfer --m /path/Qwen3-4B --isq q6k
 <summary><b>GGUF models</b></summary>
 
 ```bash
-# Single GPU — GGUF
+# Multi-GPU GGUF (model ID + subfolder)
+xinfer --d 0,1,2,3 --m unsloth/GLM-5.2-GGUF --f UD-Q2_K_XL
+
+# Remote GGUF — single-file model
 xinfer --m unsloth/Qwen3.5-27B-GGUF --f Qwen3.5-27B-Q4_K_M.gguf
 
-# Multi-GPU — GGUF
+# Local GGUF file (direct path)
 xinfer --d 0,1 --m /path/Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf
+
+# Local GGUF folder
+xinfer --d 0,1,2,3 --m /path/to/model-GGUF/
 ```
 
 </details>
@@ -466,7 +472,7 @@ Constraint-based generation via llguidance — Lark grammars, regex, JSON Schema
 
 | Flag | Description |
 |---|---|
-| `--m` | Model source: HuggingFace model ID, local Safetensors directory, or local GGUF file |
+| `--m` | Model source: HuggingFace model ID, local Safetensors directory, local GGUF file, or local folder containing GGUF files |
 | `--w` | Legacy alias for local Safetensors directory; prefer `--m <local_dir>` |
 | `--f` | Local GGUF file when used alone; remote GGUF filename when paired with `--m <model_id>` |
 | `--d` | Device IDs (e.g. `--d 0,1`) |

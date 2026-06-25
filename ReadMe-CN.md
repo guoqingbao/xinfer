@@ -250,11 +250,17 @@ xinfer --m /path/Qwen3-4B --isq q6k
 <summary><b>GGUF 模型</b></summary>
 
 ```bash
-# 单卡 — GGUF
+# 多卡 GGUF（模型 ID + 子文件夹）
+xinfer --d 0,1,2,3 --m unsloth/GLM-5.2-GGUF --f UD-Q2_K_XL
+
+# 远程 GGUF — 单文件模型
 xinfer --m unsloth/Qwen3.5-27B-GGUF --f Qwen3.5-27B-Q4_K_M.gguf
 
-# 多卡 — GGUF
+# 本地 GGUF 文件（直接路径）
 xinfer --d 0,1 --m /path/Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf
+
+# 本地 GGUF 文件夹
+xinfer --d 0,1,2,3 --m /path/to/model-GGUF/
 ```
 
 </details>
@@ -460,7 +466,7 @@ xinfer --m unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF \
 
 | 参数 | 说明 |
 |---|---|
-| `--m` | 模型来源：HuggingFace 模型 ID、本地 Safetensors 目录或本地 GGUF 文件 |
+| `--m` | 模型来源：HuggingFace 模型 ID、本地 Safetensors 目录、本地 GGUF 文件或包含 GGUF 文件的本地文件夹 |
 | `--w` | 本地 Safetensors 目录的旧别名；新命令优先使用 `--m <local_dir>` |
 | `--f` | 单独使用时为本地 GGUF 文件；配合 `--m <model_id>` 时为远程 GGUF 文件名 |
 | `--d` | 设备 ID（如 `--d 0,1`） |
