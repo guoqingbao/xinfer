@@ -99,6 +99,13 @@ nav.scrolled{background:rgba(6,8,15,.92);border-color:var(--c-border)}
 .cb-b pre{margin:0;font-family:var(--mono);font-size:.82rem;line-height:1.7;white-space:pre-wrap;word-break:break-all}
 .t-c{color:#79c0ff}.t-f{color:#ffa657}.t-s{color:#a5d6ff}.t-x{color:#8b949e}.t-g{color:#7ee787}
 
+/* --- DEMO VIDEO --- */
+.demo-wrap{max-width:900px;margin:0 auto}
+.demo-video-box{position:relative;border-radius:var(--r);overflow:hidden;
+  background:#000;box-shadow:0 8px 32px rgba(0,0,0,.45);line-height:0}
+.demo-video-box video{width:100%;display:block;border:none;margin:0;padding:0;outline:none;
+  background:#000;vertical-align:bottom}
+
 /* --- FEATURES --- */
 .fgrid{display:grid;grid-template-columns:repeat(3,1fr);gap:16px}
 .fcard{padding:24px;border-radius:var(--r);background:var(--c-card);border:1px solid var(--c-border);
@@ -203,6 +210,7 @@ footer{padding:56px 0 28px;border-top:1px solid var(--c-border);position:relativ
     <div class="nlinks">
       <a href="#features" data-i="nav.feat">Features</a>
       <a href="#perf" data-i="nav.perf">Performance</a>
+      <a href="#demo" data-i="nav.demo">Demo</a>
       <a href="#install" data-i="nav.inst">Install</a>
       <a href="#dl" data-i="nav.dl">Downloads</a>
       <a href="#docs" data-i="nav.docs">Docs</a>
@@ -221,6 +229,7 @@ footer{padding:56px 0 28px;border-top:1px solid var(--c-border);position:relativ
 <div class="mnav" id="mnav">
   <a href="#features" data-i="nav.feat">Features</a>
   <a href="#perf" data-i="nav.perf">Performance</a>
+  <a href="#demo" data-i="nav.demo">Demo</a>
   <a href="#install" data-i="nav.inst">Install</a>
   <a href="#dl" data-i="nav.dl">Downloads</a>
   <a href="#docs" data-i="nav.docs">Docs</a>
@@ -247,6 +256,7 @@ footer{padding:56px 0 28px;border-top:1px solid var(--c-border);position:relativ
       </div>
       <div class="hero-btns">
         <a href="#install" class="bp" data-i="hero.cta1">Get Started</a>
+        <a href="#demo" class="bs" data-i="hero.cta3">▶ Watch Demo</a>
         <a href="https://github.com/guoqingbao/xinfer" target="_blank" class="bs" data-i="hero.cta2">View on GitHub →</a>
       </div>
     </div>
@@ -337,8 +347,22 @@ footer{padding:56px 0 28px;border-top:1px solid var(--c-border);position:relativ
   </div>
 </section>
 
+<!-- DEMO -->
+<section id="demo" style="padding-top:40px">
+  <div class="wrap">
+    <div class="demo-wrap rv">
+      <p class="label" data-i="demo.label" style="text-align:center">Demo</p>
+      <h2 class="stitle gt" data-i="demo.title" style="text-align:center">See It in Action</h2>
+      <p class="sdesc" data-i="demo.desc" style="text-align:center;margin:0 auto 28px">Watch xInfer serve a 35B model with real-time inference and tool calling.</p>
+      <div class="demo-video-box">
+        <video id="demo-vid" controls muted playsinline preload="metadata" src="assets/demo.mp4"></video>
+      </div>
+    </div>
+  </div>
+</section>
+
 <!-- INSTALL -->
-<section id="install">
+<section id="install" style="padding-top:40px">
   <div class="wrap">
     <p class="label rv" data-i="i.label">Quick Start</p>
     <h2 class="stitle rv gt" data-i="i.title">Install &amp; Run</h2>
@@ -499,12 +523,13 @@ footer{padding:56px 0 28px;border-top:1px solid var(--c-border);position:relativ
 /* ═══ i18n ═══ */
 var I={
 en:{
-'nav.feat':'Features','nav.perf':'Performance','nav.inst':'Install','nav.dl':'Downloads','nav.docs':'Docs',
+'nav.feat':'Features','nav.perf':'Performance','nav.demo':'Demo','nav.inst':'Install','nav.dl':'Downloads','nav.docs':'Docs',
 'hero.tag':'Pure Rust · Production Ready',
 'hero.t1':'Blazing-fast LLM Inference','hero.t2':'in Pure Rust',
 'hero.sub':'No PyTorch. No Python runtime. Just fast, portable, production-ready inference.',
-'hero.term':'terminal','hero.cta1':'Get Started','hero.cta2':'View on GitHub →',
+'hero.term':'terminal','hero.cta1':'Get Started','hero.cta2':'View on GitHub →','hero.cta3':'▶ Watch Demo',
 'cp':'Copy','cpd':'Copied!',
+'demo.label':'Demo','demo.title':'See It in Action','demo.desc':'Watch xInfer serve a 35B model with real-time inference and tool calling.',
 'bt.new':'NEW','bt.msg':'Running NVFP4 models under 4-bit KV cache on V100 — first ever.',
 'f.label':'Features','f.title':'Built for Speed & Simplicity',
 'f.desc':'Everything you need for production LLM inference — without the Python baggage.',
@@ -538,12 +563,13 @@ en:{
 'ft.tag':'Blazing-fast LLM inference in pure Rust.','ft.docs':'Documentation','ft.rel':'Releases'
 },
 cn:{
-'nav.feat':'功能','nav.perf':'性能','nav.inst':'安装','nav.dl':'下载','nav.docs':'文档',
+'nav.feat':'功能','nav.perf':'性能','nav.demo':'演示','nav.inst':'安装','nav.dl':'下载','nav.docs':'文档',
 'hero.tag':'纯 Rust · 生产就绪',
 'hero.t1':'纯 Rust 实现的','hero.t2':'极速 LLM 推理引擎',
 'hero.sub':'无需 PyTorch，无需 Python 运行时，开箱即用。',
-'hero.term':'终端','hero.cta1':'快速开始','hero.cta2':'查看 GitHub →',
+'hero.term':'终端','hero.cta1':'快速开始','hero.cta2':'查看 GitHub →','hero.cta3':'▶ 观看演示',
 'cp':'复制','cpd':'已复制!',
+'demo.label':'演示','demo.title':'一览即知','demo.desc':'观看 xInfer 运行 35B 模型，实时推理与工具调用。',
 'bt.new':'新','bt.msg':'V100 上运行 NVFP4 模型 + 4-bit KV 缓存 — 业内首次。',
 'f.label':'功能特性','f.title':'为速度与简洁而生',
 'f.desc':'生产级 LLM 推理所需的一切 — 无需 Python 依赖。',
@@ -741,6 +767,18 @@ function draw(){cx.clearRect(0,0,cv.width,cv.height);pts.forEach(function(p){
 });requestAnimationFrame(draw)}
 rsz();init();draw();
 window.addEventListener('resize',function(){rsz();init()});
+
+/* ═══ Demo video auto-play on scroll ═══ */
+var dv=document.getElementById('demo-vid');
+if(dv){
+  var dvio=new IntersectionObserver(function(ee){
+    ee.forEach(function(e){
+      if(e.isIntersecting){dv.play().catch(function(){})}
+      else{dv.pause()}
+    });
+  },{threshold:.4});
+  dvio.observe(dv);
+}
 })();
 </script>
 </body>

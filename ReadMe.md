@@ -21,6 +21,14 @@
 
 ---
 
+## 📽️ Demo
+
+<p align="center">
+  <video src="https://guoqingbao.github.io/xinfer/assets/demo.mp4" width="600" controls></video>
+</p>
+
+---
+
 ## 🚀 Quick Start
 
 ### 📦 Install
@@ -179,12 +187,6 @@ xinfer --m unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF \
 # Metal/MacOS
 xinfer --m unsloth/Qwen3.5-4B-GGUF --f Qwen3.5-4B-Q4_K_M.gguf
 ```
-
----
-
-## 📽️ Demo
-
-<video src="https://youtu.be/3z82y8iQR7E" width="1000px"></video>
 
 ---
 

@@ -417,6 +417,7 @@ jobs:
           generate_index "sm121" "$SM121_WHL" "$SM121_STD" ""
 
           sed "s|var XINFER_VER='[^']*';|var XINFER_VER='${VERSION}';|" pages/index.html > site/index.html
+          cp -r pages/assets site/assets 2>/dev/null || true
 
           # Auto-detect install script
           cat > site/install.sh << 'SCRIPT'

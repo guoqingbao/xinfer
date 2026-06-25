@@ -20,6 +20,13 @@
 | **🐍** | 轻量 Python 绑定 | 需要 Python 入口时可选 PyO3 wheel 包 |
 
 ---
+## 📽️ 演示
+
+<p align="center">
+  <video src="https://guoqingbao.github.io/xinfer/assets/demo.mp4" width="600" controls></video>
+</p>
+
+---
 
 ## 🚀 快速开始
 
@@ -179,12 +186,6 @@ xinfer --m unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF \
 # Metal/MacOS
 xinfer --m unsloth/Qwen3.5-4B-GGUF --f Qwen3.5-4B-Q4_K_M.gguf
 ```
-
----
-
-## 📽️ 演示
-
-<video src="https://youtu.be/3z82y8iQR7E" width="1000px"></video>
 
 ---
 
