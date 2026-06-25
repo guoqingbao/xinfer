@@ -142,7 +142,6 @@ impl From<DType> for SerializableDType {
             DType::F16 => Self::F16,
             DType::F32 => Self::F32,
             DType::F64 => Self::F64,
-            DType::F8E8M0 | DType::F8E4M3 => Self::U8,
         }
     }
 }
