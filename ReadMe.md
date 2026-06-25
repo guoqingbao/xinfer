@@ -182,6 +182,12 @@ xinfer --m unsloth/Qwen3.5-4B-GGUF --f Qwen3.5-4B-Q4_K_M.gguf
 
 ---
 
+## 📽️ Demo
+
+<video src="https://youtu.be/3z82y8iQR7E" width="1000px"></video>
+
+---
+
 ## 📘 Usage
 > For **Python installaion**, running model with `python3 -m xinfer.server` 
 
@@ -497,12 +503,6 @@ Constraint-based generation via llguidance — Lark grammars, regex, JSON Schema
 ```bash
 XINFER_NVFP4_FORCE_LUT=1 xinfer --m nvidia/Qwen3-30B-A3B-FP4 --ui-server
 ```
-
----
-
-## 📽️ Demo
-
-<video src="https://github.com/user-attachments/assets/7fc6aa0b-78ac-4323-923f-d761dd12857f" width="1000px"></video>
 
 ---
 

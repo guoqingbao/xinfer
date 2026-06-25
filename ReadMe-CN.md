@@ -182,6 +182,12 @@ xinfer --m unsloth/Qwen3.5-4B-GGUF --f Qwen3.5-4B-Q4_K_M.gguf
 
 ---
 
+## 📽️ 演示
+
+<video src="https://youtu.be/3z82y8iQR7E" width="1000px"></video>
+
+---
+
 ## 📘 使用方法
 > **Python包安装后**请使用 `python3 -m xinfer.server` 方式运行
 
@@ -496,12 +502,6 @@ xinfer --m unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF \
 ```bash
 XINFER_NVFP4_FORCE_LUT=1 xinfer --m nvidia/Qwen3-30B-A3B-FP4 --ui-server
 ```
-
----
-
-## 📽️ 演示
-
-<video src="https://github.com/user-attachments/assets/7fc6aa0b-78ac-4323-923f-d761dd12857f" width="1000px"></video>
 
 ---
 
