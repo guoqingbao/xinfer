@@ -11,7 +11,9 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::{thread, time};
 pub trait ProgressLike: Send + Sync {
-    fn get_progress(&mut self) -> Vec<(usize, usize)>;
+    /// Returns Ok with progress values, or Err if the connection is broken
+    /// (e.g. runner process crashed during model loading).
+    fn get_progress(&mut self) -> std::result::Result<Vec<(usize, usize)>, String>;
     fn set_progress(&mut self, p: usize);
 }
 
@@ -21,8 +23,8 @@ pub struct ProgressReporter {
 }
 
 impl ProgressLike for ProgressReporter {
-    fn get_progress(&mut self) -> Vec<(usize, usize)> {
-        vec![(self.rank, self.progress)]
+    fn get_progress(&mut self) -> std::result::Result<Vec<(usize, usize)>, String> {
+        Ok(vec![(self.rank, self.progress)])
     }
 
     fn set_progress(&mut self, p: usize) {
@@ -95,18 +97,22 @@ impl RemoteProgressReporter {
 }
 
 impl ProgressLike for RemoteProgressReporter {
-    fn get_progress(&mut self) -> Vec<(usize, usize)> {
+    fn get_progress(&mut self) -> std::result::Result<Vec<(usize, usize)>, String> {
         let mut progress_values = Vec::with_capacity(self.streams.len());
         for mut stream in &mut self.streams {
-            if let Ok(msg) = receive_local(&mut stream, false) {
-                if let MessageType::LoadingProgress((rank, progress)) = msg {
+            match receive_local(&mut stream, false) {
+                Ok(MessageType::LoadingProgress((rank, progress))) => {
                     progress_values.push((rank, progress));
                 }
-            } else {
-                panic!("Error when loading model!");
+                Ok(_) => {}
+                Err(e) => {
+                    return Err(format!(
+                        "Runner process disconnected during model loading: {e}"
+                    ));
+                }
             }
         }
-        progress_values
+        Ok(progress_values)
     }
 
     fn set_progress(&mut self, p: usize) {
@@ -190,19 +196,29 @@ pub fn progress_worker(
     let handle = thread::spawn(move || loop {
         {
             let _ = thread::sleep(time::Duration::from_millis(10 as u64));
-            let progress = reporter.write().get_progress();
-            for (rank, progress) in progress {
-                finished_map.insert(rank, progress);
-                if let Some(pb) = progress_bar.as_ref() {
-                    pb.update(rank, progress);
-                }
-            }
+            match reporter.write().get_progress() {
+                Ok(progress) => {
+                    for (rank, progress) in progress {
+                        finished_map.insert(rank, progress);
+                        if let Some(pb) = progress_bar.as_ref() {
+                            pb.update(rank, progress);
+                        }
+                    }
 
-            if finished_map.values().all(|v| v >= &length) {
-                if let Some(pb) = progress_bar.as_ref() {
-                    pb.finish();
+                    if finished_map.values().all(|v| v >= &length) {
+                        if let Some(pb) = progress_bar.as_ref() {
+                            pb.finish();
+                        }
+                        break;
+                    }
                 }
-                break;
+                Err(e) => {
+                    crate::log_error!("{}", e);
+                    if let Some(pb) = progress_bar.as_ref() {
+                        pb.finish();
+                    }
+                    break;
+                }
             }
         }
     });
