@@ -3,7 +3,7 @@ use super::logger::ChatCompletionLogger;
 use super::{
     build_guided_decoding_grammar, build_messages_and_images, collect_openai_constraint_grammar,
     normalize_reasoning_controls,
-    streaming::{ChatResponse, Streamer, StreamingStatus},
+    streaming::{ChatResponse, Streamer},
     ChatResponder, DetokenizeRequest, DetokenizeResponse, EmbeddingRequest, EmbeddingResponse,
     EncodingFormat, TokenizeInput, TokenizeRequest, TokenizeResponse,
 };
@@ -537,7 +537,7 @@ pub async fn chat_completion(
         };
 
         let stream = stream;
-        let (response_tx, client_rx) = flume::unbounded();
+        let (response_tx, client_rx) = flume::bounded(256);
         let (disconnect_tx, mut disconnect_rx) = watch::channel(false);
 
         // Clone data needed for the async task
@@ -1146,11 +1146,7 @@ pub async fn chat_completion(
         });
 
         ChatResponder::Streamer(
-            Sse::new(Streamer {
-                rx: client_rx,
-                status: StreamingStatus::Uninitialized,
-                disconnect_tx: Some(disconnect_tx),
-            })
+            Sse::new(Streamer::new(client_rx, Some(disconnect_tx)))
             .keep_alive(
                 KeepAlive::new()
                     .interval(Duration::from_millis(
