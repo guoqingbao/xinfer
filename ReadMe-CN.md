@@ -251,7 +251,7 @@ xinfer --m /path/Qwen3-4B --isq q6k
 
 ```bash
 # 多卡 GGUF（模型 ID + 子文件夹）
-xinfer --d 0,1,2,3 --m unsloth/GLM-5.2-GGUF --f UD-Q2_K_XL
+xinfer --d 0,1,2,3 --m unsloth/Qwen3.5-122B-A10B-GGUF --f Q3_K_M
 
 # 远程 GGUF — 单文件模型
 xinfer --m unsloth/Qwen3.5-27B-GGUF --f Qwen3.5-27B-Q4_K_M.gguf
