@@ -116,7 +116,6 @@ impl BlockManager {
         let block = &mut self.blocks[block_id];
         assert_eq!(block.ref_count, 0);
         block.reset();
-        self.free_block_ids.retain(|&id| id != block_id);
         self.used_block_ids.insert(block_id);
         block
     }
