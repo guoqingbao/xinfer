@@ -180,7 +180,8 @@ fn presorted_expert_assignments(
 
 /// Try to load `e_score_correction_bias` from the MoE var-builder.
 /// First tries `gate.e_score_correction_bias` (Qwen style), then falls back
-/// to `e_score_correction_bias` directly (MiniMax style).
+/// to `e_score_correction_bias` directly (MiniMax style), then tries
+/// `exp_probs_b.bias` (GLM-DSA / GGUF style).
 fn try_load_e_score_correction_bias(vb: &VarBuilderX, num_experts: usize) -> Option<Tensor> {
     let vb_gate = vb.pp("gate");
     vb_gate
@@ -199,6 +200,11 @@ fn try_load_e_score_correction_bias(vb: &VarBuilderX, num_experts: usize) -> Opt
                 DType::F32,
             )
             .ok()
+        })
+        .or_else(|| {
+            vb.pp("exp_probs_b")
+                .get_with_hints_dtype(num_experts, "bias", shard(0, 0, 1), DType::F32)
+                .ok()
         })
 }
 
@@ -615,6 +621,39 @@ fn can_quantize_to(dtype: GgmlDType) -> bool {
     )
 }
 
+/// Dtypes supported natively by the `moe_gemm_gguf` kernel (no requant needed).
+/// Metal only supports K-quants + Q8_0; CUDA also supports IQ formats.
+fn moe_gemm_gguf_supports(dtype: GgmlDType) -> bool {
+    #[cfg(feature = "metal")]
+    {
+        matches!(
+            dtype,
+            GgmlDType::Q2K
+                | GgmlDType::Q3K
+                | GgmlDType::Q4K
+                | GgmlDType::Q5K
+                | GgmlDType::Q6K
+                | GgmlDType::Q8_0
+        )
+    }
+    #[cfg(not(feature = "metal"))]
+    {
+        matches!(
+            dtype,
+            GgmlDType::Q2K
+                | GgmlDType::Q3K
+                | GgmlDType::Q4K
+                | GgmlDType::Q5K
+                | GgmlDType::Q6K
+                | GgmlDType::Q8_0
+                | GgmlDType::IQ2_XXS
+                | GgmlDType::IQ2_XS
+                | GgmlDType::IQ3_XXS
+                | GgmlDType::IQ4_XS
+        )
+    }
+}
+
 fn closest_quantizable_dtype(orig: GgmlDType) -> GgmlDType {
     if can_quantize_to(orig) {
         return orig;
@@ -651,72 +690,42 @@ impl FusedMoeGGUF {
 
         let gate = Linear::new(gate_ws, None, &None)?;
 
-        let (gate_experts, up_experts, down_experts, orig_gate_dtype, orig_down_dtype) = match &vb.0
-        {
-            Either::Right(v) => {
-                let packed_result = v.pp("ffn_gate_up_exps").get(
-                    (
-                        num_experts,
-                        moe_cfg.moe_intermediate_size * 2,
-                        cfg.hidden_size,
-                    ),
-                    "weight",
-                );
-                if let Ok(packed) = packed_result {
-                    let orig_dtype = packed.dtype();
-                    let deq = packed.dequantize_f16(&v.device())?;
-                    let gate_exp = deq
-                        .narrow(1, 0, moe_cfg.moe_intermediate_size)?
-                        .contiguous()?;
-                    let up_exp = deq
-                        .narrow(
-                            1,
-                            moe_cfg.moe_intermediate_size,
-                            moe_cfg.moe_intermediate_size,
-                        )?
-                        .contiguous()?;
-                    let down_qt = v.pp("ffn_down_exps").get(
-                        (num_experts, cfg.hidden_size, moe_cfg.moe_intermediate_size),
-                        "weight",
-                    )?;
-                    let down_dtype = down_qt.dtype();
-                    (
-                        gate_exp,
-                        up_exp,
-                        down_qt.dequantize_f16(&v.device())?,
-                        orig_dtype,
-                        down_dtype,
-                    )
-                } else {
-                    let gate_qt = v.pp("ffn_gate_exps").get(
-                        (num_experts, moe_cfg.moe_intermediate_size, cfg.hidden_size),
-                        "weight",
-                    )?;
-                    let orig_dtype = gate_qt.dtype();
-                    let down_qt = v.pp("ffn_down_exps").get(
-                        (num_experts, cfg.hidden_size, moe_cfg.moe_intermediate_size),
-                        "weight",
-                    )?;
-                    let down_dtype = down_qt.dtype();
-                    (
-                        gate_qt.dequantize_f16(&v.device())?,
-                        v.pp("ffn_up_exps")
-                            .get(
-                                (num_experts, moe_cfg.moe_intermediate_size, cfg.hidden_size),
-                                "weight",
-                            )?
-                            .dequantize_f16(&v.device())?,
-                        down_qt.dequantize_f16(&v.device())?,
-                        orig_dtype,
-                        down_dtype,
-                    )
-                }
-            }
-            _ => {
-                panic!("Invalid varbuilder!");
-            }
+        let v = match &vb.0 {
+            Either::Right(v) => v.clone(),
+            _ => panic!("Invalid varbuilder!"),
         };
 
+        let is_packed = v.pp("ffn_gate_up_exps").contains_key("weight");
+
+        // Get original dtypes from tensor metadata without loading data to GPU.
+        let (orig_gate_dtype, orig_down_dtype) = if is_packed {
+            let gate_dt = v
+                .pp("ffn_gate_up_exps")
+                .tensor_dtype("weight")
+                .unwrap_or(GgmlDType::Q8_0);
+            let down_dt = v
+                .pp("ffn_down_exps")
+                .tensor_dtype("weight")
+                .unwrap_or(GgmlDType::Q8_0);
+            (gate_dt, down_dt)
+        } else {
+            let gate_dt = v
+                .pp("ffn_gate_exps")
+                .tensor_dtype("weight")
+                .unwrap_or(GgmlDType::Q8_0);
+            let down_dt = v
+                .pp("ffn_down_exps")
+                .tensor_dtype("weight")
+                .unwrap_or(GgmlDType::Q8_0);
+            (gate_dt, down_dt)
+        };
+
+        // Check if the moe_gemm_gguf kernel supports this dtype directly
+        let kernel_supports_gate = moe_gemm_gguf_supports(orig_gate_dtype);
+        let kernel_supports_down = moe_gemm_gguf_supports(orig_down_dtype);
+
+        // Determine target requant dtypes (only used when kernel doesn't support native format
+        // or block alignment fails for direct sharding)
         let chunk_base = moe_cfg.moe_intermediate_size / comm.world_size();
         let target_gate_dtype = closest_quantizable_dtype(orig_gate_dtype);
         let ggml_dtype = if chunk_base % target_gate_dtype.block_size() == 0 {
@@ -776,22 +785,232 @@ impl FusedMoeGGUF {
             (ggml_dtype, high_precision_dtype, cur_chunk_size)
         };
 
-        let (gate_experts, up_experts, down_experts) = (
-            gate_experts
-                .narrow(1, comm.rank() * moe_intermediate_chunk, cur_chunk_size)?
-                .contiguous()?,
-            up_experts
-                .narrow(1, comm.rank() * moe_intermediate_chunk, cur_chunk_size)?
-                .contiguous()?,
-            down_experts
-                .narrow(2, comm.rank() * moe_intermediate_chunk, cur_chunk_size)?
-                .contiguous()?,
-        );
-        let gate_experts = Arc::new(QTensor::quantize(&gate_experts, ggml_dtype)?);
-        let up_experts = Arc::new(QTensor::quantize(&up_experts, ggml_dtype)?);
-        let down_experts = Arc::new(QTensor::quantize(&down_experts, high_precision_dtype)?);
+        let shard_offset = comm.rank() * moe_intermediate_chunk;
+
+        let (gate_experts, up_experts, down_experts) = if is_packed {
+            // Packed gate_up_exps: shard each half separately using world_size*2 trick.
+            // rank -> gate shard, rank+world_size -> up shard
+            let packed_shape = (
+                num_experts,
+                moe_cfg.moe_intermediate_size * 2,
+                cfg.hidden_size,
+            );
+            let ws2 = comm.world_size() * 2;
+
+            let gate_q = if kernel_supports_gate && chunk_base % orig_gate_dtype.block_size() == 0 {
+                if let Some(qt) = v.pp("ffn_gate_up_exps").get_sharded(
+                    packed_shape,
+                    "weight",
+                    1,
+                    comm.rank(),
+                    ws2,
+                )? {
+                    qt
+                } else {
+                    Self::fallback_shard_gate_up(
+                        &v,
+                        "ffn_gate_up_exps",
+                        packed_shape,
+                        0,
+                        moe_cfg.moe_intermediate_size,
+                        shard_offset,
+                        cur_chunk_size,
+                        ggml_dtype,
+                    )?
+                }
+            } else {
+                Self::fallback_shard_gate_up(
+                    &v,
+                    "ffn_gate_up_exps",
+                    packed_shape,
+                    0,
+                    moe_cfg.moe_intermediate_size,
+                    shard_offset,
+                    cur_chunk_size,
+                    ggml_dtype,
+                )?
+            };
+
+            let up_q = if kernel_supports_gate && chunk_base % orig_gate_dtype.block_size() == 0 {
+                if let Some(qt) = v.pp("ffn_gate_up_exps").get_sharded(
+                    packed_shape,
+                    "weight",
+                    1,
+                    comm.rank() + comm.world_size(),
+                    ws2,
+                )? {
+                    qt
+                } else {
+                    Self::fallback_shard_gate_up(
+                        &v,
+                        "ffn_gate_up_exps",
+                        packed_shape,
+                        moe_cfg.moe_intermediate_size,
+                        moe_cfg.moe_intermediate_size,
+                        shard_offset,
+                        cur_chunk_size,
+                        ggml_dtype,
+                    )?
+                }
+            } else {
+                Self::fallback_shard_gate_up(
+                    &v,
+                    "ffn_gate_up_exps",
+                    packed_shape,
+                    moe_cfg.moe_intermediate_size,
+                    moe_cfg.moe_intermediate_size,
+                    shard_offset,
+                    cur_chunk_size,
+                    ggml_dtype,
+                )?
+            };
+
+            // down_exps: direct shard on dim 2
+            let down_q = if kernel_supports_down && chunk_base % orig_down_dtype.block_size() == 0 {
+                if let Some(qt) = v.pp("ffn_down_exps").get_sharded(
+                    (num_experts, cfg.hidden_size, moe_cfg.moe_intermediate_size),
+                    "weight",
+                    2,
+                    comm.rank(),
+                    comm.world_size(),
+                )? {
+                    qt
+                } else {
+                    Self::fallback_shard_down(
+                        &v,
+                        num_experts,
+                        cfg.hidden_size,
+                        moe_cfg.moe_intermediate_size,
+                        shard_offset,
+                        cur_chunk_size,
+                        high_precision_dtype,
+                    )?
+                }
+            } else {
+                Self::fallback_shard_down(
+                    &v,
+                    num_experts,
+                    cfg.hidden_size,
+                    moe_cfg.moe_intermediate_size,
+                    shard_offset,
+                    cur_chunk_size,
+                    high_precision_dtype,
+                )?
+            };
+
+            (gate_q, up_q, down_q)
+        } else {
+            // Separate gate/up/down: direct sharded loading for each
+            let gate_q = if kernel_supports_gate && chunk_base % orig_gate_dtype.block_size() == 0 {
+                if let Some(qt) = v.pp("ffn_gate_exps").get_sharded(
+                    (num_experts, moe_cfg.moe_intermediate_size, cfg.hidden_size),
+                    "weight",
+                    1,
+                    comm.rank(),
+                    comm.world_size(),
+                )? {
+                    qt
+                } else {
+                    Self::fallback_shard_expert(
+                        &v,
+                        "ffn_gate_exps",
+                        num_experts,
+                        moe_cfg.moe_intermediate_size,
+                        cfg.hidden_size,
+                        1,
+                        shard_offset,
+                        cur_chunk_size,
+                        ggml_dtype,
+                    )?
+                }
+            } else {
+                Self::fallback_shard_expert(
+                    &v,
+                    "ffn_gate_exps",
+                    num_experts,
+                    moe_cfg.moe_intermediate_size,
+                    cfg.hidden_size,
+                    1,
+                    shard_offset,
+                    cur_chunk_size,
+                    ggml_dtype,
+                )?
+            };
+
+            let up_q = if kernel_supports_gate && chunk_base % orig_gate_dtype.block_size() == 0 {
+                if let Some(qt) = v.pp("ffn_up_exps").get_sharded(
+                    (num_experts, moe_cfg.moe_intermediate_size, cfg.hidden_size),
+                    "weight",
+                    1,
+                    comm.rank(),
+                    comm.world_size(),
+                )? {
+                    qt
+                } else {
+                    Self::fallback_shard_expert(
+                        &v,
+                        "ffn_up_exps",
+                        num_experts,
+                        moe_cfg.moe_intermediate_size,
+                        cfg.hidden_size,
+                        1,
+                        shard_offset,
+                        cur_chunk_size,
+                        ggml_dtype,
+                    )?
+                }
+            } else {
+                Self::fallback_shard_expert(
+                    &v,
+                    "ffn_up_exps",
+                    num_experts,
+                    moe_cfg.moe_intermediate_size,
+                    cfg.hidden_size,
+                    1,
+                    shard_offset,
+                    cur_chunk_size,
+                    ggml_dtype,
+                )?
+            };
+
+            let down_q = if kernel_supports_down && chunk_base % orig_down_dtype.block_size() == 0 {
+                if let Some(qt) = v.pp("ffn_down_exps").get_sharded(
+                    (num_experts, cfg.hidden_size, moe_cfg.moe_intermediate_size),
+                    "weight",
+                    2,
+                    comm.rank(),
+                    comm.world_size(),
+                )? {
+                    qt
+                } else {
+                    Self::fallback_shard_down(
+                        &v,
+                        num_experts,
+                        cfg.hidden_size,
+                        moe_cfg.moe_intermediate_size,
+                        shard_offset,
+                        cur_chunk_size,
+                        high_precision_dtype,
+                    )?
+                }
+            } else {
+                Self::fallback_shard_down(
+                    &v,
+                    num_experts,
+                    cfg.hidden_size,
+                    moe_cfg.moe_intermediate_size,
+                    shard_offset,
+                    cur_chunk_size,
+                    high_precision_dtype,
+                )?
+            };
+
+            (gate_q, up_q, down_q)
+        };
 
         let world_size = comm.world_size();
+
+        let bias = try_load_e_score_correction_bias(&vb, num_experts);
 
         Ok(Self {
             gate,
@@ -799,11 +1018,79 @@ impl FusedMoeGGUF {
             up_experts,
             down_experts,
             act: cfg.hidden_act,
-            routing: MoeRouting::from_moe_cfg(moe_cfg, None),
+            routing: MoeRouting::from_moe_cfg(moe_cfg, bias),
             all_reduce: AllReduce::new(comm),
             world_size,
             dtype,
         })
+    }
+
+    fn fallback_shard_expert(
+        v: &crate::utils::gguf_varbuilder::VarBuilder,
+        prefix: &str,
+        num_experts: usize,
+        dim0: usize,
+        dim1: usize,
+        shard_dim: usize,
+        shard_offset: usize,
+        cur_chunk_size: usize,
+        target_dtype: GgmlDType,
+    ) -> Result<Arc<QTensor>> {
+        let qt = v.pp(prefix).get((num_experts, dim0, dim1), "weight")?;
+        let f16 = qt.dequantize_f16(&v.device())?;
+        drop(qt);
+        v.clear_cache();
+        let f16 = f16
+            .narrow(shard_dim, shard_offset, cur_chunk_size)?
+            .contiguous()?;
+        let q = Arc::new(QTensor::quantize(&f16, target_dtype)?);
+        drop(f16);
+        Ok(q)
+    }
+
+    fn fallback_shard_gate_up(
+        v: &crate::utils::gguf_varbuilder::VarBuilder,
+        prefix: &str,
+        packed_shape: (usize, usize, usize),
+        narrow_offset: usize,
+        intermediate_size: usize,
+        shard_offset: usize,
+        cur_chunk_size: usize,
+        target_dtype: GgmlDType,
+    ) -> Result<Arc<QTensor>> {
+        let packed = v.pp(prefix).get(packed_shape, "weight")?;
+        let deq = packed.dequantize_f16(&v.device())?;
+        drop(packed);
+        v.clear_cache();
+        let f16 = deq
+            .narrow(1, narrow_offset, intermediate_size)?
+            .narrow(1, shard_offset, cur_chunk_size)?
+            .contiguous()?;
+        drop(deq);
+        let q = Arc::new(QTensor::quantize(&f16, target_dtype)?);
+        drop(f16);
+        Ok(q)
+    }
+
+    fn fallback_shard_down(
+        v: &crate::utils::gguf_varbuilder::VarBuilder,
+        num_experts: usize,
+        hidden_size: usize,
+        intermediate_size: usize,
+        shard_offset: usize,
+        cur_chunk_size: usize,
+        target_dtype: GgmlDType,
+    ) -> Result<Arc<QTensor>> {
+        let qt = v
+            .pp("ffn_down_exps")
+            .get((num_experts, hidden_size, intermediate_size), "weight")?;
+        let f16 = qt.dequantize_f16(&v.device())?;
+        drop(qt);
+        v.clear_cache();
+        let f16 = f16.narrow(2, shard_offset, cur_chunk_size)?.contiguous()?;
+        let q = Arc::new(QTensor::quantize(&f16, target_dtype)?);
+        drop(f16);
+        Ok(q)
     }
 
     pub fn new(cfg: &Config, vb: VarBuilderX, comm: Rc<Comm>, dtype: DType) -> Result<Self> {
@@ -835,26 +1122,81 @@ impl FusedMoeGGUF {
                 );
                 if let Ok(packed) = packed_result {
                     let orig_dtype = packed.dtype();
-                    let deq = packed.dequantize_f16(&v.device())?;
-                    let gate_exp = deq
-                        .narrow(1, 0, moe_cfg.moe_intermediate_size)?
-                        .contiguous()?;
-                    let up_exp = deq
-                        .narrow(
-                            1,
-                            moe_cfg.moe_intermediate_size,
-                            moe_cfg.moe_intermediate_size,
-                        )?
-                        .contiguous()?;
-                    let down = v.pp("ffn_down_exps").get(
-                        (num_experts, cfg.hidden_size, moe_cfg.moe_intermediate_size),
-                        "weight",
-                    )?;
-                    (
-                        Arc::new(QTensor::quantize(&gate_exp, orig_dtype)?),
-                        Arc::new(QTensor::quantize(&up_exp, orig_dtype)?),
-                        down,
-                    )
+                    if moe_gemm_gguf_supports(orig_dtype) {
+                        // Kernel supports this dtype; split packed into gate/up without requant.
+                        // Use get_sharded with world_size=2 to read each half directly.
+                        let half_shape = (
+                            num_experts,
+                            moe_cfg.moe_intermediate_size * 2,
+                            cfg.hidden_size,
+                        );
+                        let gate_exp = v
+                            .pp("ffn_gate_up_exps")
+                            .get_sharded(half_shape, "weight", 1, 0, 2)?;
+                        let up_exp = v
+                            .pp("ffn_gate_up_exps")
+                            .get_sharded(half_shape, "weight", 1, 1, 2)?;
+                        if let (Some(g), Some(u)) = (gate_exp, up_exp) {
+                            let down = v.pp("ffn_down_exps").get(
+                                (num_experts, cfg.hidden_size, moe_cfg.moe_intermediate_size),
+                                "weight",
+                            )?;
+                            (g, u, down)
+                        } else {
+                            // Fallback: dequant + requant
+                            let requant_dtype = if can_quantize_to(orig_dtype) {
+                                orig_dtype
+                            } else {
+                                closest_quantizable_dtype(orig_dtype)
+                            };
+                            let deq = packed.dequantize_f16(&v.device())?;
+                            let gate_f16 = deq
+                                .narrow(1, 0, moe_cfg.moe_intermediate_size)?
+                                .contiguous()?;
+                            let up_f16 = deq
+                                .narrow(
+                                    1,
+                                    moe_cfg.moe_intermediate_size,
+                                    moe_cfg.moe_intermediate_size,
+                                )?
+                                .contiguous()?;
+                            let down = v.pp("ffn_down_exps").get(
+                                (num_experts, cfg.hidden_size, moe_cfg.moe_intermediate_size),
+                                "weight",
+                            )?;
+                            (
+                                Arc::new(QTensor::quantize(&gate_f16, requant_dtype)?),
+                                Arc::new(QTensor::quantize(&up_f16, requant_dtype)?),
+                                down,
+                            )
+                        }
+                    } else {
+                        let requant_dtype = if can_quantize_to(orig_dtype) {
+                            orig_dtype
+                        } else {
+                            closest_quantizable_dtype(orig_dtype)
+                        };
+                        let deq = packed.dequantize_f16(&v.device())?;
+                        let gate_exp = deq
+                            .narrow(1, 0, moe_cfg.moe_intermediate_size)?
+                            .contiguous()?;
+                        let up_exp = deq
+                            .narrow(
+                                1,
+                                moe_cfg.moe_intermediate_size,
+                                moe_cfg.moe_intermediate_size,
+                            )?
+                            .contiguous()?;
+                        let down = v.pp("ffn_down_exps").get(
+                            (num_experts, cfg.hidden_size, moe_cfg.moe_intermediate_size),
+                            "weight",
+                        )?;
+                        (
+                            Arc::new(QTensor::quantize(&gate_exp, requant_dtype)?),
+                            Arc::new(QTensor::quantize(&up_exp, requant_dtype)?),
+                            down,
+                        )
+                    }
                 } else {
                     (
                         v.pp("ffn_gate_exps").get(
@@ -877,13 +1219,15 @@ impl FusedMoeGGUF {
             }
         };
 
+        let bias = try_load_e_score_correction_bias(&vb, num_experts);
+
         Ok(Self {
             gate,
             gate_experts,
             up_experts,
             down_experts,
             act: cfg.hidden_act,
-            routing: MoeRouting::from_moe_cfg(moe_cfg, None),
+            routing: MoeRouting::from_moe_cfg(moe_cfg, bias),
             all_reduce: AllReduce::new(comm),
             world_size: 1,
             dtype,
