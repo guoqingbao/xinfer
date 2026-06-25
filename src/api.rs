@@ -125,9 +125,6 @@ impl EngineBuilder {
             ),
             ModelRepo::ModelPath(path) => (None, Some(path.to_owned()), None),
             ModelRepo::ModelFile(files) => {
-                if files.len() > 1 {
-                    crate::log_warn!("Multiple GGUF files provided, using the first one.");
-                }
                 let weight_file = files.into_iter().next().map(|f| f.to_owned());
                 (None, None, weight_file)
             }

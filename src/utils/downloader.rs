@@ -191,6 +191,60 @@ impl Downloader {
         })
     }
 
+    fn find_split_gguf_shards(main_file: &Path) -> Vec<PathBuf> {
+        let file_name = main_file.file_name().and_then(|f| f.to_str()).unwrap_or("");
+        let re = regex::Regex::new(r"^(.+)-(\d{5})-of-(\d{5})\.gguf$").unwrap();
+        let Some(caps) = re.captures(file_name) else {
+            return vec![main_file.to_path_buf()];
+        };
+        let prefix = &caps[1];
+        let total: usize = caps[3].parse().unwrap_or(1);
+        let dir = main_file.parent().unwrap_or(Path::new("."));
+
+        let mut shards: Vec<PathBuf> = (1..=total)
+            .map(|i| dir.join(format!("{}-{:05}-of-{:05}.gguf", prefix, i, total)))
+            .filter(|p| p.exists())
+            .collect();
+
+        if shards.len() != total {
+            crate::log_warn!(
+                "Expected {} GGUF shards but found {}; using only the main file",
+                total,
+                shards.len()
+            );
+            return vec![main_file.to_path_buf()];
+        }
+
+        shards.sort();
+        crate::log_info!("Found {} split GGUF shards for {}", shards.len(), prefix);
+        shards
+    }
+
+    /// Scan a directory for the main GGUF file (excludes mmproj auxiliary files).
+    /// Returns the path to the best candidate, preferring the largest non-mmproj
+    /// `.gguf` file (or the first split shard alphabetically).
+    fn find_main_gguf_in_dir(dir: &Path) -> Option<PathBuf> {
+        let entries = std::fs::read_dir(dir).ok()?;
+        let mut candidates: Vec<(PathBuf, u64)> = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() || !Self::has_gguf_extension(&path) {
+                continue;
+            }
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if Self::is_mmproj_filename(name) {
+                continue;
+            }
+            let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+            candidates.push((path, size));
+        }
+        if candidates.is_empty() {
+            return None;
+        }
+        candidates.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        Some(candidates[0].0.clone())
+    }
+
     fn local_gguf_model(main_file: &Path) -> Result<ModelPaths> {
         if !main_file.exists() {
             candle_core::bail!("Model file not found: {}", main_file.display());
@@ -201,6 +255,8 @@ impl Downloader {
                 main_file.display()
             );
         }
+
+        let filenames = Self::find_split_gguf_shards(main_file);
 
         let auxiliary_filenames = Self::find_local_mmproj_file(main_file)
             .map(|path| {
@@ -216,7 +272,7 @@ impl Downloader {
             tokenizer_filename: PathBuf::new(),
             tokenizer_config_filename: PathBuf::new(),
             config_filename: PathBuf::new(),
-            filenames: vec![main_file.to_path_buf()],
+            filenames,
             auxiliary_filenames,
             generation_config_filename: "".into(),
             chat_template_filename: None,
@@ -286,8 +342,22 @@ impl Downloader {
             &self.weight_path,
             &self.weight_file,
         ) {
-            //model in a folder (safetensor format, huggingface folder structure)
-            (None, Some(path), None) => (Self::local_safetensors_model(path)?, false),
+            (None, Some(path), None) => {
+                let p = Path::new(path.as_str());
+                if p.is_dir() {
+                    if let Some(main_gguf) = Self::find_main_gguf_in_dir(p) {
+                        crate::log_info!(
+                            "Auto-detected main GGUF file in directory: {}",
+                            main_gguf.display()
+                        );
+                        (Self::local_gguf_model(&main_gguf)?, true)
+                    } else {
+                        (Self::local_safetensors_model(path)?, false)
+                    }
+                } else {
+                    (Self::local_safetensors_model(path)?, false)
+                }
+            }
             //model in a quantized file (gguf/ggml format)
             (None, path, Some(file)) => {
                 let path = path.clone().unwrap_or_default();
@@ -298,7 +368,15 @@ impl Downloader {
             (Some(model), None, None) if Path::new(model).exists() => {
                 let path = Path::new(model);
                 if path.is_dir() {
-                    (Self::local_safetensors_model(model)?, false)
+                    if let Some(main_gguf) = Self::find_main_gguf_in_dir(path) {
+                        crate::log_info!(
+                            "Auto-detected main GGUF file in directory: {}",
+                            main_gguf.display()
+                        );
+                        (Self::local_gguf_model(&main_gguf)?, true)
+                    } else {
+                        (Self::local_safetensors_model(model)?, false)
+                    }
                 } else if path.is_file() {
                     (Self::local_gguf_model(path)?, true)
                 } else {
@@ -588,6 +666,38 @@ impl Downloader {
         })
     }
 
+    fn discover_remote_gguf_shards(
+        filename: &str,
+        remote_files: &std::collections::HashSet<String>,
+    ) -> Vec<String> {
+        let re = regex::Regex::new(r"^(.+)-(\d{5})-of-(\d{5})\.gguf$").unwrap();
+        let Some(caps) = re.captures(filename) else {
+            return vec![filename.to_string()];
+        };
+        let prefix = &caps[1];
+        let total: usize = caps[3].parse().unwrap_or(1);
+
+        let mut shards: Vec<String> = (1..=total)
+            .map(|i| format!("{}-{:05}-of-{:05}.gguf", prefix, i, total))
+            .filter(|name| remote_files.contains(name))
+            .collect();
+
+        if shards.len() != total {
+            crate::log_warn!(
+                "Expected {} remote GGUF shards but found {} in repo; using only the main file",
+                total,
+                shards.len()
+            );
+            return vec![filename.to_string()];
+        }
+        shards.sort();
+        crate::log_info!(
+            "Discovered {} split GGUF shards in remote repo",
+            shards.len()
+        );
+        shards
+    }
+
     pub fn download_gguf_model(&self, revision: Option<String>) -> Result<ModelPaths> {
         assert!(self.model_id.is_some(), "No model id provided!");
         crate::log_info!(
@@ -595,7 +705,7 @@ impl Downloader {
             self.weight_file.as_ref().unwrap(),
             self.model_id.as_ref().unwrap(),
         );
-        let filename = self.weight_file.clone().unwrap();
+        let mut filename = self.weight_file.clone().unwrap();
         let mut filenames = vec![];
         let api = hf_hub::api::sync::Api::new().unwrap();
         let revision = revision.unwrap_or("main".to_string());
@@ -605,17 +715,60 @@ impl Downloader {
             revision.to_string(),
         ));
         let repo_info = repo.info().map_err(candle_core::Error::wrap)?;
-        let mmproj_name = Self::pick_mmproj_filename(
-            repo_info.siblings.iter().map(|s| s.rfilename.as_str()),
-            Some(&filename),
-        );
+        let remote_files: std::collections::HashSet<String> = repo_info
+            .siblings
+            .iter()
+            .map(|s| s.rfilename.clone())
+            .collect();
+
+        // If --f is a subfolder (no .gguf extension), discover GGUF files in it
+        if !filename.ends_with(".gguf") {
+            let subfolder = filename.trim_end_matches('/').to_string();
+            let prefix = format!("{}/", subfolder);
+            let mut gguf_files: Vec<String> = remote_files
+                .iter()
+                .filter(|f| f.starts_with(&prefix) && f.ends_with(".gguf"))
+                .cloned()
+                .collect();
+            gguf_files.sort();
+            if gguf_files.is_empty() {
+                candle_core::bail!(
+                    "No GGUF files found in subfolder '{}' of repo {}. \
+                     Available files: {:?}",
+                    subfolder,
+                    self.model_id.as_ref().unwrap(),
+                    remote_files.iter().take(20).collect::<Vec<_>>()
+                );
+            }
+            crate::log_info!(
+                "Subfolder '{}' contains {} GGUF file(s); using '{}' as primary",
+                subfolder,
+                gguf_files.len(),
+                gguf_files[0]
+            );
+            filename = gguf_files[0].clone();
+        }
+
+        let mmproj_name =
+            Self::pick_mmproj_filename(remote_files.iter().map(|s| s.as_str()), Some(&filename));
+
+        let shard_names = Self::discover_remote_gguf_shards(&filename, &remote_files);
 
         let mut auxiliary_filenames = Vec::new();
         if let Some(cache_path) = self.check_cache() {
-            let cached_gguf_file = cache_path.join(&filename);
-            if cached_gguf_file.exists() {
-                crate::log_warn!("Found cache: {}", cached_gguf_file.display());
-                filenames.push(cached_gguf_file.clone());
+            let mut all_cached = true;
+            for shard_name in &shard_names {
+                let cached_file = cache_path.join(shard_name);
+                if cached_file.exists() {
+                    crate::log_warn!("Found cache: {}", cached_file.display());
+                    filenames.push(cached_file);
+                } else {
+                    all_cached = false;
+                    break;
+                }
+            }
+            if !all_cached {
+                filenames.clear();
             }
 
             if let Some(mmproj_name) = &mmproj_name {
@@ -640,10 +793,15 @@ impl Downloader {
         }
 
         if filenames.is_empty() {
-            let filename = repo
-                .get(filename.as_str())
-                .map_err(candle_core::Error::wrap)?;
-            filenames.push(filename);
+            for shard_name in &shard_names {
+                let downloaded = self.hf_get_with_retry(
+                    &repo,
+                    shard_name,
+                    5,
+                    std::time::Duration::from_secs(5),
+                )?;
+                filenames.push(downloaded);
+            }
         }
 
         if auxiliary_filenames.is_empty() {

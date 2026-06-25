@@ -1,15 +1,19 @@
-use candle::quantized::QTensor;
+use candle::quantized::{GgmlDType, QTensor};
 use candle::{Device, Result, Shape};
 use candle_core as candle;
 use std::fs::File;
 use std::sync::Arc;
 use std::sync::Mutex;
-// light-cached qvarbuilder
+
+struct GgufShard {
+    content: candle_core::quantized::gguf_file::Content,
+    file: File,
+}
 
 #[derive(Clone)]
 pub struct VarBuilder {
-    content: Arc<candle_core::quantized::gguf_file::Content>,
-    file: Arc<std::sync::Mutex<File>>,
+    shards: Arc<Mutex<Vec<GgufShard>>>,
+    tensor_to_shard: Arc<std::collections::HashMap<String, usize>>,
     cache: Arc<Mutex<Option<(String, Arc<QTensor>)>>>,
     path: Vec<String>,
     device: Device,
@@ -18,12 +22,35 @@ pub struct VarBuilder {
 
 impl VarBuilder {
     pub fn from_gguf<P: AsRef<std::path::Path>>(p: P, device: &Device) -> Result<Self> {
-        let file_path = p.as_ref().to_string_lossy().to_string();
-        let mut file = File::open(&p)?;
-        let content = candle_core::quantized::gguf_file::Content::read(&mut file)?;
+        Self::from_gguf_files(&[p.as_ref().to_path_buf()], device)
+    }
+
+    pub fn from_gguf_files(paths: &[std::path::PathBuf], device: &Device) -> Result<Self> {
+        assert!(!paths.is_empty(), "No GGUF files provided!");
+        let file_path = paths[0].to_string_lossy().to_string();
+        let mut shards = Vec::with_capacity(paths.len());
+        let mut tensor_to_shard = std::collections::HashMap::new();
+
+        for (shard_idx, path) in paths.iter().enumerate() {
+            let mut file = File::open(path)?;
+            let content = candle_core::quantized::gguf_file::Content::read(&mut file)?;
+            for name in content.tensor_infos.keys() {
+                tensor_to_shard.insert(name.clone(), shard_idx);
+            }
+            shards.push(GgufShard { content, file });
+        }
+
+        if paths.len() > 1 {
+            crate::log_info!(
+                "Loaded {} GGUF shards with {} total tensors",
+                paths.len(),
+                tensor_to_shard.len()
+            );
+        }
+
         Ok(Self {
-            content: Arc::new(content),
-            file: Arc::new(std::sync::Mutex::new(file)),
+            shards: Arc::new(Mutex::new(shards)),
+            tensor_to_shard: Arc::new(tensor_to_shard),
             cache: Arc::new(Mutex::new(None)),
             path: Vec::new(),
             device: device.clone(),
@@ -39,8 +66,8 @@ impl VarBuilder {
         let mut path = self.path.clone();
         path.push(s.to_string());
         Self {
-            content: self.content.clone(),
-            file: self.file.clone(),
+            shards: self.shards.clone(),
+            tensor_to_shard: self.tensor_to_shard.clone(),
             cache: self.cache.clone(),
             path,
             device: self.device.clone(),
@@ -56,15 +83,24 @@ impl VarBuilder {
         }
     }
 
+    fn resolve_shard(&self, tensor_path: &str) -> Result<usize> {
+        self.tensor_to_shard
+            .get(tensor_path)
+            .copied()
+            .ok_or_else(|| {
+                candle::Error::Msg(format!(
+                    "cannot find tensor {tensor_path} in any GGUF shard"
+                ))
+            })
+    }
+
     pub fn get<S: Into<Shape>>(&self, s: S, name: &str) -> Result<Arc<QTensor>> {
         let path = self.path(name);
 
-        // Check cache
         {
             let cache_guard = self.cache.lock().unwrap();
             if let Some((ref cached_name, ref cached_tensor)) = *cache_guard {
                 if cached_name == &path {
-                    // Return cached tensor
                     let shape = s.into();
                     if cached_tensor.shape() != &shape {
                         candle::bail!(
@@ -77,10 +113,11 @@ impl VarBuilder {
             }
         }
 
-        let mut file = self.file.lock().unwrap();
-        let tensor = self.content.tensor(&mut *file, &path, &self.device)?;
+        let shard_idx = self.resolve_shard(&path)?;
+        let mut shards = self.shards.lock().unwrap();
+        let shard = &mut shards[shard_idx];
+        let tensor = shard.content.tensor(&mut shard.file, &path, &self.device)?;
         let tensor = Arc::new(tensor);
-        // Update cache
         *self.cache.lock().unwrap() = Some((path.clone(), tensor.clone()));
 
         let shape = s.into();
@@ -122,10 +159,17 @@ impl VarBuilder {
         let mut shard_shape = shape.dims().to_vec();
         shard_shape[dim] /= world_size;
 
-        let mut file = self.file.lock().unwrap();
-        let Some(tensor) =
-            self.content
-                .tensor_shard(&mut *file, &path, dim, rank, world_size, &self.device)?
+        let shard_idx = self.resolve_shard(&path)?;
+        let mut shards = self.shards.lock().unwrap();
+        let shard = &mut shards[shard_idx];
+        let Some(tensor) = shard.content.tensor_shard(
+            &mut shard.file,
+            &path,
+            dim,
+            rank,
+            world_size,
+            &self.device,
+        )?
         else {
             return Ok(None);
         };
@@ -140,10 +184,11 @@ impl VarBuilder {
     }
 
     pub fn get_no_shape(&self, name: &str) -> Result<Arc<QTensor>> {
-        let mut file = self.file.lock().unwrap();
-        let tensor = self
-            .content
-            .tensor(&mut *file, &self.path(name), &self.device)?;
+        let path = self.path(name);
+        let shard_idx = self.resolve_shard(&path)?;
+        let mut shards = self.shards.lock().unwrap();
+        let shard = &mut shards[shard_idx];
+        let tensor = shard.content.tensor(&mut shard.file, &path, &self.device)?;
         Ok(Arc::new(tensor))
     }
 
@@ -156,13 +201,36 @@ impl VarBuilder {
     }
 
     pub fn contains_key(&self, key: &str) -> bool {
-        self.content.tensor_infos.contains_key(&self.path(key))
+        let path = self.path(key);
+        self.tensor_to_shard.contains_key(&path)
     }
 
     pub fn tensor_shape(&self, key: &str) -> Option<Vec<usize>> {
-        self.content
+        let path = self.path(key);
+        let shard_idx = self.tensor_to_shard.get(&path)?;
+        let shards = self.shards.lock().unwrap();
+        shards[*shard_idx]
+            .content
             .tensor_infos
-            .get(&self.path(key))
+            .get(&path)
             .map(|info| info.shape.dims().to_vec())
+    }
+
+    pub fn tensor_dtype(&self, key: &str) -> Option<GgmlDType> {
+        let path = self.path(key);
+        let shard_idx = self.tensor_to_shard.get(&path)?;
+        let shards = self.shards.lock().unwrap();
+        shards[*shard_idx]
+            .content
+            .tensor_infos
+            .get(&path)
+            .map(|info| info.ggml_dtype)
+    }
+
+    pub fn first_content_metadata(
+        &self,
+    ) -> std::collections::HashMap<String, candle_core::quantized::gguf_file::Value> {
+        let shards = self.shards.lock().unwrap();
+        shards[0].content.metadata.clone()
     }
 }
