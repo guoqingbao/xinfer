@@ -982,7 +982,10 @@ impl LLMEngine {
     pub fn prepare_step(&mut self) -> Result<Option<(Vec<usize>, bool, Vec<Sequence>)>> {
         let (scheduled_ids, is_prefill) = match self.scheduler.schedule() {
             Ok((ids, prefill)) => (ids, prefill),
-            Err(_) => (vec![], true),
+            Err(e) => {
+                crate::log_error!("[Scheduler] Schedule error: {:?}", e);
+                (vec![], true)
+            }
         };
         if scheduled_ids.is_empty() {
             return Ok(None);
@@ -1678,16 +1681,15 @@ impl LLMEngine {
             if let Some(ref l) = logger {
                 l.log_prompt(&pp.prompt);
             }
-            if let Ok((seq_id, prompt_length, rx)) = self.add_request_pretokenized(
+            let (seq_id, prompt_length, rx) = self.add_request_pretokenized(
                 &pp.params,
                 &pp.prompt,
                 pp.token_ids,
                 RequestType::Completion,
                 &images,
                 pp.image_idx,
-            ) {
-                receivers.push((seq_id, prompt_length, rx));
-            }
+            )?;
+            receivers.push((seq_id, prompt_length, rx));
         }
         Ok(receivers)
     }
@@ -2194,18 +2196,14 @@ impl LLMEngine {
                                 Ok(n) => task_processed = n,
                                 Err(e) => {
                                     crate::log_error!("[Engine Loop] Finish error: {:?}", e);
-                                    if !guard.cancel_all_with_reason(Some(e.to_string())) {
-                                        std::process::exit(1);
-                                    }
+                                    guard.cancel_all_with_reason(Some(e.to_string()));
                                 }
                             }
                         }
                         Err(e) => {
                             crate::log_error!("[Engine Loop] Forward error: {:?}", e);
                             let mut guard = engine.write();
-                            if !guard.cancel_all_with_reason(Some(e.to_string())) {
-                                std::process::exit(1);
-                            }
+                            guard.cancel_all_with_reason(Some(e.to_string()));
                         }
                     }
                 }

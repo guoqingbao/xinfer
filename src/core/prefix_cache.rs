@@ -34,6 +34,7 @@ struct PrefixEntry {
     block_id: usize,
     children: usize,
     access_id: u64,
+    content_hash: u64,
 }
 
 pub struct PrefixCache {
@@ -100,7 +101,11 @@ impl PrefixCache {
                 }
             }
             let hash = Self::hash_block(parent_hash, block_tokens);
-            if self.entries.contains_key(&hash) {
+            let fingerprint = Self::content_fingerprint(block_tokens);
+            if let Some(entry) = self.entries.get(&hash) {
+                if entry.content_hash != fingerprint {
+                    break;
+                }
                 matched += 1;
                 parent_hash = hash;
                 last_hash = Some(hash);
@@ -213,11 +218,17 @@ impl PrefixCache {
                 }
             }
             let hash = Self::hash_block(base, block_tokens);
+            let fingerprint = Self::content_fingerprint(block_tokens);
             if self.entries.contains_key(&hash) {
-                let access_id = self.next_access_id();
-                if let Some(entry) = self.entries.get_mut(&hash) {
-                    entry.access_id = access_id;
+                let content_match = self
+                    .entries
+                    .get(&hash)
+                    .map_or(false, |e| e.content_hash == fingerprint);
+                if !content_match {
+                    break;
                 }
+                let access_id = self.next_access_id();
+                self.entries.get_mut(&hash).unwrap().access_id = access_id;
                 self.touch_leaf(hash);
             } else {
                 if let Some(parent) = parent_hash {
@@ -236,6 +247,7 @@ impl PrefixCache {
                         block_id: *block_id,
                         children: 0,
                         access_id,
+                        content_hash: fingerprint,
                     },
                 );
                 self.leaf_set.insert(hash);
@@ -343,6 +355,13 @@ impl PrefixCache {
     fn hash_block(parent_hash: u64, tokens: &[u32]) -> u64 {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         parent_hash.hash(&mut hasher);
+        tokens.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    fn content_fingerprint(tokens: &[u32]) -> u64 {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        0xDEADBEEFu64.hash(&mut hasher);
         tokens.hash(&mut hasher);
         hasher.finish()
     }
