@@ -79,10 +79,8 @@ impl VarBuilderX<'_> {
         );
         let weight_files = model_pathes.get_weight_filenames();
         if is_gguf {
-            let vb = crate::utils::gguf_varbuilder::VarBuilder::from_gguf_files(
-                &weight_files,
-                device,
-            )?;
+            let vb =
+                crate::utils::gguf_varbuilder::VarBuilder::from_gguf_files(&weight_files, device)?;
             let auxiliary_vb = model_pathes
                 .get_auxiliary_filenames()
                 .first()
