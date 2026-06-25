@@ -277,17 +277,22 @@ impl DeepSeekForCausalLM {
             dtype,
         )?;
 
-        let rotary_emb = Arc::new(ScalingRotaryEmbedding::new(
-            if is_qvar_builder || config.higher_precision_required() {
-                DType::F32
-            } else {
-                dtype
-            },
-            config,
-            &vb.device(),
-            is_rope_i,
-            config.rope_theta,
-        )?);
+        let rotary_emb = {
+            let mut mla_config = config.clone();
+            mla_config.head_dim = Some(mla_cfg.qk_rope_head_dim);
+            mla_config.partial_rotary_factor = None;
+            Arc::new(ScalingRotaryEmbedding::new(
+                if is_qvar_builder || config.higher_precision_required() {
+                    DType::F32
+                } else {
+                    dtype
+                },
+                &mla_config,
+                &vb.device(),
+                is_rope_i,
+                config.rope_theta,
+            )?)
+        };
 
         let reporter = progress_reporter.clone();
         let mut layers = Vec::new();
