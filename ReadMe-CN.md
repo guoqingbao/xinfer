@@ -22,9 +22,7 @@
 ---
 ## 📽️ 演示
 
-<p align="center">
-  <video src="./pages/assets/demo.mp4" width="600" controls></video>
-</p>
+<video src="pages/assets/demo.mp4" width="600" controls></video>
 
 ---
 
