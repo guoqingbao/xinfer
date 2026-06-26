@@ -24,7 +24,7 @@
 ## 📽️ Demo
 
 <p align="center">
-  <video src="https://guoqingbao.github.io/xinfer/assets/demo.mp4" width="600" controls></video>
+  <video src="./pages/assets/demo.mp4" width="600" controls></video>
 </p>
 
 ---
@@ -229,6 +229,9 @@ xinfer --m GadflyII/GLM-4.7-Flash-NVFP4
 
 # Interactive CLI chat
 xinfer --i --m unsloth/Qwen3.5-27B-GGUF --f Qwen3.5-27B-Q4_K_M.gguf
+
+# Faster GDN prefill on Hopper with slight precision loss
+SM90_LOWER_PRECISION_GDN_PREFILL=1 xinfer --m Qwen/Qwen3.5-35B-A3B-FP8
 ```
 
 <details>

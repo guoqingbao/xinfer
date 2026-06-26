@@ -23,7 +23,7 @@
 ## 📽️ 演示
 
 <p align="center">
-  <video src="https://guoqingbao.github.io/xinfer/assets/demo.mp4" width="600" controls></video>
+  <video src="./pages/assets/demo.mp4" width="600" controls></video>
 </p>
 
 ---
@@ -228,6 +228,9 @@ xinfer --m GadflyII/GLM-4.7-Flash-NVFP4
 
 # 交互式 CLI 对话
 xinfer --i --m unsloth/Qwen3.5-27B-GGUF --f Qwen3.5-27B-Q4_K_M.gguf
+
+# Hopper 上加速 GDN 预填充，精度略有损失
+SM90_LOWER_PRECISION_GDN_PREFILL=1 xinfer --m Qwen/Qwen3.5-35B-A3B-FP8
 ```
 
 <details>
