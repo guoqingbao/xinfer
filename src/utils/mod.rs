@@ -613,6 +613,8 @@ pub fn config_from_gguf<R: std::io::Seek + std::io::Read>(
         let index_head_dim = md_opt_usize(format!("{arch}.attention.indexer.key_length").as_str());
         let index_n_heads = md_opt_usize(format!("{arch}.attention.indexer.head_count").as_str());
         let index_topk = md_opt_usize(format!("{arch}.attention.indexer.top_k").as_str());
+        let index_skip_topk_offset =
+            md_opt_usize(format!("{arch}.leading_dense_block_count").as_str());
 
         let expert_weights_scale = md_opt_f64(format!("{arch}.expert_weights_scale").as_str());
 
@@ -648,6 +650,9 @@ pub fn config_from_gguf<R: std::io::Seek + std::io::Read>(
         }
         if let Some(v) = index_topk {
             obj.insert("index_topk".into(), serde_json::json!(v));
+        }
+        if let Some(v) = index_skip_topk_offset {
+            obj.insert("index_skip_topk_offset".into(), serde_json::json!(v));
         }
         if let Some(v) = expert_weights_scale {
             obj.insert("routed_scaling_factor".into(), serde_json::json!(v));
@@ -2062,20 +2067,16 @@ pub fn get_arch_rope(
             ModelType::GLM4MoeLite,
             "[gMASK]<sop><|user|>{}<|assistant|>".to_string(),
         ),
+        "GlmMoeDsaForCausalLM" => (
+            ModelType::GLM5,
+            "[gMASK]<sop><|user|>{}<|assistant|>".to_string(),
+        ),
         "DeepseekV3ForCausalLM"
         | "DeepseekV32ForCausalLM"
         | "DeepseekForCausalLM"
-        | "GlmMoeDsaForCausalLM"
         | "deepseek3"
         | "deepseek2"
-        | "deepseek" => {
-            let chat_tmpl = if arch == "GlmMoeDsaForCausalLM" {
-                "[gMASK]<sop><|user|>{}<|assistant|>".to_string()
-            } else {
-                "<|User|>{}<|Assistant|>".to_string()
-            };
-            (ModelType::DeepSeek, chat_tmpl)
-        }
+        | "deepseek" => (ModelType::DeepSeek, "<|User|>{}<|Assistant|>".to_string()),
         "Phi3ForCausalLM" | "Phi4ForCausalLM" | "phi3" | "phi4" => {
             (ModelType::Phi4, "<|user|>\n{}<|assistant|>".to_string())
         }
@@ -2529,6 +2530,8 @@ mod tests {
             is_multi_model: Some(true),
             extra_config_json: Some(extra_config_json.to_string()),
             is_f16_mode: false,
+            mtp_num_hidden_layers: None,
+            mtp_use_dedicated_embeddings: None,
         }
     }
 

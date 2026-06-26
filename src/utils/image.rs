@@ -680,6 +680,8 @@ mod tests {
             is_multi_model: None,
             extra_config_json,
             is_f16_mode: false,
+            mtp_num_hidden_layers: None,
+            mtp_use_dedicated_embeddings: None,
         }
     }
 

@@ -891,6 +891,7 @@ pub enum ModelType {
     Yi,
     StableLM,
     DeepSeek,
+    GLM5,
     Mistral3VL,
     Qwen3VL,
     LLaMa4,

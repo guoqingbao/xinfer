@@ -92,6 +92,7 @@ pub enum Model {
     GLM4MoE(Arc<GLM4MoEForCausalLM>),
     GLM4MoeLite(Arc<GLM4MoeLiteForCausalLM>),
     DeepSeek(Arc<DeepSeekForCausalLM>),
+    GLM5(Arc<DeepSeekForCausalLM>),
     Mistral3VL(Arc<Mistral3ForConditionalGeneration>),
     Gemma3(Arc<Gemma3ForConditionalGeneration>),
     Gemma4(Arc<Gemma4ForCausalLM>),
@@ -155,7 +156,7 @@ impl ModelRunner {
     pub(crate) fn is_mla_model(&self) -> bool {
         matches!(
             self.model_type,
-            ModelType::GLM4MoeLite | ModelType::DeepSeek
+            ModelType::GLM4MoeLite | ModelType::DeepSeek | ModelType::GLM5
         )
     }
 
@@ -445,6 +446,7 @@ impl ModelRunner {
                 GLM4MoE => GLM4MoEForCausalLM,
                 GLM4MoeLite => GLM4MoeLiteForCausalLM,
                 DeepSeek => DeepSeekForCausalLM,
+                GLM5 => DeepSeekForCausalLM,
                 Mistral3VL => Mistral3ForConditionalGeneration,
                 Gemma3 => Gemma3ForConditionalGeneration,
                 Gemma4 => Gemma4ForCausalLM,
@@ -469,6 +471,7 @@ impl ModelRunner {
                 GLM4MoE => EmbedInputs,
                 GLM4MoeLite => EmbedInputs,
                 DeepSeek => EmbedInputs,
+                GLM5 => EmbedInputs,
                 Mistral3VL => NoneArg,
                 Gemma3 => NoneArg,
                 Gemma4 => EmbedInputs,
@@ -494,6 +497,7 @@ impl ModelRunner {
                     GLM4MoE => EmbedInputs,
                     GLM4MoeLite => EmbedInputs,
                     DeepSeek => EmbedInputs,
+                    GLM5 => EmbedInputs,
                     Mistral3VL => NoneArg,
                     Gemma3 => NoneArg,
                     Gemma4 => EmbedInputs,
@@ -690,7 +694,10 @@ impl ModelRunner {
                     continue;
                 }
                 let (_, page_size, num_kv_heads, head_dim) = k_cache.dims4()?;
-                let is_mla = matches!(model_type, ModelType::GLM4MoeLite | ModelType::DeepSeek);
+                let is_mla = matches!(
+                    model_type,
+                    ModelType::GLM4MoeLite | ModelType::DeepSeek | ModelType::GLM5
+                );
                 params = Some(FlashInferKvParams {
                     kv_dtype: k_cache.dtype(),
                     out_dtype: dtype,
@@ -857,7 +864,10 @@ impl ModelRunner {
                 config.hidden_size,
                 #[cfg(feature = "flashinfer")]
                 &flashinfer_kv_params,
-                matches!(model_type, ModelType::GLM4MoeLite | ModelType::DeepSeek),
+                matches!(
+                    model_type,
+                    ModelType::GLM4MoeLite | ModelType::DeepSeek | ModelType::GLM5
+                ),
             ),
             #[cfg(all(feature = "cuda", feature = "graph"))]
             mtp_capturer: mtp_wrapper.map(|w| {
@@ -869,7 +879,10 @@ impl ModelRunner {
                     config.hidden_size,
                     #[cfg(feature = "flashinfer")]
                     &flashinfer_kv_params,
-                    matches!(model_type, ModelType::GLM4MoeLite | ModelType::DeepSeek),
+                    matches!(
+                        model_type,
+                        ModelType::GLM4MoeLite | ModelType::DeepSeek | ModelType::GLM5
+                    ),
                 )
             }),
             #[cfg(feature = "flashinfer")]
@@ -1144,6 +1157,7 @@ impl ModelRunner {
                 GLM4MoE => false,
                 GLM4MoeLite => false,
                 DeepSeek => false,
+                GLM5 => false,
                 Mistral3VL => images,
                 Gemma3 => images,
                 Gemma4 => false,
@@ -1890,6 +1904,7 @@ impl ModelRunner {
             Model::GLM4MoE(model) => model.get_vocab_size(),
             Model::GLM4MoeLite(model) => model.get_vocab_size(),
             Model::DeepSeek(model) => model.get_vocab_size(),
+            Model::GLM5(model) => model.get_vocab_size(),
             Model::Mistral3VL(model) => model.get_vocab_size(),
             Model::Gemma3(model) => model.get_vocab_size(),
             Model::Gemma4(model) => model.get_vocab_size(),
