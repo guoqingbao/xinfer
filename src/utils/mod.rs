@@ -362,7 +362,11 @@ pub fn config_from_gguf<R: std::io::Seek + std::io::Read>(
             .ok()
             .map(|v| v as usize)
     };
-    let md_opt_f64 = |key: &str| md_get(key).and_then(|v| v.to_f64()).ok();
+    let md_opt_f64 = |key: &str| {
+        md_get(key)
+            .and_then(|v| v.to_f64().or_else(|_| v.to_f32().map(|f| f as f64)))
+            .ok()
+    };
     let md_opt_bool = |key: &str| md_get(key).and_then(|v| v.to_bool()).ok();
     let md_opt_string = |key: &str| {
         md_get(key)
@@ -426,7 +430,10 @@ pub fn config_from_gguf<R: std::io::Seek + std::io::Read>(
 
         let expert_weights_scale = md_get(format!("{arch}.expert_weights_scale").as_str());
         let expert_weights_scale = if expert_weights_scale.is_ok() {
-            expert_weights_scale.unwrap().to_f64().ok()
+            let v = expert_weights_scale.unwrap();
+            v.to_f64()
+                .ok()
+                .or_else(|| v.to_f32().ok().map(|f| f as f64))
         } else {
             None
         };
