@@ -2419,6 +2419,8 @@ mod tests {
             is_multi_model: Some(true),
             extra_config_json: Some(extra_config_json.to_string()),
             is_f16_mode: false,
+            mtp_num_hidden_layers: None,
+            mtp_use_dedicated_embeddings: None,
         }
     }
 

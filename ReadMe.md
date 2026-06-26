@@ -506,6 +506,7 @@ Constraint-based generation via llguidance — Lark grammars, regex, JSON Schema
 | Variable | Description |
 |---|---|
 | `XINFER_NVFP4_FORCE_LUT=1` | Force software NVFP4 decode to use the LUT-based dequantization path (higher precision) instead of hardware FP4 intrinsics on Blackwell (SM100+). Useful when decode precision matters more than peak throughput. |
+| `XINFER_SSE_BUFFER_SIZE=256` | Size of the bounded SSE streaming buffer per client connection (default: 256). Increase for slow network proxies or high-throughput models. |
 
 **Example (Blackwell with high-precision NVFP4 decode):**
 ```bash

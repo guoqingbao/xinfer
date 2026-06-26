@@ -20,7 +20,6 @@ use axum::{
     },
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use flume::{Receiver, TrySendError};
 use futures::Stream;
 use once_cell::sync::Lazy;
 use regex::Regex;
@@ -34,6 +33,7 @@ use std::{
     task::{Context, Poll},
     time::{Duration, Instant},
 };
+use tokio::sync::mpsc;
 use tokio::task;
 use tokio::time;
 use uuid::Uuid;
@@ -403,19 +403,19 @@ enum ClaudeStreamItem {
 }
 
 pub struct ClaudeStreamer {
-    rx: Receiver<ClaudeStreamItem>,
+    rx: mpsc::Receiver<ClaudeStreamItem>,
     status: ClaudeStreamingStatus,
 }
 
 impl Stream for ClaudeStreamer {
     type Item = Result<Event, axum::Error>;
 
-    fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         if self.status == ClaudeStreamingStatus::Stopped {
             return Poll::Ready(None);
         }
-        match self.rx.try_recv() {
-            Ok(item) => match item {
+        match self.rx.poll_recv(cx) {
+            Poll::Ready(Some(item)) => match item {
                 ClaudeStreamItem::Event(event) => {
                     if self.status != ClaudeStreamingStatus::Started {
                         self.status = ClaudeStreamingStatus::Started;
@@ -427,16 +427,13 @@ impl Stream for ClaudeStreamer {
                     Poll::Ready(None)
                 }
             },
-            Err(err) => {
-                if self.status == ClaudeStreamingStatus::Started
-                    && err == flume::TryRecvError::Disconnected
-                {
+            Poll::Ready(None) => {
+                if self.status == ClaudeStreamingStatus::Started {
                     self.status = ClaudeStreamingStatus::Interrupted;
-                    Poll::Ready(None)
-                } else {
-                    Poll::Pending
                 }
+                Poll::Ready(None)
             }
+            Poll::Pending => Poll::Pending,
         }
     }
 }
@@ -451,11 +448,11 @@ const FINAL_EVENT_TIMEOUT_MS: u64 = 500;
 
 struct ClaudeStreamingContext {
     seq_id: usize,
-    response_tx: flume::Sender<ClaudeStreamItem>,
+    response_tx: mpsc::Sender<ClaudeStreamItem>,
 }
 
 impl ClaudeStreamingContext {
-    fn new(seq_id: usize, response_tx: flume::Sender<ClaudeStreamItem>) -> Self {
+    fn new(seq_id: usize, response_tx: mpsc::Sender<ClaudeStreamItem>) -> Self {
         Self {
             seq_id,
             response_tx,
@@ -465,8 +462,8 @@ impl ClaudeStreamingContext {
     fn send_event(&self, event: Event) -> Result<(), StreamSendError> {
         match self.response_tx.try_send(ClaudeStreamItem::Event(event)) {
             Ok(_) => Ok(()),
-            Err(TrySendError::Full(_)) => Err(StreamSendError::Full),
-            Err(TrySendError::Disconnected(_)) => Err(StreamSendError::Disconnected),
+            Err(mpsc::error::TrySendError::Full(_)) => Err(StreamSendError::Full),
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(StreamSendError::Disconnected),
         }
     }
 
@@ -1743,7 +1740,7 @@ impl ClaudeThinkingStreamEmitter {
 
 async fn send_json_event_with_timeout<T: Serialize>(
     seq_id: usize,
-    response_tx: &flume::Sender<ClaudeStreamItem>,
+    response_tx: &mpsc::Sender<ClaudeStreamItem>,
     name: &str,
     data: &T,
     timeout: Duration,
@@ -1761,12 +1758,7 @@ async fn send_json_event_with_timeout<T: Serialize>(
         }
     };
 
-    match time::timeout(
-        timeout,
-        response_tx.send_async(ClaudeStreamItem::Event(event)),
-    )
-    .await
-    {
+    match time::timeout(timeout, response_tx.send(ClaudeStreamItem::Event(event))).await {
         Ok(Ok(_)) => true,
         Ok(Err(err)) => {
             crate::log_warn!(
@@ -1790,10 +1782,10 @@ async fn send_json_event_with_timeout<T: Serialize>(
 
 async fn send_done_with_timeout(
     seq_id: usize,
-    response_tx: &flume::Sender<ClaudeStreamItem>,
+    response_tx: &mpsc::Sender<ClaudeStreamItem>,
     timeout: Duration,
 ) -> bool {
-    match time::timeout(timeout, response_tx.send_async(ClaudeStreamItem::Done)).await {
+    match time::timeout(timeout, response_tx.send(ClaudeStreamItem::Done)).await {
         Ok(Ok(_)) => true,
         Ok(Err(err)) => {
             crate::log_warn!(
@@ -1815,7 +1807,7 @@ async fn send_done_with_timeout(
 
 async fn finalize_stream_on_backpressure(
     seq_id: usize,
-    response_tx: &flume::Sender<ClaudeStreamItem>,
+    response_tx: &mpsc::Sender<ClaudeStreamItem>,
     text_block_open: bool,
     text_block_index: usize,
     total_decoded_tokens: usize,
@@ -1871,7 +1863,7 @@ async fn finalize_stream_on_backpressure(
 async fn handle_stream_send_error(
     err: StreamSendError,
     seq_id: usize,
-    response_tx: &flume::Sender<ClaudeStreamItem>,
+    response_tx: &mpsc::Sender<ClaudeStreamItem>,
     text_block_open: bool,
     text_block_index: usize,
     total_decoded_tokens: usize,
@@ -2210,10 +2202,11 @@ pub async fn messages(
         };
 
         let buffer_size = env::var("CLAUDE_SSE_BUFFER")
+            .or_else(|_| env::var("XINFER_SSE_BUFFER_SIZE"))
             .ok()
             .and_then(|val| val.parse::<usize>().ok())
             .unwrap_or(256);
-        let (response_tx, client_rx) = flume::bounded(buffer_size);
+        let (response_tx, client_rx) = mpsc::channel(buffer_size);
         let engine_clone = data.engine.clone();
         let stream_model_id = model_id.clone();
         let stream_parser_model_id = parser_model_id.clone();
@@ -2260,13 +2253,13 @@ pub async fn messages(
                                 ClaudeStreamItem::Event(Event::default().comment("keep-alive"))
                             ) {
                                 match err {
-                                    TrySendError::Full(_) => {
+                                    mpsc::error::TrySendError::Full(_) => {
                                         crate::log_warn!(
                                             "[Seq {}] SSE buffer full during keepalive",
                                             seq_id
                                         );
                                     }
-                                    TrySendError::Disconnected(_) => {
+                                    mpsc::error::TrySendError::Closed(_) => {
                                         crate::log_warn!(
                                             "[Seq {}] SSE client disconnected during keepalive",
                                             seq_id
