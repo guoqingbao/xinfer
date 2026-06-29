@@ -73,6 +73,7 @@ fn build_econfig() -> EngineConfig {
         0,                                   // node_rank
         None,                                // master_addr
         29500,                               // master_port
+        false,                               // enable_tool_grammar
     )
 }
 

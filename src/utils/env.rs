@@ -62,17 +62,25 @@ pub fn default_reasoning_max_tokens() -> usize {
     *DEFAULT_REASONING_MAX_TOKENS.get_or_init(|| {
         env::var(DEFAULT_REASONING_MAX_TOKENS_ENV)
             .map(|raw| {
-                raw.trim().parse::<usize>()
-                    .map(|n| if n == 0 { DEFAULT_REASONING_MAX_TOKENS_VALUE } else { n })
+                raw.trim()
+                    .parse::<usize>()
+                    .map(|n| {
+                        if n == 0 {
+                            DEFAULT_REASONING_MAX_TOKENS_VALUE
+                        } else {
+                            n
+                        }
+                    })
                     .unwrap_or(DEFAULT_REASONING_MAX_TOKENS_VALUE)
             })
             .unwrap_or(DEFAULT_REASONING_MAX_TOKENS_VALUE)
     })
 }
 
-/// Environment variable to disable soft masking for gradient smoothing
-/// When set to "0", "false", or "no", soft masking is enabled (default behavior)
-/// When set to any other value (or not set), soft masking is disabled (hard masking)
+/// Environment variable to disable soft masking for gradient smoothing.
+/// When NOT set: soft masking is ENABLED (default behavior).
+/// When set to "1", "true", or "yes": soft masking is DISABLED (hard -inf masking).
+/// When set to "0", "false", or "no": soft masking is ENABLED.
 pub const SOFT_MASK_DISABLED_ENV: &str = "XINFER_SOFT_MASK_DISABLED";
 
 static SOFT_MASK_DISABLED: OnceLock<bool> = OnceLock::new();

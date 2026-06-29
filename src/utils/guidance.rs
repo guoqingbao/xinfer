@@ -5,8 +5,8 @@
 // - GuidanceState: matcher state for speculative decoding
 // - Mask operations: batch mask bias and early exit validation
 
-use crate::utils::special_tokens::SpecialTokens;
 use crate::utils::config::TokenizerConfig;
+use crate::utils::special_tokens::SpecialTokens;
 use anyhow::Result;
 use candle_core::Tensor;
 use llguidance::{api::TopLevelGrammar, Matcher, ParserFactory as LlgParserFactory};

@@ -158,7 +158,9 @@ impl LLMEngine {
                 .as_ref()
                 .map(EosTokenId::to_vec)
                 .unwrap_or_default(),
-            config.bos_token_id.map_or(Vec::new(), |bos| vec![bos as u32]),
+            config
+                .bos_token_id
+                .map_or(Vec::new(), |bos| vec![bos as u32]),
             &config_tokenizer,
         );
         assert!(
@@ -627,12 +629,9 @@ impl LLMEngine {
         let mut max_tokens = if let Some(max_t) = params.max_tokens {
             max_t
         } else {
-            params.max_tokens = Some(
-                params
-                    .max_tokens
-                    .unwrap_or(self.econfig.max_tokens.unwrap_or(16384)),
-            );
-            params.max_tokens.unwrap()
+            let default_max = self.econfig.max_tokens.unwrap_or(16384);
+            params.max_tokens = Some(default_max);
+            default_max
         };
         let requested_max_tokens = max_tokens;
 
@@ -1643,7 +1642,8 @@ impl LLMEngine {
                 prompt_template.set_enable_thinking(false);
             }
         } else {
-            prompt_template.set_enable_thinking(params.thinking.unwrap_or(!self.econfig.disable_reasoning));
+            prompt_template
+                .set_enable_thinking(params.thinking.unwrap_or(!self.econfig.disable_reasoning));
         };
         prompt_template.set_messages(messages);
         let image_idx: i32 = 0;
@@ -1679,27 +1679,39 @@ impl LLMEngine {
         // Generation alignment and open/close parity enforcement
         if let Some(grammar) = &params.grammar {
             if self.guidance_tokens.add_bos_token {
-                // BOS-based trimming: trim at BOS token (for models with add_bos_token=true)
-                if let Ok(bos_string) = self.tokenizer.decode(&self.guidance_tokens.bos_token_ids, false) {
-                    if let Some((prompt, _trimmed)) = prompt.rsplit_once(&bos_string) {
-                        return (prompt.to_string(), image_idx)
+                // BOS-based trimming: trim the last BOS token from the prompt tail.
+                // Only trim if the prompt actually ends with the BOS string to avoid
+                // splitting in the middle of a multi-turn conversation.
+                if let Ok(bos_string) = self
+                    .tokenizer
+                    .decode(&self.guidance_tokens.bos_token_ids, false)
+                {
+                    if prompt.trim_end().ends_with(&bos_string) {
+                        if let Some((prefix, _)) = prompt.rsplit_once(&bos_string) {
+                            return (prefix.to_string(), image_idx);
+                        }
                     }
                 }
                 for bos_token in self.guidance_tokens.bos_token_ids.iter() {
-                    if let Ok(bos_string) = self.tokenizer.decode(&[bos_token.clone()], false) {
-                        if let Some((prompt, _trimmed)) = prompt.rsplit_once(&bos_string) {
-                            return (prompt.to_string(), image_idx)
+                    if let Ok(bos_string) = self.tokenizer.decode(&[*bos_token], false) {
+                        if prompt.trim_end().ends_with(&bos_string) {
+                            if let Some((prefix, _)) = prompt.rsplit_once(&bos_string) {
+                                return (prefix.to_string(), image_idx);
+                            }
                         }
                     }
                 }
             } else {
                 // Reasoning tag-based trimming: check for reasoning start/end tokens
-                if let Some((start_str, end_str)) = get_reasoning_token_strings(&self.guidance_tokens, &self.tokenizer) {
+                if let Some((start_str, end_str)) =
+                    get_reasoning_token_strings(&self.guidance_tokens, &self.tokenizer)
+                {
                     if is_reasoning_grammar(&grammar) {
                         // Control entire reasoning block via guidance
-                        if prompt.trim().ends_with(&start_str) || prompt.trim().ends_with(&end_str) {
+                        if prompt.trim().ends_with(&start_str) || prompt.trim().ends_with(&end_str)
+                        {
                             if let Some((prompt, _trimmed)) = prompt.rsplit_once(&start_str) {
-                                return (prompt.to_string(), image_idx)
+                                return (prompt.to_string(), image_idx);
                             }
                         }
                     } else {
@@ -1707,7 +1719,7 @@ impl LLMEngine {
                         // A completed inert <think>\n\n</think> block or even an injected think template are harmless
                         if prompt.trim().ends_with(&start_str) {
                             if let Some((prompt, _trimmed)) = prompt.rsplit_once(&start_str) {
-                                return (prompt.to_string(), image_idx)
+                                return (prompt.to_string(), image_idx);
                             }
                         }
                     }

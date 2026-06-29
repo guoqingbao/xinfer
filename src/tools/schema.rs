@@ -1,6 +1,6 @@
 // src/tools/schema.rs
 //! JSON Schema utilities for tool parameters
-//! 
+//!
 //! Provides helpers for working with JSON Schema in tool definitions.
 
 use crate::tools::Tool;

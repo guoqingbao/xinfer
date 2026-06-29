@@ -6,15 +6,15 @@ use llguidance::api::TopLevelGrammar;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 
+use crate::server::parser::{StreamToolParser, ToolConfig};
 use crate::server::ChatCompletionRequest;
 use crate::tools::Tool;
-use crate::server::parser::{StreamToolParser, ToolConfig};
 use crate::utils::chat_template::ChatTemplate;
 use crate::utils::config::ModelType;
 use crate::utils::config::ReasoningEffort;
+use crate::utils::env::default_reasoning_max_tokens;
 use crate::utils::guidance::GuidanceTokens;
 use tokenizers::Tokenizer;
-use crate::utils::env::default_reasoning_max_tokens;
 
 // COMMON TRAITS
 
@@ -137,17 +137,41 @@ fn sanitize_sanitized_schema_recursive(schema: &Value) -> Value {
     // Based on llguidance parser/src/json/schema.rs IMPLEMENTED and META_AND_ANNOTATIONS
     const VALIDATION_KEYWORDS: &[&str] = &[
         // Core
-        "anyOf", "oneOf", "allOf", "$ref", "const", "enum", "type",
+        "anyOf",
+        "oneOf",
+        "allOf",
+        "$ref",
+        "const",
+        "enum",
+        "type",
         // Array
-        "items", "additionalItems", "prefixItems", "minItems", "maxItems",
+        "items",
+        "additionalItems",
+        "prefixItems",
+        "minItems",
+        "maxItems",
         // Object
-        "properties", "additionalProperties", "patternProperties", "required", "minProperties", "maxProperties",
+        "properties",
+        "additionalProperties",
+        "patternProperties",
+        "required",
+        "minProperties",
+        "maxProperties",
         // String
-        "minLength", "maxLength", "pattern", "format",
+        "minLength",
+        "maxLength",
+        "pattern",
+        "format",
         // Number
-        "minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum", "multipleOf",
+        "minimum",
+        "maximum",
+        "exclusiveMinimum",
+        "exclusiveMaximum",
+        "multipleOf",
         // Schema definitions (for $ref resolution)
-        "$defs", "definitions", "$anchor",
+        "$defs",
+        "definitions",
+        "$anchor",
     ];
 
     match schema {
@@ -160,7 +184,10 @@ fn sanitize_sanitized_schema_recursive(schema: &Value) -> Value {
                     if let Value::Object(props) = value {
                         let mut new_props = serde_json::Map::new();
                         for (prop_name, prop_schema) in props {
-                            new_props.insert(prop_name.clone(), sanitize_sanitized_schema_recursive(prop_schema));
+                            new_props.insert(
+                                prop_name.clone(),
+                                sanitize_sanitized_schema_recursive(prop_schema),
+                            );
                         }
                         out.insert(key.clone(), Value::Object(new_props));
                     } else {
@@ -419,7 +446,7 @@ impl GrammarBuilder for ReasoningGrammar {
     fn format(&mut self) -> TopLevelGrammar {
         let lark = self.build_lark();
         if lark.is_empty() {
-            TopLevelGrammar::from_lark_ascii("startf\ntext: /(?s:.+?)/")
+            TopLevelGrammar::from_lark_ascii("start: text\ntext: /(?s:.+?)/")
         } else {
             TopLevelGrammar::from_lark_ascii(&lark)
         }
@@ -497,12 +524,15 @@ text: /(?s:.+?)/"#
                 .to_string()
         } else {
             if let Some(max_tokens) = self.max_tokens {
-                format!(r#"start: text
-text[stop="", max_tokens={}]: /(?s:.+?)/"#, max_tokens)
+                format!(
+                    r#"start: text
+text[stop="", max_tokens={}]: /(?s:.+?)/"#,
+                    max_tokens
+                )
             } else {
                 r#"start: text
 text[stop=""]: /(?s:.+?)/"#
-                .to_string()
+                    .to_string()
             }
         }
     }
@@ -1001,10 +1031,10 @@ impl GrammarBuilder for ToolCallGrammar {
     fn build_lark(&mut self) -> String {
         match self.format {
             ToolFormat::QwenCoder => self.build_qwen_coder_lark(),
-            ToolFormat::MiniMax   => self.build_minimax_lark(),
-            ToolFormat::Gemma4    => self.build_gemma4_lark(),
-            ToolFormat::Json      => self.build_json_lark(),
-            ToolFormat::Generic   => self.build_generic_lark(),
+            ToolFormat::MiniMax => self.build_minimax_lark(),
+            ToolFormat::Gemma4 => self.build_gemma4_lark(),
+            ToolFormat::Json => self.build_json_lark(),
+            ToolFormat::Generic => self.build_generic_lark(),
         }
     }
     fn compose_alternate(&mut self, _other: &mut Self) -> Self {
@@ -1106,7 +1136,9 @@ text: /(?s:.+?)/
         }
 
         let mut rules: Vec<String> = Vec::new();
-        let tool_rule_names: Vec<String> = (0..self.tools.len()).map(|i| format!("tool_{}", i)).collect();
+        let tool_rule_names: Vec<String> = (0..self.tools.len())
+            .map(|i| format!("tool_{}", i))
+            .collect();
 
         rules.push("start: tool_call".to_string());
         rules.push(format!("tool_call: {} tool_content {}", start_tag, end_tag));
@@ -1117,9 +1149,13 @@ text: /(?s:.+?)/
 
         for (tool_idx, tool) in tools_clone.iter().enumerate() {
             let tool_name = &tool.function.name;
-            let (args_expr, param_value_rules) = self.build_gemma4_args_pattern(&tool.function.parameters, &tool_idx);
+            let (args_expr, param_value_rules) =
+                self.build_gemma4_args_pattern(&tool.function.parameters, &tool_idx);
 
-            let tool_rule = format!("tool_{}: \"call:{}{{\" {} \"}}\"", tool_idx, tool_name, args_expr);
+            let tool_rule = format!(
+                "tool_{}: \"call:{}{{\" {} \"}}\"",
+                tool_idx, tool_name, args_expr
+            );
             rules.push(tool_rule);
 
             for param_value in param_value_rules {
@@ -1156,7 +1192,7 @@ text: /(?s:.+?)/
 gemma4_array_items: gemma4_value ("," gemma4_value)*
 gemma4_value: gemma4_string | gemma4_number | gemma4_boolean | gemma4_array | gemma4_object
 "#
-            .to_string()
+        .to_string()
     }
 
     fn _build_gemma4_object_definition() -> String {
@@ -1166,7 +1202,7 @@ gemma4_key_value: gemma4_key ":" gemma4_value
 gemma4_key: /[^:]+/
 gemma4_value: gemma4_string | gemma4_number | gemma4_boolean | gemma4_array | gemma4_object
 "#
-            .to_string()
+        .to_string()
     }
 
     fn build_gemma4_pattern_definition(_rule_name: &str, value: &serde_json::Value) -> String {
@@ -1196,7 +1232,11 @@ gemma4_value: gemma4_string | gemma4_number | gemma4_boolean | gemma4_array | ge
         r#""{" gemma4_object_items? "}""#.to_string()
     }
 
-    fn build_gemma4_args_pattern(&mut self, params: &serde_json::Value, tool_idx: &usize) -> (String, Vec<String>) {
+    fn build_gemma4_args_pattern(
+        &mut self,
+        params: &serde_json::Value,
+        tool_idx: &usize,
+    ) -> (String, Vec<String>) {
         let mut param_value_rules: Vec<String> = Vec::new();
         let mut param_names: Vec<String> = Vec::new();
 
@@ -1215,13 +1255,23 @@ gemma4_value: gemma4_string | gemma4_number | gemma4_boolean | gemma4_array | ge
                         if let Some(type_val) = obj_val.get("type").and_then(|t| t.as_str()) {
                             if type_val == "array" {
                                 // Add nested array rules
-                                self.value_rules.insert("gemma4_array_items".to_string(), "gemma4_value (\",\" gemma4_value)*".to_string());
+                                self.value_rules.insert(
+                                    "gemma4_array_items".to_string(),
+                                    "gemma4_value (\",\" gemma4_value)*".to_string(),
+                                );
                                 self.value_rules.insert("gemma4_value".to_string(), "gemma4_string | gemma4_number | gemma4_boolean | gemma4_array | gemma4_object".to_string());
                             } else if type_val == "object" {
                                 // Add nested object rules
-                                self.value_rules.insert("gemma4_object_items".to_string(), "gemma4_key_value (\",\" gemma4_key_value)*".to_string());
-                                self.value_rules.insert("gemma4_key_value".to_string(), "gemma4_key \":\" gemma4_value".to_string());
-                                self.value_rules.insert("gemma4_key".to_string(), "/[^:]+/".to_string());
+                                self.value_rules.insert(
+                                    "gemma4_object_items".to_string(),
+                                    "gemma4_key_value (\",\" gemma4_key_value)*".to_string(),
+                                );
+                                self.value_rules.insert(
+                                    "gemma4_key_value".to_string(),
+                                    "gemma4_key \":\" gemma4_value".to_string(),
+                                );
+                                self.value_rules
+                                    .insert("gemma4_key".to_string(), "/[^:]+/".to_string());
                             }
                         }
                     }
@@ -1247,7 +1297,6 @@ gemma4_value: gemma4_string | gemma4_number | gemma4_boolean | gemma4_array | ge
         (args_expr, param_value_rules)
     }
 
-
     fn build_gemma4_type_pattern(value: &serde_json::Value) -> String {
         if let Some(obj) = value.as_object() {
             if let Some(type_val) = obj.get("type").and_then(|t| t.as_str()) {
@@ -1266,8 +1315,6 @@ gemma4_value: gemma4_string | gemma4_number | gemma4_boolean | gemma4_array | ge
             "gemma4_value".to_string()
         }
     }
-
-
 
     fn build_qwen_coder_lark(&mut self) -> String {
         let mut rules: Vec<String> = Vec::new();
@@ -1361,7 +1408,6 @@ gemma4_value: gemma4_string | gemma4_number | gemma4_boolean | gemma4_array | ge
         let lark = rules.join("\n") + "\n";
         lark
     }
-
 
     fn build_minimax_lark(&mut self) -> String {
         let mut rules: Vec<String> = Vec::new();
@@ -1476,11 +1522,11 @@ gemma4_value: gemma4_string | gemma4_number | gemma4_boolean | gemma4_array | ge
             format!("%json {}", schema_json)
         };
         let lhs = if param_type == "string" {
-            match self.format{
+            match self.format {
                 ToolFormat::MiniMax => {
                     format!(r#"{}[suffix="</parameter>\n"]"#, rule_name)
-                },
-                _ =>{
+                }
+                _ => {
                     format!(r#"{}[suffix="\n</parameter>\n"]"#, rule_name)
                 }
             }
@@ -1497,7 +1543,6 @@ pub struct GrammarRequestDispatcher<'a> {
     pub guidance_tokens: &'a GuidanceTokens,
     pub tool_config: &'a crate::server::parser::ToolConfig,
     pub enable_tool_grammar: bool,
-    pub allow_constraint_api: bool,
     pub parser_name: String,
     pub tokenizer: &'a Tokenizer,
     pub chat_template: Option<crate::utils::chat_template::ChatTemplate>,
@@ -1510,7 +1555,6 @@ impl<'a> GrammarRequestDispatcher<'a> {
         guidance_tokens: &'a GuidanceTokens,
         tool_config: &'a crate::server::parser::ToolConfig,
         enable_tool_grammar: bool,
-        allow_constraint_api: bool,
         parser_name: String,
         tokenizer: &'a Tokenizer,
         chat_template: Option<crate::utils::chat_template::ChatTemplate>,
@@ -1521,7 +1565,6 @@ impl<'a> GrammarRequestDispatcher<'a> {
             guidance_tokens,
             tool_config,
             enable_tool_grammar,
-            allow_constraint_api,
             parser_name,
             tokenizer,
             chat_template,
@@ -1530,24 +1573,28 @@ impl<'a> GrammarRequestDispatcher<'a> {
     }
 
     pub fn build_grammar(self) -> Option<TopLevelGrammar> {
-        if !self.allow_constraint_api && !self.enable_tool_grammar {
+        if !self.enable_tool_grammar {
             return None;
         }
         let constraint_grammar = self.build_constraint_grammar();
         let tool_grammar = self.build_tool_grammar();
         let reasoning_effort = self.build_reasoning_effort();
-        // Get max_tokens from request
+
+        // Only activate LLG when the request actually specifies something to constrain.
+        // Matches vLLM/SGLang behavior: guidance is a no-op for plain chat completions.
+        if constraint_grammar.is_none() && tool_grammar.is_none() && reasoning_effort.is_none() {
+            return None;
+        }
+
         let max_tokens = self.request.max_tokens.unwrap_or(0);
 
-        // If constraint_grammar is None, use a default "any text" grammar
-        // This allows tool grammars to be composed even without constraints
+        // Provide a permissive fallback only when tools/reasoning need a base grammar to compose with
         let constraint_grammar = constraint_grammar.unwrap_or_else(|| {
             StructuredOutputsGrammar::new(StructuredConstraint::Lark(
                 "start: text\ntext: /(?s:.+?)/".to_string(),
             ))
         });
 
-        // Use tokenizer and chat_template from dispatcher fields for fallback application
         Some(GrammarComposer::compose_all_grammars(
             vec![constraint_grammar],
             tool_grammar,
@@ -1687,25 +1734,25 @@ impl<'a> GrammarRequestDispatcher<'a> {
         // TODO align 1:1 with parser selection
         match self.parser_name.as_str() {
             "qwen_coder" => Some(ToolCallGrammar::new_qwen_coder(
-                    tools,
-                    start_token_id,
-                    end_token_id,
-                )),
+                tools,
+                start_token_id,
+                end_token_id,
+            )),
             "minimax_m2" => Some(ToolCallGrammar::new_minimax(
-                    tools,
-                    start_token_id,
-                    end_token_id,
-                )),
+                tools,
+                start_token_id,
+                end_token_id,
+            )),
             "gemma4" => Some(ToolCallGrammar::new_json(
-                    tools,
-                    start_token_id,
-                    end_token_id,
-                )),
+                tools,
+                start_token_id,
+                end_token_id,
+            )),
             "qwen" | "json" | _ => Some(ToolCallGrammar::new_json(
-                    tools,
-                    start_token_id,
-                    end_token_id,
-                ))
+                tools,
+                start_token_id,
+                end_token_id,
+            )),
         }
     }
 
@@ -1741,11 +1788,20 @@ impl GrammarComposer {
             disable_reasoning,
         );
         let mut grammar = Self::finalize_with_eos(final_grammar, guidance_tokens);
-        // Models like MiniMax allow us to change the model's role in responding to permit "multi-agent" conversations
-        // Need a helper to extract the capability from the chat template and role name from request
-        let role = "assistant".to_string();
-        
-        // Only prefix with BOS if add_bos_token is true
+
+        // Derive role from chat template: MiniMax uses "ai", most others use "assistant"
+        let role = chat_template
+            .as_ref()
+            .and_then(|t| t.get_template_string())
+            .and_then(|tmpl| {
+                if tmpl.contains("\"ai\"") || tmpl.contains("'ai'") {
+                    Some("ai".to_string())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| "assistant".to_string());
+
         if guidance_tokens.add_bos_token {
             grammar = Self::prefix_with_bos(grammar, guidance_tokens, role);
         }
@@ -1815,9 +1871,8 @@ impl GrammarComposer {
             let start_id = *guidance_tokens.reasoning_start_ids.first().unwrap_or(&0);
             let end_id = *guidance_tokens.reasoning_end_ids.first().unwrap_or(&0);
             let mut reasoning = ReasoningGrammar::new(start_id, end_id, effort);
-            let mut reasoning_grammar = StructuredOutputsGrammar::new(
-                StructuredConstraint::Lark(reasoning.build_lark()),
-            );
+            let mut reasoning_grammar =
+                StructuredOutputsGrammar::new(StructuredConstraint::Lark(reasoning.build_lark()));
             // Use sequence: reasoning_block followed by base
             let mut base_mut = base;
             return reasoning_grammar.compose_sequence(&mut base_mut);
@@ -1826,7 +1881,7 @@ impl GrammarComposer {
     }
 
     fn prefix_with_bos(
-        mut grammar: TopLevelGrammar,
+        grammar: TopLevelGrammar,
         guidance_tokens: &GuidanceTokens,
         role: String,
     ) -> TopLevelGrammar {
@@ -1850,7 +1905,10 @@ impl GrammarComposer {
 
         // Build BOS rule(s) - support multiple BOS tokens with alternation
         let bos_rule = if guidance_tokens.bos_token_ids.len() == 1 {
-            format!(r#"bos: <[{}]> "{}:" "\n" "#, guidance_tokens.bos_token_ids[0], &role)
+            format!(
+                r#"bos: <[{}]> "{}:" "\n" "#,
+                guidance_tokens.bos_token_ids[0], &role
+            )
         } else {
             let ids: Vec<String> = guidance_tokens
                 .bos_token_ids
@@ -1877,7 +1935,7 @@ impl GrammarComposer {
         );
 
         TopLevelGrammar::from_lark_ascii(&new_lark)
-}
+    }
 
     fn finalize_with_eos(
         mut grammar: StructuredOutputsGrammar,
@@ -2022,19 +2080,11 @@ pub fn apply_thinking_fallback_lark(
             Some(lark)
         }
         None => {
-            // No reasoning tokens in guidance_tokens, apply fallback
+            // No reasoning tokens found via tokenizer decode — skip fallback to avoid panic
             crate::log_info!(
-                "[llg] No reasoning tokens in guidance_tokens, applying fallback"
+                "[llg] No reasoning tokens decodable from guidance_tokens, skipping fallback"
             );
-
-            let reason_start = format!("<[{}]>", guidance_tokens.reasoning_start_ids[0]);
-            let reason_end = format!("<[{}]>", guidance_tokens.reasoning_end_ids[0]);
-
-            let lark = lark
-                .replace(&reason_start, "\"<thinking>\"")
-                .replace(&reason_end, "\"</thinking>\"");
-
-            Some(lark)
+            None
         }
     }
 }
@@ -2057,12 +2107,9 @@ pub fn apply_thinking_fallback(
     let lark_str = get_lark_from_top_level_grammar(&grammar);
 
     // Apply the lark-based fallback transformation
-    if let Some(transformed_lark) = apply_thinking_fallback_lark(
-        lark_str,
-        guidance_tokens,
-        chat_template,
-        tokenizer,
-    ) {
+    if let Some(transformed_lark) =
+        apply_thinking_fallback_lark(lark_str, guidance_tokens, chat_template, tokenizer)
+    {
         TopLevelGrammar::from_lark_ascii(&transformed_lark)
     } else {
         grammar
@@ -2094,15 +2141,15 @@ pub fn get_reasoning_token_strings(
     Some((start_str, end_str))
 }
 
-/// Check if a TopLevelGrammar contains reasoning block patterns
+/// Check if a TopLevelGrammar contains reasoning block patterns.
+/// Looks for the `reasoning_block:` rule definition (LHS with colon) combined with
+/// token ID syntax, to distinguish from user grammars that might mention "reasoning_block".
 pub fn is_reasoning_grammar(grammar: &TopLevelGrammar) -> bool {
-    // Extract the Lark representation from TopLevelGrammar
     let lark_str = get_lark_from_top_level_grammar(grammar);
-    // Check for reasoning-specific definition in the grammar structure
-    lark_str
-        .split("\n")
-        .into_iter()
-        .any(|l: &str| l.contains("reasoning_block") && l.contains("<[") && l.contains("]>"))
+    lark_str.lines().any(|l| {
+        let trimmed = l.trim();
+        trimmed.starts_with("reasoning_block:") && trimmed.contains("<[") && trimmed.contains("]>")
+    })
 }
 
 /// Build TopLevelGrammar from a GrammarRequest
@@ -2165,7 +2212,6 @@ pub fn generate_grammar_from_request(
     request: &crate::server::ChatCompletionRequest,
     guidance_tokens: &crate::utils::guidance::GuidanceTokens,
     enable_tool_grammar: bool,
-    allow_constraint_api: bool,
     model_type: &crate::utils::config::ModelType,
     _model_id: &str,
     parser_name: String,
@@ -2173,7 +2219,6 @@ pub fn generate_grammar_from_request(
     chat_template: Option<ChatTemplate>,
     disable_reasoning: bool,
 ) -> Option<TopLevelGrammar> {
-    // Use new GrammarRequestDispatcher for grammar composition
     let tool_config = ToolConfig::from_tokenizer(tokenizer, model_type);
 
     let dispatcher = GrammarRequestDispatcher::new(
@@ -2181,7 +2226,6 @@ pub fn generate_grammar_from_request(
         guidance_tokens,
         &tool_config,
         enable_tool_grammar,
-        allow_constraint_api,
         parser_name,
         tokenizer,
         chat_template,
@@ -2191,26 +2235,12 @@ pub fn generate_grammar_from_request(
     dispatcher.build_grammar()
 }
 
-/// Build guided decoding grammar for claude_server.rs
-/// This function constructs a synthetic ChatCompletionRequest from claude-style parameters
-/// and delegates to generate_grammar_from_request for grammar composition.
+/// Build guided decoding grammar for claude_server.rs.
 ///
-/// Parameters:
-/// - guidance_tokens: Contains EOS and reasoning token IDs
-/// - tool_config: Model-specific tool call token configuration
-/// - tools: List of available tools for grammar generation
-/// - tool_parser_name: Name of the tool parser (e.g., "qwen_coder", "json")
-/// - constraint_grammar: Optional constraint grammar from structured_outputs
-/// - tool_choice_required: Whether tool choice is required
-/// - forced_tool_name: Optional specific tool name to force
-/// - max_tokens: Maximum tokens for generation
-/// - reasoning_effort: Optional reasoning effort level
-/// - enable_tool_grammar: Whether to enable tool grammar generation
-/// - allow_constraint_api: Whether to allow constraint API
-/// - tokenizer: Tokenizer for token ID lookup and grammar composition
-/// - model_type: Model type for parser selection
-/// - model_id: Model ID for parser configuration
-/// - chat_template: Optional chat template for reasoning token detection
+/// Constructs a synthetic ChatCompletionRequest from Claude-style parameters so the
+/// unified GrammarRequestDispatcher can handle grammar composition.  This adapter
+/// exists because the Claude API surface differs from the OpenAI-compatible one;
+/// refactoring both paths into a shared non-HTTP struct is tracked as future work.
 pub fn build_guided_decoding_grammar(
     guidance_tokens: &crate::utils::guidance::GuidanceTokens,
     _tool_config: &crate::server::parser::ToolConfig,
@@ -2222,10 +2252,9 @@ pub fn build_guided_decoding_grammar(
     max_tokens: usize,
     reasoning_effort: Option<crate::utils::config::ReasoningEffort>,
     enable_tool_grammar: bool,
-    allow_constraint_api: bool,
     tokenizer: &Tokenizer,
     model_type: &crate::utils::config::ModelType,
-    model_id: &str,
+    _model_id: &str,
     chat_template: Option<ChatTemplate>,
     disable_reasoning: bool,
 ) -> Option<TopLevelGrammar> {
@@ -2273,7 +2302,6 @@ pub fn build_guided_decoding_grammar(
         guidance_tokens,
         &tool_config,
         enable_tool_grammar,
-        allow_constraint_api,
         parser_name,
         tokenizer,
         chat_template,
@@ -2553,9 +2581,20 @@ mod tests {
         let sanitized = sanitize_schema_for_llguidance(&schema);
 
         // Metadata fields should be stripped
-        assert!(sanitized["properties"]["count"].get("default").is_none(), "default should be stripped");
-        assert!(sanitized["properties"]["count"].get("description").is_none(), "description should be stripped");
-        assert!(sanitized["properties"]["count"].get("title").is_none(), "title should be stripped");
+        assert!(
+            sanitized["properties"]["count"].get("default").is_none(),
+            "default should be stripped"
+        );
+        assert!(
+            sanitized["properties"]["count"]
+                .get("description")
+                .is_none(),
+            "description should be stripped"
+        );
+        assert!(
+            sanitized["properties"]["count"].get("title").is_none(),
+            "title should be stripped"
+        );
 
         // Validation fields should be preserved
         assert_eq!(sanitized["properties"]["count"]["type"], "integer");
@@ -2604,19 +2643,37 @@ mod tests {
         let sanitized = sanitize_schema_for_llguidance(&schema);
 
         // Debug: print the sanitized schema
-        eprintln!("Original schema: {}", serde_json::to_string_pretty(&schema).unwrap());
-        eprintln!("Sanitized schema: {}", serde_json::to_string_pretty(&sanitized).unwrap());
+        eprintln!(
+            "Original schema: {}",
+            serde_json::to_string_pretty(&schema).unwrap()
+        );
+        eprintln!(
+            "Sanitized schema: {}",
+            serde_json::to_string_pretty(&sanitized).unwrap()
+        );
 
         // $defs should be REMOVED (not preserved) - refs are resolved
-        assert!(sanitized.get("$defs").is_none(), "$defs should be removed after resolution");
+        assert!(
+            sanitized.get("$defs").is_none(),
+            "$defs should be removed after resolution"
+        );
 
         // $ref should be replaced with the actual definition
         let items_schema = &sanitized["properties"]["questions"]["items"];
-        assert!(items_schema.get("$ref").is_none(), "$ref should be replaced");
+        assert!(
+            items_schema.get("$ref").is_none(),
+            "$ref should be replaced"
+        );
 
         // The items should now have the resolved definition (type: object with properties)
-        assert_eq!(items_schema["type"], "object", "items should be resolved to object type");
-        assert!(items_schema.get("properties").is_some(), "resolved items should have properties");
+        assert_eq!(
+            items_schema["type"], "object",
+            "items should be resolved to object type"
+        );
+        assert!(
+            items_schema.get("properties").is_some(),
+            "resolved items should have properties"
+        );
     }
 
     #[test]
@@ -2698,26 +2755,50 @@ mod tests {
         let sanitized = sanitize_schema_for_llguidance(&schema);
 
         // Debug: print the sanitized schema
-        eprintln!("Full tool offer sanitized schema: {}", serde_json::to_string_pretty(&sanitized).unwrap());
+        eprintln!(
+            "Full tool offer sanitized schema: {}",
+            serde_json::to_string_pretty(&sanitized).unwrap()
+        );
 
         // $defs should be REMOVED (not preserved) - refs are resolved
-        assert!(sanitized.get("$defs").is_none(), "$defs should be removed after resolution");
+        assert!(
+            sanitized.get("$defs").is_none(),
+            "$defs should be removed after resolution"
+        );
 
         // $ref in properties should be replaced with actual definition
         let questions_items = &sanitized["properties"]["questions"]["items"];
-        assert!(questions_items.get("$ref").is_none(), "$ref should be replaced with resolved definition");
+        assert!(
+            questions_items.get("$ref").is_none(),
+            "$ref should be replaced with resolved definition"
+        );
 
         // The resolved items should have the actual definition (type: object with properties)
-        assert_eq!(questions_items["type"], "object", "items should be resolved to object type");
-        assert!(questions_items.get("properties").is_some(), "resolved items should have properties");
-        assert!(questions_items.get("required").is_some(), "resolved items should have required");
+        assert_eq!(
+            questions_items["type"], "object",
+            "items should be resolved to object type"
+        );
+        assert!(
+            questions_items.get("properties").is_some(),
+            "resolved items should have properties"
+        );
+        assert!(
+            questions_items.get("required").is_some(),
+            "resolved items should have required"
+        );
 
         // $ref inside $defs should also be resolved
         let ask_user_question = sanitized["properties"]["questions"]["items"].clone();
         let options = ask_user_question["properties"]["options"].clone();
         let items = options["items"].clone();
-        assert!(items.get("$ref").is_none(), "$ref inside options should be resolved");
-        assert_eq!(items["type"], "object", "resolved items should be object type");
+        assert!(
+            items.get("$ref").is_none(),
+            "$ref inside options should be resolved"
+        );
+        assert_eq!(
+            items["type"], "object",
+            "resolved items should be object type"
+        );
     }
 
     #[test]
@@ -2747,16 +2828,31 @@ mod tests {
         let (schema_without_defs, defs) = extract_defs(&schema);
 
         // $defs should be removed from schema
-        assert!(schema_without_defs.get("$defs").is_none(), "$defs should be removed from schema");
+        assert!(
+            schema_without_defs.get("$defs").is_none(),
+            "$defs should be removed from schema"
+        );
 
         // Definitions should be extracted
         assert_eq!(defs.len(), 2, "Should extract 2 definitions");
-        assert!(defs.contains_key("Question"), "Should contain Question definition");
-        assert!(defs.contains_key("Option"), "Should contain Option definition");
+        assert!(
+            defs.contains_key("Question"),
+            "Should contain Question definition"
+        );
+        assert!(
+            defs.contains_key("Option"),
+            "Should contain Option definition"
+        );
 
         // Schema structure should be preserved
-        assert_eq!(schema_without_defs["type"], "object", "Schema type should be preserved");
-        assert!(schema_without_defs.get("properties").is_some(), "Properties should be preserved");
+        assert_eq!(
+            schema_without_defs["type"], "object",
+            "Schema type should be preserved"
+        );
+        assert!(
+            schema_without_defs.get("properties").is_some(),
+            "Properties should be preserved"
+        );
     }
 
     #[test]
@@ -2795,24 +2891,37 @@ mod tests {
 
         // All definitions should be extracted
         assert_eq!(defs.len(), 2, "Should extract 2 definitions");
-        assert!(defs.contains_key("Option"), "Should contain Option definition");
-        assert!(defs.contains_key("Question"), "Should contain Question definition");
+        assert!(
+            defs.contains_key("Option"),
+            "Should contain Option definition"
+        );
+        assert!(
+            defs.contains_key("Question"),
+            "Should contain Question definition"
+        );
 
         // $defs should be removed from schema
-        assert!(schema_without_defs.get("$defs").is_none(), "$defs should be removed");
+        assert!(
+            schema_without_defs.get("$defs").is_none(),
+            "$defs should be removed"
+        );
     }
 
     #[test]
     fn test_resolve_schema_refs_simple() {
         // Test that resolve_schema_refs replaces $ref with actual definition
-        let defs: HashMap<String, Value> = [
-            ("Question".to_string(), json!({
+        let defs: HashMap<String, Value> = [(
+            "Question".to_string(),
+            json!({
                 "type": "object",
                 "properties": {
                     "text": {"type": "string"}
                 }
-            }))
-        ].iter().cloned().collect();
+            }),
+        )]
+        .iter()
+        .cloned()
+        .collect();
 
         let schema = json!({
             "type": "object",
@@ -2824,32 +2933,52 @@ mod tests {
         let resolved = resolve_schema_refs(&schema, &defs);
 
         // $ref should be replaced with actual definition
-        assert!(resolved["properties"]["question"].get("$ref").is_none(), "$ref should be replaced");
-        assert_eq!(resolved["properties"]["question"]["type"], "object", "Should have resolved type");
-        assert!(resolved["properties"]["question"].get("properties").is_some(), "Should have resolved properties");
+        assert!(
+            resolved["properties"]["question"].get("$ref").is_none(),
+            "$ref should be replaced"
+        );
+        assert_eq!(
+            resolved["properties"]["question"]["type"], "object",
+            "Should have resolved type"
+        );
+        assert!(
+            resolved["properties"]["question"]
+                .get("properties")
+                .is_some(),
+            "Should have resolved properties"
+        );
     }
 
     #[test]
     fn test_resolve_schema_refs_nested() {
         // Test that resolve_schema_refs handles nested $ref within definitions
         let defs: HashMap<String, Value> = [
-            ("Option".to_string(), json!({
-                "type": "object",
-                "properties": {
-                    "value": {"type": "string"}
-                }
-            })),
-            ("Question".to_string(), json!({
-                "type": "object",
-                "properties": {
-                    "text": {"type": "string"},
-                    "options": {
-                        "type": "array",
-                        "items": {"$ref": "#/$defs/Option"}
+            (
+                "Option".to_string(),
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "value": {"type": "string"}
                     }
-                }
-            }))
-        ].iter().cloned().collect();
+                }),
+            ),
+            (
+                "Question".to_string(),
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "text": {"type": "string"},
+                        "options": {
+                            "type": "array",
+                            "items": {"$ref": "#/$defs/Option"}
+                        }
+                    }
+                }),
+            ),
+        ]
+        .iter()
+        .cloned()
+        .collect();
 
         let schema = json!({
             "type": "object",
@@ -2865,14 +2994,26 @@ mod tests {
 
         // Top-level $ref should be resolved
         let questions_items = &resolved["properties"]["questions"]["items"];
-        assert!(questions_items.get("$ref").is_none(), "Top-level $ref should be resolved");
-        assert_eq!(questions_items["type"], "object", "Should have resolved type");
+        assert!(
+            questions_items.get("$ref").is_none(),
+            "Top-level $ref should be resolved"
+        );
+        assert_eq!(
+            questions_items["type"], "object",
+            "Should have resolved type"
+        );
 
         // Nested $ref in options should also be resolved
         let options = &questions_items["properties"]["options"];
         let options_items = &options["items"];
-        assert!(options_items.get("$ref").is_none(), "Nested $ref should be resolved");
-        assert_eq!(options_items["type"], "object", "Nested items should have resolved type");
+        assert!(
+            options_items.get("$ref").is_none(),
+            "Nested $ref should be resolved"
+        );
+        assert_eq!(
+            options_items["type"], "object",
+            "Nested items should have resolved type"
+        );
     }
 
     #[test]
@@ -2890,7 +3031,10 @@ mod tests {
         let resolved = resolve_schema_refs(&schema, &defs);
 
         // $ref should remain when definition is missing (won't crash)
-        assert!(resolved["properties"]["question"].get("$ref").is_some(), "$ref should remain when def is missing");
+        assert!(
+            resolved["properties"]["question"].get("$ref").is_some(),
+            "$ref should remain when def is missing"
+        );
     }
 
     #[test]
@@ -2935,14 +3079,23 @@ mod tests {
         let sanitized = sanitize_schema_for_llguidance(&schema);
 
         // Debug: print the sanitized schema
-        eprintln!("Sanitized schema for llguidance: {}", serde_json::to_string_pretty(&sanitized).unwrap());
+        eprintln!(
+            "Sanitized schema for llguidance: {}",
+            serde_json::to_string_pretty(&sanitized).unwrap()
+        );
 
         // $defs should be removed (refs are resolved)
-        assert!(sanitized.get("$defs").is_none(), "$defs should be removed after resolution");
+        assert!(
+            sanitized.get("$defs").is_none(),
+            "$defs should be removed after resolution"
+        );
 
         // $ref should be replaced with actual definition
         let questions_items = &sanitized["properties"]["questions"]["items"];
-        assert!(questions_items.get("$ref").is_none(), "$ref should be replaced");
+        assert!(
+            questions_items.get("$ref").is_none(),
+            "$ref should be replaced"
+        );
 
         // Try to compile the sanitized schema with llguidance
         // This should not fail if $defs is properly resolved
@@ -2965,13 +3118,28 @@ mod tests {
         let sanitized = sanitize_schema_for_llguidance(&schema);
 
         // Property names should be preserved
-        assert!(sanitized["properties"].get("city").is_some(), "city property should be preserved");
-        assert!(sanitized["properties"].get("mode").is_some(), "mode property should be preserved");
-        assert!(sanitized["properties"].get("count").is_some(), "count property should be preserved");
+        assert!(
+            sanitized["properties"].get("city").is_some(),
+            "city property should be preserved"
+        );
+        assert!(
+            sanitized["properties"].get("mode").is_some(),
+            "mode property should be preserved"
+        );
+        assert!(
+            sanitized["properties"].get("count").is_some(),
+            "count property should be preserved"
+        );
 
         // Metadata should be stripped from properties
-        assert!(sanitized["properties"]["city"].get("description").is_none(), "description should be stripped from city");
-        assert!(sanitized["properties"]["mode"].get("description").is_none(), "description should be stripped from mode");
+        assert!(
+            sanitized["properties"]["city"].get("description").is_none(),
+            "description should be stripped from city"
+        );
+        assert!(
+            sanitized["properties"]["mode"].get("description").is_none(),
+            "description should be stripped from mode"
+        );
     }
 
     #[test]
@@ -2996,10 +3164,20 @@ mod tests {
         let sanitized = sanitize_schema_for_llguidance(&schema);
 
         // Nested property names should be preserved
-        assert!(sanitized["properties"]["outer"]["properties"].get("inner").is_some(), "inner property should be preserved");
+        assert!(
+            sanitized["properties"]["outer"]["properties"]
+                .get("inner")
+                .is_some(),
+            "inner property should be preserved"
+        );
 
         // Metadata should be stripped from nested properties
-        assert!(sanitized["properties"]["outer"]["properties"]["inner"].get("description").is_none(), "description should be stripped");
+        assert!(
+            sanitized["properties"]["outer"]["properties"]["inner"]
+                .get("description")
+                .is_none(),
+            "description should be stripped"
+        );
     }
 
     #[test]
@@ -3053,7 +3231,10 @@ mod tests {
         let sanitized = sanitize_schema_for_llguidance(&schema);
 
         // Examples should be stripped
-        assert!(sanitized.get("examples").is_none(), "examples should be stripped");
+        assert!(
+            sanitized.get("examples").is_none(),
+            "examples should be stripped"
+        );
 
         // Type should be preserved
         assert_eq!(sanitized["type"], "string");
@@ -3074,7 +3255,12 @@ mod tests {
         let sanitized = sanitize_schema_for_llguidance(&schema);
 
         // Default should be stripped from nested properties
-        assert!(sanitized["items"]["properties"]["name"].get("default").is_none(), "default should be stripped");
+        assert!(
+            sanitized["items"]["properties"]["name"]
+                .get("default")
+                .is_none(),
+            "default should be stripped"
+        );
 
         // Type should be preserved
         assert_eq!(sanitized["items"]["properties"]["name"]["type"], "string");
@@ -3187,7 +3373,6 @@ mod tests {
             &guidance_tokens,
             &tool_config,
             true,
-            false,
             "qwen_coder".to_string(),
             &tokenizer,
             None,
@@ -3232,7 +3417,6 @@ mod tests {
             &guidance_tokens,
             &tool_config,
             true,
-            false,
             "qwen_coder".to_string(),
             &tokenizer,
             None,
@@ -3281,7 +3465,6 @@ mod tests {
             &guidance_tokens,
             &tool_config,
             true,
-            false,
             "qwen_coder".to_string(),
             &tokenizer,
             None,
@@ -3385,7 +3568,6 @@ mod tests {
             &guidance_tokens,
             &tool_config,
             true,
-            false,
             "qwen_coder".to_string(),
             &tokenizer,
             None,
@@ -3428,7 +3610,6 @@ mod tests {
             &guidance_tokens,
             &tool_config,
             true,
-            false,
             "qwen_coder".to_string(),
             &tokenizer,
             None,
@@ -3466,7 +3647,6 @@ mod tests {
             &guidance_tokens,
             &tool_config,
             true,
-            false,
             "qwen_coder".to_string(),
             &tokenizer,
             None,
@@ -3482,7 +3662,7 @@ mod tests {
             "Should have generated tool grammar"
         );
     }
-/*
+    /*
     #[test]
     fn test_gemma4_tool_call_format_matches_template() {
         // Test that Gemma4 format matches chat_template.jinja specification

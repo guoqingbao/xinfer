@@ -2,8 +2,8 @@
 use super::logger::ChatCompletionLogger;
 use super::GrammarRequest;
 use super::{
-    streaming::{ChatResponse, Streamer},
     build_messages_and_images, normalize_reasoning_controls,
+    streaming::{ChatResponse, Streamer},
     ChatResponder, DetokenizeRequest, DetokenizeResponse, EmbeddingRequest, EmbeddingResponse,
     EncodingFormat, TokenizeInput, TokenizeRequest, TokenizeResponse,
 };
@@ -379,11 +379,17 @@ pub async fn chat_completion(
 
     let mut params = SamplingParams::new_with_max_tokens(max_tokens);
     // Apply request values with fallback to generation config
-    params.temperature = request.temperature.or(generation_cfg.and_then(|gc| gc.temperature));
+    params.temperature = request
+        .temperature
+        .or(generation_cfg.and_then(|gc| gc.temperature));
     params.top_k = request.top_k.or(generation_cfg.and_then(|gc| gc.top_k));
     params.top_p = request.top_p.or(generation_cfg.and_then(|gc| gc.top_p));
-    params.frequency_penalty = request.frequency_penalty.or(generation_cfg.and_then(|gc| gc.frequency_penalty));
-    params.presence_penalty = request.presence_penalty.or(generation_cfg.and_then(|gc| gc.presence_penalty));
+    params.frequency_penalty = request
+        .frequency_penalty
+        .or(generation_cfg.and_then(|gc| gc.frequency_penalty));
+    params.presence_penalty = request
+        .presence_penalty
+        .or(generation_cfg.and_then(|gc| gc.presence_penalty));
     // Set stop_token_ids from engine eos_token_id only (no request override)
     params.stop_token_ids = generation_cfg
         .and_then(|gc| gc.eos_token_id.clone())
@@ -391,7 +397,6 @@ pub async fn chat_completion(
     params.session_id = request.session_id.clone();
     params.thinking = request.thinking.clone();
     params.stop_sequences = request.stop.clone();
-    #[cfg(not(feature = "python"))]
     {
         let effort_str = request
             .reasoning_effort
@@ -403,18 +408,15 @@ pub async fn chat_completion(
             None
         };
     }
-    #[cfg(feature = "python")]
-    {
-        // In Python builds, request.reasoning_effort is Option<String>
-        // Convert it to ReasoningEffort
-        let effort_str = request.reasoning_effort.clone().unwrap_or_else(|| "none".to_string());
-        params.reasoning_effort = if effort_str != "none" {
-            Some(ReasoningEffort::from_str(effort_str))
-        } else {
-            None
-        };
-    }
-    let (img_cfg, model_type, tool_config, engine_config, guidance_tokens, tokenizer) = {
+    let (
+        img_cfg,
+        model_type,
+        tool_config,
+        engine_config,
+        guidance_tokens,
+        tokenizer,
+        chat_template,
+    ) = {
         let e = data.engine.read();
         (
             e.img_cfg.clone(),
@@ -423,11 +425,10 @@ pub async fn chat_completion(
             e.econfig.clone(),
             e.guidance_tokens.clone(),
             e.tokenizer.clone(),
+            e.get_chat_template(),
         )
     };
 
-    // Generate complete grammar from request using unified single-call function
-    // This handles all permutations: tools, structured_outputs, response_format, constraint
     let enforce_parser = engine_config.enforce_parser.clone();
     let tool_parser_name = if let Some(ref enforced) = enforce_parser {
         enforced.clone()
@@ -436,26 +437,19 @@ pub async fn chat_completion(
             super::resolve_engine_model_id(&engine_config).unwrap_or_else(|| model_id.clone());
         StreamToolParser::parser_name_for_model(&model_type, &parser_model_id).to_string()
     };
-    
-    // Get the chat template from the engine
-    let chat_template = {
-        let e = data.engine.read();
-        e.get_chat_template()
-    };
 
+    // Set max_tokens on request if not already set (needed by grammar dispatcher)
     let mut grammar_request = request.clone();
-    if !grammar_request.max_tokens.is_some() {
+    if grammar_request.max_tokens.is_none() {
         grammar_request.max_tokens = Some(max_tokens);
     }
-    
-    // Use new GrammarRequestDispatcher for grammar composition
+
     let grammar = {
         let dispatcher = GrammarRequestDispatcher::new(
             &grammar_request,
             &guidance_tokens,
             &tool_config,
             engine_config.enable_tool_grammar,
-            engine_config.allow_constraint_api,
             tool_parser_name,
             &tokenizer,
             Some(chat_template),
@@ -1965,37 +1959,20 @@ pub async fn grammar_completion(
     State(data): State<Arc<ServerData>>,
     request: Json<GrammarRequest>,
 ) -> ChatResponder {
-    // Only allow if constraint API is enabled via CLI
-    if !data.econfig.allow_constraint_api {
+    if !data.econfig.enable_tool_grammar {
         return ChatResponder::ValidationError(
-            "Grammar endpoint requires allow_constraint_api CLI flag".to_string(),
+            "Grammar endpoint requires --enable-tool-grammar CLI flag".to_string(),
         );
     }
 
-    // Parse grammar using guidance.rs
-    let grammar =
-        match build_grammar_from_request(&request.grammar_type, &request.grammar)
-        {
-            Ok(g) => g,
-            Err(e) => return ChatResponder::ValidationError(e.to_string()),
-        };
+    // Parse grammar to validate it
+    let _grammar = match build_grammar_from_request(&request.grammar_type, &request.grammar) {
+        Ok(g) => g,
+        Err(e) => return ChatResponder::ValidationError(e.to_string()),
+    };
 
-    // Build sampling params with grammar
-    let mut params = SamplingParams::new_with_max_tokens(
-        request
-            .max_tokens
-            .unwrap_or(data.econfig.max_tokens.unwrap_or(16384)),
-    );
-    params.temperature = request.temperature;
-    params.top_k = request.top_k;
-    params.top_p = request.top_p;
-    params.frequency_penalty = request.frequency_penalty;
-    params.presence_penalty = request.presence_penalty;
-    params.session_id = request.session_id.clone();
-    params.thinking = request.thinking;
-    params.stop_sequences = request.stop.clone();
-    params.grammar = Some(grammar);
-
-    // Delegate to existing streaming logic
-    ChatResponder::ValidationError("Grammar endpoint not fully implemented".to_string())
+    // TODO: Wire grammar endpoint to chat_completion inference path
+    ChatResponder::ValidationError(
+        "/v1/grammar endpoint is not yet fully implemented. Use /v1/chat/completions with structured_outputs instead.".to_string()
+    )
 }

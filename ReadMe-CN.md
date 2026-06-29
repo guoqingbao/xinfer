@@ -191,147 +191,6 @@ xinfer --m unsloth/Qwen3.5-4B-GGUF --f Qwen3.5-4B-Q4_K_M.gguf
 ## 📘 使用方法
 > **Python包安装后**请使用 `python3 -m xinfer.server` 方式运行
 
-### 安装
-
-<details>
-<summary><b>CUDA（Linux）</b></summary>
-
-```bash
-# 前置依赖
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-sudo apt-get install -y git build-essential libssl-dev pkg-config
-
-# 可选：CUDA toolkit + NCCL
-sudo apt-get install -y cuda-nvcc-12-9 cuda-nvrtc-dev-12-9 libcublas-dev-12-9 libcurand-dev-12-9
-sudo apt-get install -y libnccl2 libnccl-dev
-
-# 编译安装
-cargo --install --features cuda,nccl,flashinfer,cutlass
-# Flash Attention 后端：
-cargo --install --features cuda,nccl,flashattn,cutlass
-# V100 / 较老硬件（无 flash 后端）：
-cargo --install --features cuda,nccl
-```
-
-</details>
-
-<details>
-<summary><b>Metal（macOS）</b></summary>
-
-```bash
-# 先安装 Xcode 命令行工具
-cargo install --features metal
-```
-
-</details>
-
-默认启动 **API 服务模式**（端口 8000）。使用 `--i` 启用交互模式 🤖，`--ui-server` 启用带 Web UI 的服务模式 🌐，`--m` 指定Huggingface模型，或`--w` 指定本地Safetensors模型路径 或`--f` 指定GGUF模型文件：
-
-> 单卡/多卡推理
-  <details open>
-    <summary>单卡推理</summary>
-
-   ```bash
-   # CUDA （将 `--i`替换成 `--ui-server`则启用网页版本）
-   vllm-rs --i --m unsloth/Qwen3.5-27B-GGUF --f Qwen3.5-27B-Q4_K_M.gguf --kv-fraction 0.8
-   # Metal/MacOS (MacOS Tahoe之前的系统可能会存在生成过慢问题，使用更小的`--max-model-len` 或 `--kv-fraction`减少显存占用)
-   vllm-rs --i --m unsloth/Qwen3.5-4B-GGUF --f Qwen3.5-4B-Q3_K_M.gguf
-   ```
-  </details>
-
-  <details open>
-    <summary>多卡未量化模型</summary>
-
-   ```bash
-   vllm-rs --d 0,1 --w /path/Qwen3-30B-A3B-Instruct-2507 --ui-server --prefix-cache
-   ```
-  </details>
-
-  <details open>
-    <summary>FP8/FP4模型</summary>
-
-  _FP8格式:_
-   ```bash
-   vllm-rs --d 0,1 --w /path/Qwen3-Coder-30B-A3B-Instruct-FP8/ --ui-server --prefix-cache
-    # Or Qwen3-Next 80B
-   vllm-rs --m Qwen/Qwen3-Coder-Next-FP8 --ui-server --d 0,1 --prefix-cache
-   ```
-
-  _MXFP4格式:_
-  ```bash
-  vllm-rs --m olka-fi/Qwen3.5-4B-MXFP4 --ui-server --prefix-cache
-  ```
-
-  _NVFP4格式:_
-  ```bash
-  vllm-rs --m AxionML/Qwen3.5-9B-NVFP4 --ui-server --prefix-cache
-  ```
-  </details>
-
-   <details open>
-    <summary>多卡量化模型</summary>
-
-   ```bash
-   vllm-rs --ui-server --d 0,1 --f /path/Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf --prefix-cache
-   ```
-  </details>
-
-   <details open>
-    <summary>未量化模型运行为Q4K量化模型，同时使用FP8 KVCache</summary>
-
-   ```bash
-   # 编译时去除`flashinfer` 或 `flashattn` 以使用fp8 kvcache
-   vllm-rs --d 0,1 --w /path/Qwen3-30B-A3B-Instruct-2507 --isq q4k --server --port 8000 --fp8-kvcache
-   ```
-  </details>
-
----
-
-## 🔌 结构化输出与约束（Guided Decoding）
-
-vLLM.rs 现在支持通过 llguidance 库实现结构化输出和约束生成。
-
-### ⚠️ 安全说明
-
-**客户端提供的约束默认被阻止。**要启用它们，您必须显式设置 `--allow-constraint-api` 标志。
-
-#### 启用客户端约束
-```bash
-# 启用客户端提交的约束 via HTTP API
-vllm-rs --m Qwen/Qwen3.5-27B-FP8 --ui-server --prefix-cache --allow-constraint-api
-```
-
-#### 客户端约束的安全风险
-客户端提供的约束可能导致严重的安全漏洞：
-
-1. **Lark 语法注入**：恶意客户端可以提交精心设计的 Lark 语法，这些语法：
-   - 可以访问超出用户角色边界的特殊令牌
-   - 注入可能导致 ReDoS 攻击的任意正则表达式模式
-   - 绕过聊天模板的角色分离
-
-2. **JSON Schema 转义**：客户端可以指定：
-   - 引用系统不打算让用户控制的内部特殊令牌
-   - 创建模糊的令牌边界，导致系统指令泄露
-   - 注入匹配系统角色的禁止正则表达式模式
-
-3. **角色边界 violation**：启用约束后，客户端可能：
-   - 逃逸聊天模板中的 `user:` 角色边界
-   - 注入 `system:` 或 `assistant:` 角色内容
-   - 操纵 tool_call 标记以注入伪造的工具响应
-   - 发明新的方法使设计不佳的系统超出预期范围运行
-
-#### 推荐用法
-- **生产环境**：仅与可信的访问系统/客户端一起设置 `--enable-tool-grammar` 和/或 `--allow-constraint-api`，或在 tokenizer-aware WAF 内联验证语法时过滤传入内容。
-
-```bash
-# 启用自动工具语法生成
-vllm-rs --m Qwen/Qwen3.5-27B-FP8 --ui-server --prefix-cache --enable-tool-grammar
-```
-
-查看 [**结构化输出文档 →**](docs/llguidance-integration.md)
-
----
-
 > Docker 内构建请参考 [**在 Docker 中运行 xInfer →**](docs/docker.md)
 
 ### 运行模型
@@ -584,9 +443,14 @@ xinfer --m unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF \
 
 ---
 
-## 🔌 结构化输出
+## 🔌 结构化输出与引导解码
 
-通过 llguidance 实现约束生成 — Lark 语法、正则表达式、JSON Schema。
+通过 llguidance 实现约束生成 — JSON Schema、正则表达式、Lark 语法、选项列表。
+
+```bash
+# 启用结构化输出和工具语法
+xinfer --m Qwen/Qwen3.6-27B-FP8 --ui-server --enable-tool-grammar
+```
 
 [结构化输出文档 →](docs/guided_decoding.md)
 

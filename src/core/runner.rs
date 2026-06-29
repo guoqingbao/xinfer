@@ -7,6 +7,7 @@ use crate::models::layers::VarBuilderX;
 use crate::models::qwen3_5_mtp::Qwen3_5MtpHead;
 use crate::server::EmbeddingStrategy;
 use crate::transfer::Transfer;
+use crate::utils::env::soft_mask_disabled;
 #[cfg(all(feature = "cuda", feature = "graph"))]
 use crate::utils::graph::{
     planned_graph_capture_batches, CudaGraphFn, CudaGraphWrapper, GraphCapturer, ModelFn,
@@ -15,7 +16,6 @@ use crate::utils::guidance::{GuidanceState, ParserFactory};
 use crate::utils::image::compute_image_slice;
 use crate::utils::logits_processor::{LogitsProcessor, Sampling};
 use crate::utils::progress::ProgressLike;
-use crate::utils::env::soft_mask_disabled;
 #[cfg(feature = "flashinfer")]
 use crate::utils::FlashInferKvParams;
 use crate::{
@@ -75,7 +75,7 @@ impl Default for SoftMaskConfig {
     fn default() -> Self {
         Self {
             mask_shift: -1000.0,
-            min_logit: -1e9,  // Prevent underflow to -inf while keeping gradient flow
+            min_logit: -1e9, // Prevent underflow to -inf while keeping gradient flow
             enabled: !soft_mask_disabled(),
         }
     }
@@ -269,6 +269,16 @@ impl ModelRunner {
         let mut modified = false;
         let vocab_size = logits.dim(1)?;
 
+        let soft_mask_cfg = SoftMaskConfig::default();
+        #[inline(always)]
+        fn soft_mask_value(logit: f32, cfg: &SoftMaskConfig) -> f32 {
+            if cfg.enabled {
+                (logit + cfg.mask_shift).max(cfg.min_logit)
+            } else {
+                f32::NEG_INFINITY
+            }
+        }
+
         let mut masks: Vec<(usize, usize, SimpleVob)> = Vec::new();
         let mut failed_seq_ids = Vec::new();
         let mut guided_seq_ids = HashSet::new();
@@ -370,30 +380,39 @@ impl ModelRunner {
             }
 
             let apply_len = std::cmp::min(vocab_size, mask_len);
-            // Soft masking configuration for gradient smoothing
-            let soft_mask = SoftMaskConfig::default();
-            for tok in 0..apply_len {
-                if !mask.is_allowed(tok as u32) {
-                    if soft_mask.enabled {
-                        // Soft masking: shift logit by configured amount
-                        // This maintains gradient flow while still suppressing disallowed tokens
-                        row[tok] = (row[tok] + soft_mask.mask_shift).max(soft_mask.min_logit);
-                    } else {
-                        // Hard masking when soft mask is disabled
-                        row[tok] = f32::NEG_INFINITY;
+
+            // Process 32 tokens at a time using the mask's raw bit vector.
+            // This avoids per-token branch overhead by bulk-skipping allowed words.
+            let mask_data = mask.as_slice();
+            let full_words = apply_len / 32;
+            for word_idx in 0..full_words {
+                let word = mask_data[word_idx];
+                if word == u32::MAX {
+                    continue; // All 32 tokens allowed — skip
+                }
+                let base = word_idx * 32;
+                if word == 0 {
+                    // All 32 tokens disallowed — bulk apply
+                    for bit in 0..32 {
+                        row[base + bit] = soft_mask_value(row[base + bit], &soft_mask_cfg);
+                    }
+                } else {
+                    for bit in 0..32 {
+                        if word & (1 << bit) == 0 {
+                            row[base + bit] = soft_mask_value(row[base + bit], &soft_mask_cfg);
+                        }
                     }
                 }
             }
-            if mask_len < vocab_size {
-                for tok in mask_len..vocab_size {
-                    if soft_mask.enabled {
-                        // Soft masking for out-of-range tokens
-                        row[tok] = (row[tok] + soft_mask.mask_shift).max(soft_mask.min_logit);
-                    } else {
-                        // Hard masking when soft mask is disabled
-                        row[tok] = f32::NEG_INFINITY;
-                    }
+            // Remaining tokens that don't fill a full word
+            for tok in (full_words * 32)..apply_len {
+                if !mask.is_allowed(tok as u32) {
+                    row[tok] = soft_mask_value(row[tok], &soft_mask_cfg);
                 }
+            }
+            // Tokens beyond mask range are disallowed
+            for tok in mask_len..vocab_size {
+                row[tok] = soft_mask_value(row[tok], &soft_mask_cfg);
             }
         }
 
@@ -1853,8 +1872,8 @@ impl ModelRunner {
                 }),
         };
 
-        // Apply penalties using cached values (same for all sequences in batch)
-        // This is done BEFORE LLG masking so as to avoid impacting masked logits
+        // Apply penalties before LLG masking (matches vLLM/SGLang order).
+        // Grammar mask must override penalties cleanly for disallowed tokens.
         let has_any_penalty =
             cached_params.frequency_penalty.is_some() || cached_params.presence_penalty.is_some();
 
@@ -1890,20 +1909,15 @@ impl ModelRunner {
 
         let mut tokens = self.sample_processed_logits(&guided_logits, &cached_params.sampling)?;
 
-        // For sequences with ff_tokens, use them instead of sampled tokens if mismatching
-        // TODO: use the fftokens as draft tokens
-        if let Some(factory) = &self.llg_factory {
+        // Use ff-tokens (fast-forward) when the grammar determines the next token deterministically.
+        // The sampled token is already mask-valid, but ff-tokens are strictly determined by the
+        // grammar and take precedence for correctness.
+        if self.llg_factory.is_some() {
             let mut guidance_states = self.guidance_states.write();
             for (i, seq_id) in seq_ids.iter().enumerate() {
                 if let Some(state) = guidance_states.get_mut(seq_id) {
                     let ff_tokens = state.compute_ff_tokens();
                     if !ff_tokens.is_empty() && ff_tokens[0] != tokens[i] {
-                        crate::log_warn!(
-                            "[Seq {}] Replacing sampled token {} with ff-token {}",
-                            seq_id,
-                            tokens[i],
-                            ff_tokens[0]
-                        );
                         tokens[i] = ff_tokens[0];
                     }
                 }

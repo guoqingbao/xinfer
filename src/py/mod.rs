@@ -5,8 +5,8 @@ use crate::core::GenerationOutput;
 use crate::server::run_server;
 use crate::transfer::{PdConfig, PdMethod, PdRole};
 use crate::utils::chat_template::Message;
-use crate::utils::config::{EngineConfig, GenerationConfig, SamplingParams};
 use crate::utils::config::ReasoningEffort;
+use crate::utils::config::{EngineConfig, GenerationConfig, SamplingParams};
 use crate::utils::get_dtype;
 use llguidance::api::TopLevelGrammar;
 use parking_lot::RwLock;
@@ -308,7 +308,7 @@ impl EngineConfig {
         pd_server_prefix_cache_ratio=None, pd_client_prefix_cache_ratio=None, yarn_scaling_factor=None,
         disable_reasoning=false, disable_cuda_graph=false, prefill_chunk_size=Some(8192),
         num_nodes=1, node_rank=0, master_addr=None, master_port=29500,
-        allow_constraint_api=false, enable_tool_grammar=false,))]
+        enable_tool_grammar=false,))]
     pub fn new(
         model_id: Option<String>,
         weight_path: Option<String>,
@@ -347,7 +347,6 @@ impl EngineConfig {
         node_rank: usize,
         master_addr: Option<String>,
         master_port: u16,
-        allow_constraint_api: bool,
         enable_tool_grammar: bool,
     ) -> Self {
         let mut device_ids = device_ids.unwrap_or_default();
@@ -408,7 +407,6 @@ impl EngineConfig {
             master_addr,
             master_port,
             mtp_num_speculative_tokens: None,
-            allow_constraint_api,
             enable_tool_grammar,
         }
     }

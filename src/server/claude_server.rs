@@ -1,18 +1,17 @@
 use super::{
-    build_messages_and_images, ChatMessage, ImageUrlContent,
-    MessageContent, MessageContentType, ServerData,
+    build_messages_and_images, ChatMessage, ImageUrlContent, MessageContent, MessageContentType,
+    ServerData,
 };
-use crate::utils::guidance_grammar::build_guided_decoding_grammar;
 use crate::core::engine::{LLMEngine, StreamItem};
 use crate::server::logger::ChatCompletionLogger;
 use crate::server::parser::{BufferedFinalizeResult, StreamResult, StreamToolParser};
 use crate::tools::helpers::{
     build_invalid_tool_call_feedback, build_tool_schema_map, filter_tool_calls,
-    retain_tool_calls_forced_name,
-    strict_tool_call_validation_enabled,
+    retain_tool_calls_forced_name, strict_tool_call_validation_enabled,
 };
 use crate::tools::{Tool, ToolCall, ToolChoice};
 use crate::utils::config::SamplingParams;
+use crate::utils::guidance_grammar::build_guided_decoding_grammar;
 use axum::{
     extract::{Json, State},
     http::StatusCode,
@@ -2164,7 +2163,6 @@ pub async fn messages(
             max_tokens,
             None,
             engine_config.enable_tool_grammar,
-            engine_config.allow_constraint_api,
             &engine.tokenizer,
             &model_type,
             &model_id,

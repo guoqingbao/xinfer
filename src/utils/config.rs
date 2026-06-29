@@ -163,10 +163,7 @@ impl EosTokenId {
             EosTokenId::Multiple(v) => {
                 // Deduplicate while preserving order
                 let mut seen = HashSet::new();
-                v.iter()
-                    .filter(|&id| seen.insert(*id))
-                    .cloned()
-                    .collect()
+                v.iter().filter(|&id| seen.insert(*id)).cloned().collect()
             }
         }
     }
@@ -443,7 +440,6 @@ pub struct EngineConfig {
     /// None means MTP is disabled.
     #[serde(default)]
     pub mtp_num_speculative_tokens: Option<usize>,
-    pub allow_constraint_api: bool,
     pub enable_tool_grammar: bool,
 }
 
@@ -552,8 +548,6 @@ pub struct EngineConfig {
     #[serde(default)]
     pub mtp_num_speculative_tokens: Option<usize>,
     #[pyo3(get, set)]
-    pub allow_constraint_api: bool,
-    #[pyo3(get, set)]
     pub enable_tool_grammar: bool,
 }
 
@@ -610,7 +604,6 @@ impl EngineConfig {
         node_rank: usize,
         master_addr: Option<String>,
         master_port: u16,
-        allow_constraint_api: bool,
         enable_tool_grammar: bool,
     ) -> Self {
         let mut device_ids = device_ids.unwrap_or_default();
@@ -670,7 +663,6 @@ impl EngineConfig {
             master_addr,
             master_port,
             mtp_num_speculative_tokens: None,
-            allow_constraint_api,
             enable_tool_grammar,
         }
     }
@@ -1277,38 +1269,39 @@ impl fmt::Debug for QuantConfig {
 }
 
 /// Reasoning effort level for grammar generation
-    /// Optimized for specific reasoning strategies based on current research (2024-2025)
-    #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-    #[serde(rename_all = "lowercase")]
-    pub enum ReasoningEffort {
-        /// No structured reasoning - direct output only
-        None,
-        /// Default model reasoning output as induced by opening a reasoning tag
-        ModelDefault,
-        /// Constrained single-paragraph reasoning (~150 chars max)
-        Low,
-        /// Standard multi-step Chain-of-Thought (CoT)
-        Medium,
-        /// Adversarial analysis with self-correction phases
-        High,
-        /// Best-of-breed Chain-of-Verification (CoVe) + Self-Critique
-        ChainOfThought,
-        /// Custom user-provided grammar template (non-Python builds only)
-        #[cfg(all(not(feature = "python"), not(feature = "pyo3")))]
-        Custom(String),
-    }
+/// Optimized for specific reasoning strategies based on current research (2024-2025)
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningEffort {
+    /// No structured reasoning - direct output only
+    None,
+    /// Default model reasoning output as induced by opening a reasoning tag
+    ModelDefault,
+    /// Constrained single-paragraph reasoning (~150 chars max)
+    Low,
+    /// Standard multi-step Chain-of-Thought (CoT)
+    Medium,
+    /// Adversarial analysis with self-correction phases
+    High,
+    /// Best-of-breed Chain-of-Verification (CoVe) + Self-Critique
+    ChainOfThought,
+    /// Custom user-provided grammar template (non-Python builds only)
+    #[cfg(all(not(feature = "python"), not(feature = "pyo3")))]
+    Custom(String),
+}
 
-    impl Default for ReasoningEffort {
-        fn default() -> Self {
-            ReasoningEffort::ModelDefault
-        }
+impl Default for ReasoningEffort {
+    fn default() -> Self {
+        ReasoningEffort::ModelDefault
     }
+}
 
-    impl ReasoningEffort {
+impl ReasoningEffort {
     /// Parse a string to ReasoningEffort
     pub fn from_str(s: String) -> Self {
         match s.to_lowercase().as_str() {
             "none" => Self::None,
+            "model_default" | "default" => Self::ModelDefault,
             "low" => Self::Low,
             "normal" | "medium" => Self::Medium,
             "high" => Self::High,
@@ -1340,7 +1333,6 @@ impl std::fmt::Display for ReasoningEffort {
         }
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -1918,12 +1910,28 @@ mod tests {
         assert_eq!(cfg.quant_method, "fp8");
     }
 
+    #[test]
     fn test_reasoning_effort_from_str() {
-        assert_eq!(ReasoningEffort::from_str("none".to_string()), ReasoningEffort::None);
-        assert_eq!(ReasoningEffort::from_str("low".to_string()), ReasoningEffort::Low);
-        assert_eq!(ReasoningEffort::from_str("medium".to_string()), ReasoningEffort::Medium);
-        assert_eq!(ReasoningEffort::from_str("high".to_string()), ReasoningEffort::High);
-        assert_eq!(ReasoningEffort::from_str("chain_of_thought".to_string()), ReasoningEffort::ChainOfThought);
+        assert_eq!(
+            ReasoningEffort::from_str("none".to_string()),
+            ReasoningEffort::None
+        );
+        assert_eq!(
+            ReasoningEffort::from_str("low".to_string()),
+            ReasoningEffort::Low
+        );
+        assert_eq!(
+            ReasoningEffort::from_str("medium".to_string()),
+            ReasoningEffort::Medium
+        );
+        assert_eq!(
+            ReasoningEffort::from_str("high".to_string()),
+            ReasoningEffort::High
+        );
+        assert_eq!(
+            ReasoningEffort::from_str("chain_of_thought".to_string()),
+            ReasoningEffort::ChainOfThought
+        );
     }
 
     #[test]

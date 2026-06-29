@@ -3,14 +3,16 @@ use std::collections::HashMap;
 use tokenizers::Tokenizer;
 
 const BOS_TOKEN_STRINGS: &[&str] = &[
-    "<s>", "<|im_start|>",
-    "<start_of_turn>", "<|beginning_of_sentence|>",
+    "<s>",
+    "<|im_start|>",
+    "<start_of_turn>",
+    "<|beginning_of_sentence|>",
     "<bos>",
     // Llama4 encapsulates the role between header IDs:
     // <|start_header_id|>user<|end_header_id|>\n\n
-    "<|start_header_id|>", "<|end_header_id|>",
-    "<|turn>"
-
+    "<|start_header_id|>",
+    "<|end_header_id|>",
+    "<|turn>",
 ];
 
 const REASONING_TOKEN_PAIRS: &[(&str, &str)] = &[
@@ -32,7 +34,7 @@ const TOOL_CALL_TOKEN_PAIRS: &[(&str, &str)] = &[
     ("<start_function_call>", "<end_function_call>"),
     ("<|tool_call>", "<tool_call|>"),
     ("[TOOL_CALLS]", "]"),
-    ("<minimax:tool_call>", "</minimax:tool_call>")
+    ("<minimax:tool_call>", "</minimax:tool_call>"),
 ];
 
 #[derive(Debug, Clone, Default)]
@@ -41,7 +43,7 @@ pub struct SpecialTokens {
     reasoning_end_ids: Vec<u32>,
     tool_call_start_ids: Vec<u32>,
     tool_call_end_ids: Vec<u32>,
-    bos_token_ids: Vec<u32>
+    bos_token_ids: Vec<u32>,
 }
 
 impl SpecialTokens {
@@ -55,10 +57,10 @@ impl SpecialTokens {
         // Build lookup maps from added tokens
         let mut added_start_map: HashMap<String, Vec<u32>> = HashMap::new();
         let mut added_end_map: HashMap<String, Vec<u32>> = HashMap::new();
-        
+
         for (id, token) in tokenizer.get_added_tokens_decoder().iter() {
             let content = token.content.as_str();
-            
+
             // Collect BOS tokens
             for &bos_str in BOS_TOKEN_STRINGS.iter() {
                 if content == bos_str {
@@ -69,23 +71,29 @@ impl SpecialTokens {
             // Build added token maps for pairs
             for &(start, end) in REASONING_TOKEN_PAIRS.iter() {
                 if content == start {
-                    added_start_map.entry(start.to_string()).or_default().push(*id);
+                    added_start_map
+                        .entry(start.to_string())
+                        .or_default()
+                        .push(*id);
                 }
                 if content == end {
                     added_end_map.entry(end.to_string()).or_default().push(*id);
                 }
             }
-            
+
             for &(start, end) in TOOL_CALL_TOKEN_PAIRS.iter() {
                 if content == start {
-                    added_start_map.entry(start.to_string()).or_default().push(*id);
+                    added_start_map
+                        .entry(start.to_string())
+                        .or_default()
+                        .push(*id);
                 }
                 if content == end {
                     added_end_map.entry(end.to_string()).or_default().push(*id);
                 }
             }
         }
-        
+
         // Process reasoning token pairs with fallback to common vocab
         for &(start, end) in REASONING_TOKEN_PAIRS.iter() {
             process_pair(
@@ -102,7 +110,7 @@ impl SpecialTokens {
                 "reasoning",
             );
         }
-        
+
         // Process tool call token pairs with fallback to common vocab
         for &(start, end) in TOOL_CALL_TOKEN_PAIRS.iter() {
             process_pair(
@@ -130,7 +138,7 @@ impl SpecialTokens {
             reasoning_end_ids,
             tool_call_start_ids,
             tool_call_end_ids,
-            bos_token_ids
+            bos_token_ids,
         }
     }
 

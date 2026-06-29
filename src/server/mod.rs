@@ -10,8 +10,8 @@ use crate::core::engine::LLMEngine;
 use crate::server::streaming::Streamer;
 use crate::transfer::PdRole;
 use crate::utils::chat_template::Message;
-use crate::utils::config::{EngineConfig, ReasoningEffort, SamplingParams};
-use crate::utils::guidance::{GuidanceTokens};
+use crate::utils::config::{EngineConfig, SamplingParams};
+use crate::utils::guidance::GuidanceTokens;
 use crate::utils::image::{
     compute_tokens_per_image, get_tensor_raw_data, load_image_from_base64, load_image_from_url,
     ImageData, ImageProcessConfig, ImageProcessTrait, IMAGE_PLACEHOLDER,
@@ -285,54 +285,26 @@ pub struct ExtraBody {
 }
 
 pub fn normalize_reasoning_controls(params: &mut SamplingParams, guidance_tokens: &GuidanceTokens) {
-    #[cfg(not(feature = "python"))]
-    {
-        let reasoning_enabled = params
-            .reasoning_effort
-            .as_ref()
-            .is_some_and(|effort| *effort != ReasoningEffort::None);
-        if !reasoning_enabled {
-            return;
-        }
-
-        let has_reasoning_tokens = !guidance_tokens.reasoning_start_ids.is_empty()
-            && !guidance_tokens.reasoning_end_ids.is_empty();
-        if !has_reasoning_tokens {
-            crate::log_warn!(
-                "[llg] reasoning_effort requested but current model/tokenizer does not expose reasoning tokens; disabling reasoning grammar"
-            );
-            params.reasoning_effort = None;
-            return;
-        }
-
-        params.thinking = Some(true);
+    let reasoning_enabled = params
+        .reasoning_effort
+        .as_ref()
+        .map(|effort| effort.is_enabled())
+        .unwrap_or(false);
+    if !reasoning_enabled {
+        return;
     }
 
-    #[cfg(feature = "python")]
-    {
-        // In Python builds, reasoning_effort is Option<ReasoningEffort>
-        // Check if it's enabled using the is_enabled() method
-        let reasoning_enabled = params
-            .reasoning_effort
-            .as_ref()
-            .map(|effort| effort.is_enabled())
-            .unwrap_or(false);
-        if !reasoning_enabled {
-            return;
-        }
-
-        let has_reasoning_tokens = !guidance_tokens.reasoning_start_ids.is_empty()
-            && !guidance_tokens.reasoning_end_ids.is_empty();
-        if !has_reasoning_tokens {
-            crate::log_warn!(
-                "[llg] reasoning_effort requested but current model/tokenizer does not expose reasoning tokens; disabling reasoning grammar"
-            );
-            params.reasoning_effort = None;
-            return;
-        }
-
-        params.thinking = Some(true);
+    let has_reasoning_tokens = !guidance_tokens.reasoning_start_ids.is_empty()
+        && !guidance_tokens.reasoning_end_ids.is_empty();
+    if !has_reasoning_tokens {
+        crate::log_warn!(
+            "[llg] reasoning_effort requested but current model/tokenizer does not expose reasoning tokens; disabling reasoning grammar"
+        );
+        params.reasoning_effort = None;
+        return;
     }
+
+    params.thinking = Some(true);
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -916,11 +888,7 @@ pub struct Args {
     #[arg(long, default_value = None)]
     pub mtp: Option<usize>,
 
-    /// Allow client-submitted constraints via HTTP API
-    #[arg(long, default_value = "false")]
-    pub allow_constraint_api: bool,
-
-    /// Whether to automatically build LLG grammar from tools
+    /// Enable grammar-based generation: tool grammar, structured outputs, and client constraints
     #[arg(long, default_value = "false")]
     pub enable_tool_grammar: bool,
 }
@@ -1735,6 +1703,7 @@ pub async fn run_server(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::config::ReasoningEffort;
     use clap::Parser;
 
     fn temp_test_path(name: &str) -> std::path::PathBuf {
@@ -1985,6 +1954,7 @@ mod tests {
             reasoning_end_ids: vec![102],
             tool_call_start_ids: Vec::new(),
             tool_call_end_ids: Vec::new(),
+            add_bos_token: false,
         };
 
         normalize_reasoning_controls(&mut params, &guidance_tokens);
@@ -2006,6 +1976,7 @@ mod tests {
             reasoning_end_ids: Vec::new(),
             tool_call_start_ids: Vec::new(),
             tool_call_end_ids: Vec::new(),
+            add_bos_token: false,
         };
 
         normalize_reasoning_controls(&mut params, &guidance_tokens);
@@ -2321,5 +2292,3 @@ mod tests {
         assert_eq!(api_url, None);
     }
 }
-
-
