@@ -3,7 +3,7 @@ use super::logger::ChatCompletionLogger;
 use super::{
     build_guided_decoding_grammar, build_messages_and_images, collect_openai_constraint_grammar,
     normalize_reasoning_controls,
-    streaming::{ChatResponse, Streamer, StreamingStatus},
+    streaming::{ChatResponse, Streamer},
     ChatResponder, DetokenizeRequest, DetokenizeResponse, EmbeddingRequest, EmbeddingResponse,
     EncodingFormat, TokenizeInput, TokenizeRequest, TokenizeResponse,
 };
@@ -41,7 +41,7 @@ struct StreamingContext {
     seq_id: usize,
     model_id: String,
     created: u64,
-    response_tx: flume::Sender<ChatResponse>,
+    response_tx: tokio::sync::mpsc::Sender<ChatResponse>,
 }
 
 /// Routes streaming tokens to either `content` or `reasoning_content` in SSE
@@ -255,7 +255,7 @@ impl StreamingContext {
         seq_id: usize,
         model_id: String,
         created: u64,
-        response_tx: flume::Sender<ChatResponse>,
+        response_tx: tokio::sync::mpsc::Sender<ChatResponse>,
     ) -> Self {
         Self {
             seq_id,
@@ -537,7 +537,11 @@ pub async fn chat_completion(
         };
 
         let stream = stream;
-        let (response_tx, client_rx) = flume::unbounded();
+        let buf_size: usize = env::var("XINFER_SSE_BUFFER_SIZE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(256);
+        let (response_tx, client_rx) = tokio::sync::mpsc::channel(buf_size);
         let (disconnect_tx, mut disconnect_rx) = watch::channel(false);
 
         // Clone data needed for the async task
@@ -1146,12 +1150,7 @@ pub async fn chat_completion(
         });
 
         ChatResponder::Streamer(
-            Sse::new(Streamer {
-                rx: client_rx,
-                status: StreamingStatus::Uninitialized,
-                disconnect_tx: Some(disconnect_tx),
-            })
-            .keep_alive(
+            Sse::new(Streamer::new(client_rx, Some(disconnect_tx))).keep_alive(
                 KeepAlive::new()
                     .interval(Duration::from_millis(
                         env::var("KEEP_ALIVE_INTERVAL")
@@ -1637,13 +1636,15 @@ pub async fn detokenize(
 mod tests {
     use super::*;
 
-    fn make_test_ctx() -> (StreamingContext, flume::Receiver<ChatResponse>) {
-        let (tx, rx) = flume::unbounded();
+    fn make_test_ctx() -> (StreamingContext, tokio::sync::mpsc::Receiver<ChatResponse>) {
+        let (tx, rx) = tokio::sync::mpsc::channel(256);
         let ctx = StreamingContext::new(1, "test-model".to_string(), 0, tx);
         (ctx, rx)
     }
 
-    fn collect_deltas(rx: &flume::Receiver<ChatResponse>) -> Vec<(Option<String>, Option<String>)> {
+    fn collect_deltas(
+        rx: &mut tokio::sync::mpsc::Receiver<ChatResponse>,
+    ) -> Vec<(Option<String>, Option<String>)> {
         let mut deltas = Vec::new();
         while let Ok(resp) = rx.try_recv() {
             if let ChatResponse::Chunk(chunk) = resp {
@@ -1660,10 +1661,10 @@ mod tests {
 
     #[test]
     fn reasoning_router_disabled_sends_all_as_content() {
-        let (ctx, rx) = make_test_ctx();
+        let (ctx, mut rx) = make_test_ctx();
         let router = ReasoningContentRouter::new(false);
         assert!(router.send("<think>hello</think>world", false, &ctx));
-        let deltas = collect_deltas(&rx);
+        let deltas = collect_deltas(&mut rx);
         assert_eq!(deltas.len(), 1);
         assert_eq!(deltas[0].0.as_deref(), Some("<think>hello</think>world"));
         assert_eq!(deltas[0].1, None);
@@ -1671,13 +1672,13 @@ mod tests {
 
     #[test]
     fn reasoning_router_disabled_no_tools_sends_reasoning_as_content() {
-        let (ctx, rx) = make_test_ctx();
+        let (ctx, mut rx) = make_test_ctx();
         let router = ReasoningContentRouter::new(false);
         assert!(router.send("<think>", true, &ctx));
         assert!(router.send("reasoning text", true, &ctx));
         assert!(router.send("</think>", false, &ctx));
         assert!(router.send("main content", false, &ctx));
-        let deltas = collect_deltas(&rx);
+        let deltas = collect_deltas(&mut rx);
         assert_eq!(deltas.len(), 4);
         for d in &deltas {
             assert!(
@@ -1693,11 +1694,11 @@ mod tests {
 
     #[test]
     fn reasoning_router_strips_markers_and_routes_reasoning() {
-        let (ctx, rx) = make_test_ctx();
+        let (ctx, mut rx) = make_test_ctx();
         let router = ReasoningContentRouter::new(true);
         // Token "<think>hello" arrives while parser says in_reasoning=true
         assert!(router.send("<think>hello", true, &ctx));
-        let deltas = collect_deltas(&rx);
+        let deltas = collect_deltas(&mut rx);
         assert_eq!(deltas.len(), 1);
         assert_eq!(deltas[0].0, None);
         assert_eq!(deltas[0].1.as_deref(), Some("hello"));
@@ -1705,11 +1706,11 @@ mod tests {
 
     #[test]
     fn reasoning_router_strips_end_marker_routes_content() {
-        let (ctx, rx) = make_test_ctx();
+        let (ctx, mut rx) = make_test_ctx();
         let router = ReasoningContentRouter::new(true);
         // Token "</think>world" arrives while parser says in_reasoning=false (already transitioned)
         assert!(router.send("</think>world", false, &ctx));
-        let deltas = collect_deltas(&rx);
+        let deltas = collect_deltas(&mut rx);
         assert_eq!(deltas.len(), 1);
         assert_eq!(deltas[0].0.as_deref(), Some("world"));
         assert_eq!(deltas[0].1, None);
@@ -1717,7 +1718,7 @@ mod tests {
 
     #[test]
     fn reasoning_router_handles_split_tokens() {
-        let (ctx, rx) = make_test_ctx();
+        let (ctx, mut rx) = make_test_ctx();
         let router = ReasoningContentRouter::new(true);
         // Simulating: <think> | reasoning part | </think> | content part
         // Parser state: false→true for <think>, true for reasoning, true→false for </think>, false for content
@@ -1725,7 +1726,7 @@ mod tests {
         assert!(router.send("reasoning part", true, &ctx));
         assert!(router.send("</think>", false, &ctx)); // marker only, stripped
         assert!(router.send("content part", false, &ctx));
-        let deltas = collect_deltas(&rx);
+        let deltas = collect_deltas(&mut rx);
         assert_eq!(deltas.len(), 2);
         assert_eq!(deltas[0].0, None);
         assert_eq!(deltas[0].1.as_deref(), Some("reasoning part"));
@@ -1735,13 +1736,13 @@ mod tests {
 
     #[test]
     fn reasoning_router_handles_prefilled_reasoning() {
-        let (ctx, rx) = make_test_ctx();
+        let (ctx, mut rx) = make_test_ctx();
         let router = ReasoningContentRouter::new(true);
         // Prefilled: prompt ends with <think>, parser starts in_reasoning=true
         assert!(router.send("I'm thinking", true, &ctx));
         assert!(router.send("</think>", false, &ctx));
         assert!(router.send("answer", false, &ctx));
-        let deltas = collect_deltas(&rx);
+        let deltas = collect_deltas(&mut rx);
         assert_eq!(deltas.len(), 2);
         assert_eq!(deltas[0].0, None);
         assert_eq!(deltas[0].1.as_deref(), Some("I'm thinking"));
@@ -1751,11 +1752,11 @@ mod tests {
 
     #[test]
     fn reasoning_router_handles_qwen_markers() {
-        let (ctx, rx) = make_test_ctx();
+        let (ctx, mut rx) = make_test_ctx();
         let router = ReasoningContentRouter::new(true);
         assert!(router.send("<|think|>reasoning", true, &ctx));
         assert!(router.send("<|/think|>answer", false, &ctx));
-        let deltas = collect_deltas(&rx);
+        let deltas = collect_deltas(&mut rx);
         assert_eq!(deltas.len(), 2);
         assert_eq!(deltas[0].0, None);
         assert_eq!(deltas[0].1.as_deref(), Some("reasoning"));
@@ -1765,20 +1766,20 @@ mod tests {
 
     #[test]
     fn reasoning_router_empty_text_is_noop() {
-        let (ctx, rx) = make_test_ctx();
+        let (ctx, mut rx) = make_test_ctx();
         let router = ReasoningContentRouter::new(true);
         assert!(router.send("", false, &ctx));
-        let deltas = collect_deltas(&rx);
+        let deltas = collect_deltas(&mut rx);
         assert!(deltas.is_empty());
     }
 
     #[test]
     fn reasoning_router_marker_only_token_sends_nothing() {
-        let (ctx, rx) = make_test_ctx();
+        let (ctx, mut rx) = make_test_ctx();
         let router = ReasoningContentRouter::new(true);
         assert!(router.send("<think>", true, &ctx));
         assert!(router.send("</think>", false, &ctx));
-        let deltas = collect_deltas(&rx);
+        let deltas = collect_deltas(&mut rx);
         assert!(
             deltas.is_empty(),
             "Pure marker tokens should produce no output"
@@ -1787,10 +1788,10 @@ mod tests {
 
     #[test]
     fn reasoning_router_plain_content_no_markers() {
-        let (ctx, rx) = make_test_ctx();
+        let (ctx, mut rx) = make_test_ctx();
         let router = ReasoningContentRouter::new(true);
         assert!(router.send("hello world", false, &ctx));
-        let deltas = collect_deltas(&rx);
+        let deltas = collect_deltas(&mut rx);
         assert_eq!(deltas.len(), 1);
         assert_eq!(deltas[0].0.as_deref(), Some("hello world"));
         assert_eq!(deltas[0].1, None);

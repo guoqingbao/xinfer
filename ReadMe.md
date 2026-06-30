@@ -23,9 +23,7 @@
 
 ## 📽️ Demo
 
-<p align="center">
-  <video src="https://guoqingbao.github.io/xinfer/assets/demo.mp4" width="600" controls></video>
-</p>
+<video src="pages/assets/demo.mp4" width="600" controls></video>
 
 ---
 
@@ -233,6 +231,9 @@ xinfer --m GadflyII/GLM-4.7-Flash-NVFP4
 
 # Interactive CLI chat
 xinfer --i --m unsloth/Qwen3.5-27B-GGUF --f Qwen3.5-27B-Q4_K_M.gguf
+
+# Faster GDN prefill on Hopper with slight precision loss
+SM90_LOWER_PRECISION_GDN_PREFILL=1 xinfer --m Qwen/Qwen3.5-35B-A3B-FP8
 
 # MultiNode: GLM 5.2 (DeepSeek V3.2 architecture, FP8)
 # Master node
@@ -516,10 +517,17 @@ Constraint-based generation via llguidance — Lark grammars, regex, JSON Schema
 | Variable | Description |
 |---|---|
 | `XINFER_NVFP4_FORCE_LUT=1` | Force software NVFP4 decode to use the LUT-based dequantization path (higher precision) instead of hardware FP4 intrinsics on Blackwell (SM100+). Useful when decode precision matters more than peak throughput. |
+| `XINFER_SSE_BUFFER_SIZE=256` | Size of the bounded SSE streaming buffer per client connection (default: 256). Increase for slow network proxies or high-throughput models. |
+| `SM90_LOWER_PRECISION_GDN_PREFILL=1` | Enable the FlashInfer SM90 persistent kernel for GatedDeltaNet (GDN) prefill on Hopper GPUs (SM90). Delivers faster prefill speedup for Qwen3.5/3.6, with a slight precision trade-off. |
 
 **Example (Blackwell with high-precision NVFP4 decode):**
 ```bash
 XINFER_NVFP4_FORCE_LUT=1 xinfer --m nvidia/Qwen3-30B-A3B-FP4 --ui-server
+```
+
+**Example (Hopper with faster GDN prefill):**
+```bash
+SM90_LOWER_PRECISION_GDN_PREFILL=1 xinfer --m Qwen/Qwen3.5-35B-A3B-FP8 --ui-server
 ```
 
 ---

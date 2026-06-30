@@ -22,9 +22,7 @@
 ---
 ## 📽️ 演示
 
-<p align="center">
-  <video src="https://guoqingbao.github.io/xinfer/assets/demo.mp4" width="600" controls></video>
-</p>
+<video src="pages/assets/demo.mp4" width="600" controls></video>
 
 ---
 
@@ -232,6 +230,9 @@ xinfer --m GadflyII/GLM-4.7-Flash-NVFP4
 
 # 交互式 CLI 对话
 xinfer --i --m unsloth/Qwen3.5-27B-GGUF --f Qwen3.5-27B-Q4_K_M.gguf
+
+# Hopper 上加速 GDN 预填充，精度略有损失
+SM90_LOWER_PRECISION_GDN_PREFILL=1 xinfer --m Qwen/Qwen3.5-35B-A3B-FP8
 
 # 多节点推理: GLM 5.2（DeepSeek V3.2 架构，FP8）
 # 主节点
@@ -514,10 +515,17 @@ xinfer --m unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF \
 | 变量 | 描述 |
 |---|---|
 | `XINFER_NVFP4_FORCE_LUT=1` | 强制 NVFP4 软件解码使用 LUT（查找表）路径替代 Blackwell (SM100+) 硬件 FP4 指令。精度更高，适用于对解码精度有要求的场景。 |
+| `XINFER_SSE_BUFFER_SIZE=256` | 每个客户端连接的 SSE 流式缓冲区大小（默认：256）。对于慢速网络代理或高吞吐模型，可适当增大。 |
+| `SM90_LOWER_PRECISION_GDN_PREFILL=1` | 在 Hopper (SM90) GPU 上启用 FlashInfer SM90 持久化内核加速 GatedDeltaNet (GDN) 预填充。可为 Qwen3.5/3.6 等混合架构模型带来预填充加速，但精度略有损失。|
 
 **示例（Blackwell 高精度 NVFP4 解码）：**
 ```bash
 XINFER_NVFP4_FORCE_LUT=1 xinfer --m nvidia/Qwen3-30B-A3B-FP4 --ui-server
+```
+
+**示例（Hopper 上加速 GDN 预填充）：**
+```bash
+SM90_LOWER_PRECISION_GDN_PREFILL=1 xinfer --m Qwen/Qwen3.5-35B-A3B-FP8 --ui-server
 ```
 
 ---

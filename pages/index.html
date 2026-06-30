@@ -277,7 +277,6 @@ footer{padding:56px 0 28px;border-top:1px solid var(--c-border);position:relativ
       <div class="fcard" data-d="210"><span class="icon">🌍</span><h3 data-i="f.4t">Cross-Platform</h3><p data-i="f.4d">CUDA on Linux, Metal on macOS. Same binary, same API everywhere.</p></div>
       <div class="fcard" data-d="280"><span class="icon">🏭</span><h3 data-i="f.5t">Production Ready</h3><p data-i="f.5d">OpenAI &amp; Anthropic APIs, built-in Web UI, MCP tool calling, structured outputs.</p></div>
       <div class="fcard" data-d="350"><span class="icon">🗜️</span><h3 data-i="f.6t">KV Compression</h3><p data-i="f.6d">TurboQuant 2–4 bit KV cache extends context up to 4.3× with minimal quality loss.</p></div>
-      <div class="fcard" data-d="420"><span class="icon">🔥</span><h3 data-i="f.7t">V100 Renaissance</h3><p data-i="f.7d">NVFP4 + TurboQuant on V100 — first-ever low-bit model + KV cache on legacy GPUs. No hardware FP4 needed.</p></div>
     </div>
   </div>
 </section>
@@ -434,26 +433,6 @@ footer{padding:56px 0 28px;border-top:1px solid var(--c-border);position:relativ
 <span class="t-x" data-i="i.e3"># Python mode</span>
 <span class="t-c">python3</span> <span class="t-f">-m</span> <span class="t-s">xinfer.server</span> <span class="t-f">--m</span> <span class="t-s">Qwen/Qwen3.6-27B-FP8</span> <span class="t-f">--ui-server</span></pre></div>
     </div>
-    <!-- V100 BANNER -->
-    <div class="rv" id="v100-banner" style="margin-top:24px;border-radius:var(--r);background:linear-gradient(135deg,rgba(56,189,248,.05),rgba(129,140,248,.03));border:1px solid rgba(56,189,248,.15);overflow:hidden">
-      <button id="v100-toggle" style="width:100%;display:flex;align-items:center;gap:10px;padding:12px 18px;background:none;border:none;cursor:pointer;text-align:left;color:inherit">
-        <span style="font-size:.65rem;font-weight:700;padding:2px 7px;border-radius:3px;background:rgba(56,189,248,.1);color:var(--c-accent);letter-spacing:.05em" data-i="bt.new">NEW</span>
-        <span style="font-size:.84rem;color:var(--c-dim);flex:1" data-i="bt.msg">Running NVFP4 models under 4-bit KV cache on V100 — first ever.</span>
-        <svg id="v100-chevron" style="width:14px;height:14px;color:var(--c-dim);transition:transform .25s;flex-shrink:0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 9l6 6 6-6"/></svg>
-      </button>
-      <div id="v100-detail" style="max-height:0;overflow:hidden;transition:max-height .3s ease">
-        <div style="padding:0 18px 14px;display:flex;flex-direction:column;gap:8px">
-          <div class="cb" style="margin:0" data-cp="xinfer --m AxionML/Qwen3.5-4B-NVFP4 --ui-server">
-            <div class="cb-h"><div class="cb-dots"><i></i><i></i><i></i></div><span class="cb-t">V100</span><button class="cpb" data-i="cp">Copy</button></div>
-            <div class="cb-b"><pre><span class="t-g">$</span> <span class="t-c">xinfer</span> <span class="t-f">--m</span> <span class="t-s">AxionML/Qwen3.5-4B-NVFP4</span> <span class="t-f">--ui-server</span></pre></div>
-          </div>
-          <div class="cb" style="margin:0" data-cp="xinfer --m AxionML/Qwen3.5-4B-NVFP4 --kvcache-dtype turbo4 --ui-server">
-            <div class="cb-h"><div class="cb-dots"><i></i><i></i><i></i></div><span class="cb-t">V100 + turbo4</span><button class="cpb" data-i="cp">Copy</button></div>
-            <div class="cb-b"><pre><span class="t-g">$</span> <span class="t-c">xinfer</span> <span class="t-f">--m</span> <span class="t-s">AxionML/Qwen3.5-4B-NVFP4</span> <span class="t-f">--kvcache-dtype</span> <span class="t-s">turbo4</span> <span class="t-f">--ui-server</span></pre></div>
-          </div>
-        </div>
-      </div>
-    </div>
   </div>
 </section>
 
@@ -530,7 +509,6 @@ en:{
 'hero.term':'terminal','hero.cta1':'Get Started','hero.cta2':'View on GitHub →','hero.cta3':'▶ Watch Demo',
 'cp':'Copy','cpd':'Copied!',
 'demo.label':'Demo','demo.title':'See It in Action','demo.desc':'Watch xInfer serve a 35B model with real-time inference and tool calling.',
-'bt.new':'NEW','bt.msg':'Running NVFP4 models under 4-bit KV cache on V100 — first ever.',
 'f.label':'Features','f.title':'Built for Speed & Simplicity',
 'f.desc':'Everything you need for production LLM inference — without the Python baggage.',
 'f.1t':'Zero Dependencies','f.1d':'Pure Rust backend — no PyTorch, no CUDA Python bindings, no Python runtime.',
@@ -539,7 +517,6 @@ en:{
 'f.4t':'Cross-Platform','f.4d':'CUDA on Linux, Metal on macOS. Same binary, same API everywhere.',
 'f.5t':'Production Ready','f.5d':'OpenAI & Anthropic APIs, built-in Web UI, MCP tool calling, structured outputs.',
 'f.6t':'KV Compression','f.6d':'TurboQuant 2–4 bit KV cache extends context up to 4.3× with minimal quality loss.',
-'f.7t':'V100 Renaissance','f.7d':'NVFP4 + TurboQuant on V100 — first-ever low-bit model + KV cache on legacy GPUs. No hardware FP4 needed.',
 'p.label':'Performance','p.title':'Real-World Benchmarks','p.desc':'Tested on V100, A100, Hopper H800, and RTX 5090.',
 'p.m':'Model','p.fmt':'Format','p.sz':'Size','p.hw':'Hardware','p.sp':'Speed','p.note':'Note',
 'p.n1':'HW NVFP4','p.n2':'HW FP8','p.n3':'SW quant','p.n4':'SW NVFP4 (no HW)','p.n5':'SW FP4',
@@ -570,7 +547,6 @@ cn:{
 'hero.term':'终端','hero.cta1':'快速开始','hero.cta2':'查看 GitHub →','hero.cta3':'▶ 观看演示',
 'cp':'复制','cpd':'已复制!',
 'demo.label':'演示','demo.title':'一览即知','demo.desc':'观看 xInfer 运行 35B 模型，实时推理与工具调用。',
-'bt.new':'新','bt.msg':'V100 上运行 NVFP4 模型 + 4-bit KV 缓存 — 业内首次。',
 'f.label':'功能特性','f.title':'为速度与简洁而生',
 'f.desc':'生产级 LLM 推理所需的一切 — 无需 Python 依赖。',
 'f.1t':'零依赖','f.1d':'纯 Rust 后端 — 无需 PyTorch、CUDA Python 绑定或 Python 运行时。',
@@ -579,7 +555,6 @@ cn:{
 'f.4t':'跨平台','f.4d':'Linux 上 CUDA，macOS 上 Metal。同一二进制，同一 API。',
 'f.5t':'生产就绪','f.5d':'OpenAI/Anthropic API、内置 Web UI、MCP 工具、结构化输出。',
 'f.6t':'KV 压缩','f.6d':'TurboQuant 2–4 bit KV 缓存，上下文扩展最高 4.3 倍。',
-'f.7t':'V100 复兴','f.7d':'V100 上 NVFP4 + TurboQuant — 业界首创低位模型 + KV 缓存在旧 GPU 上运行。无需硬件 FP4 支持。',
 'p.label':'性能','p.title':'真实基准测试','p.desc':'在 V100、A100、Hopper H800 和 RTX 5090 上测试。',
 'p.m':'模型','p.fmt':'格式','p.sz':'大小','p.hw':'硬件','p.sp':'速度','p.note':'说明',
 'p.n1':'硬件 NVFP4','p.n2':'硬件 FP8','p.n3':'软件量化','p.n4':'软件 NVFP4 (无硬件加速)','p.n5':'软件 FP4',
@@ -616,14 +591,6 @@ function setLang(l){
 document.getElementById('b-en').onclick=function(){setLang('en')};
 document.getElementById('b-cn').onclick=function(){setLang('cn')};
 setLang(lang);
-
-/* ═══ V100 Banner Toggle ═══ */
-var v100t=document.getElementById('v100-toggle'),v100d=document.getElementById('v100-detail'),v100c=document.getElementById('v100-chevron'),v100open=false;
-if(v100t){v100t.onclick=function(){
-  v100open=!v100open;
-  if(v100open){v100d.style.maxHeight=v100d.scrollHeight+'px';v100c.style.transform='rotate(180deg)'}
-  else{v100d.style.maxHeight='0px';v100c.style.transform='rotate(0deg)'}
-}}
 
 /* ═══ Nav scroll ═══ */
 var nv=document.getElementById('nav');

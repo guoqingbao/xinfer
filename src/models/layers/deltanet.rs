@@ -859,18 +859,47 @@ impl GatedDeltaNet {
             };
 
             if self.num_k_heads != self.num_v_heads {
-                gdn::gated_delta_rule_recurrence_varlen_gqa(
-                    &q,
-                    &k,
-                    &v,
-                    &g,
-                    &beta,
-                    global_state,
-                    seq_slots,
-                    &cu_seqlens,
-                    self.scale as f32,
-                    recurrent_snapshots.as_ref(),
-                )?
+                let flashinfer_result = if !input_metadata.is_mtp_verify
+                    && crate::utils::env::sm90_lower_precision_gdn_prefill()
+                {
+                    #[cfg(all(feature = "cuda", feature = "flashinfer"))]
+                    {
+                        let g_exp = g.exp()?;
+                        gdn::gated_delta_rule_prefill_flashinfer_gqa(
+                            &q,
+                            &k,
+                            &v,
+                            &g_exp,
+                            &beta,
+                            global_state,
+                            seq_slots,
+                            &cu_seqlens,
+                            self.scale as f32,
+                        )?
+                    }
+                    #[cfg(not(all(feature = "cuda", feature = "flashinfer")))]
+                    {
+                        None
+                    }
+                } else {
+                    None
+                };
+                if let Some(out) = flashinfer_result {
+                    out
+                } else {
+                    gdn::gated_delta_rule_recurrence_varlen_gqa(
+                        &q,
+                        &k,
+                        &v,
+                        &g,
+                        &beta,
+                        global_state,
+                        seq_slots,
+                        &cu_seqlens,
+                        self.scale as f32,
+                        recurrent_snapshots.as_ref(),
+                    )?
+                }
             } else {
                 let q_scaled = (&q * self.scale)?;
                 gdn::gated_delta_rule_recurrence_varlen(
