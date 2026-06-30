@@ -137,7 +137,7 @@ Add `--kvcache-dtype` to compress KV cache and extend context length:
 * ✅ Qwen3.5/3.6 Dense/MoE (27B, 35B, 122B, 397B, Multimodal model)
 * ✅ Mistral v1, v2
 * ✅ Mistral-3-VL Reasoning (3B, 8B, 14B, Multimodal model)
-* ✅ GLM4 (0414, **Not ChatGLM**)
+* ✅ GLM4 (0414)
 * ✅ GLM4 MoE (4.6/4.7)
 * ✅ GLM4.7 Flash
 * ✅ GLM 5.2 (DeepSeek V3.2 DSA architecture)
@@ -219,8 +219,8 @@ xinfer --m olka-fi/Qwen3.5-4B-MXFP4
 # GGUF model (4-bit KvCache)
 xinfer --m unsloth/Qwen3.5-27B-GGUF --f Qwen3.5-27B-Q4_K_M.gguf --kvcache-dtype turbo4
 
-# GLM 5.2 GGUF (multi-shard, auto-detected from HF subfolder)
-xinfer --d 0,1,2,3 --m unsloth/GLM-5.2-GGUF --f UD-Q2_K_XL --kvcache-dtype fp8
+# Multi-shard 5.2 GGUF (auto-detected from HF subfolder)
+xinfer --d 0,1,2,3 --m unsloth/Qwen3.5-122B-A10B-GGUF --f Q3_K_M --kvcache-dtype fp8
 
 # FP8 on Metal
 xinfer --m Qwen/Qwen3.5-4B-FP8
@@ -231,11 +231,14 @@ xinfer --m unsloth/gemma-4-26b-a4b-it-NVFP4
 # MLA model (GLM4.7 Flash)
 xinfer --m GadflyII/GLM-4.7-Flash-NVFP4
 
-# GLM 5.2 (DeepSeek V3.2 architecture, FP8)
-xinfer --d 0,1,2,3 --m zai-org/GLM-5.2-FP8 --kvcache-dtype fp8
-
 # Interactive CLI chat
 xinfer --i --m unsloth/Qwen3.5-27B-GGUF --f Qwen3.5-27B-Q4_K_M.gguf
+
+# MultiNode: GLM 5.2 (DeepSeek V3.2 architecture, FP8)
+# Master node
+xinfer --d 0,1,2,3,4,5,6,7 --m zai-org/GLM-5.2-FP8 --num-nodes 2 --node-rank 0 --master-addr 192.168.xxx.xxx
+# Other node(s)
+xinfer --d 0,1,2,3,4,5,6,7 --m zai-org/GLM-5.2-FP8 --num-nodes 2 --node-rank 1 --master-addr 192.168.xxx.xxx
 ```
 
 <details>
@@ -259,7 +262,7 @@ xinfer --m /path/Qwen3-4B --isq q6k
 
 ```bash
 # Multi-GPU GGUF (model ID + subfolder)
-xinfer --d 0,1,2,3 --m unsloth/GLM-5.2-GGUF --f UD-Q2_K_XL
+xinfer --d 0,1,2,3 --m unsloth/Qwen3.5-122B-A10B-GGUF --f Q3_K_M
 
 # Remote GGUF — single-file model
 xinfer --m unsloth/Qwen3.5-27B-GGUF --f Qwen3.5-27B-Q4_K_M.gguf
@@ -268,7 +271,7 @@ xinfer --m unsloth/Qwen3.5-27B-GGUF --f Qwen3.5-27B-Q4_K_M.gguf
 xinfer --d 0,1 --m /path/Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf
 
 # Local GGUF folder
-xinfer --d 0,1,2,3 --m /path/to/GLM-5.2-GGUF/
+xinfer --d 0,1,2,3 --m /path/to/Qwen3.5-122B-A10B-GGUF/Q3_K_M
 ```
 
 </details>

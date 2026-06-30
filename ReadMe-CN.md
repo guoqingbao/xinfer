@@ -136,7 +136,7 @@ xinfer --w /home/Qwen3.6-35B-A3B --d 0,1 --ui-server --mtp 2
 * ✅ Qwen3.5/3.6 Dense/MoE 系列（27B、35B、122B、397B、多模态）
 * ✅ Mistral v1、v2
 * ✅ Mistral-3-VL Reasoning（3B、8B、14B、多模态）
-* ✅ GLM4（0414 版本，**非 ChatGLM**）
+* ✅ GLM4（0414 版本）
 * ✅ GLM4 MoE（4.6/4.7）
 * ✅ GLM4.7 Flash
 * ✅ GLM 5.2（DeepSeek V3.2 DSA 架构）
@@ -218,8 +218,8 @@ xinfer --m olka-fi/Qwen3.5-4B-MXFP4
 # GGUF 模型（4 位 KV 缓存）
 xinfer --m unsloth/Qwen3.5-27B-GGUF --f Qwen3.5-27B-Q4_K_M.gguf --kvcache-dtype turbo4
 
-# GLM 5.2 GGUF（多分片，自动检测 HF 子文件夹）
-xinfer --d 0,1,2,3 --m unsloth/GLM-5.2-GGUF --f UD-Q2_K_XL --kvcache-dtype fp8
+# GGUF 多分片（自动检测 HF 子文件夹）
+xinfer --d 0,1,2,3 --m unsloth/Qwen3.5-122B-A10B-GGUF --f Q3_K_M --kvcache-dtype fp8
 
 # FP8 Metal
 xinfer --m Qwen/Qwen3.5-4B-FP8
@@ -230,11 +230,14 @@ xinfer --m unsloth/gemma-4-26b-a4b-it-NVFP4
 # MLA 模型（GLM4.7 Flash）
 xinfer --m GadflyII/GLM-4.7-Flash-NVFP4
 
-# GLM 5.2（DeepSeek V3.2 架构，FP8）
-xinfer --d 0,1,2,3 --m zai-org/GLM-5.2-FP8 --kvcache-dtype fp8
-
 # 交互式 CLI 对话
 xinfer --i --m unsloth/Qwen3.5-27B-GGUF --f Qwen3.5-27B-Q4_K_M.gguf
+
+# 多节点推理: GLM 5.2（DeepSeek V3.2 架构，FP8）
+# 主节点
+xinfer --d 0,1,2,3,4,5,6,7 --m zai-org/GLM-5.2-FP8 --num-nodes 2 --node-rank 0 --master-addr 192.168.xxx.xxx
+# 次节点
+xinfer --d 0,1,2,3,4,5,6,7 --m zai-org/GLM-5.2-FP8 --num-nodes 2 --node-rank 1 --master-addr 192.168.xxx.xxx
 ```
 
 <details>
@@ -258,7 +261,7 @@ xinfer --m /path/Qwen3-4B --isq q6k
 
 ```bash
 # 多卡 GGUF（模型 ID + 子文件夹）
-xinfer --d 0,1,2,3 --m unsloth/GLM-5.2-GGUF --f UD-Q2_K_XL
+xinfer --d 0,1,2,3 --m unsloth/Qwen3.5-122B-A10B-GGUF --f Q3_K_M
 
 # 远程 GGUF — 单文件模型
 xinfer --m unsloth/Qwen3.5-27B-GGUF --f Qwen3.5-27B-Q4_K_M.gguf
@@ -267,7 +270,7 @@ xinfer --m unsloth/Qwen3.5-27B-GGUF --f Qwen3.5-27B-Q4_K_M.gguf
 xinfer --d 0,1 --m /path/Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf
 
 # 本地 GGUF 文件夹
-xinfer --d 0,1,2,3 --m /path/to/GLM-5.2-GGUF/
+xinfer --d 0,1,2,3 --m /path/to/Qwen3.5-122B-A10B-GGUF/Q3_K_M
 ```
 
 </details>
