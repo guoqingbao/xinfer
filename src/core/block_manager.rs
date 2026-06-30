@@ -412,6 +412,19 @@ impl BlockManager {
         }
 
         let cached_tokens = matched_blocks * self.block_size;
+        seq.mamba_prefix_warmup_tokens = None;
+        if self.mamba_prefix_enabled && matched_blocks == 0 && raw_matched_blocks > 0 {
+            let raw_cached_tokens = raw_matched_blocks * self.block_size;
+            if raw_cached_tokens > cached_tokens && raw_cached_tokens < tokens.len() {
+                seq.mamba_prefix_warmup_tokens = Some(raw_cached_tokens);
+                crate::log_info!(
+                    "Seq {}: scheduling mamba prefix warmup snapshot at {} cached tokens (raw {} blocks, no compatible mamba snapshot)",
+                    seq.id,
+                    raw_cached_tokens,
+                    raw_matched_blocks
+                );
+            }
+        }
         if matched_blocks > 0 {
             crate::log_info!(
                 "Prefix cache hit seq {} ({} cached tokens, {} blocks)",

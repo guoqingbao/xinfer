@@ -258,7 +258,7 @@ impl Scheduler {
                 break;
             }
 
-            let effective_tokens = std::cmp::min(chunk_size, seq.len() - seq.num_cached_tokens);
+            let effective_tokens = seq.prefill_chunk_tokens(chunk_size);
 
             if self.running.len() >= max_seqs_limit
                 || scheduled_ids.len() >= std::cmp::max(self.cfg.max_num_seqs, MIN_NUM_SCHEDULED_REQS)
@@ -768,7 +768,8 @@ impl Scheduler {
         for (i, id) in scheduled_ids.iter().enumerate() {
             if *id < self.running.len() {
                 let seq = &self.running[*id];
-                if seq.len() < chunk_size || seq.num_cached_tokens + chunk_size >= seq.len() {
+                let chunk_tokens = seq.prefill_chunk_tokens(chunk_size);
+                if chunk_tokens == 0 || seq.num_cached_tokens + chunk_tokens >= seq.len() {
                     let _ = self
                         .block_manager
                         .capture_mamba_prefix_state(seq, seq.len());
@@ -779,15 +780,16 @@ impl Scheduler {
                 } else {
                     let _ = self
                         .block_manager
-                        .capture_mamba_prefix_state(seq, seq.num_cached_tokens + chunk_size);
+                        .capture_mamba_prefix_state(seq, seq.num_cached_tokens + chunk_tokens);
                     remove_ids.push(seq.id);
                     let mut seq = seq.clone();
-                    seq.num_cached_tokens += chunk_size;
+                    seq.num_cached_tokens += chunk_tokens;
                     // The active mamba slot already contains the state at this
                     // chunk boundary. Keep the captured snapshot available for
                     // other requests, but do not force this in-progress request
                     // to revalidate it on the next scheduling pass.
                     seq.mamba_prefix_hash = None;
+                    seq.clear_mamba_prefix_warmup();
                     seq.status = SequenceStatus::Waiting;
                     chunked_info.push((
                         seq.id,

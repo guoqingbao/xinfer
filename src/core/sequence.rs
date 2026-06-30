@@ -39,6 +39,8 @@ pub struct Sequence {
     pub block_table: Vec<u32>,
     pub num_cached_tokens: usize,
     pub mamba_prefix_hash: Option<u64>,
+    #[serde(skip)]
+    pub mamba_prefix_warmup_tokens: Option<usize>,
     pub last_token: u32,
     pub block_size: usize,
     pub sampling_params: SamplingParams,
@@ -171,6 +173,7 @@ impl Sequence {
             block_table: Vec::new(),
             num_cached_tokens: 0,
             mamba_prefix_hash: None,
+            mamba_prefix_warmup_tokens: None,
             sampling_params,
             block_size,
             last_token: *token_ids.last().unwrap_or(&0),
@@ -212,6 +215,41 @@ impl Sequence {
         self.num_cached_tokens / self.block_size
     }
 
+    pub fn prefill_chunk_tokens(&self, default_chunk_size: usize) -> usize {
+        let remaining = self.len().saturating_sub(self.num_cached_tokens);
+        if remaining == 0 {
+            return 0;
+        }
+        if self.num_cached_tokens == 0 {
+            if let Some(target_tokens) = self.mamba_prefix_warmup_tokens {
+                if target_tokens > self.num_cached_tokens && target_tokens < self.len() {
+                    return (target_tokens - self.num_cached_tokens).min(default_chunk_size);
+                }
+            }
+        }
+        remaining.min(default_chunk_size)
+    }
+
+    pub fn clear_mamba_prefix_warmup(&mut self) {
+        self.mamba_prefix_warmup_tokens = None;
+    }
+
+    pub fn clone_for_prefill_forward(&self) -> Self {
+        let mut seq = self.clone();
+        if self.num_cached_tokens == 0 {
+            if let Some(target_tokens) = self.mamba_prefix_warmup_tokens {
+                if target_tokens > self.num_cached_tokens && target_tokens < self.len() {
+                    seq.token_ids.truncate(target_tokens);
+                    if let Some(&last_token) = seq.token_ids.last() {
+                        seq.last_token = last_token;
+                    }
+                }
+            }
+        }
+        seq.clear_mamba_prefix_warmup();
+        seq
+    }
+
     pub fn append_token(&mut self, token: u32) {
         self.token_ids.push(token);
         self.output_ids.push(token);
@@ -234,5 +272,84 @@ impl Sequence {
 
     pub fn clear_block_table(&mut self) {
         self.block_table.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Sequence;
+    use crate::utils::config::SamplingParams;
+
+    fn test_sequence(len: usize) -> Sequence {
+        Sequence::new(
+            (0..len as u32).collect(),
+            64,
+            SamplingParams::default(),
+            &None,
+            -1,
+        )
+    }
+
+    #[test]
+    fn prefill_chunk_tokens_uses_mamba_warmup_boundary() {
+        let mut seq = test_sequence(20_000);
+        seq.num_cached_tokens = 0;
+        seq.mamba_prefix_warmup_tokens = Some(5_824);
+
+        assert_eq!(seq.prefill_chunk_tokens(8_192), 5_824);
+
+        seq.num_cached_tokens = 5_824;
+        assert_eq!(seq.prefill_chunk_tokens(8_192), 8_192);
+    }
+
+    #[test]
+    fn prefill_chunk_tokens_ignores_invalid_mamba_warmup_boundary() {
+        let mut seq = test_sequence(10_000);
+        seq.num_cached_tokens = 4_096;
+        seq.mamba_prefix_warmup_tokens = Some(4_096);
+
+        assert_eq!(seq.prefill_chunk_tokens(8_192), 5_904);
+
+        seq.mamba_prefix_warmup_tokens = Some(12_000);
+        assert_eq!(seq.prefill_chunk_tokens(8_192), 5_904);
+    }
+
+    #[test]
+    fn clone_for_prefill_forward_truncates_to_mamba_warmup_boundary() {
+        let mut seq = test_sequence(10_000);
+        seq.num_cached_tokens = 0;
+        seq.mamba_prefix_warmup_tokens = Some(5_824);
+
+        let forward = seq.clone_for_prefill_forward();
+
+        assert_eq!(forward.len(), 5_824);
+        assert_eq!(forward.last_token, 5_823);
+        assert_eq!(forward.prefill_chunk_tokens(8_192), 5_824);
+        assert_eq!(seq.len(), 10_000);
+    }
+
+    #[test]
+    fn clone_for_prefill_forward_ignores_warmup_after_cached_prefix() {
+        let mut seq = test_sequence(10_000);
+        seq.num_cached_tokens = 8_192;
+        seq.mamba_prefix_warmup_tokens = Some(8_320);
+
+        let forward = seq.clone_for_prefill_forward();
+
+        assert_eq!(seq.prefill_chunk_tokens(8_192), 1_808);
+        assert_eq!(forward.len(), 10_000);
+        assert_eq!(forward.prefill_chunk_tokens(8_192), 1_808);
+    }
+
+    #[test]
+    fn mamba_warmup_boundary_is_not_serialized() {
+        let mut seq = test_sequence(10_000);
+        seq.mamba_prefix_warmup_tokens = Some(5_824);
+
+        let encoded = bincode::serialize(&seq).unwrap();
+        let decoded: Sequence = bincode::deserialize(&encoded).unwrap();
+
+        assert_eq!(decoded.len(), seq.len());
+        assert_eq!(decoded.mamba_prefix_warmup_tokens, None);
     }
 }

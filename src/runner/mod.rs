@@ -291,9 +291,19 @@ pub fn receive_local(stream: &mut LocalStream, use_json: bool) -> std::io::Resul
     stream.read_exact(&mut serialized)?;
 
     let message: MessageType = if use_json {
-        serde_json::from_slice(&serialized).expect("JSON deserialization failed")
+        serde_json::from_slice(&serialized).map_err(|err| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("JSON deserialization failed: {err}"),
+            )
+        })?
     } else {
-        bincode::deserialize(&serialized).expect("Bincode deserialization failed")
+        bincode::deserialize(&serialized).map_err(|err| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Bincode deserialization failed: {err}"),
+            )
+        })?
     };
 
     // Send acknowledgment

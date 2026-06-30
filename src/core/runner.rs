@@ -1251,8 +1251,7 @@ impl ModelRunner {
         let chunk_size = self.config.effective_prefill_chunk_size();
         let mut max_context_len = 0;
         for (seq_idx, seq) in seqs.iter().enumerate() {
-            let seqlen = seq.len();
-            let num_tokens = std::cmp::min(chunk_size, seqlen - seq.num_cached_tokens);
+            let num_tokens = seq.prefill_chunk_tokens(chunk_size);
             input_ids
                 .extend(&seq.token_ids[seq.num_cached_tokens..seq.num_cached_tokens + num_tokens]);
             positions.extend(

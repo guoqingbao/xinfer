@@ -1011,7 +1011,16 @@ impl LLMEngine {
         }
 
         let seqs = self.scheduler.get_sequences(&scheduled_ids);
-        let owned_seqs: Vec<Sequence> = seqs.iter().map(|s| (*s).clone()).collect();
+        let owned_seqs: Vec<Sequence> = seqs
+            .iter()
+            .map(|s| {
+                if is_prefill {
+                    s.clone_for_prefill_forward()
+                } else {
+                    (*s).clone()
+                }
+            })
+            .collect();
         Ok(Some((scheduled_ids, is_prefill, owned_seqs)))
     }
 
