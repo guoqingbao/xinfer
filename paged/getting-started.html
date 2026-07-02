@@ -1,0 +1,332 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>快速开始 — xInfer</title>
+  <link rel="icon" href="assets/images/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="assets/css/main.css?v=1">
+</head>
+<body>
+
+<header class="site-header"><div class="header-inner"><a href="index.html" class="logo"><img src="assets/images/logo.svg" alt="xInfer"><span>xInfer</span></a><nav class="nav-links"><a href="index.html" data-zh="首页" data-en="Home">首页</a><a href="getting-started.html" data-zh="快速开始" data-en="Getting Started">快速开始</a><a href="user-guide.html" data-zh="使用指南" data-en="User Guide">使用指南</a><a href="developer-guide.html" data-zh="开发指南" data-en="Developer Guide">开发指南</a><a href="api-reference.html" data-zh="API 参考" data-en="API Reference">API 参考</a></nav><div class="nav-actions"><button class="lang-toggle" aria-label="Switch language">EN</button><div class="theme-dropdown"><select class="theme-select" aria-label="Select theme"><option value="dark">🌙 Dark</option><option value="light">☀️ Light</option><option value="enflame">🔥 Enflame</option></select></div><a href="https://github.com/guoqingbao/xinfer" class="btn btn-sm btn-page" target="_blank">GitHub</a><button class="mobile-toggle" aria-label="Menu"><span></span><span></span><span></span></button></div></div></header>
+<div class="scroll-progress"></div>
+<div class="search-overlay"><div class="search-box"><div class="search-input-wrapper"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg><input type="text" class="search-input" placeholder="Search documentation... (Ctrl+K)"></div><div class="search-results"><div class="search-hint">Type to search documentation...</div></div></div></div>
+
+<div class="page-header">
+  <div class="container">
+    <h1 data-zh="快速开始" data-en="Getting Started">快速开始</h1>
+    <p data-zh="从零开始，在几分钟内运行你的第一个本地 LLM。" data-en="Go from zero to running your first local LLM in minutes.">从零开始，在几分钟内运行你的第一个本地 LLM。</p>
+  </div>
+</div>
+
+<section class="section">
+  <div class="container">
+    <div class="doc-layout">
+      <nav class="doc-sidebar">
+        <div class="doc-sidebar-group">
+          <h4 data-zh="准备工作" data-en="Prerequisites">准备工作</h4>
+          <a href="#prerequisites" data-zh="系统要求" data-en="System Requirements">系统要求</a>
+          <a href="#hardware" data-zh="硬件要求" data-en="Hardware">硬件要求</a>
+        </div>
+        <div class="doc-sidebar-group">
+          <h4 data-zh="安装" data-en="Installation">安装</h4>
+          <a href="#install-script" data-zh="一键安装" data-en="One-Line Install">一键安装</a>
+          <a href="#npm" data-zh="npm 安装" data-en="npm Install">npm 安装</a>
+          <a href="#build-source" data-zh="源码编译" data-en="Build from Source">源码编译</a>
+          <a href="#docker" data-zh="Docker" data-en="Docker">Docker</a>
+          <a href="#python-wheel" data-zh="Python 轮子" data-en="Python Wheel">Python 轮子</a>
+        </div>
+        <div class="doc-sidebar-group">
+          <h4 data-zh="首次运行" data-en="First Run">首次运行</h4>
+          <a href="#first-run" data-zh="启动模型" data-en="Launch a Model">启动模型</a>
+          <a href="#test-api" data-zh="测试 API" data-en="Test the API">测试 API</a>
+          <a href="#web-ui" data-zh="Web UI" data-en="Web UI">Web UI</a>
+          <a href="#more-formats" data-zh="更多示例" data-en="More Examples">更多示例</a>
+          <a href="#agent-integrations" data-zh="Agent 集成" data-en="Agent Integrations">Agent 集成</a>
+          <a href="#build-features" data-zh="编译特性" data-en="Build Features">编译特性</a>
+        </div>
+      </nav>
+      <div class="doc-content">
+
+        <h2 id="prerequisites" data-zh="系统要求" data-en="System Requirements">系统要求</h2>
+        <div class="table-wrapper">
+          <table>
+            <thead><tr><th data-zh="组件" data-en="Component">组件</th><th data-zh="要求" data-en="Requirement">要求</th></tr></thead>
+            <tbody>
+              <tr><td data-zh="操作系统" data-en="OS">操作系统</td><td data-zh="Linux (CUDA)、Windows (CUDA) 或 macOS (Metal)" data-en="Linux (CUDA), Windows (CUDA), or macOS (Metal)">Linux (CUDA)、Windows (CUDA) 或 macOS (Metal)</td></tr>
+              <tr><td data-zh="Rust 工具链" data-en="Rust Toolchain">Rust 工具链</td><td data-zh="Rust 1.75+（仅源码编译需要）" data-en="Rust 1.75+ (source build only)">Rust 1.75+（仅源码编译需要）</td></tr>
+              <tr><td>CUDA</td><td data-zh="11.x / 12.x / 13.0（Linux/Windows GPU）" data-en="11.x / 12.x / 13.0 (Linux/Windows GPU)">11.x / 12.x / 13.0（Linux/Windows GPU）</td></tr>
+              <tr><td>Python</td><td data-zh="3.8+（仅 Python 绑定需要）" data-en="3.8+ (Python bindings only)">3.8+（仅 Python 绑定需要）</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="hardware" data-zh="硬件要求" data-en="Hardware Requirements">硬件要求</h2>
+        <div class="table-wrapper">
+          <table>
+            <thead><tr><th data-zh="平台" data-en="Platform">平台</th><th data-zh="最低 GPU" data-en="Minimum GPU">最低 GPU</th><th data-zh="推荐" data-en="Recommended">推荐</th></tr></thead>
+            <tbody>
+              <tr><td>CUDA</td><td data-zh="SM70+ (V100) 8GB+" data-en="SM70+ (V100) 8GB+">SM70+ (V100) 8GB+</td><td data-zh="SM90 (H100) / RTX 5090 用于 FP8/NVFP4/DeepGEMM" data-en="SM90 (H100) / RTX 5090 for FP8/NVFP4/DeepGEMM">SM90 (H100) / RTX 5090</td></tr>
+              <tr><td>Metal</td><td data-zh="Apple Silicon M1+，8GB+" data-en="Apple Silicon M1+, 8GB+">Apple Silicon M1+，8GB+</td><td data-zh="M4 Pro/Max 推荐" data-en="M4 Pro/Max recommended">M4 Pro/Max 推荐</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="install-script" data-zh="一键安装" data-en="One-Line Install">一键安装</h2>
+        <p data-zh="自动检测平台，安装预编译二进制、DEB 包或 Python 包：" data-en="Auto-detects platform. Installs pre-built binary, DEB package, or Python package:">自动检测平台，安装预编译二进制、DEB 包或 Python 包：</p>
+        <pre><code><span class="token-comment">$</span> <span class="token-keyword">curl</span> <span class="token-flag">-sSL</span> <span class="token-string">https://guoqingbao.github.io/xinfer/install.sh</span> | <span class="token-keyword">bash</span></code><button class="copy-btn" data-copy-text="curl -sSL https://guoqingbao.github.io/xinfer/install.sh | bash">Copy</button></pre>
+
+        <h2 id="npm" data-zh="npm 安装" data-en="npm Install">npm 安装</h2>
+        <pre><code><span class="token-keyword">npm</span> install <span class="token-flag">-g</span> <span class="token-string">xinfer-ai</span></code><button class="copy-btn" data-copy-text="npm install -g xinfer-ai">Copy</button></pre>
+
+        <h2 id="build-source" data-zh="源码编译" data-en="Build from Source">源码编译</h2>
+        <div class="tabs">
+          <button class="tab-btn active" data-tab="tab-cuda" data-zh="CUDA (Linux)" data-en="CUDA (Linux)">CUDA (Linux)</button>
+          <button class="tab-btn" data-tab="tab-metal" data-zh="Metal (macOS)" data-en="Metal (macOS)">Metal (macOS)</button>
+        </div>
+        <div class="tab-content active" id="tab-cuda">
+          <pre><code><span class="token-comment"># 安装 Rust 工具链</span>
+<span class="token-keyword">curl</span> <span class="token-flag">--proto</span> <span class="token-string">'=https'</span> <span class="token-flag">--tlsv1.2</span> <span class="token-flag">-sSf</span> <span class="token-string">https://sh.rustup.rs</span> | <span class="token-keyword">sh</span>
+
+<span class="token-comment"># SM70/SM75 (V100)：移除 flashinfer,cutlass 特性</span>
+<span class="token-keyword">cargo</span> install <span class="token-flag">--git</span> <span class="token-string">https://github.com/guoqingbao/xinfer</span> xinfer \
+  <span class="token-flag">--features</span> <span class="token-string">cuda,nccl,flashinfer,cutlass</span></code><button class="copy-btn" data-copy-text="cargo install --git https://github.com/guoqingbao/xinfer xinfer --features cuda,nccl,flashinfer,cutlass">Copy</button></pre>
+        </div>
+        <div class="tab-content" id="tab-metal">
+          <pre><code><span class="token-keyword">cargo</span> build <span class="token-flag">--release</span> <span class="token-flag">--features</span> <span class="token-string">metal</span></code><button class="copy-btn" data-copy-text="cargo build --release --features metal">Copy</button></pre>
+        </div>
+
+        <div class="callout-info">
+          <div class="callout-title" data-zh="💡 提示" data-en="💡 Tip">💡 提示</div>
+          <p data-zh="SM70/SM75 GPU（V100、T4）请移除 flashinfer 和 cutlass 特性。SM80+（A100）支持全部特性。SM90+（H100）额外支持 CUTLASS FP8 和 DeepGEMM。" data-en="SM70/SM75 GPUs (V100, T4): remove flashinfer and cutlass features. SM80+ (A100) supports all features. SM90+ (H100) adds CUTLASS FP8 and DeepGEMM.">SM70/SM75 GPU（V100、T4）请移除 flashinfer 和 cutlass 特性。SM80+（A100）支持全部特性。SM90+（H100）额外支持 CUTLASS FP8 和 DeepGEMM。</p>
+        </div>
+
+        <h2 id="docker" data-zh="Docker 部署" data-en="Docker">Docker 部署</h2>
+        <p data-zh="使用脚本或命令行构建 Docker 镜像。可自定义特性、算力版本和 CUDA 版本：" data-en="Build Docker images with script or command line. Customize features, compute capability, and CUDA version:">构建 Docker 镜像：</p>
+        <pre><code><span class="token-comment"># 通过脚本构建（指定特性、SM 版本、CUDA 版本）</span>
+<span class="token-keyword">./build_docker.sh</span> <span class="token-string">"cuda,nccl,flashinfer,python"</span> <span class="token-value">sm_80</span> <span class="token-number">12.9.0</span>
+
+<span class="token-comment"># 或通过 docker build 命令</span>
+<span class="token-keyword">docker</span> build <span class="token-flag">--network=host</span> <span class="token-flag">-f</span> <span class="token-string">"Dockerfile"</span> <span class="token-flag">-t</span> <span class="token-string">"xinfer:latest"</span> \
+  <span class="token-flag">--build-arg</span> <span class="token-flag">CUDA_VERSION</span>=<span class="token-string">"12.9.0"</span> \
+  <span class="token-flag">--build-arg</span> <span class="token-flag">WITH_FEATURES</span>=<span class="token-string">"cuda,nccl,flashinfer,cutlass,python"</span> \
+  <span class="token-flag">--build-arg</span> <span class="token-flag">CUDA_COMPUTE_CAP</span>=<span class="token-string">"sm_80"</span> .</code><button class="copy-btn" data-copy-text='./build_docker.sh "cuda,nccl,flashinfer,python" sm_80 12.9.0'>Copy</button></pre>
+        <p data-zh="运行 Docker 容器：" data-en="Run Docker containers:">运行容器：</p>
+        <pre><code><span class="token-comment"># 查看帮助</span>
+<span class="token-keyword">docker</span> run <span class="token-flag">--rm -it --gpus all --network host</span> xinfer:latest <span class="token-keyword">xinfer</span> <span class="token-flag">--help</span>
+
+<span class="token-comment"># API 服务器（确保使用 --network host）</span>
+<span class="token-keyword">docker</span> run <span class="token-flag">--rm -it --gpus all --network host</span> xinfer:latest \
+  <span class="token-keyword">xinfer</span> <span class="token-flag">--m</span> <span class="token-string">Qwen/Qwen3-0.6B</span> <span class="token-flag">--server</span>
+
+<span class="token-comment"># 交互式 + 挂载本地模型</span>
+<span class="token-keyword">docker</span> run <span class="token-flag">--rm -it --gpus all --network host</span> <span class="token-flag">-v</span> <span class="token-string">/data:/data</span> xinfer:latest bash
+<span class="token-keyword">xinfer</span> <span class="token-flag">--m</span> <span class="token-string">/data/Qwen3-Coder-30B-A3B-FP8</span> <span class="token-flag">--ui-server</span></code><button class="copy-btn" data-copy-text="docker run --rm -it --gpus all --network host xinfer:latest xinfer --m Qwen/Qwen3-0.6B --server">Copy</button></pre>
+
+        <h2 id="python-wheel" data-zh="Python 轮子" data-en="Python Wheel">Python 轮子</h2>
+        <pre><code><span class="token-keyword">pip</span> install maturin maturin[patchelf]
+<span class="token-keyword">./build.sh</span> <span class="token-flag">--release</span> <span class="token-flag">--features</span> <span class="token-string">cuda,nccl,flashinfer,cutlass,python</span>
+<span class="token-keyword">pip</span> install target/wheels/xinfer*.whl <span class="token-flag">--force-reinstall</span></code><button class="copy-btn" data-copy-text="pip install maturin maturin[patchelf]
+./build.sh --release --features cuda,nccl,flashinfer,cutlass,python
+pip install target/wheels/xinfer*.whl --force-reinstall">Copy</button></pre>
+
+        <h2 id="first-run" data-zh="启动模型" data-en="Launch a Model">启动模型</h2>
+        <ol class="steps">
+          <li class="step-item">
+            <h3 data-zh="Rust CLI 启动" data-en="Rust CLI Launch">Rust CLI 启动</h3>
+            <pre><code><span class="token-comment"># FP8 模型 + Web UI + TurboQuant</span>
+<span class="token-keyword">xinfer</span> <span class="token-flag">--m</span> <span class="token-string">Qwen/Qwen3.6-27B-FP8</span> <span class="token-flag">--kvcache-dtype</span> <span class="token-value">turbo4</span> <span class="token-flag">--ui-server</span>
+
+<span class="token-comment"># GGUF 模型</span>
+<span class="token-keyword">xinfer</span> <span class="token-flag">--m</span> <span class="token-string">unsloth/Qwen3.5-27B-GGUF</span> <span class="token-flag">--f</span> <span class="token-string">Qwen3.5-27B-Q4_K_M.gguf</span> <span class="token-flag">--ui-server</span></code><button class="copy-btn" data-copy-text="xinfer --m Qwen/Qwen3.6-27B-FP8 --kvcache-dtype turbo4 --ui-server">Copy</button></pre>
+          </li>
+          <li class="step-item">
+            <h3 data-zh="Python 启动" data-en="Python Launch">Python 启动</h3>
+            <pre><code><span class="token-keyword">python3</span> <span class="token-flag">-m</span> <span class="token-string">xinfer.server</span> <span class="token-flag">--m</span> <span class="token-string">Qwen/Qwen3.6-27B-FP8</span> <span class="token-flag">--kvcache-dtype</span> <span class="token-value">turbo4</span> <span class="token-flag">--ui-server</span></code><button class="copy-btn" data-copy-text="python3 -m xinfer.server --m Qwen/Qwen3.6-27B-FP8 --kvcache-dtype turbo4 --ui-server">Copy</button></pre>
+          </li>
+        </ol>
+
+        <h2 id="test-api" data-zh="测试 API" data-en="Test the API">测试 API</h2>
+        <p data-zh="服务启动后，默认监听 http://localhost:8000：" data-en="Once running, the server defaults to http://localhost:8000:">服务启动后，默认监听 <code>http://localhost:8000</code>：</p>
+        <pre><code><span class="token-keyword">curl</span> <span class="token-string">http://localhost:8000/v1/chat/completions</span> \
+  <span class="token-flag">-H</span> <span class="token-string">"Content-Type: application/json"</span> \
+  <span class="token-flag">-d</span> <span class="token-string">'{
+  "model": "default",
+  "messages": [{"role": "user", "content": "Hello!"}],
+  "max_tokens": 128,
+  "stream": true
+}'</span></code><button class="copy-btn" data-copy-text='curl http://localhost:8000/v1/chat/completions -H "Content-Type: application/json" -d &apos;{"model":"default","messages":[{"role":"user","content":"Hello!"}],"max_tokens":128,"stream":true}&apos;'>Copy</button></pre>
+
+        <h2 id="web-ui" data-zh="Web UI" data-en="Web UI">Web UI</h2>
+        <p data-zh="添加 --ui-server 标志启动内置 ChatGPT 风格 Web UI。API 端口 8000，UI 端口 8001。" data-en="Add --ui-server to launch the built-in ChatGPT-style Web UI. API on port 8000, UI on port 8001.">添加 <code>--ui-server</code> 标志启动内置 ChatGPT 风格 Web UI。API 端口 8000，UI 端口 8001。</p>
+
+        <h2 id="more-formats" data-zh="更多运行示例" data-en="More Run Examples">更多运行示例</h2>
+
+        <h3 data-zh="GGUF 模型加载" data-en="GGUF Model Loading">GGUF 模型加载</h3>
+        <p data-zh="GGUF 支持多种加载模式——单文件、本地目录自动检测、远程 HuggingFace 仓库子目录：" data-en="GGUF supports multiple loading modes — single file, local directory auto-detection, remote HuggingFace repo subfolders:">GGUF 支持多种加载模式：</p>
+        <pre><code><span class="token-comment"># 本地 GGUF 单文件</span>
+<span class="token-keyword">xinfer</span> <span class="token-flag">--m</span> <span class="token-string">/path/model-Q4_K_M.gguf</span>
+
+<span class="token-comment"># 本地 GGUF 目录（自动检测最大 .gguf 文件，多分片自动发现）</span>
+<span class="token-keyword">xinfer</span> <span class="token-flag">--m</span> <span class="token-string">/path/GLM-5.2-GGUF/</span> <span class="token-flag">--ui-server</span>
+
+<span class="token-comment"># 远程 GGUF 单文件（从 HuggingFace 下载）</span>
+<span class="token-keyword">xinfer</span> <span class="token-flag">--m</span> <span class="token-string">unsloth/Qwen3-0.6B-GGUF</span> <span class="token-flag">--f</span> <span class="token-string">Qwen3-0.6B-Q4_K_M.gguf</span>
+
+<span class="token-comment"># 远程 GGUF 子目录（自动检测多分片文件）</span>
+<span class="token-keyword">xinfer</span> <span class="token-flag">--d</span> <span class="token-number">0,1,2,3</span> <span class="token-flag">--m</span> <span class="token-string">unsloth/GLM-5.2-GGUF</span> <span class="token-flag">--f</span> <span class="token-string">UD-Q2_K_XL</span></code><button class="copy-btn" data-copy-text="xinfer --m /path/model-Q4_K_M.gguf">Copy</button></pre>
+
+        <h3 data-zh="ISQ 在线量化" data-en="ISQ On-the-fly Quantization">ISQ 在线量化</h3>
+        <p data-zh="从 Safetensors 权重实时量化为 GGUF，无需预下载量化模型：" data-en="Quantize Safetensors weights to GGUF on-the-fly without pre-downloading:">实时量化为 GGUF：</p>
+        <pre><code><span class="token-comment"># ISQ Q4K + FP8 KV 缓存</span>
+<span class="token-keyword">xinfer</span> <span class="token-flag">--m</span> <span class="token-string">Qwen/Qwen3.6-35B-A3B</span> <span class="token-flag">--isq</span> <span class="token-value">q4k</span> <span class="token-flag">--kvcache-dtype</span> <span class="token-value">fp8</span>
+
+<span class="token-comment"># ISQ Q4K + TurboQuant</span>
+<span class="token-keyword">xinfer</span> <span class="token-flag">--m</span> <span class="token-string">Qwen/Qwen3.6-35B-A3B</span> <span class="token-flag">--isq</span> <span class="token-value">q4k</span> <span class="token-flag">--kvcache-dtype</span> <span class="token-value">turbo4</span>
+
+<span class="token-comment"># Metal ISQ</span>
+<span class="token-keyword">xinfer</span> <span class="token-flag">--m</span> <span class="token-string">/path/Qwen3-4B</span> <span class="token-flag">--isq</span> <span class="token-value">q6k</span></code><button class="copy-btn" data-copy-text="xinfer --m Qwen/Qwen3.6-35B-A3B --isq q4k --kvcache-dtype turbo4">Copy</button></pre>
+
+        <h3 data-zh="多模态模型" data-en="Multimodal Models">多模态模型</h3>
+        <p data-zh="视觉语言模型支持通过 Web UI 上传图片或 API 发送 image_url/base64：" data-en="Vision-language models support image uploads via Web UI or image_url/base64 via API:">视觉语言模型：</p>
+        <pre><code><span class="token-comment"># Qwen3.6 35B MoE 多模态 (FP8)</span>
+<span class="token-keyword">xinfer</span> <span class="token-flag">--m</span> <span class="token-string">Qwen/Qwen3.6-35B-A3B-FP8</span> <span class="token-flag">--ui-server</span>
+
+<span class="token-comment"># Qwen3-VL 8B (GGUF)</span>
+<span class="token-keyword">xinfer</span> <span class="token-flag">--m</span> <span class="token-string">unsloth/Qwen3-VL-8B-Instruct-GGUF</span> <span class="token-flag">--f</span> <span class="token-string">Qwen3-VL-8B-Instruct-Q8_0.gguf</span> <span class="token-flag">--ui-server</span>
+
+<span class="token-comment"># Gemma4 26B MoE 多模态 (NVFP4)</span>
+<span class="token-keyword">xinfer</span> <span class="token-flag">--m</span> <span class="token-string">unsloth/gemma-4-26b-a4b-it-NVFP4</span> <span class="token-flag">--ui-server</span>
+
+<span class="token-comment"># Mistral-3 VL 3B (BF16)</span>
+<span class="token-keyword">xinfer</span> <span class="token-flag">--m</span> <span class="token-string">mistralai/Ministral-3-3B</span> <span class="token-flag">--ui-server</span></code><button class="copy-btn" data-copy-text="xinfer --m Qwen/Qwen3.6-35B-A3B-FP8 --ui-server">Copy</button></pre>
+        <div class="callout-info">
+          <div class="callout-title" data-zh="📸 GGUF 视觉模型" data-en="📸 GGUF Vision Models">📸 GGUF 视觉模型</div>
+          <p data-zh="对于 GGUF 多模态模型，将 mmproj-*.gguf 视觉塔文件放在主模型文件同目录下，会自动检测。" data-en="For GGUF multimodal models, place the mmproj-*.gguf vision tower file in the same directory as the main model file — it will be auto-detected.">GGUF 多模态模型的 mmproj 文件会自动检测。</p>
+        </div>
+
+        <h3 data-zh="交互式 CLI" data-en="Interactive CLI">交互式 CLI</h3>
+        <pre><code><span class="token-keyword">xinfer</span> <span class="token-flag">--i</span> <span class="token-flag">--m</span> <span class="token-string">unsloth/Qwen3.5-27B-GGUF</span> <span class="token-flag">--f</span> <span class="token-string">Qwen3.5-27B-Q4_K_M.gguf</span></code><button class="copy-btn" data-copy-text="xinfer --i --m unsloth/Qwen3.5-27B-GGUF --f Qwen3.5-27B-Q4_K_M.gguf">Copy</button></pre>
+
+        <h2 id="agent-integrations" data-zh="Agent 集成" data-en="Agent Integrations">Agent 集成</h2>
+        <p data-zh="xInfer 作为 OpenAI/Anthropic 兼容后端，已验证支持多个 AI Agent 框架。启动 xInfer 后只需配置 Base URL 即可接入：" data-en="xInfer as an OpenAI/Anthropic-compatible backend works with multiple AI Agent frameworks. Just start xInfer and configure the Base URL:">启动 xInfer 后配置 Base URL 接入 Agent：</p>
+        <div class="tabs">
+          <button class="tab-btn active" data-tab="tab-gs-xbot" data-zh="xbot" data-en="xbot">xbot</button>
+          <button class="tab-btn" data-tab="tab-gs-claude" data-zh="Claude Code" data-en="Claude Code">Claude Code</button>
+          <button class="tab-btn" data-tab="tab-gs-opencode" data-zh="OpenCode" data-en="OpenCode">OpenCode</button>
+          <button class="tab-btn" data-tab="tab-gs-goose" data-zh="Goose" data-en="Goose">Goose</button>
+          <button class="tab-btn" data-tab="tab-gs-kilo" data-zh="Kilo Code" data-en="Kilo Code">Kilo Code</button>
+        </div>
+        <div class="tab-content active" id="tab-gs-xbot">
+          <pre><code><span class="token-comment"># 1) 启动 xInfer</span>
+<span class="token-keyword">xinfer</span> <span class="token-flag">--m</span> <span class="token-string">Qwen/Qwen3.6-27B-FP8</span>
+
+<span class="token-comment"># 2) 安装 xbot</span>
+<span class="token-keyword">npm</span> install <span class="token-flag">-g</span> <span class="token-string">@trusted-ai/xbot</span>
+
+<span class="token-comment"># 3) 配置 (选择 custom, Base URL: http://localhost:8000/v1/)</span>
+<span class="token-keyword">xbot</span> config <span class="token-flag">--provider</span>
+
+<span class="token-comment"># 4) 使用</span>
+<span class="token-keyword">xbot</span> repl</code><button class="copy-btn" data-copy-text="npm install -g @trusted-ai/xbot && xbot config --provider">Copy</button></pre>
+        </div>
+        <div class="tab-content" id="tab-gs-claude">
+          <pre><code><span class="token-comment"># 1) 启动 xInfer（Anthropic 兼容端点）</span>
+<span class="token-keyword">xinfer</span> <span class="token-flag">--m</span> <span class="token-string">Qwen/Qwen3-Coder-Next-FP8</span> <span class="token-flag">--server</span> <span class="token-flag">--d</span> <span class="token-number">0,1</span>
+
+<span class="token-comment"># 2) 配置 Claude Code</span>
+<span class="token-keyword">export</span> <span class="token-flag">ANTHROPIC_BASE_URL</span>=<span class="token-string">"http://127.0.0.1:8000"</span>
+<span class="token-keyword">export</span> <span class="token-flag">ANTHROPIC_AUTH_TOKEN</span>=<span class="token-string">"sk-dummy"</span>
+<span class="token-keyword">export</span> <span class="token-flag">CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC</span>=<span class="token-number">1</span>
+
+<span class="token-comment"># 或在 ~/.claude/settings.json 中持久化</span>
+{
+  <span class="token-flag">"env"</span>: {
+    <span class="token-flag">"ANTHROPIC_BASE_URL"</span>: <span class="token-string">"http://127.0.0.1:8000"</span>,
+    <span class="token-flag">"ANTHROPIC_MODEL"</span>: <span class="token-string">"default"</span>,
+    <span class="token-flag">"ANTHROPIC_AUTH_TOKEN"</span>: <span class="token-string">"sk-dummy"</span>
+  }
+}
+
+<span class="token-comment"># 3) 启动</span>
+<span class="token-keyword">claude</span></code><button class="copy-btn" data-copy-text='export ANTHROPIC_BASE_URL="http://127.0.0.1:8000" && export ANTHROPIC_AUTH_TOKEN="sk-dummy" && claude'>Copy</button></pre>
+        </div>
+        <div class="tab-content" id="tab-gs-opencode">
+          <pre><code><span class="token-comment"># 安装</span>
+<span class="token-keyword">curl</span> <span class="token-flag">-fsSL</span> <span class="token-string">https://opencode.ai/install</span> | <span class="token-keyword">bash</span>
+
+<span class="token-comment"># 配置 ~/.config/opencode/config.json</span>
+{
+  <span class="token-flag">"provider"</span>: {
+    <span class="token-flag">"xinfer"</span>: {
+      <span class="token-flag">"npm"</span>: <span class="token-string">"@ai-sdk/openai-compatible"</span>,
+      <span class="token-flag">"name"</span>: <span class="token-string">"xInfer Local"</span>,
+      <span class="token-flag">"options"</span>: { <span class="token-flag">"baseURL"</span>: <span class="token-string">"http://localhost:8000/v1"</span> },
+      <span class="token-flag">"models"</span>: { <span class="token-flag">"qwen3-coder"</span>: { <span class="token-flag">"name"</span>: <span class="token-string">"Qwen3 Coder"</span> } }
+    }
+  },
+  <span class="token-flag">"model"</span>: <span class="token-string">"xinfer/qwen3-coder"</span>
+}
+
+<span class="token-comment"># 启动</span>
+<span class="token-keyword">opencode</span></code><button class="copy-btn" data-copy-text='curl -fsSL https://opencode.ai/install | bash'>Copy</button></pre>
+        </div>
+        <div class="tab-content" id="tab-gs-goose">
+          <pre><code><span class="token-comment"># 安装 (https://block.github.io/goose/)</span>
+<span class="token-keyword">export</span> <span class="token-flag">VLLM_API_KEY</span>=<span class="token-string">"empty"</span>
+
+<span class="token-comment"># 配置 (Custom Providers → OpenAI Compatible)</span>
+<span class="token-keyword">goose</span> configure
+<span class="token-comment"># Provider: xinfer, URL: http://127.0.0.1:8000/v1/, Models: default</span>
+
+<span class="token-comment"># 启动</span>
+<span class="token-keyword">goose</span></code><button class="copy-btn" data-copy-text='export VLLM_API_KEY="empty" && goose configure'>Copy</button></pre>
+        </div>
+        <div class="tab-content" id="tab-gs-kilo">
+          <pre><code><span class="token-comment"># 安装</span>
+<span class="token-keyword">npm</span> install <span class="token-flag">-g</span> <span class="token-string">@kilocode/cli</span>
+
+<span class="token-comment"># 配置 ~/.config/kilo/config.json (同 OpenCode 格式)</span>
+
+<span class="token-comment"># 启动</span>
+<span class="token-keyword">kilo</span></code><button class="copy-btn" data-copy-text="npm install -g @kilocode/cli">Copy</button></pre>
+        </div>
+        <div class="callout-info">
+          <div class="callout-title" data-zh="💡 Qwen Coder 模型" data-en="💡 Qwen Coder Models">💡 Qwen Coder 模型</div>
+          <p data-zh="对于 Qwen Coder 模型，推荐使用 --enforce-parser qwen_coder 以获得最可靠的工具调用解析。所有 Agent 都支持 XINFER_CHAT_LOGGER=1 环境变量用于调试。" data-en="For Qwen Coder models, use --enforce-parser qwen_coder for the most reliable tool call parsing. All agents support XINFER_CHAT_LOGGER=1 for debugging.">Qwen Coder 推荐 --enforce-parser qwen_coder。</p>
+        </div>
+
+        <h2 id="build-features" data-zh="编译特性矩阵" data-en="Build Feature Matrix">编译特性矩阵</h2>
+        <div class="table-wrapper">
+          <table>
+            <thead><tr><th data-zh="特性" data-en="Feature">特性</th><th data-zh="说明" data-en="Description">说明</th><th data-zh="GPU 要求" data-en="GPU">GPU 要求</th></tr></thead>
+            <tbody>
+              <tr><td><code>cuda</code></td><td data-zh="CUDA 后端（必需）" data-en="CUDA backend (required)">CUDA 后端</td><td>SM70+</td></tr>
+              <tr><td><code>nccl</code></td><td data-zh="多 GPU 通信（多卡必需）" data-en="Multi-GPU communication">多 GPU 通信</td><td>SM70+</td></tr>
+              <tr><td><code>flashinfer</code></td><td data-zh="FlashInfer 注意力后端" data-en="FlashInfer attention backend">FlashInfer</td><td>SM80+</td></tr>
+              <tr><td><code>cutlass</code></td><td data-zh="CUTLASS FP8/DeepGEMM 后端" data-en="CUTLASS FP8/DeepGEMM backend">CUTLASS</td><td>SM80+</td></tr>
+              <tr><td><code>flashattn</code></td><td data-zh="Flash Attention 2/3 后端" data-en="Flash Attention 2/3 backend">Flash Attn</td><td>SM80+</td></tr>
+              <tr><td><code>metal</code></td><td data-zh="Apple Metal 后端" data-en="Apple Metal backend">Metal</td><td>Apple M1+</td></tr>
+              <tr><td><code>python</code></td><td data-zh="PyO3 Python 绑定" data-en="PyO3 Python bindings">Python 绑定</td><td>—</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout-warning">
+          <div class="callout-title" data-zh="⚠️ SM70/SM75 注意" data-en="⚠️ SM70/SM75 Note">⚠️ SM70/SM75 注意</div>
+          <p data-zh="V100 / T4 用户编译时请移除 flashinfer 和 cutlass 特性，它们需要 SM80+。编译命令：cargo install --git ... xinfer --features cuda,nccl" data-en="V100 / T4 users: remove flashinfer and cutlass features (require SM80+). Build: cargo install --git ... xinfer --features cuda,nccl">V100 / T4 用户请移除 flashinfer 和 cutlass 特性。</p>
+        </div>
+
+        <div class="callout-success">
+          <div class="callout-title" data-zh="✅ 完成" data-en="✅ Done">✅ 完成</div>
+          <p data-zh="恭喜！你已成功运行了 xInfer。接下来查看使用指南了解高级配置。" data-en="Congratulations! You've launched xInfer. Check the User Guide for advanced configuration.">恭喜！你已成功运行了 xInfer。接下来查看<a href="user-guide.html" data-zh="使用指南" data-en="User Guide">使用指南</a>了解高级配置。</p>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<footer class="site-footer"><div class="container"><div class="footer-grid"><div class="footer-brand"><a href="index.html" class="logo"><img src="assets/images/logo.svg" alt="xInfer"><span>xInfer</span></a><p data-zh="纯 Rust 构建的极速 LLM 推理引擎。" data-en="Blazing-fast LLM inference in pure Rust.">纯 Rust 构建的极速 LLM 推理引擎。</p></div><div class="footer-col"><h4 data-zh="文档" data-en="Docs">文档</h4><a href="getting-started.html" data-zh="快速开始" data-en="Getting Started">快速开始</a><a href="user-guide.html" data-zh="使用指南" data-en="User Guide">使用指南</a><a href="developer-guide.html" data-zh="开发指南" data-en="Developer Guide">开发指南</a><a href="api-reference.html" data-zh="API 参考" data-en="API Reference">API 参考</a></div><div class="footer-col"><h4 data-zh="资源" data-en="Resources">资源</h4><a href="https://github.com/guoqingbao/xinfer" target="_blank" data-zh="GitHub 仓库" data-en="GitHub Repo">GitHub 仓库</a><a href="https://www.npmjs.com/package/xinfer-ai" target="_blank" data-zh="npm 包" data-en="npm Package">npm 包</a></div><div class="footer-col"><h4 data-zh="社区" data-en="Community">社区</h4><a href="https://github.com/guoqingbao/xinfer/issues" target="_blank" data-zh="报告问题" data-en="Report Issue">报告问题</a></div></div><div class="footer-bottom"><span data-zh="MIT 许可证 © 2024 xInfer Team" data-en="MIT License © 2024 xInfer Team">MIT 许可证 © 2024 xInfer Team</span><span data-zh="由 Candle ML 框架驱动" data-en="Powered by Candle ML Framework">由 Candle ML 框架驱动</span></div></div></footer>
+<script src="assets/js/main.js?v=1"></script>
+</body>
+</html>

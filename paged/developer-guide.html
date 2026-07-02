@@ -1,0 +1,331 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>开发指南 — xInfer</title>
+  <link rel="icon" href="assets/images/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="assets/css/main.css?v=1">
+</head>
+<body>
+
+<header class="site-header"><div class="header-inner"><a href="index.html" class="logo"><img src="assets/images/logo.svg" alt="xInfer"><span>xInfer</span></a><nav class="nav-links"><a href="index.html" data-zh="首页" data-en="Home">首页</a><a href="getting-started.html" data-zh="快速开始" data-en="Getting Started">快速开始</a><a href="user-guide.html" data-zh="使用指南" data-en="User Guide">使用指南</a><a href="developer-guide.html" data-zh="开发指南" data-en="Developer Guide">开发指南</a><a href="api-reference.html" data-zh="API 参考" data-en="API Reference">API 参考</a></nav><div class="nav-actions"><button class="lang-toggle" aria-label="Switch language">EN</button><div class="theme-dropdown"><select class="theme-select" aria-label="Select theme"><option value="dark">🌙 Dark</option><option value="light">☀️ Light</option><option value="enflame">🔥 Enflame</option></select></div><a href="https://github.com/guoqingbao/xinfer" class="btn btn-sm btn-page" target="_blank">GitHub</a><button class="mobile-toggle" aria-label="Menu"><span></span><span></span><span></span></button></div></div></header>
+<div class="scroll-progress"></div>
+<div class="search-overlay"><div class="search-box"><div class="search-input-wrapper"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg><input type="text" class="search-input" placeholder="Search documentation... (Ctrl+K)"></div><div class="search-results"><div class="search-hint">Type to search documentation...</div></div></div></div>
+
+<div class="page-header">
+  <div class="container">
+    <h1 data-zh="开发指南" data-en="Developer Guide">开发指南</h1>
+    <p data-zh="了解 xInfer 的架构设计、如何作为 Rust crate 集成、以及如何贡献代码。" data-en="Understand xInfer's architecture, use it as a Rust crate, and contribute code.">了解 xInfer 的架构设计、如何作为 Rust crate 集成、以及如何贡献代码。</p>
+  </div>
+</div>
+
+<section class="section">
+  <div class="container">
+    <div class="doc-layout">
+      <nav class="doc-sidebar">
+        <div class="doc-sidebar-group">
+          <h4 data-zh="架构" data-en="Architecture">架构</h4>
+          <a href="#overview" data-zh="架构概览" data-en="Overview">架构概览</a>
+          <a href="#pipeline" data-zh="推理流水线" data-en="Inference Pipeline">推理流水线</a>
+        </div>
+        <div class="doc-sidebar-group">
+          <h4 data-zh="集成" data-en="Integration">集成</h4>
+          <a href="#rust-crate" data-zh="Rust Crate 使用" data-en="Rust Crate">Rust Crate 使用</a>
+          <a href="#crate-api" data-zh="Crate API 示例" data-en="Crate API">Crate API 示例</a>
+        </div>
+        <div class="doc-sidebar-group">
+          <h4 data-zh="贡献" data-en="Contributing">贡献</h4>
+          <a href="#contributing" data-zh="贡献指南" data-en="Contributing">贡献指南</a>
+          <a href="#adding-models" data-zh="添加新模型" data-en="Adding Models">添加新模型</a>
+          <a href="#check-model" data-zh="兼容性检查" data-en="Check Model">兼容性检查</a>
+          <a href="#test-model" data-zh="模型测试" data-en="Test Model">模型测试</a>
+          <a href="#agent-integrations" data-zh="Agent 集成" data-en="Agent Integrations">Agent 集成</a>
+        </div>
+      </nav>
+      <div class="doc-content">
+
+        <h2 id="overview" data-zh="架构概览" data-en="Architecture Overview">架构概览</h2>
+        <p data-zh="xInfer 采用分层架构，从 API 层到硬件后端，每一层职责清晰：" data-en="xInfer uses a layered architecture with clear separation of concerns from API to hardware:">xInfer 采用分层架构设计：</p>
+        <div class="diagram-container reveal">
+          <div class="arch-diagram">
+            <div class="arch-layer layer-api" data-zh="🌐 API 层 — OpenAI/Anthropic 兼容 REST + Web UI + MCP" data-en="🌐 API Layer — OpenAI/Anthropic REST + Web UI + MCP">🌐 API 层 — OpenAI/Anthropic 兼容 REST + Web UI + MCP</div>
+            <div class="arch-arrow">↕</div>
+            <div class="arch-layer layer-engine" data-zh="⚙️ 推理引擎 — 连续批处理、流式生成、引导解码" data-en="⚙️ Inference Engine — Continuous batching, streaming, guided decoding">⚙️ 推理引擎 — 连续批处理、流式生成、引导解码</div>
+            <div class="arch-arrow">↕</div>
+            <div class="arch-layer layer-scheduler" data-zh="📋 调度器 — PagedAttention、KV 缓存管理、TurboQuant" data-en="📋 Scheduler — PagedAttention, KV cache, TurboQuant">📋 调度器 — PagedAttention、KV 缓存管理、TurboQuant</div>
+            <div class="arch-arrow">↕</div>
+            <div class="arch-layer layer-backend" data-zh="🔧 计算后端 — Flash Attention / FlashInfer / DeepGEMM / Candle" data-en="🔧 Compute Backend — Flash Attention / FlashInfer / DeepGEMM / Candle">🔧 计算后端 — Flash Attention / FlashInfer / DeepGEMM / Candle</div>
+            <div class="arch-arrow">↕</div>
+            <div class="arch-layer layer-hardware" data-zh="🖥️ 硬件层 — CUDA (SM70+) / Metal (Apple Silicon) / NCCL 多 GPU" data-en="🖥️ Hardware — CUDA (SM70+) / Metal (Apple Silicon) / NCCL Multi-GPU">🖥️ 硬件层 — CUDA (SM70+) / Metal (Apple Silicon) / NCCL 多 GPU</div>
+          </div>
+        </div>
+
+        <h2 id="pipeline" data-zh="推理流水线" data-en="Inference Pipeline">推理流水线</h2>
+        <p data-zh="请求的完整生命周期——从 HTTP 请求到流式 Token 输出：" data-en="Full lifecycle of a request — from HTTP request to streamed token output:">请求的完整生命周期：</p>
+        <div class="pipeline-flow">
+          <div class="pipeline-stage reveal">
+            <div class="pipeline-stage-icon">🌐</div>
+            <div class="pipeline-stage-body">
+              <h4 data-zh="① 请求接入" data-en="① Request Ingestion">① 请求接入</h4>
+              <p data-zh="HTTP 请求通过 OpenAI 兼容端点 (/v1/chat/completions) 或 Anthropic 兼容端点 (/v1/messages) 进入。MCP 工具定义自动注入系统提示。" data-en="HTTP requests enter via OpenAI-compatible (/v1/chat/completions) or Anthropic-compatible (/v1/messages) endpoints. MCP tool definitions auto-injected into system prompt.">HTTP 请求通过 API 端点进入。MCP 工具自动注入。</p>
+            </div>
+          </div>
+          <div class="pipeline-arrow">▼</div>
+          <div class="pipeline-stage reveal">
+            <div class="pipeline-stage-icon">📝</div>
+            <div class="pipeline-stage-body">
+              <h4 data-zh="② 分词和模板" data-en="② Tokenization & Templating">② 分词和模板</h4>
+              <p data-zh="应用模型特定的 chat template（Jinja2）并使用 tokenizers 分词。结构化输出约束在此阶段组合 grammar。reasoning_effort 可附加推理前缀。" data-en="Model-specific chat template (Jinja2) applied, then tokenized. Structured output constraints compose grammar at this stage. reasoning_effort appends reasoning prefix.">应用 chat template → 分词 → grammar 组合。</p>
+            </div>
+          </div>
+          <div class="pipeline-arrow">▼</div>
+          <div class="pipeline-stage reveal">
+            <div class="pipeline-stage-icon">📦</div>
+            <div class="pipeline-stage-body">
+              <h4 data-zh="③ 连续批处理 + PagedAttention" data-en="③ Continuous Batching + PagedAttention">③ 连续批处理</h4>
+              <p data-zh="调度器将请求组合成动态批次。PagedAttention 分页管理 KV 缓存（按 64-token block 对齐）。前缀缓存自动查找最长匹配前缀并复用 KV 块。TurboQuant (2-4 bit WHT 压缩) 进一步扩展上下文容量。" data-en="Scheduler batches requests dynamically. PagedAttention manages KV cache in 64-token blocks. Prefix cache auto-finds longest matching prefix. TurboQuant (2-4 bit WHT compression) extends context capacity.">调度 → PagedAttention → 前缀缓存 → TurboQuant。</p>
+            </div>
+          </div>
+          <div class="pipeline-arrow">▼</div>
+          <div class="pipeline-stage reveal">
+            <div class="pipeline-stage-icon">⚡</div>
+            <div class="pipeline-stage-body">
+              <h4 data-zh="④ 前向传播（多后端）" data-en="④ Forward Pass (Multi-Backend)">④ 前向传播</h4>
+              <p data-zh="通过选定的注意力后端执行：FlashInfer (SM80+)、Flash Attention 2/3、DeepGEMM (Hopper)。CUDA Graph 捕获常见 batch size (1–32) 的计算图消除 kernel launch 开销。PD 分离模式下预填充和解码分配到不同 GPU。MTP 模式每次前向传播预测多个 Token。" data-en="Executed via selected attention backend: FlashInfer (SM80+), Flash Attention 2/3, DeepGEMM (Hopper). CUDA Graphs capture batch 1-32 to eliminate launch overhead. PD disagg splits prefill/decode across GPUs. MTP predicts multiple tokens per forward pass.">FlashInfer / FlashAttn / DeepGEMM → CUDA Graph → PD → MTP。</p>
+            </div>
+          </div>
+          <div class="pipeline-arrow">▼</div>
+          <div class="pipeline-stage reveal">
+            <div class="pipeline-stage-icon">🎯</div>
+            <div class="pipeline-stage-body">
+              <h4 data-zh="⑤ 采样 + 引导解码" data-en="⑤ Sampling + Guided Decoding">⑤ 采样 + 引导解码</h4>
+              <p data-zh="支持 temperature / top-p / top-k / min-p / repetition penalty 采样。llguidance 库通过 compute_mask → mask logits → apply penalties → sample → commit_token 循环约束输出。支持 JSON Schema、正则、Lark 语法、选择、结构标签约束。失败时 fail-soft 降级。" data-en="Supports temperature / top-p / top-k / min-p / repetition penalty. llguidance library constrains output via compute_mask → mask logits → apply penalties → sample → commit_token loop. Supports JSON Schema, regex, Lark grammar, choice, structural tags. Fail-soft on errors.">采样 → mask → penalties → llguidance 约束。</p>
+            </div>
+          </div>
+          <div class="pipeline-arrow">▼</div>
+          <div class="pipeline-stage reveal">
+            <div class="pipeline-stage-icon">📡</div>
+            <div class="pipeline-stage-body">
+              <h4 data-zh="⑥ 流式响应 + 工具解析" data-en="⑥ Streaming + Tool Parsing">⑥ 流式响应</h4>
+              <p data-zh="Token 通过 SSE 流式返回客户端。工具调用解析器使用状态机：正常状态 → 检测开始标记 → 缓冲 → 解析结构化工具调用 → finish_reason='tool_calls'。在推理块 (&lt;think&gt;) 和代码块内不检测工具调用。" data-en="Tokens streamed via SSE. Tool parser state machine: normal → detect start token → buffer → parse structured tool calls → finish_reason='tool_calls'. Tool calls not detected inside reasoning or code blocks.">SSE 流式 → 工具解析状态机 → 返回客户端。</p>
+            </div>
+          </div>
+        </div>
+
+        <h2 id="rust-crate" data-zh="Rust Crate 使用" data-en="Using as a Rust Crate">Rust Crate 使用</h2>
+        <p data-zh="xInfer 可以作为 Rust 库集成到你的项目中：" data-en="xInfer can be integrated into your Rust project as a library crate:">xInfer 可以作为 Rust 库集成：</p>
+        <pre><code><span class="token-comment"># Cargo.toml</span>
+[dependencies]
+<span class="token-keyword">xinfer</span> = { git = <span class="token-string">"https://github.com/guoqingbao/xinfer"</span>, features = [<span class="token-string">"cuda"</span>] }</code><button class="copy-btn" data-copy-text='xinfer = { git = "https://github.com/guoqingbao/xinfer", features = ["cuda"] }'>Copy</button></pre>
+
+        <h2 id="crate-api" data-zh="Crate API 示例" data-en="Crate API Examples">Crate API 示例</h2>
+
+        <h3 data-zh="文本生成" data-en="Text Generation">文本生成</h3>
+        <pre><code><span class="token-keyword">use</span> <span class="token-type">xinfer</span>::api::{EngineBuilder, ModelRepo};
+<span class="token-keyword">use</span> <span class="token-type">xinfer</span>::server::{ChatMessage, MessageContentType};
+<span class="token-keyword">use</span> <span class="token-type">xinfer</span>::utils::{config::SamplingParams, log_throughput};
+
+<span class="token-keyword">fn</span> <span class="token-value">main</span>() -> <span class="token-type">anyhow::Result</span>&lt;()&gt; {
+    <span class="token-keyword">let mut</span> engine =
+        <span class="token-type">EngineBuilder</span>::new(<span class="token-type">ModelRepo</span>::ModelID((<span class="token-string">"google/gemma-3-4b-it"</span>, None))).build()?;
+
+    <span class="token-keyword">let</span> messages = vec![<span class="token-type">ChatMessage</span> {
+        role: <span class="token-string">"user"</span>.to_string(),
+        content: <span class="token-type">MessageContentType</span>::PureText(<span class="token-string">"Say hello from the Rust API."</span>.to_string()),
+    }];
+
+    <span class="token-keyword">let</span> params = <span class="token-type">SamplingParams</span>::default();
+    <span class="token-keyword">let</span> output = engine.generate(params, messages)?;
+    println!(<span class="token-string">"\n\n{}"</span>, output.decode_output);
+    log_throughput(&vec![output]);
+}</code><button class="copy-btn" data-copy-text='use xinfer::api::{EngineBuilder, ModelRepo};
+use xinfer::server::{ChatMessage, MessageContentType};
+use xinfer::utils::{config::SamplingParams, log_throughput};
+
+fn main() -> anyhow::Result<()> {
+    let mut engine = EngineBuilder::new(ModelRepo::ModelID(("google/gemma-3-4b-it", None))).build()?;
+    let messages = vec![ChatMessage { role: "user".to_string(), content: MessageContentType::PureText("Say hello.".to_string()) }];
+    let output = engine.generate(SamplingParams::default(), messages)?;
+    println!("{}", output.decode_output);
+}'>Copy</button></pre>
+
+        <h3 data-zh="多模态请求（图片 URL）" data-en="Multimodal Request (Image URL)">多模态请求</h3>
+        <pre><code><span class="token-keyword">use</span> <span class="token-type">xinfer</span>::api::{EngineBuilder, ModelRepo};
+<span class="token-keyword">use</span> <span class="token-type">xinfer</span>::server::{ChatMessage, MessageContent, MessageContentType};
+<span class="token-keyword">use</span> <span class="token-type">xinfer</span>::utils::config::SamplingParams;
+
+<span class="token-keyword">fn</span> <span class="token-value">main</span>() -> <span class="token-type">candle_core::Result</span>&lt;()&gt; {
+    <span class="token-keyword">let mut</span> engine = <span class="token-type">EngineBuilder</span>::new(<span class="token-type">ModelRepo</span>::ModelID((
+        <span class="token-string">"Qwen/Qwen3-VL-8B-Instruct"</span>.to_string(), None,
+    ))).build()?;
+
+    <span class="token-keyword">let</span> messages = vec![<span class="token-type">ChatMessage</span> {
+        role: <span class="token-string">"user"</span>.to_string(),
+        content: <span class="token-type">MessageContentType</span>::Multi(vec![
+            <span class="token-type">MessageContent</span>::Text { text: <span class="token-string">"Describe this image:"</span>.to_string() },
+            <span class="token-type">MessageContent</span>::ImageUrl {
+                image_url: <span class="token-string">"https://example.com/cat.png"</span>.to_string(),
+            },
+        ]),
+    }];
+
+    <span class="token-keyword">let</span> output = engine.generate(<span class="token-type">SamplingParams</span>::default(), messages)?;
+    println!(<span class="token-string">"{}"</span>, output.decode_output);
+    <span class="token-type">Ok</span>(())
+}</code><button class="copy-btn" data-copy-text='use xinfer::api::{EngineBuilder, ModelRepo};
+use xinfer::server::{ChatMessage, MessageContent, MessageContentType};
+
+fn main() -> candle_core::Result<()> {
+    let mut engine = EngineBuilder::new(ModelRepo::ModelID(("Qwen/Qwen3-VL-8B-Instruct".to_string(), None))).build()?;
+    let messages = vec![ChatMessage { role: "user".to_string(), content: MessageContentType::Multi(vec![MessageContent::Text { text: "Describe:".to_string() }, MessageContent::ImageUrl { image_url: "https://example.com/cat.png".to_string() }]) }];
+    let output = engine.generate(SamplingParams::default(), messages)?;
+    println!("{}", output.decode_output);
+    Ok(())
+}'>Copy</button></pre>
+
+        <h3 data-zh="启动 API 服务器" data-en="Start API Server">启动 API 服务器</h3>
+        <pre><code><span class="token-keyword">use</span> <span class="token-type">xinfer</span>::api::{EngineBuilder, ModelRepo};
+
+<span class="token-keyword">fn</span> <span class="token-value">main</span>() -> <span class="token-type">candle_core::Result</span>&lt;()&gt; {
+    <span class="token-keyword">let mut</span> engine = <span class="token-type">EngineBuilder</span>::new(<span class="token-type">ModelRepo</span>::ModelID((
+        <span class="token-string">"Qwen/Qwen3-0.6B"</span>.to_string(), None,
+    ))).build()?;
+
+    engine.start_server(<span class="token-number">8000</span>, <span class="token-keyword">true</span>, <span class="token-keyword">false</span>)?;
+    <span class="token-type">Ok</span>(())
+}</code><button class="copy-btn" data-copy-text='use xinfer::api::{EngineBuilder, ModelRepo};
+fn main() -> candle_core::Result<()> {
+    let mut engine = EngineBuilder::new(ModelRepo::ModelID(("Qwen/Qwen3-0.6B".to_string(), None))).build()?;
+    engine.start_server(8000, true, false)?;
+    Ok(())
+}'>Copy</button></pre>
+
+        <h3 data-zh="多 GPU (Rust API)" data-en="Multi-GPU (Rust API)">多 GPU (Rust API)</h3>
+        <pre><code><span class="token-keyword">use</span> <span class="token-type">xinfer</span>::api::{EngineBuilder, ModelRepo};
+
+<span class="token-keyword">fn</span> <span class="token-value">main</span>() -> <span class="token-type">candle_core::Result</span>&lt;()&gt; {
+    <span class="token-keyword">let mut</span> engine = <span class="token-type">EngineBuilder</span>::new(<span class="token-type">ModelRepo</span>::ModelFile(vec![
+        <span class="token-string">"/path/Qwen3-VL-8B-Instruct-GGUF-Q4_KM.gguf"</span>.to_string(),
+    ]))
+    .with_multirank(<span class="token-string">"0,1"</span>)?
+    .build()?;
+
+    engine.start_server(<span class="token-number">8000</span>, <span class="token-keyword">true</span>, <span class="token-keyword">true</span>)?;
+    <span class="token-type">Ok</span>(())
+}</code><button class="copy-btn" data-copy-text='use xinfer::api::{EngineBuilder, ModelRepo};
+fn main() -> candle_core::Result<()> {
+    let mut engine = EngineBuilder::new(ModelRepo::ModelFile(vec!["/path/model.gguf".to_string()])).with_multirank("0,1")?.build()?;
+    engine.start_server(8000, true, true)?;
+    Ok(())
+}'>Copy</button></pre>
+
+        <h2 id="contributing" data-zh="贡献指南" data-en="Contributing">贡献指南</h2>
+        <ol class="steps">
+          <li class="step-item">
+            <h3 data-zh="Fork 和克隆" data-en="Fork & Clone">Fork 和克隆</h3>
+            <pre><code><span class="token-keyword">git</span> clone <span class="token-string">https://github.com/YOUR_USER/xinfer.git</span>
+<span class="token-keyword">cd</span> xinfer</code></pre>
+          </li>
+          <li class="step-item">
+            <h3 data-zh="创建分支" data-en="Create Branch">创建分支</h3>
+            <pre><code><span class="token-keyword">git</span> checkout <span class="token-flag">-b</span> <span class="token-string">feature/my-feature</span></code></pre>
+          </li>
+          <li class="step-item">
+            <h3 data-zh="编译和测试" data-en="Build & Test">编译和测试</h3>
+            <pre><code><span class="token-keyword">cargo</span> build <span class="token-flag">--features</span> <span class="token-string">cuda</span>
+<span class="token-keyword">cargo</span> test
+<span class="token-keyword">cargo</span> fmt <span class="token-flag">--check</span>
+<span class="token-keyword">cargo</span> clippy <span class="token-flag">--</span> <span class="token-flag">-D</span> warnings</code></pre>
+          </li>
+          <li class="step-item">
+            <h3 data-zh="提交 PR" data-en="Submit PR">提交 PR</h3>
+            <p data-zh="推送到 Fork 并创建 Pull Request，描述你的更改和测试。" data-en="Push to your fork and create a Pull Request describing changes and tests.">推送到 Fork 并创建 Pull Request。</p>
+          </li>
+        </ol>
+
+        <h2 id="adding-models" data-zh="添加新模型（AI 辅助）" data-en="Adding New Models (AI-Assisted)">添加新模型（AI 辅助）</h2>
+        <p data-zh="xInfer 提供 Cursor Agent Skill，指导 AI 编码助手完成适配新模型的完整流程。覆盖 Safetensors/GGUF 格式、Dense/MoE 架构、多种量化格式（MXFP4、FP8、ISQ 等）。" data-en="xInfer ships with a Cursor Agent Skill that guides AI coding assistants through adapting new model architectures. Covers Safetensors/GGUF formats, Dense/MoE architectures, and quantization formats (MXFP4, FP8, ISQ, etc.).">AI 辅助添加模型：</p>
+        <div class="table-wrapper">
+          <table>
+            <thead><tr><th data-zh="阶段" data-en="Phase">阶段</th><th data-zh="说明" data-en="Description">说明</th></tr></thead>
+            <tbody>
+              <tr><td>0 — <span data-zh="收集信息" data-en="Gather Info">收集信息</span></td><td data-zh="收集模型配置、权重张量信息和 GGUF 元数据" data-en="Collect model config, weight tensor info, and GGUF metadata">收集模型信息</td></tr>
+              <tr><td>1 — <span data-zh="分析" data-en="Analyze">分析</span></td><td data-zh="与现有模型比较，识别最近模板，分类为 Dense/MoE/Hybrid/Multimodal" data-en="Compare against existing models, identify closest template, classify as Dense/MoE/Hybrid/Multimodal">架构分析</td></tr>
+              <tr><td>2 — <span data-zh="内核" data-en="Kernels">内核</span></td><td data-zh="判断是否需要 CUDA + Metal 新内核（在 attention.rs 中）" data-en="Determine if new CUDA + Metal kernels needed in attention.rs">内核检查</td></tr>
+              <tr><td>3 — <span data-zh="实现" data-en="Implement">实现</span></td><td data-zh="创建 src/models/<arch>.rs，处理 HF 和 GGUF 权重路径" data-en="Create src/models/<arch>.rs, handle HF and GGUF weight paths">模型实现</td></tr>
+              <tr><td>4 — <span data-zh="注册" data-en="Register">注册</span></td><td data-zh="注册到 mod.rs、config.rs、utils/mod.rs、runner.rs" data-en="Wire into mod.rs, config.rs, utils/mod.rs, runner.rs">模型注册</td></tr>
+              <tr><td>5 — <span data-zh="编译" data-en="Build">编译</span></td><td data-zh="使用正确的平台特性编译并修复所有错误/警告" data-en="Compile with correct features and fix all errors/warnings">编译测试</td></tr>
+              <tr><td>6 — <span data-zh="验证" data-en="Check">验证</span></td><td data-zh="验证张量格式、量化一致性和多 GPU TP 整除性" data-en="Validate tensor format, quantization consistency, multi-GPU TP divisibility">质量验证</td></tr>
+              <tr><td>7 — <span data-zh="测试" data-en="Test">测试</span></td><td data-zh="启动服务器，发送 OpenAI 兼容请求，调试常见问题" data-en="Start server, send OpenAI requests, debug common issues">端到端测试</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <h3 data-zh="支持的配置" data-en="Supported Configurations">支持的配置</h3>
+        <div class="table-wrapper">
+          <table>
+            <thead><tr><th data-zh="维度" data-en="Dimension">维度</th><th data-zh="支持类型" data-en="Supported">支持类型</th></tr></thead>
+            <tbody>
+              <tr><td data-zh="格式" data-en="Format">格式</td><td>Safetensors (HF), GGUF, GPTQ, AWQ</td></tr>
+              <tr><td data-zh="架构" data-en="Architecture">架构</td><td>Dense, MoE, Hybrid MoE, Multimodal (VL)</td></tr>
+              <tr><td data-zh="量化" data-en="Quantization">量化</td><td>ISQ (Q4K, Q8_0...), FP8, MXFP4, NVFP4, GPTQ, AWQ</td></tr>
+              <tr><td data-zh="注意力" data-en="Attention">注意力</td><td>GQA, MQA, MHA, Sliding Window, MLA</td></tr>
+              <tr><td data-zh="平台" data-en="Platform">平台</td><td>CUDA (Linux/Windows), Metal (macOS)</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <pre><code><span class="token-comment"># 在 Cursor 中让 Agent 添加模型</span>
+<span class="token-string">Add support for the model google/gemma-4-26B-A4B-it</span>
+<span class="token-comment"># 或提供本地路径</span>
+<span class="token-string">Add support for the model at /path/to/my-model/</span></code></pre>
+
+        <h2 id="check-model" data-zh="模型兼容性检查" data-en="Model Compatibility Check">模型兼容性检查</h2>
+        <p data-zh="xInfer 提供 AI 辅助的模型兼容性检查 Skill，在加载前验证配置正确性、权重张量格式、量化一致性和多 GPU TP 整除性。" data-en="xInfer provides an AI-assisted model compatibility check skill that validates config correctness, weight tensor format, quantization consistency, and multi-GPU TP divisibility before loading.">AI 辅助的兼容性检查：</p>
+        <pre><code><span class="token-comment"># 在 Cursor 中</span>
+<span class="token-string">Check this model: https://huggingface.co/AxionML/Qwen3.5-27B-NVFP4/blob/main/config.json</span>
+<span class="token-comment"># 或检查本地模型</span>
+<span class="token-string">Check the model at /data/Qwen3.5-122B-A10B-NVFP4/ for 4-GPU loading</span></code></pre>
+        <div class="table-wrapper">
+          <table>
+            <thead><tr><th data-zh="检查项" data-en="Check">检查项</th><th data-zh="说明" data-en="Description">说明</th></tr></thead>
+            <tbody>
+              <tr><td data-zh="张量格式" data-en="Tensor Format">张量格式</td><td data-zh="验证每种量化格式的张量命名和形状（BF16, FP8, NVFP4, MXFP4）" data-en="Verify tensor naming and shapes for each quant format (BF16, FP8, NVFP4, MXFP4)">验证量化格式张量</td></tr>
+              <tr><td data-zh="量化忽略列表" data-en="Quant Ignore List">量化忽略列表</td><td data-zh="混合精度模型的忽略层验证（字面路径、正则、glob 通配符）" data-en="Verify ignore list for mixed-precision models (literal, regex, glob)">混合精度忽略列表</td></tr>
+              <tr><td data-zh="多 GPU 整除性" data-en="Multi-Rank Divisibility">多 GPU 整除性</td><td data-zh="测试 TP 在 1/2/4/8 GPU 上的整除性（Q/KV heads, MoE, FP8 block 对齐）" data-en="Test TP divisibility for 1/2/4/8 GPUs (Q/KV heads, MoE, FP8 block alignment)">TP 整除性检查</td></tr>
+              <tr><td data-zh="加载器路径" data-en="Loader Path">加载器路径</td><td data-zh="验证张量命名是否匹配 xinfer 的加载器优先级" data-en="Verify tensor naming matches xinfer's loader priority order">加载器兼容性</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="test-model" data-zh="模型测试" data-en="Model Testing">模型测试</h2>
+        <p data-zh="AI 辅助的自动化模型测试 Skill——GPU 检测、模型加载、API 测试和结果汇总。" data-en="AI-assisted automated model testing — GPU detection, model loading, API testing, and result summarization.">自动化模型测试：</p>
+        <pre><code><span class="token-comment"># 在 Cursor 中</span>
+<span class="token-string">Test all models in /data/</span>
+<span class="token-comment"># 或指定模型</span>
+<span class="token-string">Test models AxionML/Qwen3.5-2B-NVFP4, Qwen/Qwen3-4B</span></code></pre>
+        <div class="table-wrapper">
+          <table>
+            <thead><tr><th data-zh="阶段" data-en="Phase">阶段</th><th data-zh="说明" data-en="Description">说明</th></tr></thead>
+            <tbody>
+              <tr><td>0 — <span data-zh="收集模型" data-en="Gather">收集模型</span></td><td data-zh="本地目录扫描或 HuggingFace ID 列表" data-en="Local folder scan or HuggingFace ID list">模型列表</td></tr>
+              <tr><td>1 — <span data-zh="资源估算" data-en="Estimate">资源估算</span></td><td data-zh="nvidia-smi 查询 GPU 显存，按需分配" data-en="nvidia-smi GPU memory query, assign accordingly">GPU 分配</td></tr>
+              <tr><td>2 — <span data-zh="编译" data-en="Build">编译</span></td><td data-zh="使用 ./build.sh 编译" data-en="Compile with ./build.sh">编译项目</td></tr>
+              <tr><td>3 — <span data-zh="创建测试" data-en="Script">创建测试</span></td><td data-zh="生成 test_model.py（1k+ 输入，1k+ 输出）" data-en="Generate test_model.py (1k+ input, 1k+ output)">测试脚本</td></tr>
+              <tr><td>4 — <span data-zh="逐模型测试" data-en="Test">逐模型测试</span></td><td data-zh="启动服务→运行测试（有/无推理）→记录结果→下一个" data-en="Start server → run test (with/without reasoning) → record → next">逐个测试</td></tr>
+              <tr><td>5 — <span data-zh="结果汇总" data-en="Summarize">结果汇总</span></td><td data-zh="Markdown 表格：格式、GPU、吞吐量、质量" data-en="Markdown table: format, GPUs, throughput, quality">汇总表</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="agent-integrations" data-zh="Agent 集成" data-en="Agent Integrations">Agent 集成</h2>
+        <p data-zh="xInfer 作为 OpenAI/Anthropic 兼容后端，已验证支持 xbot、Claude Code、OpenCode、Kilo Code、Goose 等 AI Agent 框架。详细配置步骤请参考：" data-en="xInfer as an OpenAI/Anthropic-compatible backend has been verified with xbot, Claude Code, OpenCode, Kilo Code, and Goose. For detailed setup steps, see:">xInfer 作为 OpenAI/Anthropic 兼容后端，已验证支持多种 AI Agent 框架。详细配置步骤请参考：</p>
+        <p><a href="getting-started.html#agent-integrations" class="btn btn-outline" data-zh="📖 快速开始 → Agent 集成指南" data-en="📖 Getting Started → Agent Integration Guide">📖 快速开始 → Agent 集成指南</a></p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<footer class="site-footer"><div class="container"><div class="footer-grid"><div class="footer-brand"><a href="index.html" class="logo"><img src="assets/images/logo.svg" alt="xInfer"><span>xInfer</span></a><p data-zh="纯 Rust 构建的极速 LLM 推理引擎。" data-en="Blazing-fast LLM inference in pure Rust.">纯 Rust 构建的极速 LLM 推理引擎。</p></div><div class="footer-col"><h4 data-zh="文档" data-en="Docs">文档</h4><a href="getting-started.html" data-zh="快速开始" data-en="Getting Started">快速开始</a><a href="user-guide.html" data-zh="使用指南" data-en="User Guide">使用指南</a><a href="developer-guide.html" data-zh="开发指南" data-en="Developer Guide">开发指南</a><a href="api-reference.html" data-zh="API 参考" data-en="API Reference">API 参考</a></div><div class="footer-col"><h4 data-zh="资源" data-en="Resources">资源</h4><a href="https://github.com/guoqingbao/xinfer" target="_blank" data-zh="GitHub 仓库" data-en="GitHub Repo">GitHub 仓库</a></div><div class="footer-col"><h4 data-zh="社区" data-en="Community">社区</h4><a href="https://github.com/guoqingbao/xinfer/issues" target="_blank" data-zh="报告问题" data-en="Report Issue">报告问题</a></div></div><div class="footer-bottom"><span data-zh="MIT 许可证 © 2024 xInfer Team" data-en="MIT License © 2024 xInfer Team">MIT 许可证 © 2024 xInfer Team</span><span data-zh="由 Candle ML 框架驱动" data-en="Powered by Candle ML Framework">由 Candle ML 框架驱动</span></div></div></footer>
+<script src="assets/js/main.js?v=1"></script>
+</body>
+</html>

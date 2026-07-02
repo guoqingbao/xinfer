@@ -459,7 +459,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          sparse-checkout: pages
+          sparse-checkout: paged
 
       - uses: actions/download-artifact@v4
         with:
@@ -508,8 +508,8 @@ jobs:
             fi
           done
 
-          sed "s|var XINFER_VER='[^']*';|var XINFER_VER='${VERSION}';|" pages/index.html > site/index.html
-          cp -r pages/assets site/assets 2>/dev/null || true
+          cp -r paged/* site/
+          sed -i "s|XINFER_VER = '[^']*'|XINFER_VER = '${VERSION}'|" site/assets/js/main.js
 
           # Auto-detect install script
           cat > site/install.sh << 'SCRIPT'

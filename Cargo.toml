@@ -1,6 +1,6 @@
 [package]
 name = "xinfer"
-version = "0.13.6"
+version = "0.13.7"
 edition = "2021"
 default-run = "xinfer"
 description = "xInfer — a minimal, high-performance large language model (LLM) inference engine in Rust."

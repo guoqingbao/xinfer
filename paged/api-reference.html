@@ -1,0 +1,363 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>API 参考 — xInfer</title>
+  <link rel="icon" href="assets/images/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="assets/css/main.css?v=1">
+</head>
+<body>
+
+<header class="site-header"><div class="header-inner"><a href="index.html" class="logo"><img src="assets/images/logo.svg" alt="xInfer"><span>xInfer</span></a><nav class="nav-links"><a href="index.html" data-zh="首页" data-en="Home">首页</a><a href="getting-started.html" data-zh="快速开始" data-en="Getting Started">快速开始</a><a href="user-guide.html" data-zh="使用指南" data-en="User Guide">使用指南</a><a href="developer-guide.html" data-zh="开发指南" data-en="Developer Guide">开发指南</a><a href="api-reference.html" data-zh="API 参考" data-en="API Reference">API 参考</a></nav><div class="nav-actions"><button class="lang-toggle" aria-label="Switch language">EN</button><div class="theme-dropdown"><select class="theme-select" aria-label="Select theme"><option value="dark">🌙 Dark</option><option value="light">☀️ Light</option><option value="enflame">🔥 Enflame</option></select></div><a href="https://github.com/guoqingbao/xinfer" class="btn btn-sm btn-page" target="_blank">GitHub</a><button class="mobile-toggle" aria-label="Menu"><span></span><span></span><span></span></button></div></div></header>
+<div class="scroll-progress"></div>
+<div class="search-overlay"><div class="search-box"><div class="search-input-wrapper"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg><input type="text" class="search-input" placeholder="Search documentation... (Ctrl+K)"></div><div class="search-results"><div class="search-hint">Type to search documentation...</div></div></div></div>
+
+<div class="page-header">
+  <div class="container">
+    <h1 data-zh="API 参考" data-en="API Reference">API 参考</h1>
+    <p data-zh="完整的 CLI 参数、REST API 端点和环境变量参考。" data-en="Complete reference for CLI flags, REST API endpoints, and environment variables.">完整的 CLI 参数、REST API 端点和环境变量参考。</p>
+  </div>
+</div>
+
+<section class="section">
+  <div class="container">
+    <div class="doc-layout">
+      <nav class="doc-sidebar">
+        <div class="doc-sidebar-group">
+          <h4 data-zh="CLI" data-en="CLI">CLI</h4>
+          <a href="#cli-model" data-zh="模型参数" data-en="Model Flags">模型参数</a>
+          <a href="#cli-server" data-zh="服务器参数" data-en="Server Flags">服务器参数</a>
+          <a href="#cli-perf" data-zh="性能参数" data-en="Performance Flags">性能参数</a>
+          <a href="#cli-advanced" data-zh="高级参数" data-en="Advanced Flags">高级参数</a>
+        </div>
+        <div class="doc-sidebar-group">
+          <h4 data-zh="REST API" data-en="REST API">REST API</h4>
+          <a href="#api-chat" data-zh="Chat Completions" data-en="Chat Completions">Chat Completions</a>
+          <a href="#api-completions" data-zh="Text Completions" data-en="Text Completions">Text Completions</a>
+          <a href="#api-embeddings" data-zh="Embeddings" data-en="Embeddings">Embeddings</a>
+          <a href="#api-tokenize" data-zh="Tokenize" data-en="Tokenize / Detokenize">Tokenize</a>
+          <a href="#api-anthropic" data-zh="Anthropic API" data-en="Anthropic API">Anthropic API</a>
+          <a href="#api-models" data-zh="Models" data-en="Models">Models</a>
+          <a href="#api-health" data-zh="Health Check" data-en="Health Check">Health Check</a>
+        </div>
+        <div class="doc-sidebar-group">
+          <h4 data-zh="高级" data-en="Advanced">高级</h4>
+          <a href="#api-structured" data-zh="结构化输出" data-en="Structured Outputs">结构化输出</a>
+          <a href="#api-sampling" data-zh="采样参数" data-en="Sampling">采样参数</a>
+        </div>
+        <div class="doc-sidebar-group">
+          <h4 data-zh="配置" data-en="Config">配置</h4>
+          <a href="#env-vars" data-zh="环境变量" data-en="Env Variables">环境变量</a>
+        </div>
+      </nav>
+      <div class="doc-content">
+
+        <h2 id="cli-model" data-zh="模型参数" data-en="Model Flags">模型参数</h2>
+        <div class="table-wrapper">
+          <table>
+            <thead><tr><th data-zh="参数" data-en="Flag">参数</th><th data-zh="说明" data-en="Description">说明</th><th data-zh="默认" data-en="Default">默认</th></tr></thead>
+            <tbody>
+              <tr><td><code>--m, --model</code></td><td data-zh="HuggingFace 模型 ID 或本地路径" data-en="HuggingFace model ID or local path">HuggingFace 模型 ID 或本地路径</td><td>—</td></tr>
+              <tr><td><code>--f, --model-file</code></td><td data-zh="GGUF 文件名" data-en="GGUF filename">GGUF 文件名</td><td>—</td></tr>
+              <tr><td><code>--isq</code></td><td data-zh="ISQ 量化类型 (Q2K–Q8K)" data-en="ISQ quant type (Q2K–Q8K)">ISQ 量化类型</td><td>—</td></tr>
+              <tr><td><code>--kvcache-dtype</code></td><td data-zh="KV 缓存类型：auto / turbo2 / turbo4 / turbo8" data-en="KV cache dtype: auto / turbo2 / turbo4 / turbo8">KV 缓存类型</td><td><code>auto</code></td></tr>
+              <tr><td><code>--dtype</code></td><td data-zh="模型精度：auto / bf16 / fp16 / fp32" data-en="Model dtype: auto / bf16 / fp16 / fp32">模型精度</td><td><code>auto</code></td></tr>
+              <tr><td><code>--chat-template</code></td><td data-zh="自定义 chat template 路径" data-en="Custom chat template path">自定义 chat template</td><td>—</td></tr>
+              <tr><td><code>--mtp</code></td><td data-zh="多 Token 预测数量" data-en="Multi-token prediction count">MTP 数量</td><td><code>0</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="cli-server" data-zh="服务器参数" data-en="Server Flags">服务器参数</h2>
+        <div class="table-wrapper">
+          <table>
+            <thead><tr><th data-zh="参数" data-en="Flag">参数</th><th data-zh="说明" data-en="Description">说明</th><th data-zh="默认" data-en="Default">默认</th></tr></thead>
+            <tbody>
+              <tr><td><code>--port</code></td><td data-zh="API 服务器端口" data-en="API server port">API 服务器端口</td><td><code>8000</code></td></tr>
+              <tr><td><code>--host</code></td><td data-zh="绑定地址" data-en="Bind address">绑定地址</td><td><code>0.0.0.0</code></td></tr>
+              <tr><td><code>--ui-server</code></td><td data-zh="启动内置 Web UI (端口 8001)" data-en="Launch built-in Web UI (port 8001)">启动 Web UI</td><td><code>false</code></td></tr>
+              <tr><td><code>--ui-port</code></td><td data-zh="Web UI 端口" data-en="Web UI port">Web UI 端口</td><td><code>8001</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="cli-perf" data-zh="性能参数" data-en="Performance Flags">性能参数</h2>
+        <div class="table-wrapper">
+          <table>
+            <thead><tr><th data-zh="参数" data-en="Flag">参数</th><th data-zh="说明" data-en="Description">说明</th><th data-zh="默认" data-en="Default">默认</th></tr></thead>
+            <tbody>
+              <tr><td><code>--max-batch</code></td><td data-zh="最大并发批量大小" data-en="Max concurrent batch size">最大批量</td><td><code>32</code></td></tr>
+              <tr><td><code>--max-seq-len</code></td><td data-zh="最大序列长度" data-en="Max sequence length">最大序列长度</td><td data-zh="模型默认" data-en="Model default">模型默认</td></tr>
+              <tr><td><code>--graph-batch</code></td><td data-zh="CUDA Graph 捕获的批量大小列表" data-en="CUDA Graph batch size list">CUDA Graph 批量</td><td><code>1,2,4,8,16,32</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="cli-advanced" data-zh="高级参数" data-en="Advanced Flags">高级参数</h2>
+        <div class="table-wrapper">
+          <table>
+            <thead><tr><th data-zh="参数" data-en="Flag">参数</th><th data-zh="说明" data-en="Description">说明</th><th data-zh="默认" data-en="Default">默认</th></tr></thead>
+            <tbody>
+              <tr><td><code>--num-ranks</code></td><td data-zh="张量并行 GPU 数量" data-en="Tensor parallel GPU count">TP GPU 数量</td><td><code>1</code></td></tr>
+              <tr><td><code>--local-num-ranks</code></td><td data-zh="本节点 GPU 数量（多节点时使用）" data-en="Local node GPU count">本节点 GPU 数</td><td>—</td></tr>
+              <tr><td><code>--rank-offset</code></td><td data-zh="多节点时的 rank 偏移量" data-en="Rank offset for multi-node">rank 偏移</td><td><code>0</code></td></tr>
+              <tr><td><code>--master-addr</code></td><td data-zh="主节点地址（多节点）" data-en="Master node address">主节点地址</td><td>—</td></tr>
+              <tr><td><code>--pd-config</code></td><td data-zh="PD 分离配置文件路径" data-en="PD disaggregation config path">PD 配置</td><td>—</td></tr>
+              <tr><td><code>--mcp-config</code></td><td data-zh="MCP 工具配置文件路径" data-en="MCP tools config path">MCP 配置</td><td>—</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="api-chat" data-zh="Chat Completions" data-en="Chat Completions">Chat Completions</h2>
+        <p data-zh="兼容 OpenAI /v1/chat/completions 端点。" data-en="OpenAI-compatible /v1/chat/completions endpoint.">兼容 OpenAI Chat Completions API：</p>
+        <pre><code><span class="token-keyword">POST</span> <span class="token-string">/v1/chat/completions</span>
+
+{
+  <span class="token-flag">"model"</span>: <span class="token-string">"default"</span>,
+  <span class="token-flag">"messages"</span>: [
+    {<span class="token-flag">"role"</span>: <span class="token-string">"system"</span>, <span class="token-flag">"content"</span>: <span class="token-string">"You are a helpful assistant."</span>},
+    {<span class="token-flag">"role"</span>: <span class="token-string">"user"</span>, <span class="token-flag">"content"</span>: <span class="token-string">"What is Rust?"</span>}
+  ],
+  <span class="token-flag">"max_tokens"</span>: <span class="token-number">256</span>,
+  <span class="token-flag">"temperature"</span>: <span class="token-number">0.7</span>,
+  <span class="token-flag">"top_p"</span>: <span class="token-number">0.9</span>,
+  <span class="token-flag">"stream"</span>: <span class="token-keyword">true</span>,
+  <span class="token-flag">"response_format"</span>: {
+    <span class="token-flag">"type"</span>: <span class="token-string">"json_schema"</span>,
+    <span class="token-flag">"json_schema"</span>: { ... }
+  }
+}</code><button class="copy-btn" data-copy-text='POST /v1/chat/completions
+{
+  "model": "default",
+  "messages": [{"role":"user","content":"Hello"}],
+  "max_tokens": 256,
+  "stream": true
+}'>Copy</button></pre>
+        <div class="callout-info">
+          <div class="callout-title" data-zh="📘 采样参数" data-en="📘 Sampling Params">📘 采样参数</div>
+          <p data-zh="支持 temperature、top_p、top_k、min_p、repetition_penalty、frequency_penalty、presence_penalty、seed 等。" data-en="Supports temperature, top_p, top_k, min_p, repetition_penalty, frequency_penalty, presence_penalty, seed, and more.">支持 temperature、top_p、top_k 等常用采样参数。</p>
+        </div>
+
+        <h2 id="api-completions" data-zh="Text Completions" data-en="Text Completions">Text Completions</h2>
+        <pre><code><span class="token-keyword">POST</span> <span class="token-string">/v1/completions</span>
+
+{
+  <span class="token-flag">"model"</span>: <span class="token-string">"default"</span>,
+  <span class="token-flag">"prompt"</span>: <span class="token-string">"Once upon a time"</span>,
+  <span class="token-flag">"max_tokens"</span>: <span class="token-number">128</span>
+}</code><button class="copy-btn" data-copy-text='POST /v1/completions
+{"model":"default","prompt":"Once upon a time","max_tokens":128}'>Copy</button></pre>
+
+        <h2 id="api-embeddings" data-zh="Embeddings" data-en="Embeddings">Embeddings</h2>
+        <pre><code><span class="token-keyword">POST</span> <span class="token-string">/v1/embeddings</span>
+
+{
+  <span class="token-flag">"model"</span>: <span class="token-string">"default"</span>,
+  <span class="token-flag">"input"</span>: <span class="token-string">"Hello world"</span>
+}
+
+<span class="token-comment">// Response</span>
+{
+  <span class="token-flag">"data"</span>: [{
+    <span class="token-flag">"embedding"</span>: [<span class="token-number">0.0123</span>, <span class="token-number">-0.0456</span>, ...],
+    <span class="token-flag">"index"</span>: <span class="token-number">0</span>
+  }]
+}</code><button class="copy-btn" data-copy-text='POST /v1/embeddings
+{"model":"default","input":"Hello world"}'>Copy</button></pre>
+
+        <h2 id="api-tokenize" data-zh="Tokenize / Detokenize" data-en="Tokenize / Detokenize">Tokenize / Detokenize</h2>
+        <p data-zh="直接访问模型分词器，无需运行推理。用于预计算 Token 数、验证输入、调试分词问题。" data-en="Direct tokenizer access without running inference. For pre-computing token counts, validating inputs, debugging tokenization.">直接分词器访问：</p>
+        <div class="tabs">
+          <button class="tab-btn active" data-tab="tab-tokenize-text" data-zh="纯文本" data-en="Plain Text">纯文本</button>
+          <button class="tab-btn" data-tab="tab-tokenize-chat" data-zh="Chat 消息" data-en="Chat Messages">Chat 消息</button>
+          <button class="tab-btn" data-tab="tab-detokenize" data-zh="Detokenize" data-en="Detokenize">Detokenize</button>
+        </div>
+        <div class="tab-content active" id="tab-tokenize-text">
+          <pre><code><span class="token-keyword">curl</span> <span class="token-flag">-XPOST</span> <span class="token-string">http://localhost:8000/tokenize</span> \
+  <span class="token-flag">-H</span> <span class="token-string">"Content-Type: application/json"</span> \
+  <span class="token-flag">-d</span> <span class="token-string">'{"prompt":"Hello, world!"}'</span>
+
+<span class="token-comment">// Response</span>
+{ <span class="token-flag">"tokens"</span>: [<span class="token-number">9906</span>, <span class="token-number">11</span>, <span class="token-number">1917</span>, <span class="token-number">0</span>], <span class="token-flag">"count"</span>: <span class="token-number">4</span>, <span class="token-flag">"max_model_len"</span>: <span class="token-number">4096</span> }</code><button class="copy-btn" data-copy-text='curl -XPOST http://localhost:8000/tokenize -H "Content-Type: application/json" -d &apos;{"prompt":"Hello, world!"}&apos;'>Copy</button></pre>
+        </div>
+        <div class="tab-content" id="tab-tokenize-chat">
+          <pre><code><span class="token-keyword">curl</span> <span class="token-flag">-XPOST</span> <span class="token-string">http://localhost:8000/tokenize</span> \
+  <span class="token-flag">-H</span> <span class="token-string">"Content-Type: application/json"</span> \
+  <span class="token-flag">-d</span> <span class="token-string">'{
+  "messages": [
+    {"role":"system","content":"You are helpful."},
+    {"role":"user","content":"Hello!"}
+  ]
+}'</span>
+
+<span class="token-comment">// 应用 chat template 后返回 Token ID</span></code><button class="copy-btn" data-copy-text='curl -XPOST http://localhost:8000/tokenize -H "Content-Type: application/json" -d &apos;{"messages":[{"role":"system","content":"You are helpful."},{"role":"user","content":"Hello!"}]}&apos;'>Copy</button></pre>
+        </div>
+        <div class="tab-content" id="tab-detokenize">
+          <pre><code><span class="token-keyword">curl</span> <span class="token-flag">-XPOST</span> <span class="token-string">http://localhost:8000/detokenize</span> \
+  <span class="token-flag">-H</span> <span class="token-string">"Content-Type: application/json"</span> \
+  <span class="token-flag">-d</span> <span class="token-string">'{"tokens":[9906,11,1917,0]}'</span>
+
+<span class="token-comment">// Response</span>
+{ <span class="token-flag">"prompt"</span>: <span class="token-string">"Hello, world!"</span> }</code><button class="copy-btn" data-copy-text='curl -XPOST http://localhost:8000/detokenize -H "Content-Type: application/json" -d &apos;{"tokens":[9906,11,1917,0]}&apos;'>Copy</button></pre>
+        </div>
+        <div class="table-wrapper" style="margin-top:1rem">
+          <table>
+            <thead><tr><th data-zh="参数" data-en="Parameter">参数</th><th data-zh="端点" data-en="Endpoint">端点</th><th data-zh="说明" data-en="Description">说明</th></tr></thead>
+            <tbody>
+              <tr><td><code>prompt</code></td><td>/tokenize</td><td data-zh="纯文本输入" data-en="Plain text input">纯文本</td></tr>
+              <tr><td><code>messages</code></td><td>/tokenize</td><td data-zh="Chat 消息（自动应用 chat template）" data-en="Chat messages (auto-applies chat template)">Chat 消息</td></tr>
+              <tr><td><code>add_special_tokens</code></td><td>/tokenize</td><td data-zh="是否添加特殊 Token（默认 true）" data-en="Add special tokens (default: true)">特殊 Token</td></tr>
+              <tr><td><code>tokens</code></td><td>/detokenize</td><td data-zh="Token ID 数组" data-en="Token ID array">Token ID</td></tr>
+              <tr><td><code>skip_special_tokens</code></td><td>/detokenize</td><td data-zh="跳过特殊 Token（默认 true）" data-en="Skip special tokens (default: true)">跳过特殊</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="api-anthropic" data-zh="Anthropic 兼容 API" data-en="Anthropic-compatible API">Anthropic 兼容 API</h2>
+        <p data-zh="xInfer 同时提供 Anthropic/Claude 兼容的 /v1/messages 端点，可直接连接 Claude Code：" data-en="xInfer also provides Anthropic/Claude-compatible /v1/messages endpoint, directly usable with Claude Code:">Claude 兼容端点：</p>
+        <pre><code><span class="token-keyword">curl</span> <span class="token-string">http://localhost:8000/v1/messages</span> \
+  <span class="token-flag">-H</span> <span class="token-string">"Content-Type: application/json"</span> \
+  <span class="token-flag">-d</span> <span class="token-string">'{
+  "model": "default",
+  "max_tokens": 256,
+  "messages": [{"role":"user","content":"Hello from Claude Code"}]
+}'</span></code><button class="copy-btn" data-copy-text='curl http://localhost:8000/v1/messages -H "Content-Type: application/json" -d &apos;{"model":"default","max_tokens":256,"messages":[{"role":"user","content":"Hello"}]}&apos;'>Copy</button></pre>
+        <p data-zh="支持 SSE 流式传输（stream: true）和 Token 计数（POST /v1/messages/count_tokens）。" data-en="Supports SSE streaming (stream: true) and token counting (POST /v1/messages/count_tokens).">支持流式和 Token 计数。</p>
+
+        <h2 id="api-models" data-zh="Models" data-en="Models">Models</h2>
+        <pre><code><span class="token-keyword">GET</span> <span class="token-string">/v1/models</span>
+
+<span class="token-comment">// Response</span>
+{
+  <span class="token-flag">"data"</span>: [{
+    <span class="token-flag">"id"</span>: <span class="token-string">"default"</span>,
+    <span class="token-flag">"object"</span>: <span class="token-string">"model"</span>,
+    <span class="token-flag">"owned_by"</span>: <span class="token-string">"xinfer"</span>
+  }]
+}</code><button class="copy-btn" data-copy-text="GET /v1/models">Copy</button></pre>
+
+        <h2 id="api-health" data-zh="Health Check" data-en="Health Check">Health Check</h2>
+        <pre><code><span class="token-keyword">GET</span> <span class="token-string">/health</span>
+
+<span class="token-comment">// Response: 200 OK</span>
+{ <span class="token-flag">"status"</span>: <span class="token-string">"ok"</span> }</code><button class="copy-btn" data-copy-text="GET /health">Copy</button></pre>
+
+        <h2 id="api-structured" data-zh="结构化输出" data-en="Structured Outputs">结构化输出</h2>
+        <p data-zh="xInfer 支持多种约束解码方式。请求中只能同时使用一种约束源。" data-en="xInfer supports multiple constrained decoding methods. Only one constraint source may be set per request.">约束解码方式：</p>
+
+        <div class="tabs">
+          <button class="tab-btn active" data-tab="tab-choice" data-zh="Choice 选择" data-en="Choice">Choice 选择</button>
+          <button class="tab-btn" data-tab="tab-regex" data-zh="Regex 正则" data-en="Regex">Regex 正则</button>
+          <button class="tab-btn" data-tab="tab-json" data-zh="JSON Schema" data-en="JSON Schema">JSON Schema</button>
+          <button class="tab-btn" data-tab="tab-grammar" data-zh="Lark 语法" data-en="Lark Grammar">Lark 语法</button>
+        </div>
+        <div class="tab-content active" id="tab-choice">
+          <pre><code><span class="token-keyword">curl</span> <span class="token-flag">-sXPOST</span> <span class="token-string">localhost:8000/v1/chat/completions</span> \
+  <span class="token-flag">-H</span> <span class="token-string">'Content-Type: application/json'</span> \
+  <span class="token-flag">-d</span> <span class="token-string">'{
+    "messages": [{"role":"user","content":"Classify this sentiment: I love it!"}],
+    "structured_outputs": {
+      "choice": ["positive", "negative", "neutral"]
+    },
+    "max_tokens": 50
+  }'</span></code><button class="copy-btn" data-copy-text='curl -sXPOST localhost:8000/v1/chat/completions -H "Content-Type: application/json" -d &apos;{"messages":[{"role":"user","content":"Classify sentiment"}],"structured_outputs":{"choice":["positive","negative","neutral"]},"max_tokens":50}&apos;'>Copy</button></pre>
+        </div>
+        <div class="tab-content" id="tab-regex">
+          <pre><code><span class="token-keyword">curl</span> <span class="token-flag">-sXPOST</span> <span class="token-string">localhost:8000/v1/chat/completions</span> \
+  <span class="token-flag">-H</span> <span class="token-string">'Content-Type: application/json'</span> \
+  <span class="token-flag">-d</span> <span class="token-string">'{
+    "messages": [{"role":"user","content":"Return a 3-digit code"}],
+    "structured_outputs": {
+      "regex": "^[0-9]{3}$"
+    },
+    "max_tokens": 10
+  }'</span></code><button class="copy-btn" data-copy-text='curl -sXPOST localhost:8000/v1/chat/completions -H "Content-Type: application/json" -d &apos;{"messages":[{"role":"user","content":"Return a 3-digit code"}],"structured_outputs":{"regex":"^[0-9]{3}$"},"max_tokens":10}&apos;'>Copy</button></pre>
+        </div>
+        <div class="tab-content" id="tab-json">
+          <pre><code><span class="token-keyword">curl</span> <span class="token-flag">-sXPOST</span> <span class="token-string">localhost:8000/v1/chat/completions</span> \
+  <span class="token-flag">-H</span> <span class="token-string">'Content-Type: application/json'</span> \
+  <span class="token-flag">-d</span> <span class="token-string">'{
+    "messages": [{"role":"user","content":"Generate a user profile"}],
+    "structured_outputs": {
+      "json": {
+        "type": "object",
+        "properties": {
+          "name": {"type": "string"},
+          "age": {"type": "integer", "minimum": 0, "maximum": 150},
+          "email": {"type": "string", "pattern": "^[a-z]+@[a-z]+\\.[a-z]+$"}
+        },
+        "required": ["name", "age", "email"],
+        "additionalProperties": false
+      }
+    },
+    "max_tokens": 500
+  }'</span></code><button class="copy-btn" data-copy-text='curl -sXPOST localhost:8000/v1/chat/completions -H "Content-Type: application/json" -d &apos;{"messages":[{"role":"user","content":"Generate a user profile"}],"structured_outputs":{"json":{"type":"object","properties":{"name":{"type":"string"},"age":{"type":"integer"}},"required":["name","age"]}},"max_tokens":500}&apos;'>Copy</button></pre>
+        </div>
+        <div class="tab-content" id="tab-grammar">
+          <pre><code><span class="token-keyword">curl</span> <span class="token-flag">-sXPOST</span> <span class="token-string">localhost:8000/v1/chat/completions</span> \
+  <span class="token-flag">-H</span> <span class="token-string">'Content-Type: application/json'</span> \
+  <span class="token-flag">-d</span> <span class="token-string">'{
+    "messages": [{"role":"user","content":"Return yes or no"}],
+    "structured_outputs": {
+      "grammar": "start: \"yes\" | \"no\""
+    },
+    "max_tokens": 10
+  }'</span></code><button class="copy-btn" data-copy-text='curl -sXPOST localhost:8000/v1/chat/completions -H "Content-Type: application/json" -d &apos;{"messages":[{"role":"user","content":"Return yes or no"}],"structured_outputs":{"grammar":"start: \"yes\" | \"no\""},"max_tokens":10}&apos;'>Copy</button></pre>
+        </div>
+
+        <div class="callout-info">
+          <div class="callout-title" data-zh="📘 约束源" data-en="📘 Constraint Sources">📘 约束源</div>
+          <p data-zh="支持三种约束源：structured_outputs（推荐）、response_format（OpenAI 兼容）、constraint + constraint_type（旧版）。同一请求只能使用一种，否则返回错误。" data-en="Three constraint sources: structured_outputs (recommended), response_format (OpenAI compatible), constraint + constraint_type (legacy). Only one per request.">三种约束源，只能同时使用一种。</p>
+        </div>
+
+        <h2 id="api-sampling" data-zh="采样参数" data-en="Sampling Parameters">采样参数</h2>
+        <div class="table-wrapper">
+          <table>
+            <thead><tr><th data-zh="参数" data-en="Parameter">参数</th><th data-zh="类型" data-en="Type">类型</th><th data-zh="说明" data-en="Description">说明</th></tr></thead>
+            <tbody>
+              <tr><td><code>temperature</code></td><td>float</td><td data-zh="采样温度（0-2），0 为贪婪解码" data-en="Sampling temperature (0-2), 0 for greedy">采样温度</td></tr>
+              <tr><td><code>top_p</code></td><td>float</td><td data-zh="核采样概率阈值（0-1）" data-en="Nucleus sampling probability threshold (0-1)">核采样</td></tr>
+              <tr><td><code>top_k</code></td><td>int</td><td data-zh="Top-K 采样" data-en="Top-K sampling">Top-K 采样</td></tr>
+              <tr><td><code>min_p</code></td><td>float</td><td data-zh="最小概率过滤" data-en="Minimum probability filter">最小概率</td></tr>
+              <tr><td><code>repetition_penalty</code></td><td>float</td><td data-zh="重复惩罚系数" data-en="Repetition penalty factor">重复惩罚</td></tr>
+              <tr><td><code>frequency_penalty</code></td><td>float</td><td data-zh="频率惩罚（-2 到 2）" data-en="Frequency penalty (-2 to 2)">频率惩罚</td></tr>
+              <tr><td><code>presence_penalty</code></td><td>float</td><td data-zh="存在惩罚（-2 到 2）" data-en="Presence penalty (-2 to 2)">存在惩罚</td></tr>
+              <tr><td><code>seed</code></td><td>int</td><td data-zh="随机种子（可复现输出）" data-en="Random seed for reproducible output">随机种子</td></tr>
+              <tr><td><code>max_tokens</code></td><td>int</td><td data-zh="最大生成 Token 数" data-en="Maximum generated tokens">最大 Token 数</td></tr>
+              <tr><td><code>reasoning_effort</code></td><td>string</td><td data-zh="推理努力级别：none/low/medium/normal/high/cot/cove" data-en="Reasoning effort: none/low/medium/normal/high/cot/cove">推理努力级别</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="env-vars" data-zh="环境变量" data-en="Environment Variables">环境变量</h2>
+        <div class="table-wrapper">
+          <table>
+            <thead><tr><th data-zh="变量" data-en="Variable">变量</th><th data-zh="说明" data-en="Description">说明</th></tr></thead>
+            <tbody>
+              <tr><td><code>HF_TOKEN</code></td><td data-zh="HuggingFace 访问令牌（下载受限模型）" data-en="HuggingFace access token for gated models">HuggingFace 访问令牌</td></tr>
+              <tr><td><code>CUDA_VISIBLE_DEVICES</code></td><td data-zh="指定可用 GPU 设备" data-en="Specify available GPU devices">指定 GPU 设备</td></tr>
+              <tr><td><code>XINFER_CHAT_LOGGER=1</code></td><td data-zh="启用聊天日志（写入 ./log 目录）" data-en="Enable chat logging (writes to ./log directory)">启用聊天日志</td></tr>
+              <tr><td><code>XINFER_SSE_BUFFER_SIZE</code></td><td data-zh="每个客户端连接的 SSE 流缓冲区大小（默认 256）" data-en="SSE streaming buffer size per client connection (default: 256)">SSE 缓冲区大小</td></tr>
+              <tr><td><code>XINFER_NVFP4_FORCE_LUT=1</code></td><td data-zh="在 Blackwell 上强制使用 LUT 解量化路径（更高精度）代替硬件 FP4 指令" data-en="Force LUT-based dequantization on Blackwell instead of hardware FP4 intrinsics (higher precision)">强制 LUT 解量化</td></tr>
+              <tr><td><code>SM90_LOWER_PRECISION_GDN_PREFILL=1</code></td><td data-zh="启用 Hopper 上 Qwen3.5/3.6 的 FlashInfer SM90 持久 GDN 预填充核（更快，略有精度损失）" data-en="Enable FlashInfer SM90 persistent GDN prefill kernel for Qwen3.5/3.6 on Hopper (faster, slight precision loss)">GDN 预填充加速</td></tr>
+              <tr><td><code>NCCL_SOCKET_IFNAME</code></td><td data-zh="NCCL 网络接口名称（多节点推理）" data-en="NCCL network interface for multi-node">NCCL 网络接口</td></tr>
+              <tr><td><code>NCCL_IB_DISABLE=1</code></td><td data-zh="禁用 InfiniBand（无 IB 环境）" data-en="Disable InfiniBand when unavailable">禁用 InfiniBand</td></tr>
+              <tr><td><code>NCCL_DEBUG=INFO</code></td><td data-zh="启用 NCCL 调试日志" data-en="Enable NCCL debug logging">NCCL 调试日志</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <pre><code><span class="token-comment"># Blackwell 高精度 NVFP4 解码</span>
+<span class="token-flag">XINFER_NVFP4_FORCE_LUT</span>=<span class="token-number">1</span> <span class="token-keyword">xinfer</span> <span class="token-flag">--m</span> <span class="token-string">nvidia/Qwen3-30B-A3B-FP4</span> <span class="token-flag">--ui-server</span>
+
+<span class="token-comment"># Hopper 快速 GDN 预填充</span>
+<span class="token-flag">SM90_LOWER_PRECISION_GDN_PREFILL</span>=<span class="token-number">1</span> <span class="token-keyword">xinfer</span> <span class="token-flag">--m</span> <span class="token-string">Qwen/Qwen3.5-35B-A3B-FP8</span> <span class="token-flag">--ui-server</span></code><button class="copy-btn" data-copy-text="XINFER_NVFP4_FORCE_LUT=1 xinfer --m nvidia/Qwen3-30B-A3B-FP4 --ui-server">Copy</button></pre>
+      </div>
+    </div>
+  </div>
+</section>
+
+<footer class="site-footer"><div class="container"><div class="footer-grid"><div class="footer-brand"><a href="index.html" class="logo"><img src="assets/images/logo.svg" alt="xInfer"><span>xInfer</span></a><p data-zh="纯 Rust 构建的极速 LLM 推理引擎。" data-en="Blazing-fast LLM inference in pure Rust.">纯 Rust 构建的极速 LLM 推理引擎。</p></div><div class="footer-col"><h4 data-zh="文档" data-en="Docs">文档</h4><a href="getting-started.html" data-zh="快速开始" data-en="Getting Started">快速开始</a><a href="user-guide.html" data-zh="使用指南" data-en="User Guide">使用指南</a><a href="developer-guide.html" data-zh="开发指南" data-en="Developer Guide">开发指南</a><a href="api-reference.html" data-zh="API 参考" data-en="API Reference">API 参考</a></div><div class="footer-col"><h4 data-zh="资源" data-en="Resources">资源</h4><a href="https://github.com/guoqingbao/xinfer" target="_blank" data-zh="GitHub 仓库" data-en="GitHub Repo">GitHub 仓库</a></div><div class="footer-col"><h4 data-zh="社区" data-en="Community">社区</h4><a href="https://github.com/guoqingbao/xinfer/issues" target="_blank" data-zh="报告问题" data-en="Report Issue">报告问题</a></div></div><div class="footer-bottom"><span data-zh="MIT 许可证 © 2024 xInfer Team" data-en="MIT License © 2024 xInfer Team">MIT 许可证 © 2024 xInfer Team</span><span data-zh="由 Candle ML 框架驱动" data-en="Powered by Candle ML Framework">由 Candle ML 框架驱动</span></div></div></footer>
+<script src="assets/js/main.js?v=1"></script>
+</body>
+</html>

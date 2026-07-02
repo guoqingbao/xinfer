@@ -467,13 +467,13 @@ impl TensorParallelRowLinear {
         let mut xs = self.linear.forward(x)?;
         #[cfg(feature = "nccl")]
         if let Some(all_reduce) = &self.all_reduce {
-            if xs.dtype() != self.dtype {
-                //only bf16/fp16 supported in all reduce
-                let xs_reduce = xs.to_dtype(self.dtype)?.apply_op1_no_bwd(all_reduce)?;
-                xs = xs_reduce.to_dtype(xs.dtype())?
-            } else {
-                xs = xs.apply_op1_no_bwd(all_reduce)?;
-            }
+            // AllReduce supports F32/BF16/F16. Perform in native dtype to avoid
+            // precision loss from F32→BF16 truncation before summation (critical
+            // for GGUF QMatMul which outputs F32).
+            xs = xs.apply_op1_no_bwd(all_reduce)?;
+        }
+        if xs.dtype() != self.dtype {
+            xs = xs.to_dtype(self.dtype)?;
         }
         if let Some(bias) = &self.bias {
             xs = xs.broadcast_add(&bias)?;
@@ -1532,12 +1532,8 @@ impl VocabParallelLinear {
             // After NCCL all_gather: [world_size * batch, local_vocab] (concat along dim 0)
             // We need to reshape to [world_size, batch, local_vocab], transpose to
             // [batch, world_size, local_vocab], then flatten last two dims to [batch, vocab]
-            let gathered = if logits.dtype() != self.dtype {
-                let g = all_gather.apply(&logits.to_dtype(self.dtype)?)?;
-                g.to_dtype(logits.dtype())?
-            } else {
-                all_gather.apply(&logits)?
-            };
+            // AllGather in native dtype (F32 for GGUF QMatMul) to preserve precision.
+            let gathered = all_gather.apply(&logits)?;
 
             let ws = all_gather.world_size;
             let local_vocab = logits.dim(logits.dims().len() - 1)?;

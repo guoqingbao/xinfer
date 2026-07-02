@@ -1,0 +1,387 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>使用指南 — xInfer</title>
+  <link rel="icon" href="assets/images/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="assets/css/main.css?v=1">
+</head>
+<body>
+
+<header class="site-header"><div class="header-inner"><a href="index.html" class="logo"><img src="assets/images/logo.svg" alt="xInfer"><span>xInfer</span></a><nav class="nav-links"><a href="index.html" data-zh="首页" data-en="Home">首页</a><a href="getting-started.html" data-zh="快速开始" data-en="Getting Started">快速开始</a><a href="user-guide.html" data-zh="使用指南" data-en="User Guide">使用指南</a><a href="developer-guide.html" data-zh="开发指南" data-en="Developer Guide">开发指南</a><a href="api-reference.html" data-zh="API 参考" data-en="API Reference">API 参考</a></nav><div class="nav-actions"><button class="lang-toggle" aria-label="Switch language">EN</button><div class="theme-dropdown"><select class="theme-select" aria-label="Select theme"><option value="dark">🌙 Dark</option><option value="light">☀️ Light</option><option value="enflame">🔥 Enflame</option></select></div><a href="https://github.com/guoqingbao/xinfer" class="btn btn-sm btn-page" target="_blank">GitHub</a><button class="mobile-toggle" aria-label="Menu"><span></span><span></span><span></span></button></div></div></header>
+<div class="scroll-progress"></div>
+<div class="search-overlay"><div class="search-box"><div class="search-input-wrapper"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg><input type="text" class="search-input" placeholder="Search documentation... (Ctrl+K)"></div><div class="search-results"><div class="search-hint">Type to search documentation...</div></div></div></div>
+
+<div class="page-header">
+  <div class="container">
+    <h1 data-zh="使用指南" data-en="User Guide">使用指南</h1>
+    <p data-zh="深入了解量化格式、KV 缓存压缩、多 GPU 推理、PD 分离等高级功能。" data-en="Deep dive into quantization formats, KV cache compression, multi-GPU inference, PD disaggregation, and more.">深入了解量化格式、KV 缓存压缩、多 GPU 推理、PD 分离等高级功能。</p>
+  </div>
+</div>
+
+<section class="section">
+  <div class="container">
+    <div class="doc-layout">
+      <nav class="doc-sidebar">
+        <div class="doc-sidebar-group">
+          <h4 data-zh="模型加载" data-en="Model Loading">模型加载</h4>
+          <a href="#model-formats" data-zh="模型格式" data-en="Model Formats">模型格式</a>
+          <a href="#isq" data-zh="ISQ 在线量化" data-en="ISQ">ISQ 在线量化</a>
+        </div>
+        <div class="doc-sidebar-group">
+          <h4 data-zh="KV 缓存" data-en="KV Cache">KV 缓存</h4>
+          <a href="#kv-turbo" data-zh="TurboQuant" data-en="TurboQuant">TurboQuant</a>
+        </div>
+        <div class="doc-sidebar-group">
+          <h4 data-zh="扩展" data-en="Scaling">扩展</h4>
+          <a href="#multi-gpu" data-zh="多 GPU 推理" data-en="Multi-GPU">多 GPU 推理</a>
+          <a href="#pd-disagg" data-zh="PD 分离" data-en="PD Disaggregation">PD 分离</a>
+          <a href="#mtp" data-zh="多 Token 预测" data-en="MTP">多 Token 预测</a>
+        </div>
+        <div class="doc-sidebar-group">
+          <h4 data-zh="高级功能" data-en="Advanced">高级功能</h4>
+          <a href="#structured" data-zh="结构化输出" data-en="Structured Outputs">结构化输出</a>
+          <a href="#mcp" data-zh="MCP 工具调用" data-en="MCP Tool Calling">MCP 工具调用</a>
+          <a href="#embedding" data-zh="嵌入端点" data-en="Embeddings">嵌入端点</a>
+          <a href="#prefix-cache" data-zh="前缀缓存" data-en="Prefix Cache">前缀缓存</a>
+          <a href="#multimodal" data-zh="视觉语言模型" data-en="VL Models">视觉语言模型</a>
+          <a href="#reasoning" data-zh="推理控制" data-en="Reasoning">推理控制</a>
+          <a href="#runtime-knobs" data-zh="运行时参数" data-en="Runtime Knobs">运行时参数</a>
+          <a href="#chat-logger" data-zh="聊天日志" data-en="Chat Logger">聊天日志</a>
+          <a href="#troubleshooting" data-zh="故障排查" data-en="Troubleshooting">故障排查</a>
+        </div>
+      </nav>
+      <div class="doc-content">
+
+        <h2 id="model-formats" data-zh="模型格式" data-en="Model Formats">模型格式</h2>
+        <p data-zh="xInfer 支持多种模型格式，按照不同精度和硬件选择：" data-en="xInfer supports multiple model formats. Choose based on precision and hardware:">xInfer 支持多种模型格式，按照不同精度和硬件选择：</p>
+        <div class="table-wrapper">
+          <table>
+            <thead><tr><th data-zh="格式" data-en="Format">格式</th><th data-zh="精度" data-en="Precision">精度</th><th data-zh="说明" data-en="Notes">说明</th></tr></thead>
+            <tbody>
+              <tr><td><strong>Safetensors</strong></td><td>FP16/BF16</td><td data-zh="完整精度，需要更多显存" data-en="Full precision, higher VRAM usage">完整精度，需要更多显存</td></tr>
+              <tr><td><strong>GGUF</strong></td><td>Q2–Q8</td><td data-zh="最广泛的量化格式，社区支持好" data-en="Most popular quant format, great community">最广泛的量化格式，社区支持好</td></tr>
+              <tr><td><strong>GPTQ / AWQ</strong></td><td>4-bit</td><td data-zh="GPU 优化的 4-bit 量化" data-en="GPU-optimized 4-bit quantization">GPU 优化的 4-bit 量化</td></tr>
+              <tr><td><strong>FP8</strong></td><td>E4M3/E5M2</td><td data-zh="SM89+（Ada）原生支持" data-en="Native on SM89+ (Ada)">SM89+（Ada）原生支持</td></tr>
+              <tr><td><strong>NVFP4</strong></td><td>4-bit</td><td data-zh="SM100+（Blackwell）原生；V100 可用软件 FP4" data-en="Native SM100+ (Blackwell); software FP4 on V100">SM100+（Blackwell）原生；V100 可用软件 FP4</td></tr>
+              <tr><td><strong>ISQ</strong></td><td>Q2–Q8</td><td data-zh="In-situ 在线量化——加载 Safetensors 并实时量化" data-en="In-situ quantization — load Safetensors and quantize on-the-fly">In-situ 在线量化</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <pre><code><span class="token-comment"># Safetensors (FP16/BF16)</span>
+<span class="token-keyword">xinfer</span> <span class="token-flag">--m</span> <span class="token-string">meta-llama/Llama-3.1-8B-Instruct</span>
+
+<span class="token-comment"># GGUF</span>
+<span class="token-keyword">xinfer</span> <span class="token-flag">--m</span> <span class="token-string">unsloth/Qwen3-30B-A3B-GGUF</span> <span class="token-flag">--f</span> <span class="token-string">Qwen3-30B-A3B-UD-Q4_K_XL.gguf</span>
+
+<span class="token-comment"># GPTQ</span>
+<span class="token-keyword">xinfer</span> <span class="token-flag">--m</span> <span class="token-string">Qwen/Qwen3-30B-A3B-GPTQ-Int4</span>
+
+<span class="token-comment"># FP8</span>
+<span class="token-keyword">xinfer</span> <span class="token-flag">--m</span> <span class="token-string">Qwen/Qwen3.6-27B-FP8</span>
+
+<span class="token-comment"># NVFP4 (Blackwell 原生)</span>
+<span class="token-keyword">xinfer</span> <span class="token-flag">--m</span> <span class="token-string">nvidia/Qwen3-30B-A3B-NVFP4</span></code><button class="copy-btn" data-copy-text="xinfer --m Qwen/Qwen3.6-27B-FP8">Copy</button></pre>
+
+        <h2 id="isq" data-zh="ISQ 在线量化" data-en="ISQ In-Situ Quantization">ISQ 在线量化</h2>
+        <p data-zh="ISQ 可以在加载 Safetensors 权重时实时量化为 GGUF 格式，无需提前下载量化模型：" data-en="ISQ quantizes Safetensors weights on-the-fly to GGUF format without pre-downloading quantized models:">ISQ 可以在加载 Safetensors 权重时实时量化为 GGUF 格式：</p>
+        <pre><code><span class="token-keyword">xinfer</span> <span class="token-flag">--m</span> <span class="token-string">meta-llama/Llama-3.1-8B-Instruct</span> <span class="token-flag">--isq</span> <span class="token-value">Q4K</span>
+<span class="token-keyword">xinfer</span> <span class="token-flag">--m</span> <span class="token-string">meta-llama/Llama-3.1-8B-Instruct</span> <span class="token-flag">--isq</span> <span class="token-value">Q6K</span></code><button class="copy-btn" data-copy-text="xinfer --m meta-llama/Llama-3.1-8B-Instruct --isq Q4K">Copy</button></pre>
+
+        <h2 id="kv-turbo" data-zh="TurboQuant KV 缓存压缩" data-en="TurboQuant KV Cache Compression">TurboQuant KV 缓存压缩</h2>
+        <p data-zh="基于 Walsh-Hadamard 变换的 KV 缓存量化，在保持输出质量的前提下将 KV 缓存内存减少至 1/3.7：" data-en="Walsh-Hadamard-based KV cache quantization compresses KV cache memory by up to 3.7× while preserving output quality:">基于 Walsh-Hadamard 变换的 KV 缓存量化：</p>
+        <div class="table-wrapper">
+          <table>
+            <thead><tr><th data-zh="模式" data-en="Mode">模式</th><th data-zh="比特" data-en="Bits">比特</th><th data-zh="压缩比" data-en="Compression">压缩比</th></tr></thead>
+            <tbody>
+              <tr><td><code>turbo8</code></td><td>8-bit</td><td>~2×</td></tr>
+              <tr><td><code>turbo4</code></td><td>4-bit</td><td>~3.7×</td></tr>
+              <tr><td><code>turbo2</code></td><td>2-bit</td><td>~4.3×</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <pre><code><span class="token-comment"># 30B+ MoE 模型在 24GB GPU 上运行</span>
+<span class="token-keyword">xinfer</span> <span class="token-flag">--m</span> <span class="token-string">Qwen/Qwen3.6-27B-FP8</span> <span class="token-flag">--kvcache-dtype</span> <span class="token-value">turbo4</span></code><button class="copy-btn" data-copy-text="xinfer --m Qwen/Qwen3.6-27B-FP8 --kvcache-dtype turbo4">Copy</button></pre>
+        <div class="callout-info">
+          <div class="callout-title" data-zh="💡 提示" data-en="💡 Tip">💡 提示</div>
+          <p data-zh="turbo4 是推荐的默认选择——在大幅节省内存的同时几乎不损失输出质量。turbo2 适合极端内存受限场景。" data-en="turbo4 is the recommended default — massive memory savings with minimal quality loss. turbo2 is for extreme VRAM constraints.">turbo4 是推荐的默认选择——在大幅节省内存的同时几乎不损失输出质量。</p>
+        </div>
+
+        <h2 id="multi-gpu" data-zh="多 GPU 推理" data-en="Multi-GPU Inference">多 GPU 推理</h2>
+        <p data-zh="使用张量并行（Tensor Parallelism）跨多张 GPU 推理大模型：" data-en="Use tensor parallelism to distribute large models across GPUs:">使用张量并行跨多张 GPU 推理大模型：</p>
+        <pre><code><span class="token-comment"># 2 GPU 张量并行</span>
+<span class="token-keyword">xinfer</span> <span class="token-flag">--m</span> <span class="token-string">deepseek-ai/DeepSeek-V3</span> <span class="token-flag">--num-ranks</span> <span class="token-number">2</span>
+
+<span class="token-comment"># 多节点推理</span>
+<span class="token-comment"># 节点 0（主节点）：</span>
+<span class="token-keyword">xinfer</span> <span class="token-flag">--m</span> <span class="token-string">deepseek-ai/DeepSeek-V3</span> <span class="token-flag">--num-ranks</span> <span class="token-number">16</span> <span class="token-flag">--local-num-ranks</span> <span class="token-number">8</span>
+<span class="token-comment"># 节点 1：</span>
+<span class="token-keyword">xinfer</span> <span class="token-flag">--m</span> <span class="token-string">deepseek-ai/DeepSeek-V3</span> <span class="token-flag">--num-ranks</span> <span class="token-number">16</span> <span class="token-flag">--local-num-ranks</span> <span class="token-number">8</span> <span class="token-flag">--rank-offset</span> <span class="token-number">8</span> <span class="token-flag">--master-addr</span> <span class="token-string">NODE0_IP</span></code><button class="copy-btn" data-copy-text="xinfer --m deepseek-ai/DeepSeek-V3 --num-ranks 2">Copy</button></pre>
+
+        <h2 id="pd-disagg" data-zh="PD 分离" data-en="PD Disaggregation">PD 分离</h2>
+        <p data-zh="将预填充（Prefill）和解码（Decode）分配到不同 GPU 或机器。PD Server 和 PD Client 必须使用相同的 KV 缓存类型。API 请求发送给 PD Client，PD Server 只处理内部预填充请求。" data-en="Split prefill and decode across GPUs or machines. PD Server and Client must use same --kvcache-dtype. API requests go to PD Client; PD Server only handles internal prefill.">PD 分离部署：</p>
+        <div class="table-wrapper">
+          <table>
+            <thead><tr><th data-zh="模式" data-en="Mode">模式</th><th data-zh="配置" data-en="Config">配置</th><th data-zh="场景" data-en="Use Case">场景</th></tr></thead>
+            <tbody>
+              <tr><td>Local IPC</td><td data-zh="默认（无标志）" data-en="Default (no flag)">默认</td><td data-zh="同一机器，CUDA" data-en="Same machine, CUDA">同机 CUDA</td></tr>
+              <tr><td>File IPC</td><td><code>--pd-url file:///path</code></td><td data-zh="Docker 容器间，共享卷" data-en="Docker containers, shared volume">容器间</td></tr>
+              <tr><td>Remote TCP</td><td><code>--pd-url tcp://host:port</code></td><td data-zh="不同机器" data-en="Different machines">跨机器</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="tabs">
+          <button class="tab-btn active" data-tab="tab-pd-local" data-zh="Local IPC" data-en="Local IPC">Local IPC</button>
+          <button class="tab-btn" data-tab="tab-pd-tcp" data-zh="Remote TCP" data-en="Remote TCP">Remote TCP</button>
+          <button class="tab-btn" data-tab="tab-pd-file" data-zh="File IPC (Docker)" data-en="File IPC (Docker)">File IPC</button>
+        </div>
+        <div class="tab-content active" id="tab-pd-local">
+          <pre><code><span class="token-comment"># PD Server（预填充 GPU，默认端口 7000）</span>
+<span class="token-keyword">xinfer</span> <span class="token-flag">--d</span> <span class="token-number">0,1</span> <span class="token-flag">--m</span> <span class="token-string">Qwen/Qwen3-30B-A3B-Instruct-2507</span> <span class="token-flag">--pd-server</span>
+
+<span class="token-comment"># PD Client（解码 GPU + API）</span>
+<span class="token-keyword">xinfer</span> <span class="token-flag">--d</span> <span class="token-number">2,3</span> <span class="token-flag">--m</span> <span class="token-string">/path/Qwen3-30B</span> <span class="token-flag">--isq</span> <span class="token-value">q4k</span> <span class="token-flag">--ui-server</span> <span class="token-flag">--port</span> <span class="token-number">8000</span> <span class="token-flag">--pd-client</span></code><button class="copy-btn" data-copy-text="xinfer --d 0,1 --m Qwen/Qwen3-30B-A3B-Instruct-2507 --pd-server">Copy</button></pre>
+        </div>
+        <div class="tab-content" id="tab-pd-tcp">
+          <pre><code><span class="token-comment"># Server 机器 (192.168.1.100)</span>
+<span class="token-keyword">xinfer</span> <span class="token-flag">--d</span> <span class="token-number">0,1</span> <span class="token-flag">--m</span> <span class="token-string">Qwen/...</span> <span class="token-flag">--pd-server</span> <span class="token-flag">--pd-url</span> <span class="token-string">tcp://0.0.0.0:8100</span>
+
+<span class="token-comment"># Client 机器</span>
+<span class="token-keyword">xinfer</span> <span class="token-flag">--d</span> <span class="token-number">0,1</span> <span class="token-flag">--m</span> <span class="token-string">/path/...</span> <span class="token-flag">--pd-client</span> <span class="token-flag">--pd-url</span> <span class="token-string">tcp://192.168.1.100:8100</span> <span class="token-flag">--ui-server</span></code><button class="copy-btn" data-copy-text="xinfer --d 0,1 --m MODEL --pd-server --pd-url tcp://0.0.0.0:8100">Copy</button></pre>
+        </div>
+        <div class="tab-content" id="tab-pd-file">
+          <pre><code><span class="token-keyword">mkdir</span> <span class="token-flag">-p</span> <span class="token-string">/tmp/pd-sockets</span>
+
+<span class="token-comment"># Server 容器</span>
+<span class="token-keyword">docker</span> run <span class="token-flag">--gpus '"device=0,1"'</span> <span class="token-flag">-v</span> <span class="token-string">/tmp/pd-sockets:/sockets</span> ...
+<span class="token-keyword">xinfer</span> <span class="token-flag">--d</span> <span class="token-number">0,1</span> <span class="token-flag">--m</span> <span class="token-string">Qwen/...</span> <span class="token-flag">--pd-server</span> <span class="token-flag">--pd-url</span> <span class="token-string">file:///sockets</span>
+
+<span class="token-comment"># Client 容器</span>
+<span class="token-keyword">docker</span> run <span class="token-flag">--gpus '"device=2,3"'</span> <span class="token-flag">-v</span> <span class="token-string">/tmp/pd-sockets:/sockets</span> ...
+<span class="token-keyword">xinfer</span> <span class="token-flag">--d</span> <span class="token-number">0,1</span> <span class="token-flag">--m</span> <span class="token-string">/path/...</span> <span class="token-flag">--pd-client</span> <span class="token-flag">--pd-url</span> <span class="token-string">file:///sockets</span> <span class="token-flag">--ui-server</span></code><button class="copy-btn" data-copy-text="xinfer --pd-server --pd-url file:///sockets">Copy</button></pre>
+        </div>
+        <div class="callout-info">
+          <div class="callout-title" data-zh="📘 Metal 注意" data-en="📘 Metal Note">📘 Metal 注意</div>
+          <p data-zh="Metal/macOS 不支持 Local IPC，需要使用 --pd-url 指定 TCP 或 File 模式。" data-en="Metal/macOS doesn't support Local IPC — use --pd-url with TCP or File mode.">Metal/macOS 需要 --pd-url。</p>
+        </div>
+
+        <h2 id="mtp" data-zh="多 Token 预测 (MTP)" data-en="Multi-Token Prediction (MTP)">多 Token 预测 (MTP)</h2>
+        <p data-zh="MTP 允许每次前向传播预测多个 Token，显著提升吞吐量。当前支持 DeepSeek V3/R1 模型。" data-en="MTP predicts multiple tokens per forward pass, boosting throughput. Currently supports DeepSeek V3/R1.">MTP 允许每次前向传播预测多个 Token：</p>
+        <pre><code><span class="token-keyword">xinfer</span> <span class="token-flag">--m</span> <span class="token-string">deepseek-ai/DeepSeek-R1</span> <span class="token-flag">--mtp</span> <span class="token-number">2</span></code><button class="copy-btn" data-copy-text="xinfer --m deepseek-ai/DeepSeek-R1 --mtp 2">Copy</button></pre>
+
+        <h2 id="structured" data-zh="结构化输出" data-en="Structured Outputs">结构化输出</h2>
+        <p data-zh="xInfer 支持 JSON Schema / 正则表达式 / 选择约束引导解码，确保输出严格遵循预期格式：" data-en="xInfer supports guided decoding with JSON Schema / regex / choice constraints:">xInfer 支持引导解码（Guided Decoding）：</p>
+        <pre><code><span class="token-keyword">curl</span> <span class="token-string">http://localhost:8000/v1/chat/completions</span> \
+  <span class="token-flag">-d</span> <span class="token-string">'{
+  "model": "default",
+  "messages": [{"role":"user","content":"List 3 cities"}],
+  "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+      "name": "cities",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "cities": {"type":"array","items":{"type":"string"}}
+        },
+        "required": ["cities"]
+      }
+    }
+  }
+}'</span></code><button class="copy-btn" data-copy-text='curl http://localhost:8000/v1/chat/completions -d &apos;{"model":"default","messages":[{"role":"user","content":"List 3 cities"}],"response_format":{"type":"json_schema","json_schema":{"name":"cities","schema":{"type":"object","properties":{"cities":{"type":"array","items":{"type":"string"}}},"required":["cities"]}}}}&apos;'>Copy</button></pre>
+
+        <h2 id="mcp" data-zh="MCP 工具调用" data-en="MCP Tool Calling">MCP 工具调用</h2>
+        <p data-zh="xInfer 内置 MCP (Model Context Protocol) 支持，自动从配置的 MCP 服务器获取工具定义并注入系统提示。支持 Stdio（本地进程）和 HTTP/SSE（远程服务器）两种传输方式。" data-en="xInfer has built-in MCP support, automatically fetching tool definitions from configured servers and injecting into system prompt. Supports Stdio (local) and HTTP/SSE (remote) transports.">xInfer 内置 MCP 支持：</p>
+        <pre><code><span class="token-comment"># 通过配置文件</span>
+<span class="token-keyword">xinfer</span> <span class="token-flag">--m</span> <span class="token-string">MODEL</span> <span class="token-flag">--mcp-config</span> <span class="token-string">mcp.json</span>
+
+<span class="token-comment"># 或单个 MCP 服务器命令</span>
+<span class="token-keyword">xinfer</span> <span class="token-flag">--m</span> <span class="token-string">MODEL</span> <span class="token-flag">--mcp-command</span> <span class="token-string">path/to/server</span> <span class="token-flag">--mcp-args</span> <span class="token-string">arg1,arg2</span></code><button class="copy-btn" data-copy-text="xinfer --m MODEL --mcp-config mcp.json">Copy</button></pre>
+        <h3 data-zh="配置文件格式" data-en="Config File Format">配置文件格式</h3>
+        <div class="tabs">
+          <button class="tab-btn active" data-tab="tab-mcp-local" data-zh="本地 (Stdio)" data-en="Local (Stdio)">本地 (Stdio)</button>
+          <button class="tab-btn" data-tab="tab-mcp-remote" data-zh="远程 (HTTP/SSE)" data-en="Remote (HTTP/SSE)">远程 (HTTP/SSE)</button>
+        </div>
+        <div class="tab-content active" id="tab-mcp-local">
+          <pre><code>{
+  <span class="token-flag">"mcpServers"</span>: {
+    <span class="token-flag">"filesystem"</span>: {
+      <span class="token-flag">"command"</span>: <span class="token-string">"path/to/executable"</span>,
+      <span class="token-flag">"args"</span>: [<span class="token-string">"arg1"</span>, <span class="token-string">"arg2"</span>],
+      <span class="token-flag">"env"</span>: { <span class="token-flag">"ENV_VAR"</span>: <span class="token-string">"value"</span> }
+    }
+  }
+}</code><button class="copy-btn" data-copy-text='{"mcpServers":{"filesystem":{"command":"path/to/server","args":["arg1"]}}}'>Copy</button></pre>
+        </div>
+        <div class="tab-content" id="tab-mcp-remote">
+          <pre><code>{
+  <span class="token-flag">"mcpServers"</span>: {
+    <span class="token-flag">"remote_server"</span>: {
+      <span class="token-flag">"url"</span>: <span class="token-string">"https://mcp.example.com/api/"</span>,
+      <span class="token-flag">"headers"</span>: {
+        <span class="token-flag">"Authorization"</span>: <span class="token-string">"Bearer YOUR_TOKEN"</span>,
+        <span class="token-flag">"Accept"</span>: <span class="token-string">"text/event-stream"</span>
+      }
+    }
+  }
+}</code><button class="copy-btn" data-copy-text='{"mcpServers":{"remote_server":{"url":"https://mcp.example.com/api/","headers":{"Authorization":"Bearer TOKEN"}}}}'>Copy</button></pre>
+        </div>
+        <p data-zh="多服务器时工具名自动加前缀避免冲突：filesystem 的 list_directory → filesystem_list_directory。" data-en="Multi-server tool names are auto-prefixed: filesystem's list_directory → filesystem_list_directory.">多服务器工具名自动加前缀。</p>
+        <div class="callout-info">
+          <div class="callout-title" data-zh="📘 工具调用流程" data-en="📘 Tool Calling Workflow">📘 工具调用流程</div>
+          <p data-zh="xInfer 只负责工具定义注入和提示构建。当模型生成工具调用时，响应以 finish_reason='tool_calls' 返回给客户端。客户端负责执行工具并将结果发回。" data-en="xInfer handles tool definition injection and prompt building only. When the model generates a tool call, the response returns with finish_reason='tool_calls'. The client executes the tool and sends results back.">xInfer 不执行工具——客户端负责执行和回传结果。</p>
+        </div>
+        <h3 data-zh="工具解析器" data-en="Tool Parsers">工具解析器</h3>
+        <p data-zh="xInfer 使用模型特定的解析器检测工具调用。可通过 --enforce-parser 强制指定解析器：" data-en="xInfer uses model-specific parsers for tool call detection. Force a specific parser with --enforce-parser:">模型特定的工具解析器：</p>
+        <div class="table-wrapper">
+          <table>
+            <thead><tr><th data-zh="模型族" data-en="Model Family">模型族</th><th data-zh="检测方式" data-en="Detection">检测方式</th><th data-zh="开始标记" data-en="Start Token">开始标记</th></tr></thead>
+            <tbody>
+              <tr><td>Qwen 2.5/3</td><td>Token ID + Text</td><td><code>&lt;tool_call&gt;</code></td></tr>
+              <tr><td>Llama 3/3.1</td><td>Token ID + Text</td><td><code>&lt;|python_tag|&gt;</code></td></tr>
+              <tr><td>Mistral</td><td>Token ID + Text</td><td><code>[TOOL_CALLS]</code></td></tr>
+              <tr><td>Gemma</td><td data-zh="仅文本" data-en="Text only">仅文本</td><td><code>&lt;start_function_call&gt;</code></td></tr>
+              <tr><td>Phi4, GLM4</td><td data-zh="仅文本" data-en="Text only">仅文本</td><td><code>&lt;tool_call&gt;</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="embedding" data-zh="嵌入端点" data-en="Embeddings">嵌入端点</h2>
+        <p data-zh="xInfer 暴露 OpenAI 风格的 /v1/embeddings 端点，支持纯文本模型（Qwen3、LLaMa、GLM4、Gemma3 等）。同一服务器同时支持 Chat 和 Embedding。" data-en="xInfer exposes OpenAI-style /v1/embeddings for text-only models (Qwen3, LLaMa, GLM4, Gemma3). Same server supports both Chat and Embeddings.">同一服务器支持 Chat 和 Embedding：</p>
+        <div class="tabs">
+          <button class="tab-btn active" data-tab="tab-embed-mean" data-zh="Mean 池化" data-en="Mean Pooling">Mean 池化</button>
+          <button class="tab-btn" data-tab="tab-embed-last" data-zh="Last Token" data-en="Last Token">Last Token</button>
+          <button class="tab-btn" data-tab="tab-embed-batch" data-zh="批量 + Base64" data-en="Batch + Base64">批量 + Base64</button>
+        </div>
+        <div class="tab-content active" id="tab-embed-mean">
+          <pre><code><span class="token-keyword">curl</span> <span class="token-flag">-XPOST</span> <span class="token-string">http://localhost:8000/v1/embeddings</span> \
+  <span class="token-flag">-H</span> <span class="token-string">"Content-Type: application/json"</span> \
+  <span class="token-flag">-d</span> <span class="token-string">'{"input":"hello world","model":"default","embedding_type":"mean"}'</span></code><button class="copy-btn" data-copy-text='curl -XPOST http://localhost:8000/v1/embeddings -H "Content-Type: application/json" -d &apos;{"input":"hello world","embedding_type":"mean"}&apos;'>Copy</button></pre>
+        </div>
+        <div class="tab-content" id="tab-embed-last">
+          <pre><code><span class="token-keyword">curl</span> <span class="token-flag">-XPOST</span> <span class="token-string">http://localhost:8000/v1/embeddings</span> \
+  <span class="token-flag">-H</span> <span class="token-string">"Content-Type: application/json"</span> \
+  <span class="token-flag">-d</span> <span class="token-string">'{"input":"hello world","embedding_type":"last"}'</span></code><button class="copy-btn" data-copy-text='curl -XPOST http://localhost:8000/v1/embeddings -H "Content-Type: application/json" -d &apos;{"input":"hello world","embedding_type":"last"}&apos;'>Copy</button></pre>
+        </div>
+        <div class="tab-content" id="tab-embed-batch">
+          <pre><code><span class="token-keyword">curl</span> <span class="token-flag">-XPOST</span> <span class="token-string">http://localhost:8000/v1/embeddings</span> \
+  <span class="token-flag">-H</span> <span class="token-string">"Content-Type: application/json"</span> \
+  <span class="token-flag">-d</span> <span class="token-string">'{"input":["hello","hola"],"embedding_type":"last","encoding_format":"base64"}'</span></code><button class="copy-btn" data-copy-text='curl -XPOST http://localhost:8000/v1/embeddings -H "Content-Type: application/json" -d &apos;{"input":["hello","hola"],"embedding_type":"last","encoding_format":"base64"}&apos;'>Copy</button></pre>
+        </div>
+        <div class="table-wrapper" style="margin-top:1rem">
+          <table>
+            <thead><tr><th data-zh="参数" data-en="Parameter">参数</th><th data-zh="值" data-en="Values">值</th><th data-zh="说明" data-en="Description">说明</th></tr></thead>
+            <tbody>
+              <tr><td><code>embedding_type</code></td><td><code>mean</code> / <code>last</code></td><td data-zh="mean: 平均所有 Token 隐藏状态；last: 最后一个 Token" data-en="mean: average all token hidden states; last: final token hidden state">池化方式</td></tr>
+              <tr><td><code>encoding_format</code></td><td><code>float</code> / <code>base64</code></td><td data-zh="float: 浮点数组；base64: Base64 编码" data-en="float: number array; base64: Base64 encoded">编码格式</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="prefix-cache" data-zh="前缀缓存" data-en="Prefix Cache">前缀缓存</h2>
+        <p data-zh="前缀缓存默认启用（CUDA 和 Metal），自动复用多轮对话中的 KV 缓存块，无需 session_id。完成的序列将完整 KV 块贡献给全局前缀缓存。新请求自动查找最长的已缓存前缀（按块对齐）并复用。" data-en="Prefix caching is enabled by default (CUDA/Metal). Finished sequences contribute full KV blocks to a global cache. New requests auto-find the longest cached prefix (block-aligned) and reuse those blocks. No session_id needed.">前缀缓存默认启用，自动复用 KV 缓存：</p>
+        <pre><code><span class="token-comment"># 禁用前缀缓存</span>
+<span class="token-keyword">xinfer</span> <span class="token-flag">--m</span> <span class="token-string">MODEL</span> <span class="token-flag">--disable-prefix-cache</span>
+
+<span class="token-comment"># 限制前缀缓存大小（按 block 大小向下取整）</span>
+<span class="token-keyword">xinfer</span> <span class="token-flag">--m</span> <span class="token-string">MODEL</span> <span class="token-flag">--prefix-cache-max-tokens</span> <span class="token-number">65536</span></code><button class="copy-btn" data-copy-text="xinfer --m MODEL --disable-prefix-cache">Copy</button></pre>
+        <h3 data-zh="默认缓存大小" data-en="Default Cache Sizes">默认缓存大小</h3>
+        <div class="table-wrapper">
+          <table>
+            <thead><tr><th data-zh="模式" data-en="Mode">模式</th><th data-zh="默认 KV 块占比" data-en="Default KV Blocks">默认占比</th></tr></thead>
+            <tbody>
+              <tr><td data-zh="普通模式" data-en="Normal mode">普通模式</td><td>~50%</td></tr>
+              <tr><td>PD Server</td><td>~75%</td></tr>
+              <tr><td>PD Client</td><td>~35%</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <h3 data-zh="缓存命中检查" data-en="Cache Hit Inspection">缓存命中检查</h3>
+        <p data-zh="Chat Completion 响应的 usage 字段包含前缀缓存命中数：" data-en="Chat Completion responses include prefix cache hit count in the usage field:">检查缓存命中：</p>
+        <pre><code><span class="token-comment">// 响应中的 usage 字段</span>
+{
+  <span class="token-flag">"usage"</span>: {
+    <span class="token-flag">"prompt_tokens"</span>: <span class="token-number">499</span>,
+    <span class="token-flag">"completion_tokens"</span>: <span class="token-number">16</span>,
+    <span class="token-flag">"prompt_tokens_details"</span>: { <span class="token-flag">"cached_tokens"</span>: <span class="token-number">480</span> }
+  }
+}</code></pre>
+        <p data-zh="推理模型（输出 &lt;think&gt;...&lt;/think&gt; 块的模型）还会返回 reasoning_tokens：" data-en="Reasoning models also return reasoning_tokens in completion_tokens_details:">推理模型还返回：</p>
+        <pre><code><span class="token-flag">"completion_tokens_details"</span>: { <span class="token-flag">"reasoning_tokens"</span>: <span class="token-number">192</span> }</code></pre>
+        <div class="callout-info">
+          <div class="callout-title" data-zh="💡 Hybrid Mamba 模型" data-en="💡 Hybrid Mamba Models">💡 Hybrid Mamba 模型</div>
+          <p data-zh="对于 Qwen3.5 等混合 Mamba 模型，前缀复用需要匹配的 Mamba 快照。使用 XINFER_MAMBA_SNAPSHOT_STRIDE_BLOCKS 环境变量控制稀疏快照捕获步长（默认 1 块）。" data-en="For hybrid Mamba models (Qwen3.5), prefix reuse needs a matching Mamba snapshot. Use XINFER_MAMBA_SNAPSHOT_STRIDE_BLOCKS env var to control sparse snapshot stride (default 1 block).">混合 Mamba 模型需要匹配快照。</p>
+        </div>
+        <div class="callout-info">
+          <div class="callout-title" data-zh="💡 调优建议" data-en="💡 Tuning Tips">💡 调优建议</div>
+          <p data-zh="前缀缓存共享 KV 内存池。更大的缓存减少可用的并发 Token 数。合理设置 --max-model-len、--kv-fraction、--cpu-mem-fold 避免换出/驱逐。" data-en="Prefix cache shares the KV memory pool. Larger cache reduces available concurrent tokens. Tune --max-model-len, --kv-fraction, --cpu-mem-fold to avoid swap/eviction.">前缀缓存共享 KV 内存池。</p>
+        </div>
+
+        <h2 id="multimodal" data-zh="视觉语言模型" data-en="Vision-Language Models">视觉语言模型</h2>
+        <p data-zh="支持的 VL 模型包括 Qwen3-VL、Qwen3.5-VL、Qwen3.6 MoE VL、Gemma3/4、Mistral3-VL。" data-en="Supported VL models include Qwen3-VL, Qwen3.5-VL, Qwen3.6 MoE VL, Gemma3/4, Mistral3-VL.">支持的 VL 模型：</p>
+        <pre><code><span class="token-comment"># 通过 Web UI 上传图片</span>
+<span class="token-keyword">xinfer</span> <span class="token-flag">--m</span> <span class="token-string">Qwen/Qwen3-VL-8B-Instruct</span> <span class="token-flag">--ui-server</span>
+
+<span class="token-comment"># 通过 API 发送图片（image_url）</span>
+<span class="token-keyword">curl</span> <span class="token-string">http://localhost:8000/v1/chat/completions</span> \
+  <span class="token-flag">-d</span> <span class="token-string">'{"model":"default","messages":[{"role":"user","content":[
+    {"type":"text","text":"Describe this image:"},
+    {"type":"image_url","image_url":{"url":"https://example.com/cat.jpg"}}
+  ]}]}'</span></code><button class="copy-btn" data-copy-text='curl http://localhost:8000/v1/chat/completions -d &apos;{"model":"default","messages":[{"role":"user","content":[{"type":"text","text":"Describe this image:"},{"type":"image_url","image_url":{"url":"https://example.com/cat.jpg"}}]}]}&apos;'>Copy</button></pre>
+
+        <h2 id="reasoning" data-zh="推理控制" data-en="Reasoning Control">推理控制</h2>
+        <p data-zh="默认情况下，xInfer 在请求未指定 thinking/enable_thinking 时启用推理模式。使用 --disable-reasoning 改变此默认行为：" data-en="By default, xInfer enables reasoning when requests omit thinking/enable_thinking. Use --disable-reasoning to change this default:">推理模式控制：</p>
+        <pre><code><span class="token-comment"># 禁用默认推理（显式请求值仍然优先）</span>
+<span class="token-keyword">xinfer</span> <span class="token-flag">--m</span> <span class="token-string">MODEL</span> <span class="token-flag">--disable-reasoning</span></code><button class="copy-btn" data-copy-text="xinfer --m MODEL --disable-reasoning">Copy</button></pre>
+        <p data-zh="reasoning_effort 参数支持的值：none、low、medium、normal、high、chain_of_thought (cot)、cove。非 Python 构建还支持 custom:&lt;template&gt;。" data-en="reasoning_effort values: none, low, medium, normal, high, chain_of_thought (cot), cove. Non-Python builds also support custom:&lt;template&gt;.">支持多种推理努力级别。</p>
+
+        <h2 id="runtime-knobs" data-zh="运行时参数" data-en="Runtime Knobs">运行时参数</h2>
+        <div class="table-wrapper">
+          <table>
+            <thead><tr><th data-zh="参数" data-en="Flag">参数</th><th data-zh="说明" data-en="Description">说明</th><th data-zh="默认" data-en="Default">默认</th></tr></thead>
+            <tbody>
+              <tr><td><code>--max-model-len</code></td><td data-zh="最大模型上下文长度" data-en="Maximum model context length">最大上下文长度</td><td data-zh="模型默认" data-en="Model default">模型默认</td></tr>
+              <tr><td><code>--max-num-seqs</code></td><td data-zh="最大并发请求数" data-en="Max concurrent requests">最大并发请求</td><td>32 (macOS: 8)</td></tr>
+              <tr><td><code>--kv-fraction</code></td><td data-zh="GPU 显存中 KV 缓存占用比例" data-en="GPU memory fraction for KV cache">KV 缓存显存比例</td><td data-zh="自动" data-en="Auto">自动</td></tr>
+              <tr><td><code>--cpu-mem-fold</code></td><td data-zh="CPU 换出内存比例" data-en="CPU swap memory ratio">CPU 换出比例</td><td><code>0.2</code></td></tr>
+              <tr><td><code>--prefill-chunk-size</code></td><td data-zh="预填充分块大小" data-en="Prefill chunk size">预填充分块</td><td>CUDA 8K, Metal 4K</td></tr>
+              <tr><td><code>--max-tokens</code></td><td data-zh="每个响应的最大 Token 数" data-en="Max tokens per response">最大响应 Token</td><td><code>16384</code></td></tr>
+              <tr><td><code>--disable-cuda-graph</code></td><td data-zh="禁用 CUDA Graph 捕获" data-en="Disable CUDA graph capture">禁用 CUDA Graph</td><td>—</td></tr>
+              <tr><td><code>--yarn-scaling-factor</code></td><td data-zh="YARN RoPE 上下文扩展因子" data-en="YARN RoPE context extension factor">YARN 扩展因子</td><td>—</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="chat-logger" data-zh="聊天日志" data-en="Chat Logger">聊天日志</h2>
+        <p data-zh="启用聊天日志记录，监控客户端与 xInfer 的详细交互：" data-en="Enable chat logging to monitor detailed interactions between clients and xInfer:">启用聊天日志：</p>
+        <pre><code><span class="token-keyword">export</span> <span class="token-flag">XINFER_CHAT_LOGGER</span>=<span class="token-number">1</span>
+<span class="token-keyword">xinfer</span> <span class="token-flag">--m</span> <span class="token-string">MODEL</span> <span class="token-flag">--ui-server</span>
+<span class="token-comment"># 日志文件写入 ./log 目录</span></code><button class="copy-btn" data-copy-text="export XINFER_CHAT_LOGGER=1">Copy</button></pre>
+
+        <h2 id="troubleshooting" data-zh="故障排查" data-en="Troubleshooting">故障排查</h2>
+        <div class="callout-warning">
+          <div class="callout-title" data-zh="⚠️ CUDA OOM" data-en="⚠️ CUDA OOM">⚠️ CUDA OOM</div>
+          <p data-zh="显存不足时：1) 降低 --max-num-seqs 值减少并发；2) 使用 --kvcache-dtype turbo4 压缩 KV 缓存；3) 降低 --kv-fraction 减少显存分配；4) 使用更小的量化格式（Q4_K_M / NVFP4）。" data-en="If OOM: 1) lower --max-num-seqs to reduce concurrency; 2) use --kvcache-dtype turbo4 for KV compression; 3) lower --kv-fraction to reduce allocation; 4) use smaller quant formats (Q4_K_M / NVFP4).">显存不足时，调整多个参数。</p>
+        </div>
+        <div class="callout-warning">
+          <div class="callout-title" data-zh="⚠️ Metal OOM" data-en="⚠️ Metal OOM">⚠️ Metal OOM</div>
+          <p data-zh="macOS 上显存不足时，降低 --max-model-len 和批量大小。FP8 KV 缓存在 Metal 上也可用（Apple M1+）。" data-en="On macOS, lower --max-model-len and batch size. FP8 KV cache is available on Metal (Apple M1+).">macOS 上降低上下文长度和批量。</p>
+        </div>
+        <div class="callout-warning">
+          <div class="callout-title" data-zh="⚠️ SM70 兼容性" data-en="⚠️ SM70 Compatibility">⚠️ SM70 兼容性</div>
+          <p data-zh="V100 用户在编译时请移除 flashinfer 和 cutlass 特性，避免编译错误。对于 GGUF/ISQ 模型，保持 --max-num-seqs 适中以避免带宽瓶颈。" data-en="V100 users: remove flashinfer and cutlass features. For GGUF/ISQ models, keep --max-num-seqs moderate to avoid bandwidth bottlenecks.">V100 用户注意编译特性和并发设置。</p>
+        </div>
+        <div class="callout-info">
+          <div class="callout-title" data-zh="💡 性能调优" data-en="💡 Performance Tuning">💡 性能调优</div>
+          <p data-zh="使用 --log 查看加载进度。注意 'swap' 消息表示 KV 缓存压力。Hopper GPU 上可使用 SM90_LOWER_PRECISION_GDN_PREFILL=1 加速 Qwen3.5/3.6 的 GDN 预填充（略有精度损失）。" data-en="Use --log to watch loading progress. Watch for 'swap' messages indicating KV pressure. On Hopper, use SM90_LOWER_PRECISION_GDN_PREFILL=1 for faster Qwen3.5/3.6 GDN prefill (slight precision tradeoff).">使用 --log 监控，注意 swap 消息。</p>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<footer class="site-footer"><div class="container"><div class="footer-grid"><div class="footer-brand"><a href="index.html" class="logo"><img src="assets/images/logo.svg" alt="xInfer"><span>xInfer</span></a><p data-zh="纯 Rust 构建的极速 LLM 推理引擎。" data-en="Blazing-fast LLM inference in pure Rust.">纯 Rust 构建的极速 LLM 推理引擎。</p></div><div class="footer-col"><h4 data-zh="文档" data-en="Docs">文档</h4><a href="getting-started.html" data-zh="快速开始" data-en="Getting Started">快速开始</a><a href="user-guide.html" data-zh="使用指南" data-en="User Guide">使用指南</a><a href="developer-guide.html" data-zh="开发指南" data-en="Developer Guide">开发指南</a><a href="api-reference.html" data-zh="API 参考" data-en="API Reference">API 参考</a></div><div class="footer-col"><h4 data-zh="资源" data-en="Resources">资源</h4><a href="https://github.com/guoqingbao/xinfer" target="_blank" data-zh="GitHub 仓库" data-en="GitHub Repo">GitHub 仓库</a></div><div class="footer-col"><h4 data-zh="社区" data-en="Community">社区</h4><a href="https://github.com/guoqingbao/xinfer/issues" target="_blank" data-zh="报告问题" data-en="Report Issue">报告问题</a></div></div><div class="footer-bottom"><span data-zh="MIT 许可证 © 2024 xInfer Team" data-en="MIT License © 2024 xInfer Team">MIT 许可证 © 2024 xInfer Team</span><span data-zh="由 Candle ML 框架驱动" data-en="Powered by Candle ML Framework">由 Candle ML 框架驱动</span></div></div></footer>
+<script src="assets/js/main.js?v=1"></script>
+</body>
+</html>

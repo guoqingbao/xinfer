@@ -1267,11 +1267,15 @@ impl FusedMoeGGUF {
             )?
         };
         let mut ys = ys.reshape((num_tokens, (), hidden_dim))?.sum(D::Minus2)?;
+        if self.world_size > 1 {
+            // AllReduce in the current dtype (F32 from moe_gemm_gguf) to preserve
+            // precision for low-bit quantized weights (IQ2_XS, Q2_K) where partial
+            // sums have high variance and BF16 truncation causes catastrophic
+            // cancellation.
+            ys = self.all_reduce.apply(&ys)?;
+        }
         if ys.dtype() != self.dtype {
             ys = ys.to_dtype(self.dtype)?;
-        }
-        if self.world_size > 1 {
-            ys = self.all_reduce.apply(&ys)?;
         }
         ys.to_dtype(original_dtype)
     }
@@ -1680,11 +1684,11 @@ impl FusedMoeISQ {
             )?
         };
         let mut ys = ys.reshape((num_tokens, (), hidden_dim))?.sum(D::Minus2)?;
-        if ys.dtype() != self.dtype {
-            ys = ys.to_dtype(self.dtype)?;
-        }
         if self.world_size > 1 {
             ys = self.all_reduce.apply(&ys)?;
+        }
+        if ys.dtype() != self.dtype {
+            ys = ys.to_dtype(self.dtype)?;
         }
         ys.to_dtype(original_dtype)
     }

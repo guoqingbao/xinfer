@@ -1,0 +1,521 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>xInfer — Blazing-Fast LLM Inference in Pure Rust</title>
+  <meta name="description" content="Blazing-fast LLM inference in pure Rust. No PyTorch. No Python runtime. Just fast, portable, production-ready inference.">
+  <link rel="icon" href="assets/images/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="assets/css/main.css?v=1">
+</head>
+<body>
+
+<header class="site-header">
+  <div class="header-inner">
+    <a href="index.html" class="logo">
+      <img src="assets/images/logo.svg" alt="xInfer">
+      <span>xInfer</span>
+    </a>
+    <nav class="nav-links">
+      <a href="index.html" data-zh="首页" data-en="Home">首页</a>
+      <a href="getting-started.html" data-zh="快速开始" data-en="Getting Started">快速开始</a>
+      <a href="user-guide.html" data-zh="使用指南" data-en="User Guide">使用指南</a>
+      <a href="developer-guide.html" data-zh="开发指南" data-en="Developer Guide">开发指南</a>
+      <a href="api-reference.html" data-zh="API 参考" data-en="API Reference">API 参考</a>
+    </nav>
+    <div class="nav-actions">
+      <button class="lang-toggle" aria-label="Switch language">EN</button>
+      <div class="theme-dropdown">
+        <select class="theme-select" aria-label="Select theme">
+          <option value="dark">🌙 Dark</option>
+          <option value="light">☀️ Light</option>
+          <option value="enflame">🔥 Enflame</option>
+        </select>
+      </div>
+      <a href="https://github.com/guoqingbao/xinfer" class="btn btn-sm btn-page" target="_blank">GitHub</a>
+      <button class="mobile-toggle" aria-label="Menu"><span></span><span></span><span></span></button>
+    </div>
+  </div>
+</header>
+<div class="scroll-progress"></div>
+
+<div class="search-overlay">
+  <div class="search-box">
+    <div class="search-input-wrapper">
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
+      <input type="text" class="search-input" placeholder="Search documentation... (Ctrl+K)">
+    </div>
+    <div class="search-results"><div class="search-hint">Type to search documentation...</div></div>
+  </div>
+</div>
+
+<section class="hero">
+  <div class="hero-bg"></div>
+  <canvas id="particles"></canvas>
+  <div class="container">
+    <div class="hero-grid">
+      <div>
+        <div class="hero-badge">
+          <span data-zh="⚡ v0.13.7 — 纯 Rust 高性能推理引擎" data-en="⚡ v0.13.7 — Pure Rust Inference Engine">⚡ v0.13.7 — 纯 Rust 高性能推理引擎</span>
+        </div>
+        <h1>
+          <span data-zh="纯 Rust LLM 推理" data-en="Pure Rust LLM Inference">纯 Rust LLM 推理</span><br>
+          <span class="gradient-text" data-zh="极速 · 零依赖 · 生产就绪" data-en="Blazing Fast · Zero Deps · Production Ready">极速 · 零依赖 · 生产就绪</span>
+        </h1>
+        <p data-zh="无 PyTorch、无 Python 运行时。原生 Flash Attention、FlashInfer、CUDA Graph、连续批处理、PD 分离、多 Token 预测（MTP）。支持 CUDA / Metal，提供 OpenAI 兼容 API 和内置 Web UI。" data-en="No PyTorch, no Python runtime. Native Flash Attention, FlashInfer, CUDA Graphs, continuous batching, PD disaggregation, multi-token prediction (MTP). Supports CUDA / Metal with OpenAI-compatible API and built-in Web UI.">无 PyTorch、无 Python 运行时。原生 Flash Attention、FlashInfer、CUDA Graph、连续批处理、PD 分离、多 Token 预测（MTP）。支持 CUDA / Metal，提供 OpenAI 兼容 API 和内置 Web UI。</p>
+        <div class="hero-buttons">
+          <a href="getting-started.html" class="btn btn-primary" data-zh="快速开始" data-en="Get Started">快速开始</a>
+          <a href="api-reference.html" class="btn btn-outline" data-zh="API 文档" data-en="API Docs">API 文档</a>
+          <a href="#demo" class="btn btn-page" data-zh="▶ 观看演示" data-en="▶ Watch Demo">▶ 观看演示</a>
+          <button class="btn btn-page" data-search-trigger data-zh="🔍 搜索 (Ctrl+K)" data-en="🔍 Search (Ctrl+K)">🔍 搜索 (Ctrl+K)</button>
+        </div>
+        <div class="stats-row">
+          <div class="stat-card reveal">
+            <div class="stat-number" data-counter data-target="197" data-suffix=" tks/s">0</div>
+            <div class="stat-label" data-zh="30B+ 模型解码速度" data-en="30B+ Model Decode Speed">30B+ 模型解码速度</div>
+          </div>
+          <div class="stat-card reveal">
+            <div class="stat-number" data-counter data-target="5000" data-suffix="">0</div>
+            <div class="stat-label" data-zh="核心代码行数" data-en="Lines of Core Code">核心代码行数</div>
+          </div>
+          <div class="stat-card reveal">
+            <div class="stat-number" data-counter data-target="4" data-suffix=".3×">0</div>
+            <div class="stat-label" data-zh="KV 缓存压缩" data-en="KV Cache Compression">KV 缓存压缩</div>
+          </div>
+        </div>
+      </div>
+      <div class="hero-code reveal">
+        <div class="hero-code-header">
+          <div class="hero-code-dot"></div>
+          <div class="hero-code-dot"></div>
+          <div class="hero-code-dot"></div>
+        </div>
+        <div id="hero-typing-code">
+          <pre><code></code></pre>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="section">
+  <div class="container">
+    <div class="section-header reveal">
+      <span class="overline" data-zh="核心特性" data-en="Core Features">核心特性</span>
+      <h2 data-zh="为生产环境打造" data-en="Built for Production">为生产环境打造</h2>
+      <p data-zh="从消费级 GPU 到多节点集群，从 FP16 到 2-bit 量化，xInfer 覆盖全场景推理需求。" data-en="From consumer GPUs to multi-node clusters, from FP16 to 2-bit quantization, xInfer covers all inference scenarios.">从消费级 GPU 到多节点集群，从 FP16 到 2-bit 量化，xInfer 覆盖全场景推理需求。</p>
+    </div>
+    <div class="features-grid">
+      <div class="feature-card reveal">
+        <span class="feature-icon">0️⃣</span>
+        <h3 data-zh="零 Python 依赖" data-en="Zero Python Dependencies">零 Python 依赖</h3>
+        <p data-zh="纯 Rust 后端——无 PyTorch、无 CUDA Python 绑定。核心调度 + 注意力逻辑不到 5000 行代码。" data-en="Pure Rust backend — no PyTorch, no CUDA Python bindings. Core scheduling + attention logic in under 5,000 lines.">纯 Rust 后端——无 PyTorch、无 CUDA Python 绑定。核心调度 + 注意力逻辑不到 5000 行代码。</p>
+      </div>
+      <div class="feature-card reveal">
+        <span class="feature-icon">⚡</span>
+        <h3 data-zh="极致性能" data-en="Blazing Fast">极致性能</h3>
+        <p data-zh="原生 Flash Attention、FlashInfer、DeepGEMM 后端、CUDA Graph 捕获。30B+ MoE 模型解码高达 197 tks/s。" data-en="Native Flash Attention, FlashInfer, DeepGEMM backends, CUDA Graph capture. 30B+ MoE models decode at up to 197 tks/s.">原生 Flash Attention、FlashInfer、DeepGEMM 后端、CUDA Graph 捕获。30B+ MoE 模型解码高达 197 tks/s。</p>
+      </div>
+      <div class="feature-card reveal">
+        <span class="feature-icon">🗜️</span>
+        <h3 data-zh="TurboQuant KV 压缩" data-en="TurboQuant KV Compression">TurboQuant KV 压缩</h3>
+        <p data-zh="基于 Walsh-Hadamard 变换的 KV 缓存压缩（2-4 bit），在单张 24/32 GB GPU 上运行 30B+ MoE 模型，百万级上下文。" data-en="Walsh-Hadamard KV cache compression (2-4 bit). Run 30B+ MoE models on a single 24/32 GB GPU with millions of context tokens.">基于 Walsh-Hadamard 变换的 KV 缓存压缩（2-4 bit），在单张 24/32 GB GPU 上运行 30B+ MoE 模型，百万级上下文。</p>
+      </div>
+      <div class="feature-card reveal">
+        <span class="feature-icon">🌍</span>
+        <h3 data-zh="跨平台" data-en="Cross-Platform">跨平台</h3>
+        <p data-zh="CUDA（Linux/Windows）和 Metal（macOS）。同一二进制，同一 API，开箱即用。" data-en="CUDA (Linux/Windows) and Metal (macOS). Same binary, same API, works out of the box.">CUDA（Linux/Windows）和 Metal（macOS）。同一二进制，同一 API，开箱即用。</p>
+      </div>
+      <div class="feature-card reveal">
+        <span class="feature-icon">🏭</span>
+        <h3 data-zh="生产就绪" data-en="Production Ready">生产就绪</h3>
+        <p data-zh="OpenAI/Anthropic 兼容 API、内置 ChatGPT 风格 Web UI、MCP 工具调用、结构化输出、嵌入 + 分词端点。" data-en="OpenAI/Anthropic-compatible APIs, built-in Web UI, MCP tool calling, structured outputs, embedding + tokenizer endpoints.">OpenAI/Anthropic 兼容 API、内置 ChatGPT 风格 Web UI、MCP 工具调用、结构化输出、嵌入 + 分词端点。</p>
+      </div>
+      <div class="feature-card reveal">
+        <span class="feature-icon">🔥</span>
+        <h3 data-zh="V100 上的 NVFP4" data-en="NVFP4 on V100">V100 上的 NVFP4</h3>
+        <p data-zh="业界首创：在 V100 上运行 NVFP4 + 低比特 KV 缓存——无需硬件 FP4 支持，在老旧 GPU 上实现一致输出。" data-en="Industry first: NVFP4 + low-bit KV cache on V100 — no hardware FP4 needed, coherent output on legacy GPUs.">业界首创：在 V100 上运行 NVFP4 + 低比特 KV 缓存——无需硬件 FP4 支持，在老旧 GPU 上实现一致输出。</p>
+      </div>
+      <div class="feature-card reveal">
+        <span class="feature-icon">🔀</span>
+        <h3 data-zh="PD 分离" data-en="PD Disaggregation">PD 分离</h3>
+        <p data-zh="将预填充和解码拆分到不同 GPU 或机器，消除长上下文预填充造成的解码卡顿。" data-en="Split prefill and decode across GPUs or machines. Eliminates decode stalls during long-context prefilling.">将预填充和解码拆分到不同 GPU 或机器，消除长上下文预填充造成的解码卡顿。</p>
+      </div>
+      <div class="feature-card reveal">
+        <span class="feature-icon">🚀</span>
+        <h3 data-zh="多 Token 预测" data-en="Multi-Token Prediction">多 Token 预测</h3>
+        <p data-zh="MTP 支持每次前向传播预测多个 Token，显著提升吞吐量。使用 --mtp 2 即可启用。" data-en="MTP predicts multiple tokens per forward pass for significantly higher throughput. Enable with --mtp 2.">MTP 支持每次前向传播预测多个 Token，显著提升吞吐量。使用 --mtp 2 即可启用。</p>
+      </div>
+      <div class="feature-card reveal">
+        <span class="feature-icon">🐍</span>
+        <h3 data-zh="Python 绑定" data-en="Python Bindings">Python 绑定</h3>
+        <p data-zh="可选 PyO3 轮子和 npm 包，当需要 Python 或 Node.js 入口时可用。也可通过 pip 或 npm 安装。" data-en="Optional PyO3 wheel and npm package when you need Python or Node.js entry points. Install via pip or npm.">可选 PyO3 轮子和 npm 包，当需要 Python 或 Node.js 入口时可用。也可通过 pip 或 npm 安装。</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="section" style="background: var(--surface-alt);">
+  <div class="container">
+    <div class="section-header reveal">
+      <span class="overline" data-zh="模型支持" data-en="Model Support">模型支持</span>
+      <h2 data-zh="广泛的模型覆盖" data-en="Broad Model Coverage">广泛的模型覆盖</h2>
+      <p data-zh="支持主流 LLM 模型族，包括 Safetensors、GGUF、GPTQ/AWQ、FP8/NVFP4、ISQ 多种格式。" data-en="Supports mainstream LLM families across Safetensors, GGUF, GPTQ/AWQ, FP8/NVFP4, ISQ formats.">支持主流 LLM 模型族，包括 Safetensors、GGUF、GPTQ/AWQ、FP8/NVFP4、ISQ 多种格式。</p>
+    </div>
+    <div class="model-families reveal">
+      <div class="model-family"><span class="model-family-icon">🦙</span><span class="model-family-name">LLaMA 2/3/4</span></div>
+      <div class="model-family"><span class="model-family-icon">🔮</span><span class="model-family-name">Qwen 2/3/3.5/3.6</span></div>
+      <div class="model-family"><span class="model-family-icon">🌬️</span><span class="model-family-name">Mistral 3 VL</span></div>
+      <div class="model-family"><span class="model-family-icon">💎</span><span class="model-family-name">Gemma 3/4</span></div>
+      <div class="model-family"><span class="model-family-icon">🔬</span><span class="model-family-name">Phi 3/4</span></div>
+      <div class="model-family"><span class="model-family-icon">🏔️</span><span class="model-family-name">DeepSeek V3/R1/V3.2</span></div>
+      <div class="model-family"><span class="model-family-icon">🧊</span><span class="model-family-name">GLM 4/4.7/5.2</span></div>
+      <div class="model-family"><span class="model-family-icon">🌀</span><span class="model-family-name">MiroThinker</span></div>
+      <div class="model-family"><span class="model-family-icon">📐</span><span class="model-family-name">Qwen3 Next</span></div>
+      <div class="model-family"><span class="model-family-icon">💫</span><span class="model-family-name">MiniMax M2.5</span></div>
+    </div>
+
+    <div class="section-header reveal" style="margin-top:3rem">
+      <h2 data-zh="支持的模型格式" data-en="Supported Model Formats">支持的模型格式</h2>
+    </div>
+    <div class="table-wrapper reveal">
+      <table>
+        <thead><tr>
+          <th data-zh="格式" data-en="Format">格式</th>
+          <th data-zh="精度" data-en="Precision">精度</th>
+          <th data-zh="GPU 要求" data-en="GPU Requirement">GPU 要求</th>
+          <th data-zh="说明" data-en="Notes">说明</th>
+        </tr></thead>
+        <tbody>
+          <tr><td><strong>Safetensors</strong></td><td>BF16/FP16</td><td data-zh="所有" data-en="All">所有</td><td data-zh="完整精度 HuggingFace 格式，本地或远程加载" data-en="Full precision HuggingFace format, local or remote loading">完整精度 HuggingFace 格式</td></tr>
+          <tr><td><strong>GGUF</strong></td><td>Q2–Q8</td><td data-zh="所有" data-en="All">所有</td><td data-zh="最广泛的量化格式，支持单文件、多分片和子目录自动检测" data-en="Most popular quant format, supports single file, multi-shard, and subfolder auto-detection">最广泛的量化格式</td></tr>
+          <tr><td><strong>GPTQ / AWQ</strong></td><td>4-bit</td><td data-zh="CUDA SM70+" data-en="CUDA SM70+">CUDA SM70+</td><td data-zh="GPU 优化 4-bit 量化，适合显存受限场景" data-en="GPU-optimized 4-bit quantization for VRAM-constrained setups">GPU 优化 4-bit 量化</td></tr>
+          <tr><td><strong>FP8</strong></td><td>E4M3/E5M2</td><td data-zh="SM89+ (Ada) HW / SM80+ SW" data-en="SM89+ (Ada) HW / SM80+ SW">SM89+/SM80+</td><td data-zh="FP8 Blockwise 格式，Hopper 上 CUTLASS 加速" data-en="FP8 blockwise format, CUTLASS acceleration on Hopper">FP8 Blockwise 格式</td></tr>
+          <tr><td><strong>NVFP4</strong></td><td>4-bit</td><td data-zh="SM100+ (Blackwell) HW / SM70+ SW" data-en="SM100+ (Blackwell) HW / SM70+ SW">SM100+/SM70+</td><td data-zh="Blackwell 原生硬件 FP4；V100/Hopper 可软件模拟" data-en="Native Blackwell HW FP4; software emulation on V100/Hopper">Blackwell 原生/软件 FP4</td></tr>
+          <tr><td><strong>MXFP4</strong></td><td>4-bit</td><td data-zh="CUDA SM70+" data-en="CUDA SM70+">CUDA SM70+</td><td data-zh="Microscaling FP4 格式" data-en="Microscaling FP4 format">Microscaling FP4</td></tr>
+          <tr><td><strong>ISQ</strong></td><td>Q2–Q8</td><td data-zh="所有" data-en="All">所有</td><td data-zh="在线量化——加载 Safetensors 后实时量化为 GGUF" data-en="On-the-fly quantization — load Safetensors and quantize to GGUF format in-memory">在线 Safetensors → GGUF</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
+<section class="section">
+  <div class="container">
+    <div class="section-header reveal">
+      <span class="overline" data-zh="性能指标" data-en="Performance">性能指标</span>
+      <h2 data-zh="实测解码速度" data-en="Benchmark Decode Speed">实测解码速度</h2>
+      <p data-zh="在 V100-32G、A100-40G、Hopper-80G 和 RTX 5090 上测试" data-en="Tested on V100-32G, A100-40G, Hopper-80G, and RTX 5090">在 V100-32G、A100-40G、Hopper-80G 和 RTX 5090 上测试</p>
+    </div>
+    <div class="table-wrapper reveal">
+      <table>
+        <thead>
+          <tr>
+            <th data-zh="模型" data-en="Model">模型</th>
+            <th data-zh="格式" data-en="Format">格式</th>
+            <th data-zh="大小" data-en="Size">大小</th>
+            <th data-zh="解码速度" data-en="Decode Speed">解码速度</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><td><strong>Qwen3-30B-A3B</strong></td><td>NVFP4</td><td>30B MoE</td><td data-zh="197.29 tks/s (RTX 5090)" data-en="197.29 tks/s (RTX 5090)">197.29 tks/s (RTX 5090)</td></tr>
+          <tr><td><strong>Ministral-3-3B</strong> (VL)</td><td>ISQ Q4K</td><td>3B</td><td>193.67 tks/s</td></tr>
+          <tr><td><strong>DeepSeek-R1-Qwen3-8B</strong></td><td>Q4_K_M</td><td>8B</td><td>139.25 tks/s</td></tr>
+          <tr><td><strong>Gemma4-26B-A4B</strong></td><td>NVFP4</td><td>26B MoE</td><td data-zh="137.23 tks/s (RTX 5090)" data-en="137.23 tks/s (RTX 5090)">137.23 tks/s (RTX 5090)</td></tr>
+          <tr><td><strong>Llama-3.1-8B</strong></td><td>ISQ Q4K</td><td>8B</td><td>133.10 tks/s</td></tr>
+          <tr><td><strong>Qwen3-VL-8B</strong> (VL)</td><td>Q8_0</td><td>8B</td><td>112.51 tks/s</td></tr>
+          <tr><td><strong>Qwen3.6-35B-A3B</strong> (VL)</td><td>FP8</td><td>35B MoE</td><td data-zh="110 tks/s (Hopper)" data-en="110 tks/s (Hopper)">110 tks/s (Hopper)</td></tr>
+          <tr><td><strong>Qwen3-30B-A3B</strong></td><td>NVFP4</td><td>30B MoE</td><td data-zh="72.86 tks/s (V100, SW FP4)" data-en="72.86 tks/s (V100, SW FP4)">72.86 tks/s (V100, SW FP4)</td></tr>
+          <tr><td><strong>Qwen3.5-27B</strong> (VL)</td><td>Q4_K_M</td><td>27B Dense</td><td data-zh="49.33 tks/s (Hopper)" data-en="49.33 tks/s (Hopper)">49.33 tks/s (Hopper)</td></tr>
+          <tr><td><strong>GLM4.7 Flash</strong></td><td>NVFP4</td><td>30B MoE</td><td data-zh="79 tks/s (Hopper, SW FP4)" data-en="79 tks/s (Hopper, SW FP4)">79 tks/s (Hopper, SW FP4)</td></tr>
+          <tr><td><strong>Gemma4-31B</strong></td><td>ISQ Q4K</td><td>31B Dense</td><td data-zh="47 tks/s (Hopper)" data-en="47 tks/s (Hopper)">47 tks/s (Hopper)</td></tr>
+          <tr><td><strong>QwQ-32B</strong></td><td>Q4_K_M</td><td>32B</td><td>46.02 tks/s</td></tr>
+          <tr><td><strong>MiniMax-M2.5</strong></td><td>NVFP4</td><td>229B MoE</td><td data-zh="64.50 tks/s (Hopper, TP=2)" data-en="64.50 tks/s (Hopper, TP=2)">64.50 tks/s (Hopper, TP=2)</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="section-header reveal" style="margin-top:3rem">
+      <h2 data-zh="Apple Silicon (M4) 性能" data-en="Apple Silicon (M4) Performance">Apple Silicon (M4) 性能</h2>
+    </div>
+    <div class="table-wrapper reveal">
+      <table>
+        <thead><tr>
+          <th data-zh="模型" data-en="Model">模型</th>
+          <th data-zh="批量" data-en="Batch">批量</th>
+          <th data-zh="输出 Token 数" data-en="Output Tokens">输出 Token 数</th>
+          <th data-zh="吞吐量" data-en="Throughput">吞吐量</th>
+        </tr></thead>
+        <tbody>
+          <tr><td><strong>Qwen3-0.6B</strong> (BF16)</td><td>128</td><td>63,488</td><td><strong>763.73</strong> tks/s</td></tr>
+          <tr><td><strong>Qwen3-0.6B</strong> (BF16)</td><td>32</td><td>15,872</td><td><strong>674.43</strong> tks/s</td></tr>
+          <tr><td><strong>Qwen3-4B</strong> (Q4_K_M)</td><td>1</td><td>1,683</td><td>31.98 tks/s</td></tr>
+          <tr><td><strong>Qwen3.5-4B</strong> (Q3_K_M)</td><td>1</td><td>1,592</td><td>23.06 tks/s</td></tr>
+          <tr><td><strong>Qwen3.5-2B</strong> (NVFP4)</td><td>2</td><td>3,942</td><td>48.10 tks/s</td></tr>
+          <tr><td><strong>Qwen3-8B</strong> (Q2_K)</td><td>1</td><td>1,300</td><td>16.07 tks/s</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="section-header reveal" style="margin-top:3rem">
+      <h2 data-zh="TurboQuant 上下文扩展" data-en="TurboQuant Context Extension">TurboQuant 上下文扩展</h2>
+      <p data-zh="TurboQuant 通过 Walsh-Hadamard 变换将 KV 缓存压缩至 2-4 bit，大幅扩展可用上下文长度。" data-en="TurboQuant compresses KV cache to 2-4 bits via Walsh-Hadamard transform, dramatically extending available context length.">TurboQuant 通过 Walsh-Hadamard 变换将 KV 缓存压缩至 2-4 bit，大幅扩展可用上下文长度。</p>
+    </div>
+    <div class="table-wrapper reveal">
+      <table>
+        <thead><tr>
+          <th data-zh="模型" data-en="Model">模型</th>
+          <th data-zh="KV 预算" data-en="KV Budget">KV 预算</th>
+          <th>BF16</th>
+          <th>turbo4</th>
+          <th data-zh="增益" data-en="Gain">增益</th>
+        </tr></thead>
+        <tbody>
+          <tr><td><strong>Qwen3.6-35B-A3B</strong> (NVFP4)</td><td>7 GB (24 GB GPU)</td><td>700k</td><td><strong>2.7M</strong></td><td><strong>3.9×</strong></td></tr>
+          <tr><td></td><td>15 GB (32 GB GPU)</td><td>1.5M</td><td><strong>5.8M</strong></td><td><strong>3.9×</strong></td></tr>
+          <tr><td><strong>Qwen3.6-27B</strong> (FP8)</td><td>7 GB</td><td>112k</td><td><strong>434k</strong></td><td><strong>3.9×</strong></td></tr>
+          <tr><td></td><td>15 GB</td><td>240k</td><td><strong>930k</strong></td><td><strong>3.9×</strong></td></tr>
+          <tr><td><strong>Qwen3-30B-A3B</strong> (Q4_K_M)</td><td>7 GB</td><td>74k</td><td><strong>281k</strong></td><td><strong>3.8×</strong></td></tr>
+          <tr><td></td><td>15 GB</td><td>160k</td><td><strong>602k</strong></td><td><strong>3.8×</strong></td></tr>
+          <tr><td><strong>Gemma4-26B-A4B</strong> (NVFP4)</td><td>7 GB</td><td>32k</td><td><strong>125k</strong></td><td><strong>3.9×</strong></td></tr>
+          <tr><td></td><td>15 GB</td><td>70k</td><td><strong>271k</strong></td><td><strong>3.9×</strong></td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="table-wrapper reveal" style="margin-top:1.5rem">
+      <table>
+        <thead><tr>
+          <th data-zh="KV 缓存模式" data-en="KV Cache Mode">KV 缓存模式</th>
+          <th data-zh="压缩比" data-en="Compression">压缩比</th>
+          <th data-zh="质量" data-en="Quality">质量</th>
+          <th data-zh="GPU 要求" data-en="GPU">GPU 要求</th>
+        </tr></thead>
+        <tbody>
+          <tr><td data-zh="默认 (BF16)" data-en="Default (BF16)">默认 (BF16)</td><td>1×</td><td data-zh="基准" data-en="Baseline">基准</td><td data-zh="所有" data-en="All">所有</td></tr>
+          <tr><td><code>fp8</code></td><td><strong>2×</strong></td><td data-zh="近无损" data-en="Near-lossless">近无损</td><td>SM70+ / M1+</td></tr>
+          <tr><td><code>turbo8</code></td><td><strong>2.6×</strong></td><td data-zh="79-100% 吞吐量" data-en="79-100% throughput">79-100% 吞吐量</td><td>SM70+ / M1+</td></tr>
+          <tr><td><code>turbo4</code></td><td><strong>3.7×</strong></td><td data-zh="最佳平衡" data-en="Best balance">最佳平衡</td><td>SM70+ / M1+</td></tr>
+          <tr><td><code>turbo3</code></td><td><strong>4.7×</strong></td><td data-zh="最大压缩" data-en="Max compression">最大压缩</td><td>SM70+</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
+<section class="section" id="demo" style="background: var(--surface-alt);">
+  <div class="container">
+    <div class="section-header reveal" style="text-align:center">
+      <span class="overline" data-zh="演示" data-en="Demo">演示</span>
+      <h2 data-zh="一览即知" data-en="See It in Action">一览即知</h2>
+      <p data-zh="观看 xInfer 运行 35B 模型，实时推理与工具调用。" data-en="Watch xInfer serve a 35B model with real-time inference and tool calling.">观看 xInfer 运行 35B 模型，实时推理与工具调用。</p>
+    </div>
+    <div class="demo-wrap reveal">
+      <div class="demo-video-box">
+        <video id="demo-vid" controls muted playsinline preload="metadata" src="assets/demo.mp4"></video>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="section">
+  <div class="container">
+    <div class="section-header reveal">
+      <span class="overline" data-zh="快速体验" data-en="Quick Start">快速体验</span>
+      <h2 data-zh="三步启动推理" data-en="Three Steps to Inference">三步启动推理</h2>
+    </div>
+    <ol class="steps">
+      <li class="step-item reveal">
+        <h3 data-zh="安装 xInfer" data-en="Install xInfer">安装 xInfer</h3>
+        <pre><code><span class="token-comment">$</span> <span class="token-keyword">curl</span> <span class="token-flag">-sSL</span> <span class="token-string">https://guoqingbao.github.io/xinfer/install.sh</span> | <span class="token-keyword">bash</span>
+<span class="token-comment"># 或者 npm install -g xinfer-ai</span></code><button class="copy-btn" data-copy-text="curl -sSL https://guoqingbao.github.io/xinfer/install.sh | bash">Copy</button></pre>
+      </li>
+      <li class="step-item reveal">
+        <h3 data-zh="启动模型 + Web UI" data-en="Launch Model + Web UI">启动模型 + Web UI</h3>
+        <pre><code><span class="token-comment">$</span> <span class="token-keyword">xinfer</span> <span class="token-flag">--m</span> <span class="token-string">Qwen/Qwen3.6-27B-FP8</span> <span class="token-flag">--kvcache-dtype</span> <span class="token-value">turbo4</span> <span class="token-flag">--ui-server</span></code><button class="copy-btn" data-copy-text="xinfer --m Qwen/Qwen3.6-27B-FP8 --kvcache-dtype turbo4 --ui-server">Copy</button></pre>
+      </li>
+      <li class="step-item reveal">
+        <h3 data-zh="调用 API" data-en="Call the API">调用 API</h3>
+        <pre><code><span class="token-comment">$</span> <span class="token-keyword">curl</span> <span class="token-string">http://localhost:8000/v1/chat/completions</span> \
+  <span class="token-flag">-H</span> <span class="token-string">"Content-Type: application/json"</span> \
+  <span class="token-flag">-d</span> <span class="token-string">'{"model":"default","messages":[{"role":"user","content":"Hello!"}],"stream":true}'</span></code><button class="copy-btn" data-copy-text='curl http://localhost:8000/v1/chat/completions -H "Content-Type: application/json" -d &apos;{"model":"default","messages":[{"role":"user","content":"Hello!"}],"stream":true}&apos;'>Copy</button></pre>
+      </li>
+    </ol>
+    <div class="callout-info reveal" style="margin-top:1.5rem">
+      <div class="callout-title" data-zh="💡 提示" data-en="💡 Tip">💡 提示</div>
+      <p data-zh="API 默认在 http://localhost:8000 启动。添加 --ui-server 将在 http://localhost:8001 启动内置 ChatGPT 风格 Web UI。支持图片上传（用于视觉语言模型）。" data-en="API defaults to http://localhost:8000. Add --ui-server to launch built-in ChatGPT-style Web UI at http://localhost:8001. Supports image uploads for vision-language models.">API 默认在 http://localhost:8000 启动。添加 --ui-server 将在 http://localhost:8001 启动内置 Web UI。</p>
+    </div>
+    <div style="margin-top:1.5rem; text-align:center;" class="reveal">
+      <a href="getting-started.html#agent-integrations" class="btn btn-outline" data-zh="🤖 查看 AI Agent 集成指南 →" data-en="🤖 See AI Agent Integration Guide →">🤖 查看 AI Agent 集成指南 →</a>
+    </div>
+  </div>
+</section>
+
+<section class="section" style="background: var(--surface-alt);">
+  <div class="container">
+    <div class="section-header reveal">
+      <span class="overline" data-zh="高级功能" data-en="Advanced Features">高级功能</span>
+      <h2 data-zh="多种运行模式" data-en="Multiple Runtime Modes">多种运行模式</h2>
+      <p data-zh="xInfer 支持丰富的运行模式，覆盖从单 GPU 到多节点集群的所有场景。" data-en="xInfer supports diverse runtime modes covering everything from single GPU to multi-node clusters.">xInfer 支持丰富的运行模式。</p>
+    </div>
+    <div class="features-grid">
+      <div class="feature-card reveal">
+        <span class="feature-icon">🖥️</span>
+        <h3 data-zh="单 GPU 推理" data-en="Single GPU">单 GPU 推理</h3>
+        <p data-zh="加载 Safetensors、GGUF、FP8、NVFP4 等格式。支持 ISQ 在线量化，无需预下载量化模型。CUDA Graph 自动捕获常用批次大小。" data-en="Load Safetensors, GGUF, FP8, NVFP4 formats. ISQ on-the-fly quantization without pre-downloading. CUDA Graph auto-captures common batch sizes.">加载多种格式。ISQ 在线量化，CUDA Graph 自动捕获。</p>
+      </div>
+      <div class="feature-card reveal">
+        <span class="feature-icon">🔗</span>
+        <h3 data-zh="多 GPU 张量并行" data-en="Multi-GPU Tensor Parallel">多 GPU 张量并行</h3>
+        <p data-zh="通过 NCCL 实现 All-Reduce/All-Gather 通信。支持 Safetensors、GPTQ、AWQ、GGUF 多分片格式。使用 --d 0,1,2,3 指定设备。" data-en="NCCL All-Reduce/All-Gather communication. Supports Safetensors, GPTQ, AWQ, GGUF multi-shard. Use --d 0,1,2,3 for device selection.">NCCL 通信，支持多种分片格式。</p>
+      </div>
+      <div class="feature-card reveal">
+        <span class="feature-icon">🌐</span>
+        <h3 data-zh="多节点推理" data-en="Multi-Node Inference">多节点推理</h3>
+        <p data-zh="基于 TCP 的 NCCL Bootstrap，无需 MPI。主节点运行调度器 + API 服务，工作节点运行无状态前向引擎。16 卡 × 2 节点实测可用。" data-en="TCP-based NCCL bootstrap, no MPI needed. Master runs scheduler + API; workers run stateless forward engines. Tested with 16 GPUs × 2 nodes.">TCP-based NCCL，无需 MPI。</p>
+      </div>
+      <div class="feature-card reveal">
+        <span class="feature-icon">🔀</span>
+        <h3 data-zh="PD 分离部署" data-en="PD Disaggregation">PD 分离部署</h3>
+        <p data-zh="预填充和解码分配到不同 GPU。支持本地 IPC、File IPC（Docker 容器间）和远程 TCP 三种通信模式。消除长上下文预填充对解码延迟的干扰。" data-en="Prefill and decode on separate GPUs. Local IPC, File IPC (Docker), and Remote TCP modes. Eliminates decode latency interference from long-context prefill.">支持 Local/File/TCP 三种 PD 通信。</p>
+      </div>
+      <div class="feature-card reveal">
+        <span class="feature-icon">📝</span>
+        <h3 data-zh="结构化输出" data-en="Structured Outputs">结构化输出</h3>
+        <p data-zh="基于 llguidance 的约束解码——JSON Schema、正则表达式、Lark 语法、选择约束、结构标签。支持 reasoning_effort 推理前缀组合。" data-en="llguidance-based constrained decoding — JSON Schema, regex, Lark grammars, choice, structural tags. Supports reasoning_effort prefix composition.">JSON Schema、正则、Lark 语法约束。</p>
+      </div>
+      <div class="feature-card reveal">
+        <span class="feature-icon">👁️</span>
+        <h3 data-zh="视觉语言模型" data-en="Vision-Language Models">视觉语言模型</h3>
+        <p data-zh="支持 Qwen3-VL、Qwen3.5-VL、Qwen3.6-VL、Gemma4、Mistral3-VL 等多模态模型。内置 Web UI 支持图片上传，API 支持 image_url 和 base64。" data-en="Supports Qwen3-VL, Qwen3.5/3.6-VL, Gemma4, Mistral3-VL multimodal models. Built-in Web UI for image uploads; API supports image_url and base64.">支持多种 VL 模型，图片上传。</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="section">
+  <div class="container">
+    <div class="section-header reveal">
+      <span class="overline" data-zh="生态集成" data-en="Ecosystem">生态集成</span>
+      <h2 data-zh="AI Agent 后端" data-en="AI Agent Backend">AI Agent 后端</h2>
+      <p data-zh="xInfer 作为 OpenAI 兼容后端，已验证支持以下 AI Agent 框架。" data-en="xInfer as an OpenAI-compatible backend has been verified with the following AI Agent frameworks.">xInfer 作为 OpenAI 兼容后端，已验证支持以下框架。</p>
+    </div>
+    <div class="community-grid">
+      <div class="community-card reveal">
+        <span class="community-icon">🤖</span>
+        <h3>xbot</h3>
+        <p data-zh="xInfer 原生 Agent 框架" data-en="xInfer native agent framework">xInfer 原生 Agent 框架</p>
+      </div>
+      <div class="community-card reveal">
+        <span class="community-icon">💻</span>
+        <h3>OpenCode</h3>
+        <p data-zh="开源 AI 编码助手" data-en="Open-source AI coding assistant">开源 AI 编码助手</p>
+      </div>
+      <div class="community-card reveal">
+        <span class="community-icon">📏</span>
+        <h3>Kilo Code</h3>
+        <p data-zh="AI 编码工具" data-en="AI coding tool">AI 编码工具</p>
+      </div>
+      <div class="community-card reveal">
+        <span class="community-icon">🧠</span>
+        <h3>Claude Code</h3>
+        <p data-zh="Anthropic Claude 代码助手" data-en="Anthropic Claude coding assistant">Anthropic Claude 代码助手</p>
+      </div>
+      <div class="community-card reveal">
+        <span class="community-icon">🪿</span>
+        <h3>Goose</h3>
+        <p data-zh="开源 AI Agent 框架" data-en="Open-source AI agent framework">开源 AI Agent 框架</p>
+      </div>
+      <div class="community-card reveal">
+        <span class="community-icon">🔌</span>
+        <h3 data-zh="MCP 工具" data-en="MCP Tools">MCP 工具</h3>
+        <p data-zh="内置 MCP (Model Context Protocol) 工具调用支持" data-en="Built-in MCP (Model Context Protocol) tool calling support">内置 MCP 工具调用</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="section" id="downloads" style="background: var(--surface-alt);">
+  <div class="container">
+    <div class="section-header reveal">
+      <span class="overline" data-zh="下载" data-en="Downloads">下载</span>
+      <h2 data-zh="预编译包" data-en="Pre-built Packages">预编译包</h2>
+      <p data-zh="为每种 GPU 架构提供预编译的二进制包和 pip 轮子。" data-en="Pre-compiled binaries and pip wheels for every GPU architecture.">为每种 GPU 架构提供预编译的二进制包和 pip 轮子。</p>
+    </div>
+    <h3 class="reveal" style="margin-bottom:0.875rem;font-size:0.95rem" data-zh="二进制下载" data-en="Binary Downloads">二进制下载</h3>
+    <div class="dl-tabs reveal">
+      <button class="active" data-dt="deb" data-zh="Deb 包" data-en="Deb Package">Deb Package</button>
+      <button data-dt="tar" data-zh="Tarball" data-en="Tarball">Tarball</button>
+      <button data-dt="whl" data-zh="Python Wheel" data-en="Python Wheel">Python Wheel</button>
+    </div>
+    <div class="dl-grid" id="dl-cards"></div>
+    <h3 class="reveal" style="margin:2.25rem 0 0.875rem;font-size:0.95rem" data-zh="pip 安装命令" data-en="pip Install Commands">pip 安装命令</h3>
+    <div class="pip-grid reveal" id="pip-grid"></div>
+  </div>
+</section>
+
+<section class="section">
+  <div class="container">
+    <div class="section-header reveal">
+      <span class="overline" data-zh="社区资源" data-en="Community">社区资源</span>
+      <h2 data-zh="加入社区" data-en="Join the Community">加入社区</h2>
+    </div>
+    <div class="community-grid">
+      <a href="https://github.com/guoqingbao/xinfer" target="_blank" class="community-card reveal">
+        <span class="community-icon">📦</span>
+        <h3 data-zh="GitHub 仓库" data-en="GitHub Repo">GitHub 仓库</h3>
+        <p data-zh="查看源码、提交 Issue、贡献代码" data-en="Browse source, file issues, contribute">查看源码、提交 Issue、贡献代码</p>
+      </a>
+      <a href="https://github.com/guoqingbao/xinfer/issues" target="_blank" class="community-card reveal">
+        <span class="community-icon">💬</span>
+        <h3 data-zh="问题反馈" data-en="Issue Tracker">问题反馈</h3>
+        <p data-zh="报告 Bug 或请求新功能" data-en="Report bugs or request features">报告 Bug 或请求新功能</p>
+      </a>
+      <a href="api-reference.html" class="community-card reveal">
+        <span class="community-icon">📖</span>
+        <h3 data-zh="API 文档" data-en="API Documentation">API 文档</h3>
+        <p data-zh="完整的 CLI 参数和 REST API 参考" data-en="Complete CLI flags and REST API reference">完整的 CLI 参数和 REST API 参考</p>
+      </a>
+    </div>
+  </div>
+</section>
+
+<footer class="site-footer">
+  <div class="container">
+    <div class="footer-grid">
+      <div class="footer-brand">
+        <a href="index.html" class="logo">
+          <img src="assets/images/logo.svg" alt="xInfer">
+          <span>xInfer</span>
+        </a>
+        <p data-zh="纯 Rust 构建的极速 LLM 推理引擎，零 Python 依赖。" data-en="Blazing-fast LLM inference in pure Rust. Zero Python dependencies.">纯 Rust 构建的极速 LLM 推理引擎，零 Python 依赖。</p>
+      </div>
+      <div class="footer-col">
+        <h4 data-zh="文档" data-en="Docs">文档</h4>
+        <a href="getting-started.html" data-zh="快速开始" data-en="Getting Started">快速开始</a>
+        <a href="user-guide.html" data-zh="使用指南" data-en="User Guide">使用指南</a>
+        <a href="developer-guide.html" data-zh="开发指南" data-en="Developer Guide">开发指南</a>
+        <a href="api-reference.html" data-zh="API 参考" data-en="API Reference">API 参考</a>
+      </div>
+      <div class="footer-col">
+        <h4 data-zh="资源" data-en="Resources">资源</h4>
+        <a href="https://github.com/guoqingbao/xinfer" target="_blank" data-zh="GitHub 仓库" data-en="GitHub Repo">GitHub 仓库</a>
+        <a href="https://www.npmjs.com/package/xinfer-ai" target="_blank" data-zh="npm 包" data-en="npm Package">npm 包</a>
+        <a href="https://github.com/guoqingbao/xinfer/issues" target="_blank" data-zh="问题反馈" data-en="Issue Tracker">问题反馈</a>
+      </div>
+      <div class="footer-col">
+        <h4 data-zh="社区" data-en="Community">社区</h4>
+        <a href="https://github.com/guoqingbao/xinfer/issues" target="_blank" data-zh="报告问题" data-en="Report Issue">报告问题</a>
+        <a href="https://github.com/guoqingbao/xinfer" target="_blank" data-zh="贡献代码" data-en="Contribute">贡献代码</a>
+      </div>
+    </div>
+    <div class="footer-bottom">
+      <span data-zh="MIT 许可证 © 2024 xInfer Team" data-en="MIT License © 2024 xInfer Team">MIT 许可证 © 2024 xInfer Team</span>
+      <span data-zh="由 Candle ML 框架驱动" data-en="Powered by Candle ML Framework">由 Candle ML 框架驱动</span>
+    </div>
+  </div>
+</footer>
+
+<script src="assets/js/main.js?v=1"></script>
+</body>
+</html>
