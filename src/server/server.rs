@@ -429,7 +429,12 @@ pub async fn chat_completion(
         )
     };
 
-    let enforce_parser = engine_config.enforce_parser.clone();
+    let enforce_parser =
+        if engine_config.enable_tool_grammar && engine_config.enforce_parser.is_none() {
+            Some("json".to_string())
+        } else {
+            engine_config.enforce_parser.clone()
+        };
     let tool_parser_name = if let Some(ref enforced) = enforce_parser {
         enforced.clone()
     } else {
@@ -527,7 +532,12 @@ pub async fn chat_completion(
     }
     let parser_model_id =
         super::resolve_engine_model_id(&engine_config).unwrap_or_else(|| model_id.clone());
-    let enforce_parser = engine_config.enforce_parser.clone();
+    let enforce_parser =
+        if engine_config.enable_tool_grammar && engine_config.enforce_parser.is_none() {
+            Some("json".to_string())
+        } else {
+            engine_config.enforce_parser.clone()
+        };
 
     let (messages, image_data) = match build_messages_and_images(&chat_messages, img_cfg.as_ref()) {
         Ok(output) => output,
@@ -542,9 +552,14 @@ pub async fn chat_completion(
         .unwrap()
         .as_millis() as u64;
 
-    // Set grammar from unified generation
+    // Set grammar from unified generation.
+    // When a grammar is active, pass reasoning end token IDs so that
+    // GuidanceState defers grammar constraints until reasoning ends.
     if let Some(g) = grammar {
         params.grammar = Some(g);
+        if !guidance_tokens.reasoning_end_ids.is_empty() {
+            params.guidance_reasoning_end_ids = guidance_tokens.reasoning_end_ids.clone();
+        }
     }
 
     if use_stream {

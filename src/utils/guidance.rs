@@ -156,6 +156,15 @@ pub struct GuidanceState {
     llm_bytes: usize,
     /// Cache for precomputed mask slices
     slicer_cache: SlicerCache,
+    /// vLLM/SGLang two-phase reasoning support:
+    /// Token IDs that mark the end of reasoning (e.g. </think>).
+    /// When non-empty, grammar constraints are deferred until after
+    /// a reasoning-end token is seen. This keeps reasoning free-form
+    /// and only constrains the structured output that follows.
+    reasoning_end_ids: Vec<u32>,
+    /// Whether reasoning has ended (the </think> token was observed).
+    /// Once true, grammar masks are applied normally.
+    reasoning_ended: bool,
 }
 
 impl GuidanceState {
@@ -163,29 +172,52 @@ impl GuidanceState {
         factory: Arc<ParserFactory>,
         grammar: &TopLevelGrammar,
     ) -> Result<Self> {
+        Self::new_from_grammar_with_reasoning(factory, grammar, Vec::new())
+    }
+
+    pub fn new_from_grammar_with_reasoning(
+        factory: Arc<ParserFactory>,
+        grammar: &TopLevelGrammar,
+        reasoning_end_ids: Vec<u32>,
+    ) -> Result<Self> {
         use crate::utils::guidance_grammar::get_lark_from_top_level_grammar;
         let lark = get_lark_from_top_level_grammar(grammar);
         crate::log_info!("[llg] Composed Grammar Constraint:\n{}\n", lark);
         let mut grammar = grammar.clone();
-        // Add generation space for EOS token to prevent overrun if max_tokens reached
         if let Some(max_tokens) = grammar.max_tokens {
-            let bos_len = 1; // Placeholders which get compiled-out in case this ever changes
+            let bos_len = 1;
             let eos_len = 1;
             grammar.max_tokens = Some(max_tokens + bos_len + eos_len);
         };
         let parser = factory.create_parser(grammar)?;
         let matcher = Matcher::new(Ok(parser));
 
+        let reasoning_ended = reasoning_end_ids.is_empty();
+
+        if !reasoning_ended {
+            crate::log_info!(
+                "[llg] Two-phase reasoning: grammar deferred until after reasoning end tokens {:?}",
+                reasoning_end_ids
+            );
+        }
+
         Ok(Self {
             matcher,
             llm_tokens: Vec::new(),
             llm_bytes: 0,
             slicer_cache: SlicerCache::default(),
+            reasoning_end_ids,
+            reasoning_ended,
         })
     }
 
-    /// Compute mask with caching for performance
+    /// Compute mask with caching for performance.
+    /// During reasoning (before </think>), returns None to allow all tokens.
+    /// After reasoning ends, delegates to the grammar matcher.
     pub fn compute_mask(&mut self) -> Result<Option<SimpleVob>> {
+        if !self.reasoning_ended {
+            return Ok(None);
+        }
         if self.matcher.is_stopped() {
             return Ok(None);
         }
@@ -193,12 +225,27 @@ impl GuidanceState {
         Ok(Some(mask))
     }
 
-    /// Commit token and track for speculative decoding recovery
+    /// Commit token and track for speculative decoding recovery.
+    /// During reasoning, tokens are tracked but NOT fed to the grammar.
+    /// When the reasoning-end token is seen, we transition to grammar mode.
     pub fn commit_token(&mut self, token: u32) -> Result<()> {
+        self.llm_tokens.push(token);
+        self.llm_bytes += 4;
+
+        if !self.reasoning_ended {
+            if self.reasoning_end_ids.contains(&token) {
+                self.reasoning_ended = true;
+                crate::log_warn!(
+                    "[llg] Reasoning ended (token {}), grammar constraints now active (after {} reasoning tokens)",
+                    token,
+                    self.llm_tokens.len()
+                );
+            }
+            return Ok(());
+        }
+
         if !self.matcher.is_stopped() {
             self.matcher.consume_token(token)?;
-            self.llm_tokens.push(token);
-            self.llm_bytes += 4;
         }
         Ok(())
     }
@@ -223,8 +270,12 @@ impl GuidanceState {
         self.llm_tokens.last().copied()
     }
 
-    /// Validate token without consuming it (for re-sampling)
+    /// Validate token without consuming it (for re-sampling).
+    /// During reasoning, all tokens are valid.
     pub fn validate_token(&mut self, token: u32) -> bool {
+        if !self.reasoning_ended {
+            return true;
+        }
         if self.matcher.is_stopped() {
             return true;
         }
@@ -232,21 +283,40 @@ impl GuidanceState {
         result == 1
     }
 
-    /// Compute mask or return EOS token set if stopped
+    /// Compute mask or return EOS token set if stopped.
+    /// During reasoning, returns an all-ones mask (allow everything).
     pub fn compute_mask_or_eos(&mut self) -> Result<SimpleVob> {
+        if !self.reasoning_ended {
+            return self
+                .matcher
+                .compute_mask_or_eos()
+                .map(|mut mask| {
+                    mask.set_all(true);
+                    mask
+                })
+                .map_err(Into::into);
+        }
         self.matcher.compute_mask_or_eos().map_err(Into::into)
     }
 
-    /// Fast-forward tokens without consuming them (for speculative decoding)
+    /// Fast-forward tokens without consuming them (for speculative decoding).
+    /// During reasoning, no fast-forward is possible.
     pub fn compute_ff_tokens(&mut self) -> Vec<u32> {
+        if !self.reasoning_ended {
+            return Vec::new();
+        }
         if self.matcher.is_stopped() {
             return Vec::new();
         }
         self.matcher.compute_ff_tokens()
     }
 
-    /// Fast-forward and consume tokens guaranteed to be accepted by the grammar
+    /// Fast-forward and consume tokens guaranteed to be accepted by the grammar.
+    /// During reasoning, no fast-forward is possible.
     pub fn consume_ff_tokens(&mut self) -> Result<Vec<u32>, anyhow::Error> {
+        if !self.reasoning_ended {
+            return Ok(Vec::new());
+        }
         if self.matcher.is_stopped() {
             return Ok(Vec::new());
         }
@@ -267,11 +337,15 @@ impl GuidanceState {
         false
     }
 
-    /// Rollback to a previous state with byte tracking
+    /// Rollback to a previous state with byte tracking.
+    /// Only rolls back the matcher for tokens that were actually fed to it
+    /// (i.e., post-reasoning tokens).
     pub fn rollback_to(&mut self, token_pos: usize, byte_pos: usize) -> Result<()> {
-        let tokens_to_rollback = self.llm_tokens.len().saturating_sub(token_pos);
-        if tokens_to_rollback > 0 {
-            self.matcher.rollback(tokens_to_rollback)?;
+        if self.reasoning_ended {
+            let tokens_to_rollback = self.llm_tokens.len().saturating_sub(token_pos);
+            if tokens_to_rollback > 0 {
+                self.matcher.rollback(tokens_to_rollback)?;
+            }
         }
         self.llm_tokens.truncate(token_pos);
         self.llm_bytes = byte_pos;

@@ -757,6 +757,10 @@ pub struct SamplingParams {
     /// Reasoning effort level for OpenAI-compatible reasoning API
     #[serde(default)]
     pub reasoning_effort: Option<ReasoningEffort>,
+    /// Token IDs marking end of reasoning (e.g. </think>).
+    /// When set, grammar constraints are deferred until after reasoning ends.
+    #[serde(default)]
+    pub guidance_reasoning_end_ids: Vec<u32>,
 }
 
 #[cfg(feature = "python")]
@@ -803,6 +807,10 @@ pub struct SamplingParams {
     pub grammar_json: Option<String>,
     /// Reasoning effort level for OpenAI-compatible reasoning API
     pub reasoning_effort: Option<ReasoningEffort>,
+    /// Token IDs marking end of reasoning (e.g. </think>).
+    /// When set, grammar constraints are deferred until after reasoning ends.
+    #[serde(default)]
+    pub guidance_reasoning_end_ids: Vec<u32>,
 }
 
 #[cfg(not(feature = "python"))]
@@ -835,6 +843,7 @@ impl SamplingParams {
             grammar: None,
             grammar_json: None,
             reasoning_effort,
+            guidance_reasoning_end_ids: Vec::new(),
         }
     }
 
@@ -855,6 +864,7 @@ impl SamplingParams {
             grammar: None,
             grammar_json: None,
             reasoning_effort: None,
+            guidance_reasoning_end_ids: Vec::new(),
         }
     }
 }
@@ -877,6 +887,7 @@ impl Default for SamplingParams {
             grammar: None,
             grammar_json: None,
             reasoning_effort: None,
+            guidance_reasoning_end_ids: Vec::new(),
         }
     }
 }

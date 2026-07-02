@@ -1639,7 +1639,12 @@ impl LLMEngine {
             if is_reasoning_grammar(&grammar) {
                 prompt_template.set_enable_thinking(true);
             } else {
-                prompt_template.set_enable_thinking(false);
+                // Grammar without reasoning rules: thinking is handled at the mask
+                // level (GuidanceState defers grammar until after </think>), so use
+                // the default thinking setting — same as the no-grammar path.
+                prompt_template.set_enable_thinking(
+                    params.thinking.unwrap_or(!self.econfig.disable_reasoning),
+                );
             }
         } else {
             prompt_template
@@ -1714,9 +1719,10 @@ impl LLMEngine {
                                 return (prompt.to_string(), image_idx);
                             }
                         }
-                    } else {
-                        // Ensure guided grammar which will not generate a think-stop token is not within reasoning envelope
-                        // A completed inert <think>\n\n</think> block or even an injected think template are harmless
+                    } else if params.guidance_reasoning_end_ids.is_empty() {
+                        // Only trim <think> when NOT using two-phase reasoning.
+                        // With two-phase reasoning, the model needs the <think> prefix
+                        // to generate reasoning freely before grammar constraints kick in.
                         if prompt.trim().ends_with(&start_str) {
                             if let Some((prompt, _trimmed)) = prompt.rsplit_once(&start_str) {
                                 return (prompt.to_string(), image_idx);

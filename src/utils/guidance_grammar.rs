@@ -368,15 +368,15 @@ reasoning_block: <[{start_id}]> "\n\n" <[{end_id}]> "\n"
                 format!(
                     r#"start: reasoning_block
 reasoning_block: <[{start_id}]> "\n" think_text? "\n" <[{end_id}]> "\n"
-think_text[temperature=0, max_tokens={rmt}]: /(?s:.+?)/
+think_text[max_tokens={rmt}]: /(?s:.+?)/
 "#
                 )
             }
             ReasoningEffort::Low => {
                 format!(
                     r#"start: reasoning_block
-reasoning_block: <[{start_id}]> "\n" think_text "\n" (think_text+ "\n")? <[{end_id}]> "\n"
-think_text[temperature=0.3, max_tokens=256]: /(?s:.+?)/
+reasoning_block: <[{start_id}]> "\n" think_text "\n" <[{end_id}]> "\n"
+think_text[max_tokens=256]: /(?s:.+?)/
 "#
                 )
             }
@@ -384,7 +384,7 @@ think_text[temperature=0.3, max_tokens=256]: /(?s:.+?)/
                 format!(
                     r#"start: reasoning_block
 reasoning_block: <[{start_id}]> "\n" think_text "\n" <[{end_id}]> "\n"
-think_text[temperature=0.5, max_tokens=768]: /(?s:.+?)/
+think_text[max_tokens=768]: /(?s:.+?)/
 "#
                 )
             }
@@ -393,11 +393,11 @@ think_text[temperature=0.5, max_tokens=768]: /(?s:.+?)/
                     r#"start: reasoning_block
 reasoning_block: <[{start_id}]> analysis_block critique_block structure_block "\n" <[{end_id}]> "\n"
 analysis_block: "\n<analysis>\n" analysis_text
-analysis_text[suffix="\n</analysis>\n", temperature=0.8, max_tokens=512]: /(?s:.+?)/
+analysis_text[suffix="\n</analysis>\n", max_tokens=512]: /(?s:.+?)/
 critique_block: "\n<critique>\n" critique_text
-critique_text[suffix="\n</critique>\n", temperature=0, max_tokens=512]: /(?s:.+?)/
+critique_text[suffix="\n</critique>\n", max_tokens=512]: /(?s:.+?)/
 structure_block: "\n<structure_response>\n" structure_text
-structure_text[suffix="\n</structure_response>\n", temperature=0.8, max_tokens=512]: /(?s:.+?)/
+structure_text[suffix="\n</structure_response>\n", max_tokens=512]: /(?s:.+?)/
 "#
                 )
             }
@@ -406,13 +406,13 @@ structure_text[suffix="\n</structure_response>\n", temperature=0.8, max_tokens=5
                     r#"start: reasoning_block
 reasoning_block: <[{start_id}]> draft_block verification_block critique_block structure_block "\n" <[{end_id}]> "\n"
 draft_block: "\n<draft>\nCardinalities of concern, intended outcomes, and structures of consideration:\n" draft_text
-draft_text[suffix="\n</draft>\n", temperature=0.8, max_tokens=768]: /(?s:.+?)/
+draft_text[suffix="\n</draft>\n", max_tokens=768]: /(?s:.+?)/
 verification_block: "\n<verify>\nQuestions, assumptions, and suppositions:\n" verification_text
-verification_text[suffix="\n</verify>\n", temperature=0, max_tokens=768]: /(?s:.+?)/
+verification_text[suffix="\n</verify>\n", max_tokens=768]: /(?s:.+?)/
 critique_block: "\n<critique>\nAdversarial assessment of evaluation:\n" critique_text
-critique_text[suffix="\n</critique>\n", temperature=0.6, max_tokens=768]: /(?s:.+?)/
+critique_text[suffix="\n</critique>\n", max_tokens=768]: /(?s:.+?)/
 structure_block: "\n<structure_response>\n" structure_text
-structure_text[suffix="\n</structure_response>\n", temperature=0.8, max_tokens=768]: /(?s:.+?)/
+structure_text[suffix="\n</structure_response>\n", max_tokens=768]: /(?s:.+?)/
 "#
                 )
             }
@@ -655,7 +655,7 @@ impl GrammarBuilder for StructuredOutputsGrammar {
             .and_then(|l| l.strip_prefix("start: "))
             .unwrap_or("text");
 
-        // Combine the start alternatives
+        // Combine the start alternatives with repetition to allow text followed by tool_call
         let combined_start = format!("( {} | {} )+", this_start, other_start);
 
         // Extract non-start rules from both grammars, deduplicate and filter empty lines
@@ -1578,27 +1578,31 @@ impl<'a> GrammarRequestDispatcher<'a> {
         }
         let constraint_grammar = self.build_constraint_grammar();
         let tool_grammar = self.build_tool_grammar();
-        let reasoning_effort = self.build_reasoning_effort();
+
+        // vLLM/SGLang architecture: grammar constraints NEVER include reasoning.
+        // Reasoning is handled at the mask level (GuidanceState defers grammar
+        // masks until after the </think> token). The grammar only constrains the
+        // structured output — tool call JSON, JSON schema, regex, etc.
+        // Reasoning effort is used only for non-grammar reasoning control.
 
         // Only activate LLG when the request actually specifies something to constrain.
-        // Matches vLLM/SGLang behavior: guidance is a no-op for plain chat completions.
-        if constraint_grammar.is_none() && tool_grammar.is_none() && reasoning_effort.is_none() {
+        if constraint_grammar.is_none() && tool_grammar.is_none() {
             return None;
         }
 
         let max_tokens = self.request.max_tokens.unwrap_or(0);
 
-        // Provide a permissive fallback only when tools/reasoning need a base grammar to compose with
+        // Build only the structured output constraint grammar — NO reasoning wrapping.
         let constraint_grammar = constraint_grammar.unwrap_or_else(|| {
             StructuredOutputsGrammar::new(StructuredConstraint::Lark(
-                "start: text\ntext: /(?s:.+?)/".to_string(),
+                "start: text\ntext[stop=\"\"]: /(?s:.+?)/".to_string(),
             ))
         });
 
         Some(GrammarComposer::compose_all_grammars(
             vec![constraint_grammar],
             tool_grammar,
-            reasoning_effort,
+            None, // Never pass reasoning — handled at mask level
             self.guidance_tokens,
             max_tokens,
             self.chat_template,
@@ -1756,6 +1760,7 @@ impl<'a> GrammarRequestDispatcher<'a> {
         }
     }
 
+    #[allow(dead_code)]
     fn build_reasoning_effort(&self) -> Option<ReasoningEffort> {
         let effort_str = self.request.reasoning_effort.as_ref()?;
         Some(ReasoningEffort::from_str(effort_str.clone()))
@@ -1819,7 +1824,7 @@ impl GrammarComposer {
         if grammars.is_empty() {
             // Default text grammar when no constraints specified
             return StructuredOutputsGrammar::new(StructuredConstraint::Lark(
-                "start: text\ntext: /(?s:.+?)/".to_string(),
+                "start: text\ntext[stop=\"\"]: /(?s:.+?)/".to_string(),
             ));
         }
         if grammars.len() == 1 {
@@ -1841,10 +1846,8 @@ impl GrammarComposer {
     ) -> StructuredOutputsGrammar {
         match tool {
             Some(mut tool_gram) => {
-                // Replace the text: rule with tool_call: rule
                 let tool_constraint = StructuredConstraint::Lark(tool_gram.build_lark());
                 let mut tool_grammar = StructuredOutputsGrammar::new(tool_constraint);
-                // Use alternation: ( text | tool_call )+
                 let mut base_mut = base;
                 base_mut.compose_alternate(&mut tool_grammar)
             }
@@ -1863,8 +1866,13 @@ impl GrammarComposer {
             return base;
         }
 
-        // If no explicit effort passed, use ModelDefault
-        let effort = effort.unwrap_or(ReasoningEffort::ModelDefault);
+        // Only wrap with reasoning grammar if explicitly requested via reasoning_effort.
+        // Don't default to ModelDefault — this matches vLLM/SGLang where reasoning is
+        // free-form and only the structured output portion is constrained.
+        let effort = match effort {
+            Some(e) => e,
+            None => return base,
+        };
 
         if effort != ReasoningEffort::None {
             // Build reasoning grammar that wraps the base
@@ -1880,6 +1888,9 @@ impl GrammarComposer {
         base
     }
 
+    /// Wrap with an unconstrained reasoning block for tool-call grammars.
+    /// Emits: <think_start> free_text <think_end> [base grammar]
+    /// The reasoning content is completely unconstrained — only the structural
     fn prefix_with_bos(
         grammar: TopLevelGrammar,
         guidance_tokens: &GuidanceTokens,

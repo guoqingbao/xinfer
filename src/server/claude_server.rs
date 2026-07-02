@@ -2134,7 +2134,12 @@ pub async fn messages(
     };
     let parser_model_id =
         super::resolve_engine_model_id(&engine_config).unwrap_or_else(|| model_id.clone());
-    let enforce_parser = engine_config.enforce_parser.clone();
+    let enforce_parser =
+        if engine_config.enable_tool_grammar && engine_config.enforce_parser.is_none() {
+            Some("json".to_string())
+        } else {
+            engine_config.enforce_parser.clone()
+        };
     let tool_parser_name = if let Some(ref enforced) = enforce_parser {
         enforced.clone()
     } else {
@@ -2151,9 +2156,10 @@ pub async fn messages(
         let model_type = engine.model_type.clone();
         let model_id = model_id.clone();
         let chat_template = Some(engine.get_chat_template());
+        let guidance_tokens = engine.guidance_tokens.clone();
 
         params.grammar = build_guided_decoding_grammar(
-            &engine.guidance_tokens,
+            &guidance_tokens,
             &tool_config,
             &resolved_tools,
             &tool_parser_name,
@@ -2169,6 +2175,10 @@ pub async fn messages(
             chat_template,
             engine_config.disable_reasoning,
         );
+
+        if params.grammar.is_some() && !guidance_tokens.reasoning_end_ids.is_empty() {
+            params.guidance_reasoning_end_ids = guidance_tokens.reasoning_end_ids.clone();
+        }
 
         if let Some(ref grammar) = params.grammar {
             let lark = crate::utils::guidance_grammar::get_lark_from_top_level_grammar(grammar);

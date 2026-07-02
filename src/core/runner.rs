@@ -300,15 +300,21 @@ impl ModelRunner {
                 continue;
             }
 
-            let grammar = sampling_params_for_batch_index(seqs, i)
+            let params = sampling_params_for_batch_index(seqs, i);
+            let grammar = params
                 .grammar
                 .as_ref()
                 .expect("guided batch entries must have a grammar");
+            let reasoning_end_ids = params.guidance_reasoning_end_ids.clone();
 
             let state = match guidance_states.entry(id) {
                 Entry::Occupied(entry) => entry.into_mut(),
                 Entry::Vacant(entry) => {
-                    match GuidanceState::new_from_grammar(factory.clone(), grammar) {
+                    match GuidanceState::new_from_grammar_with_reasoning(
+                        factory.clone(),
+                        grammar,
+                        reasoning_end_ids,
+                    ) {
                         Ok(state) => entry.insert(state),
                         Err(err) => {
                             guidance_failed.insert(id);
