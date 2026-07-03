@@ -2,21 +2,17 @@
 // This module contains non-grammar guidance utilities:
 // - GuidanceTokens: token ID collections
 // - ParserFactory: llguidance parser factory
-// - GuidanceState: matcher state for speculative decoding
-// - Mask operations: batch mask bias and early exit validation
+// - GuidanceState: matcher state for guided decoding
 
 use crate::utils::config::TokenizerConfig;
 use crate::utils::special_tokens::SpecialTokens;
 use anyhow::Result;
-use candle_core::Tensor;
 use llguidance::{api::TopLevelGrammar, Matcher, ParserFactory as LlgParserFactory};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokenizers::Tokenizer;
-use toktrie::{SimpleVob, TokTrie};
-use toktrie_hf_tokenizers::{ByteTokenizer, ByteTokenizerEnv};
-
-use crate::utils::logits_processor::{LogitsProcessor, Sampling};
+use toktrie::SimpleVob;
+use toktrie_hf_tokenizers::ByteTokenizer;
 
 // Re-export from guidance_grammar for grammar-related types
 // Only export the two entrypoints: generate_grammar_from_request and build_grammar_from_request
@@ -110,52 +106,10 @@ pub fn build_llg_factory(
     Ok(Arc::new(factory))
 }
 
-pub fn load_toktrie_from_path(path: impl AsRef<std::path::Path>) -> Result<TokTrie> {
-    let tokenizer = ByteTokenizer::from_file(path)?;
-    let env = ByteTokenizerEnv::new(tokenizer, None)?;
-    Ok(env.tok_trie)
-}
-
-/// WS regex pattern for Lark grammars - matches whitespace including spaces, tabs, newlines, carriage returns
-pub fn lark_ws_regex() -> &'static str {
-    "/[ \\t\\n\\r]+/"
-}
-
-/// Cache for precomputed mask slices to avoid expensive re-computation
-#[derive(Clone, Default)]
-pub struct SlicerCache {
-    cache: HashMap<usize, Vec<bool>>,
-}
-
-impl SlicerCache {
-    /// Get or compute a mask slice for a given position
-    pub fn get_or_compute(
-        &mut self,
-        pos: usize,
-        compute_fn: impl FnOnce() -> Vec<bool>,
-    ) -> &Vec<bool> {
-        if !self.cache.contains_key(&pos) {
-            self.cache.insert(pos, compute_fn());
-        }
-        self.cache
-            .get(&pos)
-            .expect("entry must exist after compute")
-    }
-
-    /// Clear the cache
-    pub fn clear(&mut self) {
-        self.cache.clear();
-    }
-}
-
 pub struct GuidanceState {
     matcher: Matcher,
-    /// Track llm tokens for speculative decoding recovery
+    /// Track generated tokens for logging and reasoning-mode transition.
     llm_tokens: Vec<u32>,
-    /// Track llm bytes for rollback calculations
-    llm_bytes: usize,
-    /// Cache for precomputed mask slices
-    slicer_cache: SlicerCache,
     /// vLLM/SGLang two-phase reasoning support:
     /// Token IDs that mark the end of reasoning (e.g. </think>).
     /// When non-empty, grammar constraints are deferred until after
@@ -168,21 +122,21 @@ pub struct GuidanceState {
 }
 
 impl GuidanceState {
-    pub fn new_from_grammar(
-        factory: Arc<ParserFactory>,
-        grammar: &TopLevelGrammar,
-    ) -> Result<Self> {
-        Self::new_from_grammar_with_reasoning(factory, grammar, Vec::new())
-    }
-
     pub fn new_from_grammar_with_reasoning(
         factory: Arc<ParserFactory>,
         grammar: &TopLevelGrammar,
         reasoning_end_ids: Vec<u32>,
     ) -> Result<Self> {
         use crate::utils::guidance_grammar::get_lark_from_top_level_grammar;
+
         let lark = get_lark_from_top_level_grammar(grammar);
-        crate::log_info!("[llg] Composed Grammar Constraint:\n{}\n", lark);
+        crate::log_info!(
+            "[llg] Composed grammar constraint: {} bytes, {} lines",
+            lark.len(),
+            lark.lines().count()
+        );
+        tracing::trace!("[llg] Composed Grammar Constraint:\n{}\n", lark);
+
         let mut grammar = grammar.clone();
         if let Some(max_tokens) = grammar.max_tokens {
             let bos_len = 1;
@@ -204,25 +158,9 @@ impl GuidanceState {
         Ok(Self {
             matcher,
             llm_tokens: Vec::new(),
-            llm_bytes: 0,
-            slicer_cache: SlicerCache::default(),
             reasoning_end_ids,
             reasoning_ended,
         })
-    }
-
-    /// Compute mask with caching for performance.
-    /// During reasoning (before </think>), returns None to allow all tokens.
-    /// After reasoning ends, delegates to the grammar matcher.
-    pub fn compute_mask(&mut self) -> Result<Option<SimpleVob>> {
-        if !self.reasoning_ended {
-            return Ok(None);
-        }
-        if self.matcher.is_stopped() {
-            return Ok(None);
-        }
-        let mask = self.matcher.compute_mask()?;
-        Ok(Some(mask))
     }
 
     /// Commit token and track for speculative decoding recovery.
@@ -230,7 +168,6 @@ impl GuidanceState {
     /// When the reasoning-end token is seen, we transition to grammar mode.
     pub fn commit_token(&mut self, token: u32) -> Result<()> {
         self.llm_tokens.push(token);
-        self.llm_bytes += 4;
 
         if !self.reasoning_ended {
             if self.reasoning_end_ids.contains(&token) {
@@ -250,37 +187,9 @@ impl GuidanceState {
         Ok(())
     }
 
-    /// Get the number of committed tokens
-    pub fn num_tokens(&self) -> usize {
-        self.llm_tokens.len()
-    }
-
-    /// Get the number of committed bytes
-    pub fn num_bytes(&self) -> usize {
-        self.llm_bytes
-    }
-
     /// Check if guidance is finished
     pub fn is_finished(&self) -> bool {
         self.matcher.is_stopped()
-    }
-
-    /// Get the last committed token
-    pub fn last_token(&self) -> Option<u32> {
-        self.llm_tokens.last().copied()
-    }
-
-    /// Validate token without consuming it (for re-sampling).
-    /// During reasoning, all tokens are valid.
-    pub fn validate_token(&mut self, token: u32) -> bool {
-        if !self.reasoning_ended {
-            return true;
-        }
-        if self.matcher.is_stopped() {
-            return true;
-        }
-        let result = self.matcher.validate_tokens(&[token]).unwrap_or(0);
-        result == 1
     }
 
     /// Compute mask or return EOS token set if stopped.
@@ -310,184 +219,6 @@ impl GuidanceState {
         }
         self.matcher.compute_ff_tokens()
     }
-
-    /// Fast-forward and consume tokens guaranteed to be accepted by the grammar.
-    /// During reasoning, no fast-forward is possible.
-    pub fn consume_ff_tokens(&mut self) -> Result<Vec<u32>, anyhow::Error> {
-        if !self.reasoning_ended {
-            return Ok(Vec::new());
-        }
-        if self.matcher.is_stopped() {
-            return Ok(Vec::new());
-        }
-
-        let ff_tokens = self.matcher.compute_ff_tokens();
-
-        for &token in &ff_tokens {
-            self.matcher.consume_token(token)?;
-            self.llm_tokens.push(token);
-            self.llm_bytes += 4;
-        }
-
-        Ok(ff_tokens)
-    }
-
-    /// Check if there are pending lexeme bytes to be consumed
-    pub fn has_pending_lexeme_bytes(&self) -> bool {
-        false
-    }
-
-    /// Rollback to a previous state with byte tracking.
-    /// Only rolls back the matcher for tokens that were actually fed to it
-    /// (i.e., post-reasoning tokens).
-    pub fn rollback_to(&mut self, token_pos: usize, byte_pos: usize) -> Result<()> {
-        if self.reasoning_ended {
-            let tokens_to_rollback = self.llm_tokens.len().saturating_sub(token_pos);
-            if tokens_to_rollback > 0 {
-                self.matcher.rollback(tokens_to_rollback)?;
-            }
-        }
-        self.llm_tokens.truncate(token_pos);
-        self.llm_bytes = byte_pos;
-        Ok(())
-    }
-
-    /// Capture current state as rollback snapshot
-    pub fn capture_snapshot(&mut self) {}
-
-    /// Clear all state
-    pub fn clear(&mut self) {
-        self.llm_tokens.clear();
-        self.llm_bytes = 0;
-        self.slicer_cache.clear();
-    }
-
-    /// Get a reference to the slicer cache
-    pub fn slicer_cache(&mut self) -> &mut SlicerCache {
-        &mut self.slicer_cache
-    }
-
-    /// Validate a sequence of tokens against the grammar
-    pub fn validate_tokens(&mut self, tokens: &[u32]) -> Option<usize> {
-        if self.matcher.is_stopped() {
-            return Some(tokens.len());
-        }
-        match self.matcher.validate_tokens(tokens) {
-            Ok(count) => Some(count),
-            Err(_) => None,
-        }
-    }
-}
-
-/// Apply sparse mask bias to logits
-/// Uses iter_set_entries to only iterate allowed tokens
-pub fn _batch_mask_bias(
-    logits: &Tensor,
-    masks: &[(usize, SimpleVob)],
-    vocab_size: usize,
-) -> candle_core::Result<Tensor> {
-    let batch_size = masks.len();
-
-    // Create bias vector initialized to -inf
-    let mut bias_data = vec![f32::NEG_INFINITY; batch_size * vocab_size];
-
-    // Fill in allowed tokens using sparse iteration
-    // masks is Vec<(batch_idx, SimpleVob)> where batch_idx is the sequence position in the batch
-    for (batch_idx, mask) in masks.iter() {
-        mask.iter_set_entries(|idx| {
-            if idx < vocab_size {
-                bias_data[*batch_idx * vocab_size + idx] = 0.0;
-            }
-        });
-    }
-
-    // Create bias tensor on same device as logits
-    let bias_tensor = Tensor::from_vec(bias_data, (batch_size, vocab_size), logits.device())?;
-
-    // GPU tensor addition (no CPU copy)
-    logits.broadcast_add(&bias_tensor)
-}
-
-/// Two-stage validation with early exit
-/// Stage 1: Sample and validate token
-/// Stage 2: Only compute mask if token is invalid
-pub fn _early_exit_validate(
-    guidance_states: &mut HashMap<usize, GuidanceState>,
-    seq_ids: &[usize],
-    tokens: &mut [u32],
-    logits: &Tensor,
-    vocab_size: usize,
-    _factory: &Arc<ParserFactory>,
-    sampling: &Sampling,
-    logit_processor: &LogitsProcessor,
-) -> candle_core::Result<()> {
-    for (seq_idx, seq_id) in seq_ids.iter().enumerate() {
-        let token = tokens[seq_idx];
-
-        if let Some(state) = guidance_states.get_mut(seq_id) {
-            // Stage 1: Validate token
-            if state.validate_token(token) {
-                // Early exit - token is valid, consume it
-                state
-                    .commit_token(token)
-                    .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
-                continue;
-            }
-
-            // Stage 2: Token is invalid, compute mask and re-sample
-            let mask = match state.compute_mask_or_eos() {
-                Ok(m) => m,
-                Err(e) => {
-                    crate::log_error!(
-                        "[llg] Unable to compute mask for token {} due to {}",
-                        token,
-                        e
-                    );
-                    continue;
-                }
-            };
-
-            // Build bias vector using sparse iteration
-            let mut acc = vec![f32::NEG_INFINITY; vocab_size];
-            mask.iter_set_entries(|idx| {
-                if idx < acc.len() {
-                    acc[idx] = 0.0;
-                }
-            });
-
-            // Get current sequence's logits as 1D tensor - MUST CLONE to avoid cross-contamination
-            let row_start = seq_idx * vocab_size;
-            let row_end = row_start + vocab_size;
-            let logits_vec = logits.flatten_all()?.to_vec1::<f32>()?;
-            let mut row_vec = logits_vec.clone(); // Clone to avoid modifying original
-            let row = &mut row_vec[row_start..row_end];
-
-            // Apply bias directly to this sequence's row
-            for tok in 0..vocab_size {
-                if acc[tok] != 0.0 {
-                    row[tok] = f32::NEG_INFINITY;
-                }
-            }
-
-            // Create 1D tensor for just this sequence
-            let biased_row = Tensor::from_vec(
-                row_vec[row_start..row_end].to_vec(),
-                (vocab_size,),
-                logits.device(),
-            )?;
-
-            // Re-sample just this sequence from the biased 1D logits
-            let re_sampled = logit_processor.sample_with_strategy(&biased_row, sampling)?;
-            tokens[seq_idx] = re_sampled[0]; // 1D output, first (only) element
-
-            // Commit the re-sampled token
-            state
-                .commit_token(tokens[seq_idx])
-                .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
-        }
-    }
-
-    Ok(())
 }
 
 #[cfg(test)]

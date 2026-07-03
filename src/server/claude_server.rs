@@ -2176,8 +2176,15 @@ pub async fn messages(
         }
 
         if let Some(ref grammar) = params.grammar {
-            let lark = crate::utils::guidance_grammar::get_lark_from_top_level_grammar(grammar);
-            crate::log_info!("[llg] Final Claude grammar:\n{}", lark);
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                let lark = crate::utils::guidance_grammar::get_lark_from_top_level_grammar(grammar);
+                tracing::debug!(
+                    "[llg] Final Claude grammar: {} bytes, {} lines",
+                    lark.len(),
+                    lark.lines().count()
+                );
+                tracing::trace!("[llg] Final Claude grammar:\n{}", lark);
+            }
         }
     }
 

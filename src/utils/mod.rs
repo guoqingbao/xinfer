@@ -10,6 +10,7 @@ pub mod gptq;
 pub mod graph;
 pub mod guidance;
 pub mod guidance_grammar;
+pub mod guided_decoding;
 pub mod heartbeat;
 pub mod image;
 pub mod kvcache_allocator;
