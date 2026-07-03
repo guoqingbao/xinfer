@@ -7,7 +7,7 @@ const THEMES = ['light', 'dark', 'enflame'];
 function getPreferredTheme() {
   const stored = localStorage.getItem('theme');
   if (stored && THEMES.includes(stored)) return stored;
-  return 'dark';
+  return 'light';
 }
 
 function setTheme(theme) {
@@ -20,10 +20,12 @@ function setTheme(theme) {
 setTheme(getPreferredTheme());
 
 function getLang() {
-  return localStorage.getItem('lang') || 'zh';
+  const stored = localStorage.getItem('lang');
+  return stored === 'zh' || stored === 'en' ? stored : 'en';
 }
 function setLang(lang) {
   localStorage.setItem('lang', lang);
+  document.documentElement.lang = lang === 'zh' ? 'zh-CN' : 'en';
   document.querySelectorAll('[data-zh][data-en]').forEach(el => {
     el.textContent = el.getAttribute('data-' + lang);
   });

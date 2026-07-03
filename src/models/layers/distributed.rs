@@ -472,11 +472,12 @@ impl TensorParallelRowLinear {
             // for GGUF QMatMul which outputs F32).
             xs = xs.apply_op1_no_bwd(all_reduce)?;
         }
-        if xs.dtype() != self.dtype {
-            xs = xs.to_dtype(self.dtype)?;
-        }
         if let Some(bias) = &self.bias {
-            xs = xs.broadcast_add(&bias)?;
+            if bias.dtype() == xs.dtype() {
+                xs = xs.broadcast_add(bias)?;
+            } else {
+                xs = xs.broadcast_add(&bias.to_dtype(xs.dtype())?)?;
+            }
         }
         Ok(xs)
     }
