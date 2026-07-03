@@ -1109,7 +1109,7 @@ text: /(?s:.+?)/
             if variants.len() == 1 {
                 variants[0].clone()
             } else {
-                serde_json::json!({ "anyOf": variants })
+                serde_json::json!({ "oneOf": variants })
             }
         };
         let payload_schema_str = serde_json::to_string(&payload_schema).unwrap_or_default();
