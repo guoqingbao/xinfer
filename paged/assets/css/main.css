@@ -609,10 +609,12 @@ ol.steps { list-style: none; counter-reset: step-counter; }
 }
 .footer-col a:hover { color: var(--primary); transform: translateX(3px); }
 .footer-bottom {
-  display: flex; justify-content: space-between; align-items: center;
+  display: flex; justify-content: space-between; align-items: center; gap: 1rem; flex-wrap: wrap;
   padding-top: 2rem; border-top: 1px solid var(--border);
   font-size: 0.8125rem; color: var(--text-tertiary);
 }
+.footer-bottom a { color: inherit; transition: color var(--transition); }
+.footer-bottom a:hover { color: var(--primary); }
 
 /* ---- Reveal Animation ---- */
 .reveal {
