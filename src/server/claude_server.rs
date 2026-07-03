@@ -2134,12 +2134,7 @@ pub async fn messages(
     };
     let parser_model_id =
         super::resolve_engine_model_id(&engine_config).unwrap_or_else(|| model_id.clone());
-    let enforce_parser =
-        if engine_config.enable_tool_grammar && engine_config.enforce_parser.is_none() {
-            Some("json".to_string())
-        } else {
-            engine_config.enforce_parser.clone()
-        };
+    let enforce_parser = engine_config.enforce_parser.clone();
     let tool_parser_name = if let Some(ref enforced) = enforce_parser {
         enforced.clone()
     } else {
