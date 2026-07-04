@@ -474,6 +474,7 @@ impl GrammarBuilder for StructuredOutputsGrammar {
 pub enum ToolFormat {
     QwenCoder,
     MiniMax,
+    Glm47Moe,
     Json,
     Generic,
 }
@@ -484,6 +485,7 @@ pub struct ToolCallGrammar {
     pub start_token_id: u32,
     pub end_token_id: u32,
     pub format: ToolFormat,
+    marker_token_ids: HashMap<String, u32>,
     value_rules: HashMap<String, String>,
 }
 
@@ -494,6 +496,7 @@ impl Default for ToolCallGrammar {
             start_token_id: 0,
             end_token_id: 0,
             format: ToolFormat::Json,
+            marker_token_ids: HashMap::new(),
             value_rules: HashMap::new(),
         }
     }
@@ -506,6 +509,7 @@ impl ToolCallGrammar {
             start_token_id,
             end_token_id,
             format: ToolFormat::Generic,
+            marker_token_ids: HashMap::new(),
             value_rules: HashMap::new(),
         }
     }
@@ -515,6 +519,7 @@ impl ToolCallGrammar {
             start_token_id,
             end_token_id,
             format: ToolFormat::QwenCoder,
+            marker_token_ids: HashMap::new(),
             value_rules: HashMap::new(),
         }
     }
@@ -524,6 +529,22 @@ impl ToolCallGrammar {
             start_token_id,
             end_token_id,
             format: ToolFormat::MiniMax,
+            marker_token_ids: HashMap::new(),
+            value_rules: HashMap::new(),
+        }
+    }
+    pub fn new_glm47_moe(
+        tools: Vec<Tool>,
+        start_token_id: u32,
+        end_token_id: u32,
+        marker_token_ids: HashMap<String, u32>,
+    ) -> Self {
+        Self {
+            tools,
+            start_token_id,
+            end_token_id,
+            format: ToolFormat::Glm47Moe,
+            marker_token_ids,
             value_rules: HashMap::new(),
         }
     }
@@ -533,6 +554,7 @@ impl ToolCallGrammar {
             start_token_id,
             end_token_id,
             format: ToolFormat::Json,
+            marker_token_ids: HashMap::new(),
             value_rules: HashMap::new(),
         }
     }
@@ -543,6 +565,7 @@ impl GrammarBuilder for ToolCallGrammar {
         match self.format {
             ToolFormat::QwenCoder => self.build_qwen_coder_lark(),
             ToolFormat::MiniMax => self.build_minimax_lark(),
+            ToolFormat::Glm47Moe => self.build_glm47_moe_lark(),
             ToolFormat::Json => self.build_json_lark(),
             ToolFormat::Generic => self.build_generic_lark(),
         }
@@ -806,6 +829,112 @@ text: /(?s:.+?)/
         lark
     }
 
+    fn build_glm47_moe_lark(&mut self) -> String {
+        let mut rules: Vec<String> = Vec::new();
+        let envelope_start_tag = format!("<[{}]>", self.start_token_id);
+        let envelope_end_tag = format!("<[{}]>", self.end_token_id);
+        let arg_key_start = self.marker_terminal("<arg_key>");
+        let arg_key_end = self.marker_terminal("</arg_key>");
+        let arg_value_start = self.marker_terminal("<arg_value>");
+        let arg_value_end = self.marker_terminal("</arg_value>");
+        let tool_rule_names: Vec<String> = (0..self.tools.len())
+            .map(|i| format!("tool_{}", i))
+            .collect();
+        rules.push("start: tool_call".to_string());
+        rules.push(format!(
+            r#"tool_call: {} tool_content {} "#,
+            envelope_start_tag, envelope_end_tag
+        ));
+        let tools = self.tools.clone();
+        for (tool_idx, tool) in tools.iter().enumerate() {
+            let tool_name_ascii: String = tool
+                .function
+                .name
+                .chars()
+                .filter(|c| c.is_ascii())
+                .collect();
+            if let Some(props) = tool
+                .function
+                .parameters
+                .get("properties")
+                .and_then(|p| p.as_object())
+            {
+                let mut param_rules_vec: Vec<String> = Vec::new();
+                let required_count = tool
+                    .function
+                    .parameters
+                    .get("required")
+                    .and_then(|r| r.as_array())
+                    .map(|arr| arr.len())
+                    .unwrap_or_default()
+                    .min(props.len());
+                for param_idx in 0..props.len() {
+                    if param_idx < required_count {
+                        param_rules_vec.push(" glm_arg_pair".to_string());
+                    } else {
+                        param_rules_vec.push(" (glm_arg_pair)?".to_string());
+                    }
+                }
+                rules.push(format!(
+                    r#"tool_{}: {}{}"#,
+                    tool_idx,
+                    lark_quote(&tool_name_ascii),
+                    param_rules_vec.join(" ")
+                ));
+            } else {
+                rules.push(format!(
+                    r#"tool_{}: {}"#,
+                    tool_idx,
+                    lark_quote(&tool_name_ascii)
+                ));
+            }
+        }
+        let tool_variants = tool_rule_names.join(" | ");
+        rules.push(format!("tool_content: {}", tool_variants));
+        rules.push(format!(
+            r#"glm_arg_pair: {} glm_arg_key {} {} glm_arg_value? {}"#,
+            arg_key_start, arg_key_end, arg_value_start, arg_value_end
+        ));
+        let mut key_values: Vec<String> = tools
+            .iter()
+            .filter_map(|tool| {
+                tool.function
+                    .parameters
+                    .get("properties")
+                    .and_then(|p| p.as_object())
+            })
+            .flat_map(|props| props.keys())
+            .map(|key| key.chars().filter(|c| c.is_ascii()).collect::<String>())
+            .filter(|key| !key.is_empty())
+            .map(|key| lark_quote(&key))
+            .collect();
+        key_values.sort();
+        key_values.dedup();
+        if key_values.is_empty() {
+            rules.push("glm_arg_key: /[A-Za-z0-9_.-]+/".to_string());
+        } else {
+            rules.push(format!("glm_arg_key: {}", key_values.join(" | ")));
+        }
+        if let Some(arg_value_end_id) = self.marker_token_ids.get("</arg_value>") {
+            let excluded = if self.end_token_id != 0 && self.end_token_id != *arg_value_end_id {
+                format!("{},{}", arg_value_end_id, self.end_token_id)
+            } else {
+                arg_value_end_id.to_string()
+            };
+            rules.push(format!("glm_arg_value: <[^{}]>+", excluded));
+        } else {
+            rules.push(r#"glm_arg_value[suffix="</arg_value>"]: /(?s:.+?)/"#.to_string());
+        }
+        rules.join("\n") + "\n"
+    }
+
+    fn marker_terminal(&self, marker: &str) -> String {
+        self.marker_token_ids
+            .get(marker)
+            .map(|id| format!("<[{}]>", id))
+            .unwrap_or_else(|| lark_quote(marker))
+    }
+
     fn get_value_rule_name(
         &mut self,
         tool_idx: usize,
@@ -830,6 +959,9 @@ text: /(?s:.+?)/
                 ToolFormat::MiniMax => {
                     format!(r#"{}[suffix="</parameter>\n"]"#, rule_name)
                 }
+                ToolFormat::Glm47Moe => {
+                    format!(r#"{}[suffix="</arg_value>"]"#, rule_name)
+                }
                 _ => {
                     format!(r#"{}[suffix="\n</parameter>\n"]"#, rule_name)
                 }
@@ -851,6 +983,48 @@ pub struct GrammarRequestDispatcher<'a> {
     pub tokenizer: &'a Tokenizer,
     pub chat_template: Option<crate::utils::chat_template::ChatTemplate>,
     pub disable_reasoning: bool,
+}
+
+pub fn request_has_structured_constraint(request: &ChatCompletionRequest) -> bool {
+    request.structured_outputs.as_ref().is_some_and(|so| {
+        so.choice
+            .as_ref()
+            .is_some_and(|choices| !choices.is_empty())
+            || so.regex.is_some()
+            || so.json.is_some()
+            || so.grammar.is_some()
+            || so.structural_tag.is_some()
+    }) || request
+        .response_format
+        .as_ref()
+        .is_some_and(|rf| matches!(rf.format_type.as_str(), "json_schema" | "json_object"))
+        || request.constraint.is_some()
+}
+
+pub fn request_has_tool_grammar(
+    request: &ChatCompletionRequest,
+    enable_tool_grammar: bool,
+) -> bool {
+    enable_tool_grammar
+        && !matches!(
+            request.tool_choice.as_ref(),
+            Some(crate::tools::ToolChoice::Mode(
+                crate::tools::ToolChoiceMode::None
+            ))
+        )
+        && request
+            .tools
+            .as_ref()
+            .is_some_and(|tools| !tools.is_empty())
+}
+
+fn request_requires_tool_call(request: &ChatCompletionRequest) -> bool {
+    matches!(
+        request.tool_choice.as_ref(),
+        Some(crate::tools::ToolChoice::Mode(
+            crate::tools::ToolChoiceMode::Required
+        )) | Some(crate::tools::ToolChoice::Function { .. })
+    )
 }
 
 impl<'a> GrammarRequestDispatcher<'a> {
@@ -877,17 +1051,33 @@ impl<'a> GrammarRequestDispatcher<'a> {
     }
 
     pub fn build_grammar(self) -> Option<TopLevelGrammar> {
+        let has_constraint = request_has_structured_constraint(self.request);
+        let should_build_tool_grammar =
+            request_has_tool_grammar(self.request, self.enable_tool_grammar);
+
+        // Avoid request-time grammar work for ordinary tool requests unless tool
+        // grammar is enabled. Explicit structured output constraints still use
+        // guided decoding even when tool grammar is disabled.
+        if !has_constraint && !should_build_tool_grammar {
+            return None;
+        }
+
         let cache_key = self.cache_key();
         if let Some(grammar) = grammar_cache_get(&cache_key) {
             crate::log_info!("[llg] Grammar cache hit");
             return Some(grammar);
         }
 
-        if !self.enable_tool_grammar {
-            return None;
-        }
-        let constraint_grammar = self.build_constraint_grammar();
-        let tool_grammar = self.build_tool_grammar();
+        let constraint_grammar = if has_constraint {
+            self.build_constraint_grammar()
+        } else {
+            None
+        };
+        let tool_grammar = if should_build_tool_grammar {
+            self.build_tool_grammar()
+        } else {
+            None
+        };
 
         // vLLM/SGLang architecture: grammar constraints NEVER include reasoning.
         // Reasoning is handled at the mask level (GuidanceState defers grammar
@@ -902,16 +1092,32 @@ impl<'a> GrammarRequestDispatcher<'a> {
 
         let max_tokens = self.request.max_tokens.unwrap_or(0);
 
-        // Build only the structured output constraint grammar — NO reasoning wrapping.
-        let constraint_grammar = constraint_grammar.unwrap_or_else(|| {
-            StructuredOutputsGrammar::new(StructuredConstraint::Lark(
-                "start: text\ntext[stop=\"\"]: /(?s:.+?)/".to_string(),
-            ))
-        });
+        let force_tool_call = request_requires_tool_call(self.request);
+        let grammar = match (constraint_grammar, tool_grammar) {
+            (None, Some(mut tool_grammar)) if force_tool_call => {
+                StructuredOutputsGrammar::new(StructuredConstraint::Lark(tool_grammar.build_lark()))
+            }
+            (None, Some(tool_grammar)) => {
+                let text_grammar = StructuredOutputsGrammar::new(StructuredConstraint::Lark(
+                    "start: text\ntext[stop=\"\"]: /(?s:.+?)/".to_string(),
+                ));
+                GrammarComposer::compose_constraint_with_tools(text_grammar, Some(tool_grammar))
+            }
+            (constraint_grammar, tool_grammar) => {
+                // Build only the structured output constraint grammar — NO reasoning wrapping.
+                let constraint_grammar = constraint_grammar.unwrap_or_else(|| {
+                    StructuredOutputsGrammar::new(StructuredConstraint::Lark(
+                        "start: text\ntext[stop=\"\"]: /(?s:.+?)/".to_string(),
+                    ))
+                });
+
+                GrammarComposer::compose_constraint_with_tools(constraint_grammar, tool_grammar)
+            }
+        };
 
         let grammar = GrammarComposer::compose_all_grammars(
-            vec![constraint_grammar],
-            tool_grammar,
+            vec![grammar],
+            None,
             self.guidance_tokens,
             max_tokens,
             self.chat_template,
@@ -922,8 +1128,13 @@ impl<'a> GrammarRequestDispatcher<'a> {
     }
 
     fn cache_key(&self) -> String {
+        let glm_marker_token_ids = if self.parser_name == "glm47_moe" {
+            self.resolve_glm_marker_token_ids()
+        } else {
+            HashMap::new()
+        };
         let key = serde_json::json!({
-            "version": 1,
+            "version": 2,
             "enable_tool_grammar": self.enable_tool_grammar,
             "parser_name": &self.parser_name,
             "max_tokens": self.request.max_tokens.unwrap_or(0),
@@ -934,6 +1145,7 @@ impl<'a> GrammarRequestDispatcher<'a> {
             "constraint": &self.request.constraint,
             "constraint_type": &self.request.constraint_type,
             "disable_reasoning": self.disable_reasoning,
+            "glm_marker_token_ids": glm_marker_token_ids,
             "guidance_tokens": {
                 "bos": &self.guidance_tokens.bos_token_ids,
                 "eos": &self.guidance_tokens.eos_token_ids,
@@ -946,6 +1158,30 @@ impl<'a> GrammarRequestDispatcher<'a> {
             "chat_template": format!("{:?}", self.chat_template),
         });
         serde_json::to_string(&key).unwrap_or_else(|_| format!("{:?}", key))
+    }
+
+    fn token_id_for_text(tokenizer: &Tokenizer, text: &str) -> Option<u32> {
+        tokenizer
+            .encode(text, false)
+            .ok()
+            .and_then(|encoded| {
+                let ids = encoded.get_ids();
+                if ids.len() == 1 {
+                    Some(ids[0])
+                } else {
+                    None
+                }
+            })
+            .or_else(|| tokenizer.get_vocab(true).get(text).copied())
+    }
+
+    fn resolve_glm_marker_token_ids(&self) -> HashMap<String, u32> {
+        ["<arg_key>", "</arg_key>", "<arg_value>", "</arg_value>"]
+            .into_iter()
+            .filter_map(|marker| {
+                Self::token_id_for_text(self.tokenizer, marker).map(|id| (marker.to_string(), id))
+            })
+            .collect()
     }
 
     fn build_constraint_grammar(&self) -> Option<StructuredOutputsGrammar> {
@@ -1044,33 +1280,29 @@ impl<'a> GrammarRequestDispatcher<'a> {
         }))
     }
 
+    fn first_tool_token_id(config_ids: &std::collections::HashSet<u32>, fallback: &[u32]) -> u32 {
+        config_ids
+            .iter()
+            .copied()
+            .min()
+            .or_else(|| fallback.first().copied())
+            .unwrap_or(0)
+    }
+
     fn build_tool_grammar(&self) -> Option<ToolCallGrammar> {
         if self.request.tools.is_none() {
             return None;
         }
 
         let tools = self.request.tools.as_ref().unwrap().clone();
-        // Extract token IDs from GuidanceTokens (u32), not from tool_config (String)
-        let start_token_id = self
-            .guidance_tokens
-            .tool_call_start_ids
-            .first()
-            .copied()
-            .unwrap_or(0);
-        let end_token_id = self
-            .guidance_tokens
-            .tool_call_end_ids
-            .first()
-            .copied()
-            .unwrap_or(0);
-
-        if !self.enable_tool_grammar {
-            return Some(ToolCallGrammar::new_generic(
-                tools,
-                start_token_id,
-                end_token_id,
-            ));
-        }
+        let start_token_id = Self::first_tool_token_id(
+            &self.tool_config.start_token_ids,
+            &self.guidance_tokens.tool_call_start_ids,
+        );
+        let end_token_id = Self::first_tool_token_id(
+            &self.tool_config.end_token_ids,
+            &self.guidance_tokens.tool_call_end_ids,
+        );
 
         // TODO align 1:1 with parser selection
         match self.parser_name.as_str() {
@@ -1083,6 +1315,12 @@ impl<'a> GrammarRequestDispatcher<'a> {
                 tools,
                 start_token_id,
                 end_token_id,
+            )),
+            "glm47_moe" => Some(ToolCallGrammar::new_glm47_moe(
+                tools,
+                start_token_id,
+                end_token_id,
+                self.resolve_glm_marker_token_ids(),
             )),
             "gemma4" => Some(ToolCallGrammar::new_json(
                 tools,
@@ -1238,10 +1476,20 @@ impl GrammarComposer {
         mut grammar: StructuredOutputsGrammar,
         guidance_tokens: &GuidanceTokens,
     ) -> TopLevelGrammar {
-        if guidance_tokens.eos_token_ids.is_empty() {
+        let lark = grammar.build_lark();
+        let eos_token_ids: Vec<u32> = guidance_tokens
+            .eos_token_ids
+            .iter()
+            .copied()
+            .filter(|id| {
+                !guidance_tokens.tool_call_end_ids.contains(id)
+                    || !lark.contains(&format!("<[{}]>", id))
+            })
+            .collect();
+
+        if eos_token_ids.is_empty() {
             return grammar.format();
         }
-        let lark = grammar.build_lark();
         if lark.contains("eos") {
             return grammar.format();
         }
@@ -1252,11 +1500,10 @@ impl GrammarComposer {
             "text"
         };
         let new_start = format!("start: {} eos", current_start_rhs);
-        let eos_rule = if guidance_tokens.eos_token_ids.len() == 1 {
-            format!("eos: <[{}]>", guidance_tokens.eos_token_ids[0])
+        let eos_rule = if eos_token_ids.len() == 1 {
+            format!("eos: <[{}]>", eos_token_ids[0])
         } else {
-            let ids: Vec<String> = guidance_tokens
-                .eos_token_ids
+            let ids: Vec<String> = eos_token_ids
                 .iter()
                 .map(|id| format!("<[{}]>", id))
                 .collect();
@@ -1544,7 +1791,7 @@ pub fn build_guided_decoding_grammar(
     tools: &[crate::tools::Tool],
     tool_parser_name: &str,
     constraint_grammar: Option<TopLevelGrammar>,
-    _tool_choice_required: bool,
+    tool_choice_required: bool,
     forced_tool_name: Option<String>,
     max_tokens: usize,
     reasoning_effort: Option<crate::utils::config::ReasoningEffort>,
@@ -1560,6 +1807,10 @@ pub fn build_guided_decoding_grammar(
     let constraint = constraint_grammar
         .as_ref()
         .map(|cg| get_lark_from_top_level_grammar(cg));
+
+    let tool_choice = forced_tool_name
+        .map(crate::tools::ToolChoice::function)
+        .or_else(|| tool_choice_required.then(crate::tools::ToolChoice::required));
 
     // Build a synthetic request with tools and constraint info
     let synthetic_request = crate::server::ChatCompletionRequest {
@@ -1581,7 +1832,7 @@ pub fn build_guided_decoding_grammar(
         } else {
             Some(tools.to_vec())
         },
-        tool_choice: forced_tool_name.map(|fn_name| crate::tools::ToolChoice::function(fn_name)),
+        tool_choice,
         response_format: None,
         extra_body: None,
         structured_outputs: None, // constraint_grammar is handled via constraint field
@@ -1613,7 +1864,7 @@ mod tests {
     use super::*;
     use crate::server::{ChatCompletionRequest, StructuredOutputs};
     use serde_json::json;
-    use tokenizers::{models::bpe::BPE, Tokenizer};
+    use tokenizers::{models::bpe::BPE, AddedToken, Tokenizer};
 
     fn guidance_tokens() -> GuidanceTokens {
         GuidanceTokens {
@@ -1655,6 +1906,17 @@ mod tests {
 
     fn tokenizer() -> Tokenizer {
         Tokenizer::new(BPE::default())
+    }
+
+    fn glm_marker_tokenizer() -> Tokenizer {
+        let mut tokenizer = tokenizer();
+        tokenizer.add_tokens(&[
+            AddedToken::from("<arg_key>", false),
+            AddedToken::from("</arg_key>", false),
+            AddedToken::from("<arg_value>", false),
+            AddedToken::from("</arg_value>", false),
+        ]);
+        tokenizer
     }
 
     #[test]
@@ -1736,6 +1998,66 @@ mod tests {
     }
 
     #[test]
+    fn test_structured_outputs_builds_grammar_when_tool_grammar_disabled() {
+        let mut req = request();
+        req.structured_outputs = Some(StructuredOutputs {
+            choice: Some(vec!["yes".to_string(), "no".to_string()]),
+            regex: None,
+            json: None,
+            grammar: None,
+            structural_tag: None,
+        });
+
+        let tokens = guidance_tokens();
+        let tokenizer = tokenizer();
+        let tool_config = ToolConfig::for_model_type(&crate::utils::config::ModelType::Qwen3);
+        let grammar = GrammarRequestDispatcher::new(
+            &req,
+            &tokens,
+            &tool_config,
+            false,
+            "json".to_string(),
+            &tokenizer,
+            None,
+            false,
+        )
+        .build_grammar()
+        .expect("structured output grammar should be built without tool grammar");
+
+        let lark = get_lark_from_top_level_grammar(&grammar);
+        assert!(lark.contains("yes"));
+        assert!(lark.contains("no"));
+    }
+
+    #[test]
+    fn test_tools_do_not_build_grammar_when_tool_grammar_disabled() {
+        let mut req = request();
+        req.tools = Some(vec![crate::tools::ToolBuilder::new(
+            "search".to_string(),
+            "Search the web".to_string(),
+        )
+        .param("query", "string", "Search query", true)
+        .build()]);
+
+        let tokens = guidance_tokens();
+        let tokenizer = tokenizer();
+        let tool_config = ToolConfig::for_model_type(&crate::utils::config::ModelType::Qwen3);
+        let grammar = GrammarRequestDispatcher::new(
+            &req,
+            &tokens,
+            &tool_config,
+            false,
+            "qwen_coder".to_string(),
+            &tokenizer,
+            None,
+            false,
+        )
+        .build_grammar();
+
+        assert!(grammar.is_none());
+    }
+
+    #[test]
     fn test_qwen_coder_tool_dispatch_builds_xml_grammar() {
         let mut req = request();
         req.tools = Some(vec![crate::tools::ToolBuilder::new(
@@ -1763,9 +2085,329 @@ mod tests {
 
         let lark = get_lark_from_top_level_grammar(&grammar);
         assert!(lark.contains("start:"));
+        assert!(lark.contains("text"));
         assert!(lark.contains("tool_call"));
         assert!(lark.contains("<function=search>"));
         assert!(lark.contains("parameter=query"));
+    }
+
+    #[test]
+    fn test_auto_tool_grammar_allows_text_response() {
+        let mut req = request();
+        req.tool_choice = Some(crate::tools::ToolChoice::auto());
+        req.tools = Some(vec![crate::tools::ToolBuilder::new(
+            "search".to_string(),
+            "Search the web".to_string(),
+        )
+        .param("query", "string", "Search query", true)
+        .build()]);
+
+        let tokens = guidance_tokens();
+        let tokenizer = tokenizer();
+        let tool_config = ToolConfig::for_model_type(&crate::utils::config::ModelType::Qwen3);
+        let grammar = GrammarRequestDispatcher::new(
+            &req,
+            &tokens,
+            &tool_config,
+            true,
+            "qwen_coder".to_string(),
+            &tokenizer,
+            None,
+            false,
+        )
+        .build_grammar()
+        .expect("auto tool grammar should be built");
+
+        let lark = get_lark_from_top_level_grammar(&grammar);
+        assert!(lark.contains("text"));
+        assert!(lark.contains("tool_call"));
+        assert!(!lark.contains("start: tool_call\n"));
+    }
+
+    #[test]
+    fn test_required_tool_grammar_forces_tool_call() {
+        let mut req = request();
+        req.tool_choice = Some(crate::tools::ToolChoice::required());
+        req.tools = Some(vec![crate::tools::ToolBuilder::new(
+            "search".to_string(),
+            "Search the web".to_string(),
+        )
+        .param("query", "string", "Search query", true)
+        .build()]);
+
+        let tokens = guidance_tokens();
+        let tokenizer = tokenizer();
+        let tool_config = ToolConfig::for_model_type(&crate::utils::config::ModelType::Qwen3);
+        let grammar = GrammarRequestDispatcher::new(
+            &req,
+            &tokens,
+            &tool_config,
+            true,
+            "qwen_coder".to_string(),
+            &tokenizer,
+            None,
+            false,
+        )
+        .build_grammar()
+        .expect("required tool grammar should be built");
+
+        let lark = get_lark_from_top_level_grammar(&grammar);
+        assert!(lark.contains("start: tool_call"));
+    }
+
+    #[test]
+    fn test_claude_auto_tool_grammar_allows_text_response() {
+        let tools = vec![crate::tools::ToolBuilder::new(
+            "search".to_string(),
+            "Search the web".to_string(),
+        )
+        .param("query", "string", "Search query", true)
+        .build()];
+
+        let tokens = guidance_tokens();
+        let tokenizer = tokenizer();
+        let tool_config = ToolConfig::for_model_type(&crate::utils::config::ModelType::Qwen3);
+        let grammar = build_guided_decoding_grammar(
+            &tokens,
+            &tool_config,
+            &tools,
+            "qwen_coder",
+            None,
+            false,
+            None,
+            16,
+            None,
+            true,
+            &tokenizer,
+            &crate::utils::config::ModelType::Qwen3,
+            "qwen",
+            None,
+            false,
+        )
+        .expect("Claude auto tool grammar should be built");
+
+        let lark = get_lark_from_top_level_grammar(&grammar);
+        assert!(lark.contains("text"));
+        assert!(lark.contains("tool_call"));
+        assert!(!lark.contains("start: tool_call\n"));
+    }
+
+    #[test]
+    fn test_claude_required_tool_grammar_forces_tool_call() {
+        let tools = vec![crate::tools::ToolBuilder::new(
+            "search".to_string(),
+            "Search the web".to_string(),
+        )
+        .param("query", "string", "Search query", true)
+        .build()];
+
+        let tokens = guidance_tokens();
+        let tokenizer = tokenizer();
+        let tool_config = ToolConfig::for_model_type(&crate::utils::config::ModelType::Qwen3);
+        let grammar = build_guided_decoding_grammar(
+            &tokens,
+            &tool_config,
+            &tools,
+            "qwen_coder",
+            None,
+            true,
+            None,
+            16,
+            None,
+            true,
+            &tokenizer,
+            &crate::utils::config::ModelType::Qwen3,
+            "qwen",
+            None,
+            false,
+        )
+        .expect("Claude required tool grammar should be built");
+
+        let lark = get_lark_from_top_level_grammar(&grammar);
+        assert!(lark.contains("start: tool_call"));
+    }
+
+    #[test]
+    fn test_tool_choice_none_does_not_build_tool_grammar() {
+        let mut req = request();
+        req.tool_choice = Some(crate::tools::ToolChoice::none());
+        req.tools = Some(vec![crate::tools::ToolBuilder::new(
+            "search".to_string(),
+            "Search the web".to_string(),
+        )
+        .param("query", "string", "Search query", true)
+        .build()]);
+
+        let tokens = guidance_tokens();
+        let tokenizer = tokenizer();
+        let tool_config = ToolConfig::for_model_type(&crate::utils::config::ModelType::Qwen3);
+        let grammar = GrammarRequestDispatcher::new(
+            &req,
+            &tokens,
+            &tool_config,
+            true,
+            "qwen_coder".to_string(),
+            &tokenizer,
+            None,
+            false,
+        )
+        .build_grammar();
+
+        assert!(grammar.is_none());
+    }
+
+    #[test]
+    fn test_tool_grammar_does_not_append_duplicate_tool_end_as_eos() {
+        let mut req = request();
+        req.tools = Some(vec![crate::tools::ToolBuilder::new(
+            "search".to_string(),
+            "Search the web".to_string(),
+        )
+        .param("query", "string", "Search query", true)
+        .build()]);
+
+        let mut tokens = guidance_tokens();
+        tokens.eos_token_ids = tokens.tool_call_end_ids.clone();
+        let tokenizer = tokenizer();
+        let tool_config = ToolConfig::for_model_type(&crate::utils::config::ModelType::Qwen3);
+        let grammar = GrammarRequestDispatcher::new(
+            &req,
+            &tokens,
+            &tool_config,
+            true,
+            "qwen_coder".to_string(),
+            &tokenizer,
+            None,
+            false,
+        )
+        .build_grammar()
+        .expect("tool grammar should be built");
+
+        let lark = get_lark_from_top_level_grammar(&grammar);
+        assert!(lark.contains("tool_call"));
+        assert!(!lark.contains("tool_call eos"));
+        assert!(!lark.contains("eos:"));
+    }
+
+    #[test]
+    fn test_tool_grammar_uses_parser_tool_config_token_ids() {
+        let mut req = request();
+        req.tools = Some(vec![crate::tools::ToolBuilder::new(
+            "search".to_string(),
+            "Search the web".to_string(),
+        )
+        .param("query", "string", "Search query", true)
+        .build()]);
+
+        let mut tokens = guidance_tokens();
+        tokens.tool_call_start_ids = vec![42];
+        tokens.tool_call_end_ids = vec![43];
+        let tokenizer = tokenizer();
+        let tool_config = ToolConfig::for_model_type(&crate::utils::config::ModelType::Qwen3);
+        let grammar = GrammarRequestDispatcher::new(
+            &req,
+            &tokens,
+            &tool_config,
+            true,
+            "qwen_coder".to_string(),
+            &tokenizer,
+            None,
+            false,
+        )
+        .build_grammar()
+        .expect("tool grammar should be built");
+
+        let lark = get_lark_from_top_level_grammar(&grammar);
+        assert!(lark.contains("<[151657]>"));
+        assert!(lark.contains("<[151658]>"));
+        assert!(!lark.contains("<[42]>"));
+        assert!(!lark.contains("<[43]>"));
+    }
+
+    #[test]
+    fn test_glm_tool_dispatch_builds_native_xml_grammar() {
+        let mut req = request();
+        req.tools = Some(vec![crate::tools::ToolBuilder::new(
+            "read".to_string(),
+            "Read a file".to_string(),
+        )
+        .param("filePath", "string", "File path", true)
+        .build()]);
+
+        let tokens = guidance_tokens();
+        let tokenizer = tokenizer();
+        let tool_config = ToolConfig::for_model_type(&crate::utils::config::ModelType::GLM4MoeLite);
+        let grammar = GrammarRequestDispatcher::new(
+            &req,
+            &tokens,
+            &tool_config,
+            true,
+            "glm47_moe".to_string(),
+            &tokenizer,
+            None,
+            false,
+        )
+        .build_grammar()
+        .expect("GLM tool grammar should be built");
+
+        let lark = get_lark_from_top_level_grammar(&grammar);
+        assert!(lark.contains("tool_call"));
+        assert!(lark.contains("read"));
+        assert!(lark.contains("glm_arg_pair"));
+        assert!(lark.contains("glm_arg_key"));
+        assert!(!lark.contains("glm_arg_key?"));
+        assert!(lark.contains("glm_arg_value?"));
+        assert!(lark.contains(r#"glm_arg_key: "filePath""#));
+        assert!(lark.contains(r#"glm_arg_value[suffix="</arg_value>"]: /(?s:.+?)/"#));
+        assert!(lark.contains("<arg_key>"));
+        assert!(lark.contains("</arg_key>"));
+        assert!(lark.contains("<arg_value>"));
+        assert!(lark.contains("</arg_value>"));
+        assert!(!lark.contains(r#""name""#));
+        assert!(!lark.contains(r#""arguments""#));
+    }
+
+    #[test]
+    fn test_glm_tool_dispatch_uses_nested_marker_token_ids() {
+        let mut req = request();
+        req.tools = Some(vec![crate::tools::ToolBuilder::new(
+            "list_dir".to_string(),
+            "List directory contents".to_string(),
+        )
+        .param("path", "string", "Directory path", true)
+        .build()]);
+
+        let tokens = guidance_tokens();
+        let tokenizer = glm_marker_tokenizer();
+        let tool_config = ToolConfig::for_model_type(&crate::utils::config::ModelType::GLM4MoeLite);
+        let grammar = GrammarRequestDispatcher::new(
+            &req,
+            &tokens,
+            &tool_config,
+            true,
+            "glm47_moe".to_string(),
+            &tokenizer,
+            None,
+            false,
+        )
+        .build_grammar()
+        .expect("GLM tool grammar should be built");
+
+        let lark = get_lark_from_top_level_grammar(&grammar);
+        for marker in ["<arg_key>", "</arg_key>", "<arg_value>", "</arg_value>"] {
+            let encoded = tokenizer.encode(marker, false).unwrap();
+            let ids = encoded.get_ids();
+            assert_eq!(ids.len(), 1);
+            assert!(
+                lark.contains(&format!("<[{}]>", ids[0])),
+                "grammar should contain token terminal for {marker}"
+            );
+        }
+        assert!(!lark.contains("</arg_key><arg_value>"));
+        assert!(lark.contains(r#"glm_arg_key: "path""#));
+        let end_value_id = tokenizer.encode("</arg_value>", false).unwrap().get_ids()[0];
+        assert!(lark.contains(&format!("glm_arg_value: <[^{},151658]>+", end_value_id)));
+        assert!(!lark.contains(r#"suffix="</arg_value>""#));
     }
 
     #[test]

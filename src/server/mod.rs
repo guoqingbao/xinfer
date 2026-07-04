@@ -298,7 +298,7 @@ pub fn normalize_reasoning_controls(params: &mut SamplingParams, guidance_tokens
         && !guidance_tokens.reasoning_end_ids.is_empty();
     if !has_reasoning_tokens {
         crate::log_warn!(
-            "[llg] reasoning_effort requested but current model/tokenizer does not expose reasoning tokens; disabling reasoning grammar"
+            "reasoning_effort requested but current model/tokenizer does not expose reasoning tokens; disabling reasoning_effort"
         );
         params.reasoning_effort = None;
         return;

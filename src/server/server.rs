@@ -21,7 +21,10 @@ use crate::tools::helpers::{
 };
 use crate::tools::{ToolChoice, ToolChoiceMode};
 use crate::utils::config::{ReasoningEffort, SamplingParams};
-use crate::utils::guidance_grammar::{build_grammar_from_request, GrammarRequestDispatcher};
+use crate::utils::guidance_grammar::{
+    build_grammar_from_request, request_has_structured_constraint, request_has_tool_grammar,
+    GrammarRequestDispatcher,
+};
 use axum::extract::{Json, Query, State};
 use axum::response::{sse::KeepAlive, Sse};
 use base64::Engine;
@@ -429,22 +432,26 @@ pub async fn chat_completion(
         )
     };
 
-    let enforce_parser = engine_config.enforce_parser.clone();
-    let tool_parser_name = if let Some(ref enforced) = enforce_parser {
-        enforced.clone()
-    } else {
-        let parser_model_id =
-            super::resolve_engine_model_id(&engine_config).unwrap_or_else(|| model_id.clone());
-        StreamToolParser::parser_name_for_model(&model_type, &parser_model_id).to_string()
-    };
+    normalize_reasoning_controls(&mut params, &guidance_tokens);
 
-    // Set max_tokens on request if not already set (needed by grammar dispatcher)
-    let mut grammar_request = request.clone();
-    if grammar_request.max_tokens.is_none() {
-        grammar_request.max_tokens = Some(max_tokens);
-    }
+    let grammar = if request_has_structured_constraint(&request)
+        || request_has_tool_grammar(&request, engine_config.enable_tool_grammar)
+    {
+        let enforce_parser = engine_config.enforce_parser.clone();
+        let tool_parser_name = if let Some(ref enforced) = enforce_parser {
+            enforced.clone()
+        } else {
+            let parser_model_id =
+                super::resolve_engine_model_id(&engine_config).unwrap_or_else(|| model_id.clone());
+            StreamToolParser::parser_name_for_model(&model_type, &parser_model_id).to_string()
+        };
 
-    let grammar = {
+        // Set max_tokens on request if not already set (needed by grammar dispatcher)
+        let mut grammar_request = request.clone();
+        if grammar_request.max_tokens.is_none() {
+            grammar_request.max_tokens = Some(max_tokens);
+        }
+
         let dispatcher = GrammarRequestDispatcher::new(
             &grammar_request,
             &guidance_tokens,
@@ -456,11 +463,9 @@ pub async fn chat_completion(
             engine_config.disable_reasoning,
         );
         dispatcher.build_grammar()
+    } else {
+        None
     };
-
-    if grammar.is_some() {
-        normalize_reasoning_controls(&mut params, &guidance_tokens);
-    }
 
     let mcp_tools = data
         .mcp_manager

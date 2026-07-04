@@ -129,13 +129,15 @@ impl GuidanceState {
     ) -> Result<Self> {
         use crate::utils::guidance_grammar::get_lark_from_top_level_grammar;
 
-        let lark = get_lark_from_top_level_grammar(grammar);
-        crate::log_info!(
-            "[llg] Composed grammar constraint: {} bytes, {} lines",
-            lark.len(),
-            lark.lines().count()
-        );
-        tracing::trace!("[llg] Composed Grammar Constraint:\n{}\n", lark);
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            let lark = get_lark_from_top_level_grammar(grammar);
+            tracing::debug!(
+                "[llg] Initializing guidance parser from grammar: {} bytes, {} lines",
+                lark.len(),
+                lark.lines().count()
+            );
+            tracing::trace!("[llg] Guidance parser grammar:\n{}\n", lark);
+        }
 
         let mut grammar = grammar.clone();
         if let Some(max_tokens) = grammar.max_tokens {

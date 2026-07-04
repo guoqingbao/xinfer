@@ -2146,7 +2146,7 @@ pub async fn messages(
         e.img_cfg.clone()
     };
 
-    {
+    if engine_config.enable_tool_grammar && !resolved_tools.is_empty() {
         let engine = data.engine.read();
         let model_type = engine.model_type.clone();
         let model_id = model_id.clone();
