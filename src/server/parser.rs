@@ -1201,7 +1201,9 @@ impl StreamToolParser {
     fn update_reasoning_state(&mut self, token_text: &str) {
         if self.active_reasoning_end.is_none() {
             for &(start, end) in REASONING_MARKERS {
-                if token_text.contains(start) || self.accumulated_output.ends_with(start) {
+                let clean_start = format!(r#"\n{}\n"#, start);
+                if (self.accumulated_output.len() == 0 && token_text.starts_with(start)) ||
+                    token_text.contains(&clean_start) || self.accumulated_output.contains(&clean_start) {
                     self.active_reasoning_end = Some(end.to_string());
                     break;
                 }

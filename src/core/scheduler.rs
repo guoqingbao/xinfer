@@ -7,6 +7,7 @@ use super::{
 };
 use crate::transfer::{PdConfig, PdRole};
 use crate::utils::config::{Config, EngineConfig, EosTokenId};
+use crate::utils::guidance_grammar::get_lark_from_top_level_grammar;
 use candle_core::Result;
 use parking_lot::RwLock;
 use regex::Regex;
@@ -216,6 +217,15 @@ impl Scheduler {
         seq.id = self.next_seq_id;
         let id = seq.id;
         self.next_seq_id += 1;
+        if crate::utils::env::debug_llg() {
+            if let Some(gram) = &seq.sampling_params.grammar {
+                crate::log_info!(
+                    "[llg] Seq {}: TopLevelGrammar:\n{}\n",
+                    &seq.id,
+                    get_lark_from_top_level_grammar(gram)
+                )
+            }
+        }
         self.waiting.push_back(seq);
         id
     }

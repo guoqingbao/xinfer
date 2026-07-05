@@ -1,4 +1,3 @@
-use crate::utils::env::soft_mask_disabled;
 use crate::utils::guidance::{GuidanceState, ParserFactory};
 use candle_core::{Result, Tensor};
 use llguidance::api::TopLevelGrammar;
@@ -32,31 +31,11 @@ impl GuidedDecodingStep {
     }
 }
 
-/// Soft masking configuration for guided decoding.
-/// Instead of hard masking to -inf, disallowed logits are shifted by a large value.
-#[derive(Clone, Debug)]
-pub struct SoftMaskConfig {
-    pub mask_shift: f32,
-    pub min_logit: f32,
-    pub enabled: bool,
-}
-
-impl Default for SoftMaskConfig {
-    fn default() -> Self {
-        Self {
-            mask_shift: -1000.0,
-            min_logit: -1e9,
-            enabled: !soft_mask_disabled(),
-        }
-    }
-}
-
 pub struct GuidedDecoding {
     factory: Option<Arc<ParserFactory>>,
     states: RwLock<HashMap<usize, GuidanceState>>,
     failed: RwLock<HashSet<usize>>,
     mismatch: RwLock<HashSet<usize>>,
-    soft_mask: SoftMaskConfig,
 }
 
 impl GuidedDecoding {
@@ -66,7 +45,6 @@ impl GuidedDecoding {
             states: RwLock::new(HashMap::new()),
             failed: RwLock::new(HashSet::new()),
             mismatch: RwLock::new(HashSet::new()),
-            soft_mask: SoftMaskConfig::default(),
         }
     }
 
@@ -197,16 +175,9 @@ impl GuidedDecoding {
         }
 
         let allow_mask = Tensor::from_vec(allow_mask, logits.shape().clone(), logits.device())?;
-        let masked_logits = if self.soft_mask.enabled {
-            let disallowed = logits
-                .affine(1.0, self.soft_mask.mask_shift as f64)?
-                .clamp(self.soft_mask.min_logit, f32::INFINITY)?;
-            allow_mask.where_cond(&logits, &disallowed)?
-        } else {
-            let disallowed =
-                Tensor::full(f32::NEG_INFINITY, logits.shape().clone(), logits.device())?;
-            allow_mask.where_cond(&logits, &disallowed)?
-        };
+        let disallowed =
+            Tensor::full(f32::NEG_INFINITY, logits.shape().clone(), logits.device())?;
+        let masked_logits: Tensor = allow_mask.where_cond(&logits, &disallowed)?;
 
         Ok((masked_logits, step))
     }

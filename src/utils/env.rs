@@ -77,18 +77,31 @@ pub fn default_reasoning_max_tokens() -> usize {
     })
 }
 
-/// Environment variable to disable soft masking for gradient smoothing.
-/// When NOT set: soft masking is ENABLED (default behavior).
-/// When set to "1", "true", or "yes": soft masking is DISABLED (hard -inf masking).
-/// When set to "0", "false", or "no": soft masking is ENABLED.
-pub const SOFT_MASK_DISABLED_ENV: &str = "XINFER_SOFT_MASK_DISABLED";
+/// Environment variable to enable llguidance debug logging.
+/// Defaults to true when not set.
+pub const DEBUG_LLG_ENV: &str = "XINFER_DEBUG_LLG";
 
-static SOFT_MASK_DISABLED: OnceLock<bool> = OnceLock::new();
+static DEBUG_LLG: OnceLock<bool> = OnceLock::new();
 
-pub fn soft_mask_disabled() -> bool {
-    *SOFT_MASK_DISABLED.get_or_init(|| {
-        env::var(SOFT_MASK_DISABLED_ENV)
-            .map(|v| !matches!(v.trim().to_lowercase().as_str(), "0" | "false" | "no"))
+pub fn debug_llg() -> bool {
+    *DEBUG_LLG.get_or_init(|| {
+        env::var(DEBUG_LLG_ENV)
+            .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false)
+    })
+}
+
+/// Environment variable to enable full-envelope grammar mode (BOS->EOS constraint).
+/// When set to "1" or "true", the grammar constrains all generation including reasoning.
+/// Default is "0" (two-phase reasoning: unconstrained reasoning, constrained response).
+pub const LLG_FULL_ENV: &str = "XINFER_LLG_FULL";
+
+static LLG_FULL: OnceLock<bool> = OnceLock::new();
+
+pub fn llg_full_enabled() -> bool {
+    *LLG_FULL.get_or_init(|| {
+        env::var(LLG_FULL_ENV)
+            .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes"))
             .unwrap_or(false)
     })
 }

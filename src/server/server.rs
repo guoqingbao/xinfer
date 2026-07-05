@@ -436,6 +436,7 @@ pub async fn chat_completion(
 
     let grammar = if request_has_structured_constraint(&request)
         || request_has_tool_grammar(&request, engine_config.enable_tool_grammar)
+        ||  crate::utils::env::llg_full_enabled()
     {
         let enforce_parser = engine_config.enforce_parser.clone();
         let tool_parser_name = if let Some(ref enforced) = enforce_parser {

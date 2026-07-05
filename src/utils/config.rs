@@ -1420,17 +1420,16 @@ impl Default for ReasoningEffort {
 impl ReasoningEffort {
     /// Parse a string to ReasoningEffort
     pub fn from_str(s: String) -> Self {
-        match s.to_lowercase().as_str() {
+        match s.to_lowercase().replace("-", "_").as_str() {
             "none" => Self::None,
-            "model_default" | "default" => Self::ModelDefault,
             "low" => Self::Low,
             "normal" | "medium" => Self::Medium,
             "high" => Self::High,
-            "xhigh" | "x_high" | "very_high" | "maximum" | "max" => Self::High,
-            "chain_of_thought" | "cot" | "cove" => Self::ChainOfThought,
+            // Maximum reasoning levels
+            "xhigh" | "x_high" | "very_high" | "maximum" | "max" | "chain_of_thought" | "cot" | "cove" => Self::ChainOfThought,
             #[cfg(all(not(feature = "python"), not(feature = "pyo3")))]
             s if s.starts_with("custom:") => Self::Custom(s[7..].to_string()),
-            _ => Self::None,
+            _ => Self::ModelDefault,
         }
     }
 
