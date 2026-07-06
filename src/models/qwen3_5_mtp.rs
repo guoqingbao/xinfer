@@ -12,11 +12,11 @@ use crate::models::layers::attention::Attention;
 use crate::models::layers::distributed::{Comm, ReplicatedLinear};
 use crate::models::layers::linear::LinearX as Linear;
 use crate::models::layers::mlp::MLP;
-use crate::models::layers::moe::{FusedMoe, FusedMoeFp8, FusedMoeGGUF, FusedMoeISQ};
+use crate::models::layers::moe::{FusedMoe, FusedMoeFp8, FusedMoeGGUF};
 use crate::models::layers::others::{rms_norm, NormX};
 use crate::models::layers::rotary_emb::{ApplyRotaryEmbedding, ScalingRotaryEmbedding};
 use crate::models::layers::VarBuilderX;
-use crate::utils::config::Config;
+use crate::utils::config::{Config, QuantConfig};
 use candle_core::{DType, Device, Module, Result, Tensor, D};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -34,7 +34,6 @@ enum MtpFusedMoe {
     BF16(FusedMoe),
     FP8(FusedMoeFp8),
     GGUF(FusedMoeGGUF),
-    ISQ(FusedMoeISQ),
 }
 
 impl MtpFusedMoe {
@@ -43,9 +42,83 @@ impl MtpFusedMoe {
             Self::BF16(m) => m.forward(xs, is_prefill),
             Self::FP8(m) => m.forward(xs, is_prefill),
             Self::GGUF(m) => m.forward(xs, is_prefill),
-            Self::ISQ(m) => m.forward(xs, is_prefill),
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MtpWeightFormat {
+    Unquantized,
+    Fp8,
+}
+
+fn has_any_key(vb: &VarBuilderX, keys: &[&str]) -> bool {
+    keys.iter().any(|key| vb.has_key(key))
+}
+
+fn detect_mtp_weight_format(vb: &VarBuilderX) -> MtpWeightFormat {
+    if vb.is_qvar_builder() {
+        return MtpWeightFormat::Unquantized;
+    }
+
+    let fp8 = has_any_key(
+        vb,
+        &[
+            "fc.weight_scale",
+            "fc.weight_scale_inv",
+            "layers.0.self_attn.q_proj.weight_scale",
+            "layers.0.self_attn.q_proj.weight_scale_inv",
+            "layers.0.mlp.gate_proj.weight_scale",
+            "layers.0.mlp.gate_proj.weight_scale_inv",
+            "layers.0.mlp.up_proj.weight_scale",
+            "layers.0.mlp.up_proj.weight_scale_inv",
+            "layers.0.mlp.down_proj.weight_scale",
+            "layers.0.mlp.down_proj.weight_scale_inv",
+            "layers.0.mlp.experts.gate_up_proj_scale_inv",
+            "layers.0.mlp.experts.down_proj_scale_inv",
+            "layers.0.mlp.experts.0.gate_proj.weight_scale",
+            "layers.0.mlp.experts.0.gate_proj.weight_scale_inv",
+            "layers.0.mlp.experts.0.up_proj.weight_scale",
+            "layers.0.mlp.experts.0.up_proj.weight_scale_inv",
+            "layers.0.mlp.experts.0.down_proj.weight_scale",
+            "layers.0.mlp.experts.0.down_proj.weight_scale_inv",
+        ],
+    );
+    if fp8 {
+        return MtpWeightFormat::Fp8;
+    }
+
+    MtpWeightFormat::Unquantized
+}
+
+fn mtp_quant_config(
+    format: MtpWeightFormat,
+    main_quant: Option<&QuantConfig>,
+) -> Option<QuantConfig> {
+    let method = match format {
+        MtpWeightFormat::Unquantized => return None,
+        MtpWeightFormat::Fp8 => "fp8",
+    };
+
+    let mut cfg = main_quant.cloned().unwrap_or_else(|| QuantConfig {
+        quant_method: method.to_string(),
+        bits: 0,
+        group_size: 0,
+        sym: None,
+        desc_act: None,
+        checkpoint_format: None,
+        fmt: None,
+        format: None,
+        weight_block_size: None,
+        modules_to_not_convert: Vec::new(),
+        config_groups: None,
+        quant_algo: None,
+        mode: None,
+        quantized_layers: None,
+        is_mlx_nvfp4: false,
+    });
+    cfg.quant_method = method.to_string();
+    Some(cfg)
 }
 
 impl MtpMlp {
@@ -131,11 +204,28 @@ impl Qwen3_5MtpHead {
         let hidden_size = config.hidden_size;
         let is_qvar_builder = vb.is_qvar_builder();
         let prefix = "mtp.";
+        let mtp_block_prefix = config.num_hidden_layers.to_string();
+        let mtp_vb = if is_qvar_builder {
+            vb.pp(&mtp_block_prefix)
+        } else {
+            vb.pp("mtp")
+        };
+        let mtp_weight_format = detect_mtp_weight_format(&mtp_vb);
+        let mtp_quant_config =
+            mtp_quant_config(mtp_weight_format, config.quantization_config.as_ref());
+        let mtp_isq_quant: Option<String> = None;
+        let mut mtp_config = config.clone();
+        mtp_config.quantization_config = mtp_quant_config.clone();
+        mtp_config.quant = None;
 
         let pre_fc_norm_hidden = rms_norm(
             hidden_size,
             config.rms_norm_eps,
-            vb.pp(&format!("{}pre_fc_norm_hidden", prefix)),
+            if is_qvar_builder {
+                mtp_vb.pp("nextn.hnorm")
+            } else {
+                vb.pp(&format!("{}pre_fc_norm_hidden", prefix))
+            },
             DType::F32,
             !is_qvar_builder,
         )?;
@@ -143,7 +233,11 @@ impl Qwen3_5MtpHead {
         let pre_fc_norm_embedding = rms_norm(
             hidden_size,
             config.rms_norm_eps,
-            vb.pp(&format!("{}pre_fc_norm_embedding", prefix)),
+            if is_qvar_builder {
+                mtp_vb.pp("nextn.enorm")
+            } else {
+                vb.pp(&format!("{}pre_fc_norm_embedding", prefix))
+            },
             DType::F32,
             !is_qvar_builder,
         )?;
@@ -151,8 +245,12 @@ impl Qwen3_5MtpHead {
         let fc = ReplicatedLinear::load_no_bias(
             hidden_size * 2,
             hidden_size,
-            vb.pp(&format!("{}fc", prefix)),
-            &None,
+            if is_qvar_builder {
+                mtp_vb.pp("nextn.eh_proj")
+            } else {
+                vb.pp(&format!("{}fc", prefix))
+            },
+            &mtp_quant_config,
             &None,
             dtype,
         )?;
@@ -160,24 +258,32 @@ impl Qwen3_5MtpHead {
         let norm = rms_norm(
             hidden_size,
             config.rms_norm_eps,
-            vb.pp(&format!("{}norm", prefix)),
+            if is_qvar_builder {
+                mtp_vb.pp("nextn.shared_head_norm")
+            } else {
+                vb.pp(&format!("{}norm", prefix))
+            },
             DType::F32,
             !is_qvar_builder,
         )?;
 
         let rotary_emb = Arc::new(ScalingRotaryEmbedding::new(
-            if is_qvar_builder || config.higher_precision_required() {
+            if is_qvar_builder || mtp_config.higher_precision_required() {
                 DType::F32
             } else {
                 dtype
             },
-            config,
+            &mtp_config,
             device,
             is_rope_i,
             config.rope_theta,
         )?);
 
-        let layer_prefix = format!("{}layers.0", prefix);
+        let layer_prefix = if is_qvar_builder {
+            mtp_block_prefix
+        } else {
+            format!("{}layers.0", prefix)
+        };
         let attn = Attention::new(
             if is_qvar_builder {
                 vb.pp(&layer_prefix)
@@ -185,7 +291,7 @@ impl Qwen3_5MtpHead {
                 vb.pp(&format!("{}.self_attn", layer_prefix))
             },
             comm.clone(),
-            config,
+            &mtp_config,
             None,
             config.sliding_window,
             dtype,
@@ -203,32 +309,26 @@ impl Qwen3_5MtpHead {
             let moe_cfg = config.moe_cfg.as_ref().unwrap();
             let fused_moe = if is_qvar_builder {
                 MtpFusedMoe::GGUF(FusedMoeGGUF::new(
-                    config,
+                    &mtp_config,
                     mlp_vb.clone(),
                     comm.clone(),
                     dtype,
                 )?)
-            } else if let Some(quant_config) = &config.quantization_config {
-                if quant_config.quant_method == "fp8" {
-                    MtpFusedMoe::FP8(FusedMoeFp8::new(
-                        config,
-                        mlp_vb.clone(),
-                        comm.clone(),
-                        dtype,
-                        quant_config,
-                    )?)
-                } else {
-                    MtpFusedMoe::BF16(FusedMoe::new(config, mlp_vb.clone(), comm.clone(), dtype)?)
-                }
-            } else if config.quant.is_some() {
-                MtpFusedMoe::ISQ(FusedMoeISQ::new(
-                    config,
+            } else if let Some(quant_config) = &mtp_quant_config {
+                MtpFusedMoe::FP8(FusedMoeFp8::new(
+                    &mtp_config,
                     mlp_vb.clone(),
                     comm.clone(),
                     dtype,
+                    quant_config,
                 )?)
             } else {
-                MtpFusedMoe::BF16(FusedMoe::new(config, mlp_vb.clone(), comm.clone(), dtype)?)
+                MtpFusedMoe::BF16(FusedMoe::new(
+                    &mtp_config,
+                    mlp_vb.clone(),
+                    comm.clone(),
+                    dtype,
+                )?)
             };
 
             let (shared_gate, shared_expert) = if let Some(intermediate_size) =
@@ -245,7 +345,7 @@ impl Qwen3_5MtpHead {
                         }
                     }
                     .to_dtype(
-                        if is_qvar_builder || config.quant.is_some() {
+                        if is_qvar_builder || mtp_config.quant.is_some() {
                             DType::F32
                         } else {
                             dtype
@@ -262,8 +362,8 @@ impl Qwen3_5MtpHead {
                         hidden_size,
                         intermediate_size,
                         &config.hidden_act,
-                        &config.quantization_config,
-                        &config.quant,
+                        &mtp_quant_config,
+                        &mtp_isq_quant,
                         false,
                         dtype,
                         if is_qvar_builder { "_shexp" } else { "" },
@@ -288,8 +388,8 @@ impl Qwen3_5MtpHead {
                 hidden_size,
                 config.intermediate_size,
                 &config.hidden_act,
-                &config.quantization_config,
-                &config.quant,
+                &mtp_quant_config,
+                &mtp_isq_quant,
                 false,
                 dtype,
                 "",
@@ -299,7 +399,11 @@ impl Qwen3_5MtpHead {
         let input_layernorm = rms_norm(
             hidden_size,
             config.rms_norm_eps,
-            vb.pp(&format!("{}.input_layernorm", layer_prefix)),
+            if is_qvar_builder {
+                vb.pp(&format!("{}.attn_norm", layer_prefix))
+            } else {
+                vb.pp(&format!("{}.input_layernorm", layer_prefix))
+            },
             DType::F32,
             !is_qvar_builder,
         )?;
@@ -307,7 +411,11 @@ impl Qwen3_5MtpHead {
         let post_attention_layernorm = rms_norm(
             hidden_size,
             config.rms_norm_eps,
-            vb.pp(&format!("{}.post_attention_layernorm", layer_prefix)),
+            if is_qvar_builder {
+                vb.pp(&format!("{}.post_attention_norm", layer_prefix))
+            } else {
+                vb.pp(&format!("{}.post_attention_layernorm", layer_prefix))
+            },
             DType::F32,
             !is_qvar_builder,
         )?;

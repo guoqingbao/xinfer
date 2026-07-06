@@ -735,7 +735,11 @@ pub fn config_from_gguf<R: std::io::Seek + std::io::Read>(
         is_multi_model: None,
         extra_config_json,
         is_f16_mode: false,
-        mtp_num_hidden_layers: None,
+        mtp_num_hidden_layers: if nextn_predict_layers > 0 {
+            Some(nextn_predict_layers)
+        } else {
+            None
+        },
         mtp_use_dedicated_embeddings: None,
     };
 
@@ -2472,6 +2476,7 @@ mod tests {
         let config = config_from_gguf(&content, &mut reader).unwrap();
 
         assert_eq!(config.num_hidden_layers, 32);
+        assert_eq!(config.mtp_num_hidden_layers, Some(1));
     }
 
     #[test]
