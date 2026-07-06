@@ -516,6 +516,7 @@ jobs:
 
           cp -r paged/* site/
           sed -i "s|XINFER_VER = '[^']*'|XINFER_VER = '${VERSION}'|" site/assets/js/main.js
+          sed -i "s|XINFER_VER='[^']*'|XINFER_VER='${VERSION}'|" site/mobile/index.html
 
           # Auto-detect install script
           cat > site/install.sh << 'SCRIPT'

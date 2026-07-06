@@ -4,8 +4,31 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>xInfer — Blazing-fast LLM Inference in Pure Rust</title>
-<meta name="description" content="High-performance LLM inference engine in pure Rust. No PyTorch. CUDA &amp; Metal. 180+ tok/s.">
+<meta name="description" content="High-performance LLM inference engine in pure Rust. No PyTorch. CUDA &amp; Metal. 197+ tok/s.">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><text y='20' font-size='20'>⚡</text></svg>">
+<script>
+(function(){
+  var params=new URLSearchParams(window.location.search);
+  var modeKey='xinfer:docsMode';
+  if(params.get('mobile')==='1'){
+    localStorage.setItem(modeKey,'mobile');
+    return;
+  }
+  if(params.get('desktop')==='1'){
+    localStorage.setItem(modeKey,'desktop');
+    window.location.replace('../index.html?desktop=1');
+    return;
+  }
+  var mode=localStorage.getItem(modeKey);
+  if(!mode){
+    localStorage.setItem(modeKey,'mobile');
+    return;
+  }
+  if(mode==='desktop'){
+    window.location.replace('../index.html?desktop=1');
+  }
+})();
+</script>
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 :root{
@@ -214,6 +237,7 @@ footer{padding:56px 0 28px;border-top:1px solid var(--c-border);position:relativ
       <a href="#install" data-i="nav.inst">Install</a>
       <a href="#dl" data-i="nav.dl">Downloads</a>
       <a href="#docs" data-i="nav.docs">Docs</a>
+      <a href="../index.html?desktop=1" data-i="nav.full">Full Docs</a>
     </div>
     <div class="nact">
       <button class="lbtn on" id="b-en">EN</button>
@@ -233,6 +257,7 @@ footer{padding:56px 0 28px;border-top:1px solid var(--c-border);position:relativ
   <a href="#install" data-i="nav.inst">Install</a>
   <a href="#dl" data-i="nav.dl">Downloads</a>
   <a href="#docs" data-i="nav.docs">Docs</a>
+  <a href="../index.html?desktop=1" data-i="nav.full">Full Docs</a>
 </div>
 
 <!-- HERO -->
@@ -272,7 +297,7 @@ footer{padding:56px 0 28px;border-top:1px solid var(--c-border);position:relativ
     <p class="sdesc rv" data-i="f.desc">Everything you need for production LLM inference — without the Python baggage.</p>
     <div class="fgrid">
       <div class="fcard" data-d="0"><span class="icon">🦀</span><h3 data-i="f.1t">Zero Dependencies</h3><p data-i="f.1d">Pure Rust backend — no PyTorch, no CUDA Python bindings, no Python runtime.</p></div>
-      <div class="fcard" data-d="70"><span class="icon">⚡</span><h3 data-i="f.2t">Blazing Fast</h3><p data-i="f.2d">Flash Attention, FlashInfer, CUDA Graphs, continuous batching. Up to 175+ tok/s.</p></div>
+      <div class="fcard" data-d="70"><span class="icon">⚡</span><h3 data-i="f.2t">Blazing Fast</h3><p data-i="f.2d">Flash Attention, FlashInfer, CUDA Graphs, continuous batching. Up to 197+ tok/s.</p></div>
       <div class="fcard" data-d="140"><span class="icon">🪶</span><h3 data-i="f.3t">Tiny Footprint</h3><p data-i="f.3d">Core scheduling &amp; attention logic in under 5,000 lines of Rust.</p></div>
       <div class="fcard" data-d="210"><span class="icon">🌍</span><h3 data-i="f.4t">Cross-Platform</h3><p data-i="f.4d">CUDA on Linux, Metal on macOS. Same binary, same API everywhere.</p></div>
       <div class="fcard" data-d="280"><span class="icon">🏭</span><h3 data-i="f.5t">Production Ready</h3><p data-i="f.5d">OpenAI &amp; Anthropic APIs, built-in Web UI, MCP tool calling, structured outputs.</p></div>
@@ -354,7 +379,7 @@ footer{padding:56px 0 28px;border-top:1px solid var(--c-border);position:relativ
       <h2 class="stitle gt" data-i="demo.title" style="text-align:center">See It in Action</h2>
       <p class="sdesc" data-i="demo.desc" style="text-align:center;margin:0 auto 28px">Watch xInfer serve a 35B model with real-time inference and tool calling.</p>
       <div class="demo-video-box">
-        <video id="demo-vid" controls muted playsinline preload="metadata" src="assets/demo.mp4"></video>
+        <video id="demo-vid" controls muted playsinline preload="metadata" src="../assets/demo.mp4"></video>
       </div>
     </div>
   </div>
@@ -502,7 +527,7 @@ footer{padding:56px 0 28px;border-top:1px solid var(--c-border);position:relativ
 /* ═══ i18n ═══ */
 var I={
 en:{
-'nav.feat':'Features','nav.perf':'Performance','nav.demo':'Demo','nav.inst':'Install','nav.dl':'Downloads','nav.docs':'Docs',
+'nav.feat':'Features','nav.perf':'Performance','nav.demo':'Demo','nav.inst':'Install','nav.dl':'Downloads','nav.docs':'Docs','nav.full':'Full Docs',
 'hero.tag':'Pure Rust · Production Ready',
 'hero.t1':'Blazing-fast LLM Inference','hero.t2':'in Pure Rust',
 'hero.sub':'No PyTorch. No Python runtime. Just fast, portable, production-ready inference.',
@@ -512,7 +537,7 @@ en:{
 'f.label':'Features','f.title':'Built for Speed & Simplicity',
 'f.desc':'Everything you need for production LLM inference — without the Python baggage.',
 'f.1t':'Zero Dependencies','f.1d':'Pure Rust backend — no PyTorch, no CUDA Python bindings, no Python runtime.',
-'f.2t':'Blazing Fast','f.2d':'Flash Attention, FlashInfer, CUDA Graphs, continuous batching. Up to 180+ tok/s.',
+'f.2t':'Blazing Fast','f.2d':'Flash Attention, FlashInfer, CUDA Graphs, continuous batching. Up to 197+ tok/s.',
 'f.3t':'Tiny Footprint','f.3d':'Core scheduling & attention logic in under 5,000 lines of Rust.',
 'f.4t':'Cross-Platform','f.4d':'CUDA on Linux, Metal on macOS. Same binary, same API everywhere.',
 'f.5t':'Production Ready','f.5d':'OpenAI & Anthropic APIs, built-in Web UI, MCP tool calling, structured outputs.',
@@ -540,7 +565,7 @@ en:{
 'ft.tag':'Blazing-fast LLM inference in pure Rust.','ft.docs':'Documentation','ft.rel':'Releases'
 },
 cn:{
-'nav.feat':'功能','nav.perf':'性能','nav.demo':'演示','nav.inst':'安装','nav.dl':'下载','nav.docs':'文档',
+'nav.feat':'功能','nav.perf':'性能','nav.demo':'演示','nav.inst':'安装','nav.dl':'下载','nav.docs':'文档','nav.full':'完整文档',
 'hero.tag':'纯 Rust · 生产就绪',
 'hero.t1':'纯 Rust 实现的','hero.t2':'极速 LLM 推理引擎',
 'hero.sub':'无需 PyTorch，无需 Python 运行时，开箱即用。',
@@ -550,7 +575,7 @@ cn:{
 'f.label':'功能特性','f.title':'为速度与简洁而生',
 'f.desc':'生产级 LLM 推理所需的一切 — 无需 Python 依赖。',
 'f.1t':'零依赖','f.1d':'纯 Rust 后端 — 无需 PyTorch、CUDA Python 绑定或 Python 运行时。',
-'f.2t':'极速推理','f.2d':'Flash Attention、FlashInfer、CUDA Graphs、连续批处理。180+ tok/s。',
+'f.2t':'极速推理','f.2d':'Flash Attention、FlashInfer、CUDA Graphs、连续批处理。197+ tok/s。',
 'f.3t':'轻量核心','f.3d':'核心调度与注意力逻辑不足 5,000 行 Rust 代码。',
 'f.4t':'跨平台','f.4d':'Linux 上 CUDA，macOS 上 Metal。同一二进制，同一 API。',
 'f.5t':'生产就绪','f.5d':'OpenAI/Anthropic API、内置 Web UI、MCP 工具、结构化输出。',
@@ -578,9 +603,17 @@ cn:{
 'ft.tag':'纯 Rust 实现的极速 LLM 推理引擎。','ft.docs':'文档','ft.rel':'发布'
 }};
 
-var lang=localStorage.getItem('xl')||'en';
+var LANG_KEY='lang',LEGACY_LANG_KEY='xl';
+function mobileLangFromStorage(){
+  var v=localStorage.getItem(LANG_KEY);
+  if(v==='zh')return'cn';
+  if(v==='en')return'en';
+  v=localStorage.getItem(LEGACY_LANG_KEY);
+  return v==='cn'?'cn':'en';
+}
+var lang=mobileLangFromStorage();
 function setLang(l){
-  lang=l;localStorage.setItem('xl',l);
+  lang=l;localStorage.setItem(LANG_KEY,l==='cn'?'zh':'en');localStorage.setItem(LEGACY_LANG_KEY,l);
   document.documentElement.lang=l==='cn'?'zh-CN':'en';
   document.querySelectorAll('[data-i]').forEach(function(el){
     var k=el.getAttribute('data-i');if(I[l][k])el.textContent=I[l][k];
@@ -588,6 +621,9 @@ function setLang(l){
   document.getElementById('b-en').classList.toggle('on',l==='en');
   document.getElementById('b-cn').classList.toggle('on',l==='cn');
 }
+window.addEventListener('storage',function(e){
+  if(e.key===LANG_KEY||e.key===LEGACY_LANG_KEY)setLang(mobileLangFromStorage());
+});
 document.getElementById('b-en').onclick=function(){setLang('en')};
 document.getElementById('b-cn').onclick=function(){setLang('cn')};
 setLang(lang);
@@ -623,7 +659,7 @@ document.querySelectorAll('.cb').forEach(function(bl){
 });
 
 /* ═══ Download cards ═══ */
-var XINFER_VER='0.13.6';
+var XINFER_VER='0.13.7';
 var DL='https://github.com/guoqingbao/xinfer/releases/download/v'+XINFER_VER+'/';
 var archs=[
   {sm:'sm70',n:'70',name:'SM70',gpu:'V100',cuda:'CUDA 12',arch:'x64',d:0},

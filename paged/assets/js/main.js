@@ -19,12 +19,20 @@ function setTheme(theme) {
 
 setTheme(getPreferredTheme());
 
+const LANG_KEY = 'lang';
+const LEGACY_LANG_KEY = 'xl';
+
 function getLang() {
-  const stored = localStorage.getItem('lang');
-  return stored === 'zh' || stored === 'en' ? stored : 'en';
+  const stored = localStorage.getItem(LANG_KEY);
+  if (stored === 'zh' || stored === 'en') return stored;
+  const legacy = localStorage.getItem(LEGACY_LANG_KEY);
+  if (legacy === 'cn') return 'zh';
+  if (legacy === 'en') return 'en';
+  return 'en';
 }
 function setLang(lang) {
-  localStorage.setItem('lang', lang);
+  localStorage.setItem(LANG_KEY, lang);
+  localStorage.setItem(LEGACY_LANG_KEY, lang === 'zh' ? 'cn' : 'en');
   document.documentElement.lang = lang === 'zh' ? 'zh-CN' : 'en';
   document.querySelectorAll('[data-zh][data-en]').forEach(el => {
     el.textContent = el.getAttribute('data-' + lang);
@@ -32,6 +40,12 @@ function setLang(lang) {
   const btn = document.querySelector('.lang-toggle');
   if (btn) btn.textContent = lang === 'zh' ? 'EN' : '中文';
 }
+
+window.addEventListener('storage', event => {
+  if (event.key === LANG_KEY || event.key === LEGACY_LANG_KEY) {
+    setLang(getLang());
+  }
+});
 
 document.addEventListener('DOMContentLoaded', () => {
   const sel = document.querySelector('.theme-select');

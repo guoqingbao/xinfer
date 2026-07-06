@@ -7,6 +7,30 @@
   <meta name="description" content="Blazing-fast LLM inference in pure Rust. No PyTorch. No Python runtime. Just fast, portable, production-ready inference.">
   <link rel="icon" href="assets/images/favicon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="assets/css/main.css?v=2">
+  <script>
+    (function () {
+      var params = new URLSearchParams(window.location.search);
+      var modeKey = 'xinfer:docsMode';
+      if (params.get('mobile') === '1') {
+        localStorage.setItem(modeKey, 'mobile');
+        window.location.replace('mobile/?mobile=1');
+        return;
+      }
+      if (params.get('desktop') === '1') {
+        localStorage.setItem(modeKey, 'desktop');
+        return;
+      }
+      if (/\/paged\/(?:index\.html)?$/.test(window.location.pathname)) return;
+      var mode = localStorage.getItem(modeKey);
+      if (!mode) {
+        mode = window.matchMedia && window.matchMedia('(max-width: 760px)').matches ? 'mobile' : 'desktop';
+        localStorage.setItem(modeKey, mode);
+      }
+      if (mode === 'mobile') {
+        window.location.replace('mobile/');
+      }
+    })();
+  </script>
 </head>
 <body>
 
@@ -502,6 +526,7 @@
         <a href="https://github.com/guoqingbao/xinfer" target="_blank" data-zh="GitHub 仓库" data-en="GitHub Repo">GitHub 仓库</a>
         <a href="https://www.npmjs.com/package/xinfer-ai" target="_blank" data-zh="npm 包" data-en="npm Package">npm 包</a>
         <a href="https://github.com/guoqingbao/xinfer/issues" target="_blank" data-zh="问题反馈" data-en="Issue Tracker">问题反馈</a>
+        <a href="mobile/?mobile=1" data-zh="移动版" data-en="Mobile Site">移动版</a>
       </div>
       <div class="footer-col">
         <h4 data-zh="社区" data-en="Community">社区</h4>
