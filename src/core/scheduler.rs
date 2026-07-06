@@ -789,7 +789,9 @@ impl Scheduler {
                     // other requests, but do not force this in-progress request
                     // to revalidate it on the next scheduling pass.
                     seq.mamba_prefix_hash = None;
-                    seq.clear_mamba_prefix_warmup();
+                    if seq.active_mamba_prefix_warmup_target().is_none() {
+                        seq.clear_mamba_prefix_warmup();
+                    }
                     seq.status = SequenceStatus::Waiting;
                     chunked_info.push((
                         seq.id,

@@ -220,14 +220,19 @@ impl Sequence {
         if remaining == 0 {
             return 0;
         }
-        if self.num_cached_tokens == 0 {
-            if let Some(target_tokens) = self.mamba_prefix_warmup_tokens {
-                if target_tokens > self.num_cached_tokens && target_tokens < self.len() {
-                    return (target_tokens - self.num_cached_tokens).min(default_chunk_size);
-                }
-            }
+        if let Some(target_tokens) = self.active_mamba_prefix_warmup_target() {
+            return (target_tokens - self.num_cached_tokens).min(default_chunk_size);
         }
         remaining.min(default_chunk_size)
+    }
+
+    pub fn active_mamba_prefix_warmup_target(&self) -> Option<usize> {
+        if let Some(target_tokens) = self.mamba_prefix_warmup_tokens {
+            if target_tokens > self.num_cached_tokens && target_tokens < self.len() {
+                return Some(target_tokens);
+            }
+        }
+        None
     }
 
     pub fn clear_mamba_prefix_warmup(&mut self) {
@@ -236,14 +241,10 @@ impl Sequence {
 
     pub fn clone_for_prefill_forward(&self) -> Self {
         let mut seq = self.clone();
-        if self.num_cached_tokens == 0 {
-            if let Some(target_tokens) = self.mamba_prefix_warmup_tokens {
-                if target_tokens > self.num_cached_tokens && target_tokens < self.len() {
-                    seq.token_ids.truncate(target_tokens);
-                    if let Some(&last_token) = seq.token_ids.last() {
-                        seq.last_token = last_token;
-                    }
-                }
+        if let Some(target_tokens) = self.active_mamba_prefix_warmup_target() {
+            seq.token_ids.truncate(target_tokens);
+            if let Some(&last_token) = seq.token_ids.last() {
+                seq.last_token = last_token;
             }
         }
         seq.clear_mamba_prefix_warmup();
@@ -303,6 +304,23 @@ mod tests {
     }
 
     #[test]
+    fn prefill_chunk_tokens_tracks_multi_chunk_mamba_warmup_boundary() {
+        let mut seq = test_sequence(50_000);
+        seq.mamba_prefix_warmup_tokens = Some(20_000);
+
+        assert_eq!(seq.prefill_chunk_tokens(8_192), 8_192);
+
+        seq.num_cached_tokens = 8_192;
+        assert_eq!(seq.prefill_chunk_tokens(8_192), 8_192);
+
+        seq.num_cached_tokens = 16_384;
+        assert_eq!(seq.prefill_chunk_tokens(8_192), 3_616);
+
+        seq.num_cached_tokens = 20_000;
+        assert_eq!(seq.prefill_chunk_tokens(8_192), 8_192);
+    }
+
+    #[test]
     fn prefill_chunk_tokens_ignores_invalid_mamba_warmup_boundary() {
         let mut seq = test_sequence(10_000);
         seq.num_cached_tokens = 4_096;
@@ -336,9 +354,22 @@ mod tests {
 
         let forward = seq.clone_for_prefill_forward();
 
-        assert_eq!(seq.prefill_chunk_tokens(8_192), 1_808);
-        assert_eq!(forward.len(), 10_000);
-        assert_eq!(forward.prefill_chunk_tokens(8_192), 1_808);
+        assert_eq!(seq.prefill_chunk_tokens(8_192), 128);
+        assert_eq!(forward.len(), 8_320);
+        assert_eq!(forward.prefill_chunk_tokens(8_192), 128);
+    }
+
+    #[test]
+    fn clone_for_prefill_forward_truncates_multi_chunk_warmup_after_cached_prefix() {
+        let mut seq = test_sequence(50_000);
+        seq.num_cached_tokens = 8_192;
+        seq.mamba_prefix_warmup_tokens = Some(20_000);
+
+        let forward = seq.clone_for_prefill_forward();
+
+        assert_eq!(forward.len(), 20_000);
+        assert_eq!(forward.last_token, 19_999);
+        assert_eq!(forward.prefill_chunk_tokens(8_192), 8_192);
     }
 
     #[test]
