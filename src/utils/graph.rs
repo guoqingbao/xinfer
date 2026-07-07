@@ -930,11 +930,13 @@ impl<M: CudaGraphModule> GraphCapturer<M> {
         let mut outputs = BTreeMap::<usize, Tensor>::new();
         let _guard = candle_core::cuda_backend::cuda_param_cache_scope(true);
 
-        for is_warmup in [true, false] {
-            if !is_warmup || capture_in_warmup {
+        for phase in CapturePhase::ALL {
+            let should_capture =
+                !phase.is_cache_prewarm() && (!phase.is_warmup() || capture_in_warmup);
+            if should_capture {
                 self.model.start_capture(verify_len)?;
             }
-            if is_warmup {
+            if phase.is_warmup() {
                 let _ = self.model.forward(
                     &input_ids,
                     &positions,
@@ -942,6 +944,10 @@ impl<M: CudaGraphModule> GraphCapturer<M> {
                     &input_metadata,
                     false,
                 )?;
+                #[cfg(feature = "cuda")]
+                if !should_capture {
+                    device.synchronize()?;
+                }
             } else {
                 let out = self.model.forward(
                     &input_ids,
@@ -952,9 +958,11 @@ impl<M: CudaGraphModule> GraphCapturer<M> {
                 )?;
                 outputs.insert(verify_len, out);
             }
-            if !is_warmup || capture_in_warmup {
-                self.model.end_capture(!is_warmup)?;
+            if should_capture {
+                self.model.end_capture(!phase.is_warmup())?;
             }
+            #[cfg(feature = "cuda")]
+            device.synchronize()?;
         }
 
         crate::log_warn!(
