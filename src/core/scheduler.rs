@@ -917,12 +917,12 @@ impl Scheduler {
                     break;
                 }
 
-                let seq = self.cached.remove(i);
+                let seq_id = self.cached[i].id;
                 crate::log_error!(
                     "No KvCache left for swap in Seq {} — cancelling request.",
-                    seq.id
+                    seq_id
                 );
-                self.cancel(seq.id);
+                self.cancel(seq_id);
                 break;
             }
 
