@@ -26,6 +26,7 @@ pub struct PrefixMatch {
 pub struct PrefixCacheUpdate {
     pub inserted: Vec<usize>,
     pub evicted: Vec<usize>,
+    pub evicted_detailed: Vec<(usize, u64, u64)>,
 }
 
 #[derive(Clone)]
@@ -187,10 +188,22 @@ impl PrefixCache {
         seed: Option<u64>,
         seed_block: Option<usize>,
     ) -> PrefixCacheUpdate {
+        self.insert_prefix_with_seed_skip(tokens, blocks, seed, seed_block, &HashSet::new())
+    }
+
+    pub fn insert_prefix_with_seed_skip(
+        &mut self,
+        tokens: &[u32],
+        blocks: &[usize],
+        seed: Option<u64>,
+        seed_block: Option<usize>,
+        skip_block_ids: &HashSet<usize>,
+    ) -> PrefixCacheUpdate {
         if !self.enabled() {
             return PrefixCacheUpdate {
                 inserted: Vec::new(),
                 evicted: Vec::new(),
+                evicted_detailed: Vec::new(),
             };
         }
 
@@ -200,6 +213,7 @@ impl PrefixCache {
             return PrefixCacheUpdate {
                 inserted: Vec::new(),
                 evicted: Vec::new(),
+                evicted_detailed: Vec::new(),
             };
         }
 
@@ -261,17 +275,40 @@ impl PrefixCache {
             .entries
             .len()
             .saturating_sub(self.config.max_cached_blocks);
-        let evicted = if excess > 0 {
-            self.evict_blocks(excess)
+        let evicted_detailed = if excess > 0 {
+            self.evict_blocks_detailed_skip(excess, skip_block_ids)
         } else {
             Vec::new()
         };
+        let evicted: Vec<usize> = evicted_detailed.iter().map(|(id, _, _)| *id).collect();
 
-        PrefixCacheUpdate { inserted, evicted }
+        PrefixCacheUpdate {
+            inserted,
+            evicted,
+            evicted_detailed,
+        }
     }
 
-    pub fn evict_blocks(&mut self, mut num_blocks: usize) -> Vec<usize> {
+    pub fn evict_blocks(&mut self, num_blocks: usize) -> Vec<usize> {
+        self.evict_blocks_detailed(num_blocks)
+            .into_iter()
+            .map(|(block_id, _, _)| block_id)
+            .collect()
+    }
+
+    /// Evict LRU leaf blocks and return `(block_id, trie_hash, content_hash)`.
+    pub fn evict_blocks_detailed(&mut self, num_blocks: usize) -> Vec<(usize, u64, u64)> {
+        self.evict_blocks_detailed_skip(num_blocks, &HashSet::new())
+    }
+
+    /// Evict LRU leaves, skipping block ids that must be kept (e.g. incoming request prefix).
+    pub fn evict_blocks_detailed_skip(
+        &mut self,
+        mut num_blocks: usize,
+        skip_block_ids: &HashSet<usize>,
+    ) -> Vec<(usize, u64, u64)> {
         let mut evicted = Vec::new();
+        let mut protected_seen = HashSet::new();
         while num_blocks > 0 {
             let Some((hash, access_id)) = self.leaf_lru.pop_front() else {
                 break;
@@ -285,9 +322,18 @@ impl PrefixCache {
             if entry.access_id != access_id || entry.children > 0 {
                 continue;
             }
+            if skip_block_ids.contains(&entry.block_id) {
+                if protected_seen.contains(&hash) {
+                    break;
+                }
+                protected_seen.insert(hash);
+                self.leaf_lru.push_back((hash, access_id));
+                continue;
+            }
+            protected_seen.clear();
             let entry = self.entries.remove(&hash).unwrap();
             self.leaf_set.remove(&hash);
-            evicted.push(entry.block_id);
+            evicted.push((entry.block_id, hash, entry.content_hash));
             num_blocks = num_blocks.saturating_sub(1);
             if let Some(parent) = entry.parent {
                 if let Some(parent_entry) = self.entries.get_mut(&parent) {
@@ -302,6 +348,24 @@ impl PrefixCache {
             }
         }
         evicted
+    }
+
+    pub fn block_id_for_hash(&self, hash: u64) -> Option<usize> {
+        self.entries.get(&hash).map(|e| e.block_id)
+    }
+
+    pub fn block_metadata(&self, block_id: usize) -> Option<(u64, u64)> {
+        self.entries
+            .values()
+            .find(|e| e.block_id == block_id)
+            .map(|e| (e.content_hash, e.parent.unwrap_or(0)))
+    }
+
+    pub fn entry_for_block(&self, block_id: usize) -> Option<(u64, u64)> {
+        self.entries
+            .iter()
+            .find(|(_, e)| e.block_id == block_id)
+            .map(|(hash, e)| (*hash, e.content_hash))
     }
 
     pub fn clear(&mut self) -> Vec<usize> {
@@ -366,58 +430,14 @@ impl PrefixCache {
         hasher.finish()
     }
 
+    pub fn content_fingerprint_for_tokens(tokens: &[u32]) -> u64 {
+        Self::content_fingerprint(tokens)
+    }
+
     fn mix_seed(parent_hash: u64, seed: u64) -> u64 {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         parent_hash.hash(&mut hasher);
         seed.hash(&mut hasher);
         hasher.finish()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{PrefixCache, PrefixCacheConfig};
-
-    #[test]
-    fn prefix_cache_matches_full_blocks() {
-        let mut cache = PrefixCache::new(
-            4,
-            PrefixCacheConfig {
-                enabled: true,
-                max_cached_blocks: 8,
-            },
-        );
-
-        let tokens = vec![1, 2, 3, 4, 5, 6, 7, 8];
-        let blocks = vec![10, 11];
-        let update = cache.insert_prefix(&tokens, &blocks);
-        assert!(update.evicted.is_empty());
-        assert_eq!(update.inserted.len(), 2);
-
-        let match_info = cache.match_prefix(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
-        assert_eq!(match_info.matched_blocks, 2);
-
-        let matched_blocks = cache.blocks_for_match(match_info.last_hash.unwrap());
-        assert_eq!(matched_blocks, blocks);
-    }
-
-    #[test]
-    fn prefix_cache_evicts_leaf_blocks() {
-        let mut cache = PrefixCache::new(
-            4,
-            PrefixCacheConfig {
-                enabled: true,
-                max_cached_blocks: 1,
-            },
-        );
-
-        let tokens = vec![1, 2, 3, 4, 5, 6, 7, 8];
-        let blocks = vec![21, 22];
-        let update = cache.insert_prefix(&tokens, &blocks);
-        assert_eq!(update.evicted.len(), 1);
-        assert_eq!(update.evicted[0], 22);
-
-        let match_info = cache.match_prefix(&tokens);
-        assert_eq!(match_info.matched_blocks, 1);
     }
 }

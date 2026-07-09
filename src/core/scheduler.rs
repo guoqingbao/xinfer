@@ -1078,8 +1078,6 @@ impl Scheduler {
                     let mut seq = if is_running {
                         self.running.remove(idx)
                     } else {
-                        // Even though the cached sequence swapped out,
-                        // no need remove it from cached list since it can be recoved
                         self.cached.remove(idx)
                     };
                     if seq.status == SequenceStatus::Running {
@@ -1308,6 +1306,20 @@ impl Scheduler {
     pub fn evict_prefix_cache_until_free(&mut self, min_free_blocks: usize) -> usize {
         self.block_manager
             .evict_prefix_cache_until_free(min_free_blocks)
+    }
+
+    pub fn evict_prefix_cache_until_free_for_seq(
+        &mut self,
+        min_free_blocks: usize,
+        seq: &Sequence,
+    ) -> usize {
+        let protected = self.block_manager.prefix_protect_blocks_for_seq(seq);
+        let protected_hashes = self.block_manager.prefix_protect_trie_hashes_for_seq(seq);
+        self.block_manager.evict_prefix_cache_until_free_skip(
+            min_free_blocks,
+            &protected,
+            &protected_hashes,
+        )
     }
 
     pub fn evict_prefix_cache_blocks(&mut self, blocks: usize) -> usize {
