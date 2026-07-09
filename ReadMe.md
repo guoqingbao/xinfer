@@ -500,7 +500,7 @@ xinfer --m Qwen/Qwen3.6-27B-FP8 --ui-server --enable-tool-grammar
 | `--max-num-seqs` | Max concurrent requests (default: 32, macOS: 8) |
 | `--max-tokens` | Max tokens per response (default: 16384) |
 | `--kv-fraction` | GPU memory fraction for KV cache |
-| `--cpu-mem-fold` | CPU swap memory ratio (default: 0.2) |
+| `--cpu-mem-fold` | CPU swap memory ratio (default: 0.5) |
 | `--pd-server` | Run as PD prefill server |
 | `--pd-client` | Run as PD decode client |
 | `--pd-url` | PD connection URL (`tcp://`, `http://`, `file://`) |

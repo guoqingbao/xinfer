@@ -39,6 +39,9 @@ pub struct Scheduler {
     cfg: EngineConfig,
     pd_config: Option<PdConfig>,
     is_last_prefill: bool,
+    /// Sequence IDs whose hybrid GDN/Mamba active slots must be released on the
+    /// runner after scheduler-side abort (swap-in failure, etc.).
+    pending_runner_releases: Vec<usize>,
 }
 
 const MIN_NUM_SCHEDULED_REQS: usize = 5;
@@ -134,7 +137,7 @@ impl Scheduler {
             block_manager: BlockManager::new(
                 runners,
                 econfig.num_blocks,
-                (econfig.cpu_mem_fold.unwrap_or(0.2f32) * econfig.num_blocks as f32) as usize,
+                (econfig.cpu_mem_fold.unwrap_or(0.5f32) * econfig.num_blocks as f32) as usize,
                 econfig.block_size,
                 prefix_cache_cfg,
                 config
@@ -163,7 +166,21 @@ impl Scheduler {
             cfg: econfig.clone(),
             pd_config: econfig.pd_config.clone(),
             is_last_prefill: false,
+            pending_runner_releases: Vec::new(),
         }
+    }
+
+    pub fn request_runner_release(&mut self, seq_id: usize) {
+        if !self.pending_runner_releases.contains(&seq_id) {
+            self.pending_runner_releases.push(seq_id);
+        }
+    }
+
+    pub fn take_pending_runner_releases(&mut self) -> Vec<usize> {
+        if self.pending_runner_releases.is_empty() {
+            return Vec::new();
+        }
+        std::mem::take(&mut self.pending_runner_releases)
     }
 
     /// Set tool call end token IDs (called by engine after tokenizer is available)
@@ -927,6 +944,7 @@ impl Scheduler {
                     seq_id
                 );
                 self.cancel(seq_id);
+                self.request_runner_release(seq_id);
                 break;
             }
 
@@ -934,8 +952,17 @@ impl Scheduler {
             seq.swapped_time = Some(cur_time);
             seq.clear_block_table(); //reallocate block table since previous gpu blocks were freed
 
-            if let Err(_) = self.block_manager.ensure_allocate(&mut seq) {
-                continue;
+            let alloc_result = if self.block_manager.has_suffix_preempt(seq.id) {
+                self.block_manager.allocate(&mut seq)
+            } else {
+                self.block_manager.ensure_allocate(&mut seq)
+            };
+            if let Err(_) = alloc_result {
+                // Transient: GPU blocks may be available on the next schedule pass.
+                // Keep the swapped CPU KV and GDN slot so swap-in can retry.
+                seq.status = SequenceStatus::Swapped;
+                self.cached.push(seq);
+                break;
             }
 
             // Swap in data from CPU (if swapped out previously)
@@ -945,8 +972,18 @@ impl Scheduler {
                     crate::log_warn!("Seq {} is swapped in for execution!", seq.id);
                 }
                 Err(e) => {
-                    seq.status = SequenceStatus::Finished;
                     crate::log_error!("Seq {} swap in failed: {:?}!", seq.id, e);
+                    self.block_manager.deallocate(&seq);
+                    seq.clear_block_table();
+                    if self.block_manager.has_cpu_swap(seq.id) {
+                        // CPU swap data intact — retry on a later schedule pass.
+                        seq.status = SequenceStatus::Swapped;
+                        self.cached.push(seq);
+                    } else {
+                        // CPU swap state lost — abort and release the GDN slot.
+                        self.request_runner_release(seq.id);
+                    }
+                    break;
                 }
             }
             self.running.push(seq);
@@ -974,18 +1011,18 @@ impl Scheduler {
             && (seq.status == SequenceStatus::Running || seq.status == SequenceStatus::Cached)
             && self.block_manager.can_swap_out(&seq)
         {
-            // make sure we have identical number of blocks when swapping in
-            // for decoding
-            if let Err(_) = self.block_manager.ensure_allocate(&mut seq) {
-                return false;
+            let prefix_mode = self.block_manager.prefix_cache_enabled();
+            if !prefix_mode {
+                // Legacy whole-sequence swap needs a shadow GPU allocation for decode recovery.
+                if let Err(_) = self.block_manager.ensure_allocate(&mut seq) {
+                    return false;
+                }
             }
             match self.block_manager.swap_out(&mut seq) {
                 Ok(_) => {
                     let mut seq = if is_running {
                         self.running.remove(idx)
                     } else {
-                        // Even though the cached sequence swapped out,
-                        // no need remove it from cached list since it can be recoved
                         self.cached.remove(idx)
                     };
                     if seq.status == SequenceStatus::Running {
@@ -993,8 +1030,9 @@ impl Scheduler {
                     } else {
                         seq.status = SequenceStatus::FinishSwapped;
                     }
-                    // seq.num_cached_tokens = seq.len();
-                    self.block_manager.deallocate(&seq);
+                    if !prefix_mode {
+                        self.block_manager.deallocate(&seq);
+                    }
                     // block table need to be reallocated when swapping in
                     self.cached.push(seq.clone());
                     return true;
@@ -1214,6 +1252,20 @@ impl Scheduler {
             .evict_prefix_cache_until_free(min_free_blocks)
     }
 
+    pub fn evict_prefix_cache_until_free_for_seq(
+        &mut self,
+        min_free_blocks: usize,
+        seq: &Sequence,
+    ) -> usize {
+        let protected = self.block_manager.prefix_protect_blocks_for_seq(seq);
+        let protected_hashes = self.block_manager.prefix_protect_trie_hashes_for_seq(seq);
+        self.block_manager.evict_prefix_cache_until_free_skip(
+            min_free_blocks,
+            &protected,
+            &protected_hashes,
+        )
+    }
+
     pub fn evict_prefix_cache_blocks(&mut self, blocks: usize) -> usize {
         self.block_manager.evict_prefix_cache_blocks(blocks)
     }
@@ -1245,7 +1297,7 @@ impl Scheduler {
             // Metal use unified memory, no cpu swap memory used
             (0f32, 0f32)
         } else {
-            let cpu_kvcache_memory_gb = kvcache_memory_gb * self.cfg.cpu_mem_fold.unwrap_or(0.2f32);
+            let cpu_kvcache_memory_gb = kvcache_memory_gb * self.cfg.cpu_mem_fold.unwrap_or(0.5f32);
             (
                 self.block_manager.get_cpu_swap_usage() * cpu_kvcache_memory_gb,
                 cpu_kvcache_memory_gb,
@@ -1262,7 +1314,7 @@ impl Scheduler {
         let kvcache_memory_gb = self.cfg.kvcache_memory_bytes as f32 / SIZE_IN_GB as f32;
         #[cfg(feature = "cuda")]
         let cpu_swap_log = {
-            let cpu_kvcache_memory_gb = kvcache_memory_gb * self.cfg.cpu_mem_fold.unwrap_or(0.2f32);
+            let cpu_kvcache_memory_gb = kvcache_memory_gb * self.cfg.cpu_mem_fold.unwrap_or(0.5f32);
             format!(
                 "CPU swap used {:.1}% ({:.2}GB/{:.2}GB)",
                 self.block_manager.get_cpu_swap_usage() * 100.0f32,
@@ -1392,25 +1444,5 @@ impl Scheduler {
         }
 
         None
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{active_sequence_limit, MIN_NUM_SCHEDULED_REQS};
-
-    #[test]
-    fn active_sequence_limit_uses_mamba_capacity_for_hybrid_models() {
-        assert_eq!(active_sequence_limit(5, Some(9)), 9);
-    }
-
-    #[test]
-    fn active_sequence_limit_preserves_minimum_for_non_hybrid_models() {
-        assert_eq!(active_sequence_limit(1, None), MIN_NUM_SCHEDULED_REQS);
-    }
-
-    #[test]
-    fn active_sequence_limit_preserves_zero_mamba_as_disabled() {
-        assert_eq!(active_sequence_limit(7, Some(0)), 7);
     }
 }

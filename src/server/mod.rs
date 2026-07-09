@@ -819,8 +819,8 @@ pub struct Args {
     #[arg(long, default_value = None)]
     pub mamba_fraction: Option<f32>,
 
-    #[arg(long, default_value = None)]
-    pub cpu_mem_fold: Option<f32>, //the percentage of cpu vs. gpu kvcache size
+    #[arg(long, default_value = None, help = "CPU KV swap pool as a multiple of GPU KV blocks (CUDA). Default: 0.5")]
+    pub cpu_mem_fold: Option<f32>,
 
     #[arg(long, default_value_t = false)]
     pub pd_server: bool, //PD server mode

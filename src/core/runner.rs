@@ -362,7 +362,7 @@ impl ModelRunner {
         let allocation = crate::utils::kvcache_allocator::KVCacheAllocation {
             num_gpu_blocks: econfig.num_blocks,
             #[cfg(feature = "cuda")]
-            num_cpu_blocks: (econfig.num_blocks as f32 * econfig.cpu_mem_fold.unwrap_or(0.2))
+            num_cpu_blocks: (econfig.num_blocks as f32 * econfig.cpu_mem_fold.unwrap_or(0.5))
                 as usize,
             #[cfg(not(feature = "cuda"))]
             num_cpu_blocks: 1, // dummy for non-CUDA platform
@@ -479,7 +479,7 @@ impl ModelRunner {
             allocator.init_kv_cache(&allocation, dtype, &device, econfig.pd_config.as_ref())?;
 
         let num_cpu_blocks =
-            (econfig.cpu_mem_fold.unwrap_or(0.2f32) * econfig.num_blocks as f32) as usize;
+            (econfig.cpu_mem_fold.unwrap_or(0.5f32) * econfig.num_blocks as f32) as usize;
         let cpu_tq_cache = allocator.init_cpu_tq_cache(num_cpu_blocks)?;
 
         let (temperature, top_k, top_p) = if econfig.generation_cfg.is_some() {
@@ -1772,17 +1772,10 @@ impl ModelRunner {
                 gpu_cache.len() > 0 && cpu_cache.len() > 0,
                 "Invalid kvcache tensors!"
             );
+            let pairs: Vec<(usize, usize)> = mappings.iter().map(|(&a, &b)| (a, b)).collect();
+            cache::swap_kv_layers(&gpu_cache, &cpu_cache, &pairs, swap_in)?;
             let block_size_bytes = cpu_cache[0].0.elem_count() / cpu_cache[0].0.dim(0)?
                 * cpu_cache[0].0.dtype().size_in_bytes();
-            for i in 0..gpu_cache.len() {
-                if swap_in {
-                    cache::swap_blocks(&cpu_cache[i].0, &gpu_cache[i].0, &mappings)?;
-                    cache::swap_blocks(&cpu_cache[i].1, &gpu_cache[i].1, &mappings)?;
-                } else {
-                    cache::swap_blocks(&gpu_cache[i].0, &cpu_cache[i].0, &mappings)?;
-                    cache::swap_blocks(&gpu_cache[i].1, &cpu_cache[i].1, &mappings)?;
-                }
-            }
             let total_mb =
                 (block_size_bytes * mappings.len() * gpu_cache.len() * 2) as f32 / 1024.0 / 1024.0;
             if swap_in {

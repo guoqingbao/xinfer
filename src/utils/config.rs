@@ -391,7 +391,7 @@ pub struct EngineConfig {
     pub num_blocks: usize,
     pub kv_fraction: Option<f32>, // After loading the model, the remaining percent of gpu used for kvcache
     pub mamba_fraction: Option<f32>, // Percent of cache budget reserved for hybrid mamba states
-    pub cpu_mem_fold: Option<f32>, // the percentage of gpu kvcache: 0.1x to 10x, default 1.0x
+    pub cpu_mem_fold: Option<f32>, // CPU swap pool as multiple of GPU KV blocks; default 0.5
     pub kvcache_memory_bytes: usize,
     #[serde(default)]
     pub mamba_memory_bytes: usize,

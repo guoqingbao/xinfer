@@ -516,7 +516,7 @@ impl LLMEngine {
             econfig.max_num_batched_tokens,
             econfig.num_blocks,
             econfig.block_size,
-            (econfig.num_blocks as f32 * econfig.cpu_mem_fold.unwrap_or(0.2f32)) as usize
+            (econfig.num_blocks as f32 * econfig.cpu_mem_fold.unwrap_or(0.5f32)) as usize
         );
 
         let mut template = ChatTemplate::new(
@@ -721,7 +721,7 @@ impl LLMEngine {
             let target_required_tokens = target_required_blocks * self.econfig.block_size;
             let evicted = self
                 .scheduler
-                .evict_prefix_cache_until_free(target_required_blocks);
+                .evict_prefix_cache_until_free_for_seq(target_required_blocks, &seq);
             if evicted > 0 {
                 crate::log_warn!(
                     "Evicted {} prefix cache block(s) to reserve {} KV tokens for request admission (prompt + {} requested decode tokens).",
@@ -988,6 +988,13 @@ impl LLMEngine {
                 }
                 Ok(())
             }
+        }
+    }
+
+    /// Release hybrid GDN/Mamba active slots queued by scheduler-side abort paths.
+    pub fn drain_pending_runner_releases(&mut self) {
+        for seq_id in self.scheduler.take_pending_runner_releases() {
+            let _ = self.notify_runner_finished(seq_id);
         }
     }
 
@@ -1541,34 +1548,34 @@ impl LLMEngine {
     }
 
     pub fn check_canceled(&mut self, reason: Option<String>) {
-        if self.cancelled_sequences.is_empty() {
-            return;
-        }
-        for i in 0..self.cancelled_sequences.len() {
-            let seq_id = self.cancelled_sequences[i];
-            self.scheduler.cancel(seq_id);
-            // Ensure model-side per-sequence state (e.g., Qwen3.5 Mamba cache slot) is released.
-            let _ = self.notify_runner_finished(seq_id);
-            if let Some(_) = self.active_requests.get(&seq_id) {
-                self.active_requests.remove(&seq_id);
-            }
-            self.stream_decoders.remove(&seq_id);
-            self.decode_start_times.remove(&seq_id);
-            self.seq_prefilled_reasoning_end.remove(&seq_id);
-            self.seq_prompt_replays.remove(&seq_id);
-            if let Some(r) = &reason {
-                if let Some(sender) = self.stream_senders.get_mut(&seq_id) {
-                    if let Some(request_type) = self.request_types.get(&seq_id) {
-                        if *request_type == RequestType::Stream {
-                            let _ = sender.try_send(StreamItem::Error(r.clone()));
+        if !self.cancelled_sequences.is_empty() {
+            for i in 0..self.cancelled_sequences.len() {
+                let seq_id = self.cancelled_sequences[i];
+                self.scheduler.cancel(seq_id);
+                // Ensure model-side per-sequence state (e.g., Qwen3.5 Mamba cache slot) is released.
+                let _ = self.notify_runner_finished(seq_id);
+                if let Some(_) = self.active_requests.get(&seq_id) {
+                    self.active_requests.remove(&seq_id);
+                }
+                self.stream_decoders.remove(&seq_id);
+                self.decode_start_times.remove(&seq_id);
+                self.seq_prefilled_reasoning_end.remove(&seq_id);
+                self.seq_prompt_replays.remove(&seq_id);
+                if let Some(r) = &reason {
+                    if let Some(sender) = self.stream_senders.get_mut(&seq_id) {
+                        if let Some(request_type) = self.request_types.get(&seq_id) {
+                            if *request_type == RequestType::Stream {
+                                let _ = sender.try_send(StreamItem::Error(r.clone()));
+                            }
                         }
                     }
                 }
+                self.stream_senders.remove(&seq_id);
             }
-            self.stream_senders.remove(&seq_id);
+            self.scheduler.clear_finished();
+            self.cancelled_sequences.clear();
         }
-        self.scheduler.clear_finished();
-        self.cancelled_sequences.clear();
+        self.drain_pending_runner_releases();
     }
 
     pub fn may_print_decoding_throughput(&mut self, active_indices: &Vec<usize>) {
@@ -2296,6 +2303,9 @@ impl LLMEngine {
                             guard.cancel_all_with_reason(Some(e.to_string()));
                         }
                     }
+                } else {
+                    let mut guard = engine.write();
+                    guard.check_canceled(None);
                 }
 
                 if task_processed == 0 {
