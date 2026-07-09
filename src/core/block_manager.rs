@@ -628,9 +628,11 @@ impl BlockManager {
             return;
         }
 
+        let mut removed_hashes = 0usize;
         for &block_id in evicted_block_ids {
             if let Some(hashes) = self.mamba_prefix_hashes_by_block.remove(&block_id) {
                 for hash in hashes {
+                    removed_hashes += 1;
                     self.valid_mamba_prefix_hashes.remove(&hash);
                     self.mamba_prefix_block_by_hash.remove(&hash);
                     if let Err(e) = self.try_remove_mamba_prefix_state(hash) {
@@ -643,6 +645,13 @@ impl BlockManager {
                     }
                 }
             }
+        }
+        if removed_hashes > 0 {
+            crate::log_info!(
+                "Removed {} mamba prefix snapshot(s) for {} evicted prefix cache block(s)",
+                removed_hashes,
+                evicted_block_ids.len()
+            );
         }
     }
 
