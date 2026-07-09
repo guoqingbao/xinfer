@@ -494,7 +494,7 @@ xinfer --m Qwen/Qwen3.6-27B-FP8 --ui-server --enable-tool-grammar
 | `--max-num-seqs` | 最大并发请求数（默认 32，macOS 为 8） |
 | `--max-tokens` | 单次最大输出 token 数（默认 16384） |
 | `--kv-fraction` | GPU 显存用于 KV 缓存的比例 |
-| `--cpu-mem-fold` | CPU 交换显存比例（默认 0.2） |
+| `--cpu-mem-fold` | CPU 交换显存比例（默认 0.5） |
 | `--pd-server` | 作为 PD 预填充服务器运行 |
 | `--pd-client` | 作为 PD 解码客户端运行 |
 | `--pd-url` | PD 连接 URL（`tcp://`、`http://`、`file://`） |

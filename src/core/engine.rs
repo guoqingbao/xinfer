@@ -516,7 +516,7 @@ impl LLMEngine {
             econfig.max_num_batched_tokens,
             econfig.num_blocks,
             econfig.block_size,
-            (econfig.num_blocks as f32 * econfig.cpu_mem_fold.unwrap_or(0.2f32)) as usize
+            (econfig.num_blocks as f32 * econfig.cpu_mem_fold.unwrap_or(0.5f32)) as usize
         );
 
         let mut template = ChatTemplate::new(
@@ -721,7 +721,7 @@ impl LLMEngine {
             let target_required_tokens = target_required_blocks * self.econfig.block_size;
             let evicted = self
                 .scheduler
-                .evict_prefix_cache_until_free(target_required_blocks);
+                .evict_prefix_cache_until_free_for_seq(target_required_blocks, &seq);
             if evicted > 0 {
                 crate::log_warn!(
                     "Evicted {} prefix cache block(s) to reserve {} KV tokens for request admission (prompt + {} requested decode tokens).",

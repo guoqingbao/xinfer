@@ -1,5 +1,6 @@
 pub mod block_manager;
 pub mod engine;
+pub mod kv_swap;
 pub mod mtp;
 pub mod prefix_cache;
 pub mod runner;

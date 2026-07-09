@@ -67,7 +67,7 @@ cargo build --release --features metal
   target/release/xinfer --m Qwen/Qwen3-VL-8B-Instruct --ui-server
   ```
 
-Common runtime knobs: `--max-model-len`, `--max-num-seqs`, `--kv-fraction` (CUDA KV share), `--cpu-mem-fold` (CPU swap ratio), `--port`, `--kvcache-dtype` (fp8/turbo8/turbo4/turbo3), `--prefix-cache`, `--prefix-cache-max-tokens`, `--ui-server`, `--batch` (perf test).
+Common runtime knobs: `--max-model-len`, `--max-num-seqs`, `--kv-fraction` (CUDA KV share), `--cpu-mem-fold` (CPU swap ratio, default `0.5`), `--port`, `--kvcache-dtype` (fp8/turbo8/turbo4/turbo3), `--prefix-cache`, `--prefix-cache-max-tokens`, `--ui-server`, `--batch` (perf test).
 
 Reasoning defaults to enabled when a request omits `thinking` / `enable_thinking`. Use `--disable-reasoning` on the Rust CLI to make the default be disabled instead; explicit request values still override the server default.
 
