@@ -46,6 +46,31 @@ snapshot capture remains dense.
 - Cached KV reuse is automatic; no `session_id` is required.
 - Sliding window attention limits how much cached context is effectively used.
 
+## CPU swap with prefix cache
+
+When prefix cache is enabled, live sequence preemption is partial:
+
+- Leading prefix/shared blocks stay on GPU and keep their sequence reference.
+- Only the sequence-owned suffix blocks are copied to CPU swap.
+- Swap-in reuses the retained GPU prefix blocks, allocates new suffix blocks,
+  and copies only the suffix KV back from CPU.
+
+This is different from prefix-cache offload. Prefix-cache offload only helps when
+an evicted cached prefix is requested again later. Partial sequence swap helps
+immediately under memory pressure because it avoids recomputing the active
+sequence suffix after preemption, even when no future request reuses that suffix.
+For hybrid Mamba/GDN models, the active recurrent state remains tied to the
+swapped sequence lifecycle and is not released until the sequence finishes or is
+cancelled. On CUDA, Mamba/GDN prefix snapshots use a separate two-tier cache:
+device snapshots are the fast path, and snapshots evicted from device memory are
+spilled to CPU so a later KV prefix hit can promote the matching recurrent state
+back instead of falling back to a shorter partial hit. Metal uses unified memory,
+so this CPU spill tier is disabled there. The CUDA CPU snapshot tier is 4x the
+device snapshot capacity. Prompt/prefill snapshots and final decode-boundary
+snapshots are protected from ordinary decode-time snapshot churn. When the CPU
+snapshot tier is full, LRU eviction frees at least 10% of the tier in one batch
+before accepting new GDN/Mamba snapshot offloads.
+
 ## Inspecting cache hits
 
 Chat completion responses include the prefix-cache hit count under

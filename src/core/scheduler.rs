@@ -146,7 +146,7 @@ impl Scheduler {
             block_manager: BlockManager::new(
                 runners,
                 econfig.num_blocks,
-                (econfig.cpu_mem_fold.unwrap_or(0.2f32) * econfig.num_blocks as f32) as usize,
+                (econfig.cpu_mem_fold.unwrap_or(0.5f32) * econfig.num_blocks as f32) as usize,
                 econfig.block_size,
                 prefix_cache_cfg,
                 config
@@ -327,11 +327,18 @@ impl Scheduler {
             self.try_receive_kvcache()?;
         }
 
-        // Swap back seq from cpu memory if possible. Prefix-cache eviction is
-        // backend-neutral, while CPU swap is CUDA-only.
+        // Swap back seq from cpu memory if possible. Aggregate KV usage can stay high
+        // under prefix cache because reusable prefix blocks occupy the GPU pool, so
+        // already-swapped sequences must still get a chance to run the precise
+        // suffix-allocation and prefix-eviction checks in `try_swap_in`.
+        let has_swapped_seq = self
+            .cached
+            .iter()
+            .any(|seq| seq.status == SequenceStatus::Swapped);
         let should_try_swap_in = cfg!(feature = "cuda")
             && preempt_ids.is_empty()
-            && (self.kv_cache_usage_percent() < KVCACHE_SWAP_THRESHOLD * 0.9
+            && (has_swapped_seq
+                || self.kv_cache_usage_percent() < KVCACHE_SWAP_THRESHOLD * 0.9
                 || (self.running.is_empty() && self.kv_cache_usage_percent() <= 0.3f32));
         if should_try_swap_in {
             #[cfg(feature = "cuda")]
@@ -904,22 +911,21 @@ impl Scheduler {
             .as_millis() as usize;
 
         for i in 0..self.cached.len() {
-            let (status, swapped_time, seq_id, seq_len) = {
+            let (status, swapped_time, seq_id) = {
                 let seq = &self.cached[i];
-                (
-                    seq.status,
-                    seq.swapped_time().unwrap_or(cur_time),
-                    seq.id,
-                    seq.len(),
-                )
+                (seq.status, seq.swapped_time().unwrap_or(cur_time), seq.id)
             };
             if status != SequenceStatus::Swapped || cur_time - swapped_time < SWAP_COOLING_PERIOD {
                 continue;
             }
 
             let available_kvcache_tokens = self.get_available_kv_tokens();
+            let swap_in_required_tokens = self
+                .block_manager
+                .swap_in_required_blocks(&self.cached[i])
+                .saturating_mul(self.cfg.block_size);
             if !self.block_manager.can_swap_in(&self.cached[i])
-                || (available_kvcache_tokens.saturating_sub(seq_len)
+                || (available_kvcache_tokens.saturating_sub(swap_in_required_tokens)
                     < MIN_KVCACHE_TOKENS_LEFT_FOR_SWAP)
             {
                 if !self.running.is_empty() {
@@ -927,7 +933,10 @@ impl Scheduler {
                     continue;
                 }
 
-                let required_blocks = self.cached[i].num_blocks().saturating_add(1);
+                let required_blocks = self
+                    .block_manager
+                    .swap_in_required_blocks(&self.cached[i])
+                    .saturating_add(1);
                 let evicted = self
                     .block_manager
                     .evict_prefix_cache_until_free(required_blocks);
@@ -951,11 +960,18 @@ impl Scheduler {
 
             let mut seq = self.cached.remove(i);
             seq.swapped_time = Some(cur_time);
-            seq.clear_block_table(); //reallocate block table since previous gpu blocks were freed
+            let partial_swap = self.block_manager.has_partial_cpu_swap(seq.id);
+            if !partial_swap {
+                seq.clear_block_table(); // reallocate block table since previous gpu blocks were freed
+            }
 
             if let Err(_) = self.block_manager.ensure_allocate(&mut seq) {
                 // Transient: GPU blocks may be available on the next schedule pass.
                 // Keep the swapped CPU KV and GDN slot so swap-in can retry.
+                if partial_swap {
+                    self.block_manager
+                        .rollback_partial_swap_in_allocation(&mut seq);
+                }
                 seq.status = SequenceStatus::Swapped;
                 self.cached.push(seq);
                 break;
@@ -969,8 +985,13 @@ impl Scheduler {
                 }
                 Err(e) => {
                     crate::log_error!("Seq {} swap in failed: {:?}!", seq.id, e);
-                    self.block_manager.deallocate(&seq);
-                    seq.clear_block_table();
+                    if partial_swap {
+                        self.block_manager
+                            .rollback_partial_swap_in_allocation(&mut seq);
+                    } else {
+                        self.block_manager.deallocate(&seq);
+                        seq.clear_block_table();
+                    }
                     if self.block_manager.has_cpu_swap(seq.id) {
                         // CPU swap data intact — retry on a later schedule pass.
                         seq.status = SequenceStatus::Swapped;
@@ -1007,10 +1028,13 @@ impl Scheduler {
             && (seq.status == SequenceStatus::Running || seq.status == SequenceStatus::Cached)
             && self.block_manager.can_swap_out(&seq)
         {
-            // make sure we have identical number of blocks when swapping in
-            // for decoding
-            if let Err(_) = self.block_manager.ensure_allocate(&mut seq) {
-                return false;
+            let prefix_mode = self.block_manager.prefix_cache_enabled();
+            if !prefix_mode {
+                // make sure we have identical number of blocks when swapping in
+                // for decoding
+                if let Err(_) = self.block_manager.ensure_allocate(&mut seq) {
+                    return false;
+                }
             }
             match self.block_manager.swap_out(&mut seq) {
                 Ok(_) => {
@@ -1027,7 +1051,9 @@ impl Scheduler {
                         seq.status = SequenceStatus::FinishSwapped;
                     }
                     // seq.num_cached_tokens = seq.len();
-                    self.block_manager.deallocate(&seq);
+                    if !prefix_mode {
+                        self.block_manager.deallocate(&seq);
+                    }
                     // block table need to be reallocated when swapping in
                     self.cached.push(seq.clone());
                     return true;
@@ -1278,7 +1304,7 @@ impl Scheduler {
             // Metal use unified memory, no cpu swap memory used
             (0f32, 0f32)
         } else {
-            let cpu_kvcache_memory_gb = kvcache_memory_gb * self.cfg.cpu_mem_fold.unwrap_or(0.2f32);
+            let cpu_kvcache_memory_gb = kvcache_memory_gb * self.cfg.cpu_mem_fold.unwrap_or(0.5f32);
             (
                 self.block_manager.get_cpu_swap_usage() * cpu_kvcache_memory_gb,
                 cpu_kvcache_memory_gb,
@@ -1295,7 +1321,7 @@ impl Scheduler {
         let kvcache_memory_gb = self.cfg.kvcache_memory_bytes as f32 / SIZE_IN_GB as f32;
         #[cfg(feature = "cuda")]
         let cpu_swap_log = {
-            let cpu_kvcache_memory_gb = kvcache_memory_gb * self.cfg.cpu_mem_fold.unwrap_or(0.2f32);
+            let cpu_kvcache_memory_gb = kvcache_memory_gb * self.cfg.cpu_mem_fold.unwrap_or(0.5f32);
             format!(
                 "CPU swap used {:.1}% ({:.2}GB/{:.2}GB)",
                 self.block_manager.get_cpu_swap_usage() * 100.0f32,

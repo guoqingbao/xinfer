@@ -409,7 +409,7 @@ impl KVCacheAllocator {
                 kv_fraction
             },
             kvcache_dtype,
-            cpu_mem_fold: econfig.cpu_mem_fold.unwrap_or(0.2),
+            cpu_mem_fold: econfig.cpu_mem_fold.unwrap_or(0.5),
             dtype_size,
             model_dtype_size,
             hybrid_mamba_slot_bytes,

@@ -362,7 +362,7 @@ impl ModelRunner {
         let allocation = crate::utils::kvcache_allocator::KVCacheAllocation {
             num_gpu_blocks: econfig.num_blocks,
             #[cfg(feature = "cuda")]
-            num_cpu_blocks: (econfig.num_blocks as f32 * econfig.cpu_mem_fold.unwrap_or(0.2))
+            num_cpu_blocks: (econfig.num_blocks as f32 * econfig.cpu_mem_fold.unwrap_or(0.5))
                 as usize,
             #[cfg(not(feature = "cuda"))]
             num_cpu_blocks: 1, // dummy for non-CUDA platform
@@ -479,7 +479,7 @@ impl ModelRunner {
             allocator.init_kv_cache(&allocation, dtype, &device, econfig.pd_config.as_ref())?;
 
         let num_cpu_blocks =
-            (econfig.cpu_mem_fold.unwrap_or(0.2f32) * econfig.num_blocks as f32) as usize;
+            (econfig.cpu_mem_fold.unwrap_or(0.5f32) * econfig.num_blocks as f32) as usize;
         let cpu_tq_cache = allocator.init_cpu_tq_cache(num_cpu_blocks)?;
 
         let (temperature, top_k, top_p) = if econfig.generation_cfg.is_some() {

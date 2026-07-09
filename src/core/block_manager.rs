@@ -28,6 +28,13 @@ impl Block {
     }
 }
 
+#[derive(Debug, Clone)]
+struct SeqSwapState {
+    prefix_block_count: usize,
+    suffix_block_count: usize,
+    cpu_block_ids: Vec<usize>,
+}
+
 pub struct BlockManager {
     blocks: Vec<Block>,
     free_block_ids: VecDeque<usize>,
@@ -37,6 +44,8 @@ pub struct BlockManager {
     free_cpu_block_ids: VecDeque<usize>,
     // mapping for swapped sequences: seq.id -> Vec<cpu_block_id>
     swapped_map: HashMap<usize, Vec<usize>>,
+    // prefix-cache mode: sequence-owned suffix blocks swapped to CPU, prefix stays on GPU
+    seq_swap_states: HashMap<usize, SeqSwapState>,
     block_size: usize,
     runners: Arc<RwLock<RunnerType>>,
     prefix_cache: Option<PrefixCache>,
@@ -101,6 +110,7 @@ impl BlockManager {
             cpu_blocks,
             free_cpu_block_ids,
             swapped_map: HashMap::new(),
+            seq_swap_states: HashMap::new(),
             block_size,
             runners,
             prefix_cache,
@@ -236,6 +246,29 @@ impl BlockManager {
         for &block_id in seq.block_table.iter().rev() {
             self.decrement_block_ref(block_id as usize);
         }
+    }
+
+    fn split_prefix_suffix(&self, seq: &Sequence) -> (usize, usize) {
+        let table_len = seq.block_table.len();
+        if table_len == 0 {
+            return (0, 0);
+        }
+
+        let mut prefix_blocks = if self.prefix_cache_enabled() {
+            (seq.num_cached_tokens / self.block_size).min(table_len)
+        } else {
+            0
+        };
+
+        while prefix_blocks < table_len {
+            let block_id = seq.block_table[prefix_blocks] as usize;
+            if self.blocks[block_id].ref_count <= 1 {
+                break;
+            }
+            prefix_blocks += 1;
+        }
+
+        (prefix_blocks, table_len.saturating_sub(prefix_blocks))
     }
 
     pub fn can_append(&self, seq: &Sequence) -> bool {
@@ -521,7 +554,7 @@ impl BlockManager {
         else {
             return None;
         };
-        let preserve_snapshot = seq.output_ids.is_empty();
+        let preserve_snapshot = seq.output_ids.is_empty() || final_decode_snapshot;
         match self.try_capture_mamba_prefix_state(seq.id, hash, preserve_snapshot) {
             Ok(true) => {
                 if let Some(&block_id_u32) = seq.block_table.get(full_blocks.saturating_sub(1)) {
@@ -953,6 +986,17 @@ impl BlockManager {
         // Need at least as many free CPU blocks as the sequence currently owns.
         #[cfg(feature = "cuda")]
         {
+            if self.prefix_cache_enabled() {
+                let (prefix_blocks, suffix_blocks) = self.split_prefix_suffix(seq);
+                if suffix_blocks == 0 || self.free_cpu_block_ids.len() < suffix_blocks {
+                    return false;
+                }
+                return seq
+                    .block_table
+                    .iter()
+                    .skip(prefix_blocks)
+                    .all(|&id| self.blocks[id as usize].ref_count == 1);
+            }
             if seq
                 .block_table
                 .iter()
@@ -973,15 +1017,45 @@ impl BlockManager {
         // Need at least as many free GPU blocks as seq.num_blocks()
         #[cfg(feature = "cuda")]
         {
+            if let Some(state) = self.seq_swap_states.get(&seq.id) {
+                return self.free_block_ids.len() >= state.suffix_block_count;
+            }
             self.free_block_ids.len() > seq.num_blocks()
         }
         #[cfg(not(feature = "cuda"))]
         false
     }
 
+    pub fn swap_in_required_blocks(&self, seq: &Sequence) -> usize {
+        self.seq_swap_states
+            .get(&seq.id)
+            .map_or(seq.num_blocks(), |state| state.suffix_block_count)
+    }
+
+    pub fn has_partial_cpu_swap(&self, seq_id: usize) -> bool {
+        self.seq_swap_states.contains_key(&seq_id)
+    }
+
+    pub fn rollback_partial_swap_in_allocation(&mut self, seq: &mut Sequence) {
+        let Some(state) = self.seq_swap_states.get(&seq.id) else {
+            return;
+        };
+        let prefix_block_count = state.prefix_block_count;
+        while seq.block_table.len() > prefix_block_count {
+            if let Some(block_id) = seq.block_table.pop() {
+                self.decrement_block_ref(block_id as usize);
+            } else {
+                break;
+            }
+        }
+    }
+
     /// Swap out the GPU blocks of `seq` into CPU swap space.
     /// Caller need to deallocate the gpu blocks used in this seq
     pub fn swap_out(&mut self, seq: &mut Sequence) -> Result<()> {
+        if self.prefix_cache_enabled() {
+            return self.swap_out_suffix(seq);
+        }
         let num_blocks = seq.block_table.len();
         if self.free_cpu_block_ids.len() < num_blocks {
             candle_core::bail!("Not enough CPU swap blocks for seq {}", seq.id);
@@ -1029,8 +1103,86 @@ impl BlockManager {
         Ok(())
     }
 
+    fn swap_out_suffix(&mut self, seq: &mut Sequence) -> Result<()> {
+        let (prefix_blocks, suffix_blocks) = self.split_prefix_suffix(seq);
+        if suffix_blocks == 0 {
+            candle_core::bail!("Seq {} has no sequence-owned suffix blocks to swap", seq.id);
+        }
+        if self.free_cpu_block_ids.len() < suffix_blocks {
+            candle_core::bail!("Not enough CPU swap blocks for seq {} suffix", seq.id);
+        }
+
+        let suffix_gpu_ids: Vec<usize> = seq
+            .block_table
+            .iter()
+            .skip(prefix_blocks)
+            .map(|&id| id as usize)
+            .collect();
+        if suffix_gpu_ids
+            .iter()
+            .any(|&block_id| self.blocks[block_id].ref_count != 1)
+        {
+            candle_core::bail!("Seq {} suffix contains shared KV blocks", seq.id);
+        }
+
+        let mut mapping = HashMap::with_capacity(suffix_blocks);
+        let mut cpu_ids = Vec::with_capacity(suffix_blocks);
+        for &gpu_bid in &suffix_gpu_ids {
+            let cpu_bid = self
+                .free_cpu_block_ids
+                .pop_front()
+                .ok_or_else(|| candle_core::Error::msg("No free CPU swap blocks"))?;
+            mapping.insert(gpu_bid, cpu_bid);
+            cpu_ids.push(cpu_bid);
+        }
+
+        if let Err(e) = self.try_swap_kvcache(mapping.clone(), false) {
+            for cpu_bid in cpu_ids {
+                self.free_cpu_block_ids.push_back(cpu_bid);
+            }
+            return Err(e);
+        }
+
+        for (&gpu_bid, &cpu_bid) in &mapping {
+            self.cpu_blocks[cpu_bid].ref_count = self.blocks[gpu_bid].ref_count;
+        }
+
+        for &gpu_bid in suffix_gpu_ids.iter().rev() {
+            self.decrement_block_ref(gpu_bid);
+        }
+        seq.block_table.truncate(prefix_blocks);
+        seq.swapped_time = Some(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("Time went backwards")
+                .as_millis() as usize,
+        );
+
+        self.swapped_map.insert(seq.id, cpu_ids.clone());
+        self.seq_swap_states.insert(
+            seq.id,
+            SeqSwapState {
+                prefix_block_count: prefix_blocks,
+                suffix_block_count: suffix_blocks,
+                cpu_block_ids: cpu_ids,
+            },
+        );
+
+        crate::log_warn!(
+            "Swap out sequence {} suffix ({} blocks) to CPU; kept {} prefix block(s) on GPU",
+            seq.id,
+            suffix_blocks,
+            prefix_blocks
+        );
+
+        Ok(())
+    }
+
     /// Need to preallocate new spaces for the seq before calling this function
     pub fn swap_in(&mut self, seq: &mut Sequence) -> Result<()> {
+        if self.seq_swap_states.contains_key(&seq.id) {
+            return self.swap_in_suffix(seq);
+        }
         let cpu_ids = self
             .swapped_map
             .remove(&seq.id)
@@ -1067,12 +1219,62 @@ impl BlockManager {
         Ok(())
     }
 
+    fn swap_in_suffix(&mut self, seq: &mut Sequence) -> Result<()> {
+        let state = self
+            .seq_swap_states
+            .get(&seq.id)
+            .cloned()
+            .ok_or_else(|| candle_core::Error::msg("No partial CPU-swap entry for seq"))?;
+
+        let required_blocks = state
+            .prefix_block_count
+            .saturating_add(state.suffix_block_count);
+        if seq.block_table.len() < required_blocks {
+            candle_core::bail!(
+                "Insufficient GPU suffix blocks to swap in sequence {}",
+                seq.id
+            );
+        }
+
+        let mapping: HashMap<usize, usize> = state
+            .cpu_block_ids
+            .iter()
+            .enumerate()
+            .map(|(i, &cpu_id)| {
+                (
+                    cpu_id,
+                    seq.block_table[state.prefix_block_count + i] as usize,
+                )
+            })
+            .collect();
+
+        self.try_swap_kvcache(mapping, true)?;
+
+        self.seq_swap_states.remove(&seq.id);
+        self.swapped_map.remove(&seq.id);
+        for cpu_bid in state.cpu_block_ids {
+            let cpu_block = &mut self.cpu_blocks[cpu_bid];
+            cpu_block.ref_count = 0;
+            self.free_cpu_block_ids.push_back(cpu_bid);
+        }
+
+        crate::log_warn!(
+            "Seq {} suffix swapped in ({} blocks); reused {} GPU prefix block(s).",
+            seq.id,
+            state.suffix_block_count,
+            state.prefix_block_count
+        );
+
+        Ok(())
+    }
+
     pub fn has_cpu_swap(&self, seq_id: usize) -> bool {
-        self.swapped_map.contains_key(&seq_id)
+        self.swapped_map.contains_key(&seq_id) || self.seq_swap_states.contains_key(&seq_id)
     }
 
     /// Free CPU-side swap blocks for a seq (if any). Useful for aborts.
     pub fn free_cpu_swap_for_seq(&mut self, seq_id: usize) {
+        self.seq_swap_states.remove(&seq_id);
         if let Some(cpu_ids) = self.swapped_map.remove(&seq_id) {
             for cpu_bid in cpu_ids {
                 let cpu_block = &mut self.cpu_blocks[cpu_bid];
