@@ -991,6 +991,13 @@ impl LLMEngine {
         }
     }
 
+    /// Release hybrid GDN/Mamba active slots queued by scheduler-side abort paths.
+    pub fn drain_pending_runner_releases(&mut self) {
+        for seq_id in self.scheduler.take_pending_runner_releases() {
+            let _ = self.notify_runner_finished(seq_id);
+        }
+    }
+
     /// Phase 1: Schedule sequences and prepare data for the forward pass.
     /// Returns (scheduled_ids, is_prefill, cloned_sequences) or None if no work.
     pub fn prepare_step(&mut self) -> Result<Option<(Vec<usize>, bool, Vec<Sequence>)>> {
@@ -1541,34 +1548,34 @@ impl LLMEngine {
     }
 
     pub fn check_canceled(&mut self, reason: Option<String>) {
-        if self.cancelled_sequences.is_empty() {
-            return;
-        }
-        for i in 0..self.cancelled_sequences.len() {
-            let seq_id = self.cancelled_sequences[i];
-            self.scheduler.cancel(seq_id);
-            // Ensure model-side per-sequence state (e.g., Qwen3.5 Mamba cache slot) is released.
-            let _ = self.notify_runner_finished(seq_id);
-            if let Some(_) = self.active_requests.get(&seq_id) {
-                self.active_requests.remove(&seq_id);
-            }
-            self.stream_decoders.remove(&seq_id);
-            self.decode_start_times.remove(&seq_id);
-            self.seq_prefilled_reasoning_end.remove(&seq_id);
-            self.seq_prompt_replays.remove(&seq_id);
-            if let Some(r) = &reason {
-                if let Some(sender) = self.stream_senders.get_mut(&seq_id) {
-                    if let Some(request_type) = self.request_types.get(&seq_id) {
-                        if *request_type == RequestType::Stream {
-                            let _ = sender.try_send(StreamItem::Error(r.clone()));
+        if !self.cancelled_sequences.is_empty() {
+            for i in 0..self.cancelled_sequences.len() {
+                let seq_id = self.cancelled_sequences[i];
+                self.scheduler.cancel(seq_id);
+                // Ensure model-side per-sequence state (e.g., Qwen3.5 Mamba cache slot) is released.
+                let _ = self.notify_runner_finished(seq_id);
+                if let Some(_) = self.active_requests.get(&seq_id) {
+                    self.active_requests.remove(&seq_id);
+                }
+                self.stream_decoders.remove(&seq_id);
+                self.decode_start_times.remove(&seq_id);
+                self.seq_prefilled_reasoning_end.remove(&seq_id);
+                self.seq_prompt_replays.remove(&seq_id);
+                if let Some(r) = &reason {
+                    if let Some(sender) = self.stream_senders.get_mut(&seq_id) {
+                        if let Some(request_type) = self.request_types.get(&seq_id) {
+                            if *request_type == RequestType::Stream {
+                                let _ = sender.try_send(StreamItem::Error(r.clone()));
+                            }
                         }
                     }
                 }
+                self.stream_senders.remove(&seq_id);
             }
-            self.stream_senders.remove(&seq_id);
+            self.scheduler.clear_finished();
+            self.cancelled_sequences.clear();
         }
-        self.scheduler.clear_finished();
-        self.cancelled_sequences.clear();
+        self.drain_pending_runner_releases();
     }
 
     pub fn may_print_decoding_throughput(&mut self, active_indices: &Vec<usize>) {
@@ -2296,6 +2303,9 @@ impl LLMEngine {
                             guard.cancel_all_with_reason(Some(e.to_string()));
                         }
                     }
+                } else {
+                    let mut guard = engine.write();
+                    guard.check_canceled(None);
                 }
 
                 if task_processed == 0 {

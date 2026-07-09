@@ -1055,6 +1055,10 @@ impl BlockManager {
         Ok(())
     }
 
+    pub fn has_cpu_swap(&self, seq_id: usize) -> bool {
+        self.swapped_map.contains_key(&seq_id)
+    }
+
     /// Free CPU-side swap blocks for a seq (if any). Useful for aborts.
     pub fn free_cpu_swap_for_seq(&mut self, seq_id: usize) {
         if let Some(cpu_ids) = self.swapped_map.remove(&seq_id) {

@@ -39,6 +39,9 @@ pub struct Scheduler {
     cfg: EngineConfig,
     pd_config: Option<PdConfig>,
     is_last_prefill: bool,
+    /// Sequence IDs whose hybrid GDN/Mamba active slots must be released on the
+    /// runner after scheduler-side abort (swap-in failure, etc.).
+    pending_runner_releases: Vec<usize>,
 }
 
 const MIN_NUM_SCHEDULED_REQS: usize = 5;
@@ -163,7 +166,21 @@ impl Scheduler {
             cfg: econfig.clone(),
             pd_config: econfig.pd_config.clone(),
             is_last_prefill: false,
+            pending_runner_releases: Vec::new(),
         }
+    }
+
+    pub fn request_runner_release(&mut self, seq_id: usize) {
+        if !self.pending_runner_releases.contains(&seq_id) {
+            self.pending_runner_releases.push(seq_id);
+        }
+    }
+
+    pub fn take_pending_runner_releases(&mut self) -> Vec<usize> {
+        if self.pending_runner_releases.is_empty() {
+            return Vec::new();
+        }
+        std::mem::take(&mut self.pending_runner_releases)
     }
 
     /// Set tool call end token IDs (called by engine after tokenizer is available)
@@ -927,6 +944,7 @@ impl Scheduler {
                     seq_id
                 );
                 self.cancel(seq_id);
+                self.request_runner_release(seq_id);
                 break;
             }
 
@@ -935,7 +953,11 @@ impl Scheduler {
             seq.clear_block_table(); //reallocate block table since previous gpu blocks were freed
 
             if let Err(_) = self.block_manager.ensure_allocate(&mut seq) {
-                continue;
+                // Transient: GPU blocks may be available on the next schedule pass.
+                // Keep the swapped CPU KV and GDN slot so swap-in can retry.
+                seq.status = SequenceStatus::Swapped;
+                self.cached.push(seq);
+                break;
             }
 
             // Swap in data from CPU (if swapped out previously)
@@ -945,8 +967,18 @@ impl Scheduler {
                     crate::log_warn!("Seq {} is swapped in for execution!", seq.id);
                 }
                 Err(e) => {
-                    seq.status = SequenceStatus::Finished;
                     crate::log_error!("Seq {} swap in failed: {:?}!", seq.id, e);
+                    self.block_manager.deallocate(&seq);
+                    seq.clear_block_table();
+                    if self.block_manager.has_cpu_swap(seq.id) {
+                        // CPU swap data intact — retry on a later schedule pass.
+                        seq.status = SequenceStatus::Swapped;
+                        self.cached.push(seq);
+                    } else {
+                        // CPU swap state lost — abort and release the GDN slot.
+                        self.request_runner_release(seq.id);
+                    }
+                    break;
                 }
             }
             self.running.push(seq);
