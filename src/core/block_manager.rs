@@ -467,11 +467,20 @@ impl BlockManager {
             }
         }
         if matched_blocks > 0 {
+            let cached_percent = cached_tokens as f64 * 100.0 / tokens.len().max(1) as f64;
             crate::log_info!(
-                "Prefix cache hit seq {} ({} cached tokens, {} blocks)",
+                "Prefix cache hit seq {}: {}/{} cached tokens ({:.1}%, {} blocks); raw KV match={} tokens ({} blocks), mamba-compatible={} tokens ({} blocks), reuse boundaries: raw KV block {}, mamba block {}",
                 seq.id,
                 cached_tokens,
-                matched_blocks
+                tokens.len(),
+                cached_percent,
+                matched_blocks,
+                raw_matched_blocks * self.block_size,
+                raw_matched_blocks,
+                cached_tokens,
+                matched_blocks,
+                raw_matched_blocks,
+                matched_blocks,
             );
             if let Some(hash) = last_hash {
                 let mut cached_blocks = prefix_cache.blocks_for_match(hash);
