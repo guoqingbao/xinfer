@@ -993,8 +993,18 @@ impl LLMEngine {
 
     /// Release hybrid GDN/Mamba active slots queued by scheduler-side abort paths.
     pub fn drain_pending_runner_releases(&mut self) {
-        for seq_id in self.scheduler.take_pending_runner_releases() {
-            let _ = self.notify_runner_finished(seq_id);
+        let pending = self.scheduler.take_pending_runner_releases();
+        for seq_id in pending {
+            // Route scheduler-side aborts through the normal cancellation path
+            // so the request bookkeeping and response channel are cleaned up as
+            // well as the runner slot. Avoid a second notification when the
+            // request was already cancelled by another path.
+            if !self.cancelled_sequences.contains(&seq_id) {
+                self.cancelled_sequences.push(seq_id);
+            }
+        }
+        if !self.cancelled_sequences.is_empty() {
+            self.check_canceled(None);
         }
     }
 

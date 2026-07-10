@@ -261,12 +261,20 @@ impl BlockManager {
     }
 
     pub fn ensure_allocate(&mut self, seq: &mut Sequence) -> Result<()> {
+        let original_len = seq.block_table.len();
         let mut new_blocks = Vec::new();
         for i in seq.block_table.len()..seq.num_blocks() {
-            let block_id = self
-                .free_block_ids
-                .pop_front()
-                .ok_or_else(|| candle_core::Error::msg("No free blocks available, retry later!"))?;
+            let Some(block_id) = self.free_block_ids.pop_front() else {
+                // Keep this operation transactional. Callers commonly retry after
+                // a transient allocation failure, so partially extending the
+                // sequence here would leak blocks and make the next retry worse.
+                while seq.block_table.len() > original_len {
+                    if let Some(block_id) = seq.block_table.pop() {
+                        self.decrement_block_ref(block_id as usize);
+                    }
+                }
+                candle_core::bail!("No free blocks available, retry later!");
+            };
             self.allocate_block(block_id);
             seq.block_table.push(block_id as u32);
             if i > seq.num_blocks() - 5 {
@@ -1029,9 +1037,9 @@ impl BlockManager {
             .ok_or_else(|| candle_core::Error::msg("No CPU-swap entry for seq"))?;
 
         if cpu_ids.len() > seq.block_table.len() {
-            // push back and free
+            // Keep the CPU-side copy intact so the caller can retry after more
+            // GPU blocks become available.
             self.swapped_map.insert(seq.id, cpu_ids);
-            self.free_cpu_swap_for_seq(seq.id);
             candle_core::bail!("Insufficient GPU blocks to swap in sequence {}", seq.id);
         }
 
@@ -1042,8 +1050,12 @@ impl BlockManager {
             .map(|(i, &cpu_id)| (cpu_id, seq.block_table[i] as usize))
             .collect();
 
-        // Actual data copy CPU → GPU
-        self.try_swap_kvcache(mapping.clone(), true)?;
+        // Actual data copy CPU → GPU. Keep the CPU ownership record on failure
+        // so the scheduler can retry or explicitly release it.
+        if let Err(e) = self.try_swap_kvcache(mapping.clone(), true) {
+            self.swapped_map.insert(seq.id, cpu_ids);
+            return Err(e);
+        }
 
         // Free CPU blocks now that data is back on GPU
         for cpu_bid in cpu_ids {

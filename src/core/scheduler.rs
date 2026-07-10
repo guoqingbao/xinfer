@@ -60,6 +60,15 @@ const PREFIX_CACHE_RATIO_PD_SERVER: f32 = 0.8;
 const PREFIX_CACHE_RATIO_PD_CLIENT: f32 = 0.5;
 const PREFIX_CACHE_PRESSURE_EVICT_PERCENT: f32 = 0.1; // evict 10% of prefix cache when under pressure
 
+fn active_sequence_limit(max_num_seqs: usize, mamba_cache_capacity: Option<usize>) -> usize {
+    if let Some(mamba_cap) = mamba_cache_capacity {
+        if mamba_cap > 0 {
+            return mamba_cap;
+        }
+    }
+    std::cmp::max(max_num_seqs, MIN_NUM_SCHEDULED_REQS)
+}
+
 fn build_prefix_cache_config(econfig: &EngineConfig) -> PrefixCacheConfig {
     let enabled = econfig.prefix_cache.unwrap_or(false);
     if !enabled {
@@ -218,18 +227,7 @@ impl Scheduler {
     }
 
     fn active_sequence_limit(&self) -> usize {
-        fn active_sequence_limit_(
-            max_num_seqs: usize,
-            mamba_cache_capacity: Option<usize>,
-        ) -> usize {
-            if let Some(mamba_cap) = mamba_cache_capacity {
-                if mamba_cap > 0 {
-                    return mamba_cap;
-                }
-            }
-            std::cmp::max(max_num_seqs, MIN_NUM_SCHEDULED_REQS)
-        }
-        active_sequence_limit_(self.cfg.max_num_seqs, self.cfg.mamba_cache_capacity)
+        active_sequence_limit(self.cfg.max_num_seqs, self.cfg.mamba_cache_capacity)
     }
 
     /// Schedule sequences and return their indexes in `running` along with prefill flag
@@ -736,6 +734,9 @@ impl Scheduler {
     }
 
     pub fn cancel(&mut self, seq_id: usize) {
+        // A normal cancellation will release the runner slot itself. Do not
+        // leave a scheduler-side release queued for the same sequence.
+        self.pending_runner_releases.retain(|&id| id != seq_id);
         for i in 0..self.running.len() {
             let seq = &mut self.running[i];
             if seq.id == seq_id {
@@ -918,7 +919,8 @@ impl Scheduler {
 
             let available_kvcache_tokens = self.get_available_kv_tokens();
             if !self.block_manager.can_swap_in(&self.cached[i])
-                || (available_kvcache_tokens - seq_len < MIN_KVCACHE_TOKENS_LEFT_FOR_SWAP)
+                || (available_kvcache_tokens.saturating_sub(seq_len)
+                    < MIN_KVCACHE_TOKENS_LEFT_FOR_SWAP)
             {
                 if !self.running.is_empty() {
                     // Wait for swap in
@@ -944,7 +946,6 @@ impl Scheduler {
                     seq_id
                 );
                 self.cancel(seq_id);
-                self.request_runner_release(seq_id);
                 break;
             }
 
