@@ -58,16 +58,6 @@ impl MiniMax3Config {
     }
 }
 
-fn resolve_input_seqlens(input_metadata: &InputMetadata) -> Result<Vec<u32>> {
-    if let Some(seqlens) = input_metadata.seqlens.as_ref() {
-        Ok(seqlens.clone())
-    } else if let Some(cu_seqlens) = input_metadata.cu_seqlens_q.as_ref() {
-        Ok(cu_seqlens.to_vec1::<u32>()?[1..].to_vec())
-    } else {
-        Ok(Vec::new())
-    }
-}
-
 enum MoeVariant {
     Mlp(MLP),
     FusedMoe(FusedMoe),
@@ -295,111 +285,6 @@ pub struct MiniMax3ForCausalLM {
     is_qvar_builder: bool,
 }
 
-/// Dispatches the shared MiniMax ModelType to the legacy M2 implementation
-/// or the isolated M3 implementation without changing the M2 model module.
-pub enum MiniMaxModel {
-    M2(crate::models::minimax::MiniMaxForCausalLM),
-    M3(MiniMax3ForCausalLM),
-}
-
-impl MiniMaxModel {
-    pub fn new(
-        vb: &VarBuilderX,
-        comm: Rc<Comm>,
-        config: &Config,
-        dtype: DType,
-        is_rope_i: bool,
-        device: &Device,
-        progress_reporter: Arc<RwLock<Box<dyn ProgressLike>>>,
-    ) -> Result<Self> {
-        let is_m3 = config
-            .architectures
-            .as_ref()
-            .and_then(|a| a.first())
-            .is_some_and(|a| a.starts_with("MiniMaxM3"));
-        if is_m3 {
-            Ok(Self::M3(MiniMax3ForCausalLM::new(
-                vb,
-                comm,
-                config,
-                dtype,
-                is_rope_i,
-                device,
-                progress_reporter,
-            )?))
-        } else {
-            Ok(Self::M2(crate::models::minimax::MiniMaxForCausalLM::new(
-                vb,
-                comm,
-                config,
-                dtype,
-                is_rope_i,
-                device,
-                progress_reporter,
-            )?))
-        }
-    }
-
-    pub fn forward(
-        &self,
-        input_ids: &Tensor,
-        positions: &Tensor,
-        kv_caches: Option<&Vec<(Tensor, Tensor)>>,
-        input_metadata: &InputMetadata,
-        embeded_inputs: bool,
-    ) -> Result<Tensor> {
-        match self {
-            Self::M2(m) => m.forward(
-                input_ids,
-                positions,
-                kv_caches,
-                input_metadata,
-                embeded_inputs,
-            ),
-            Self::M3(m) => m.forward(
-                input_ids,
-                positions,
-                kv_caches,
-                input_metadata,
-                embeded_inputs,
-            ),
-        }
-    }
-
-    pub fn forward_embedding(
-        &self,
-        input_ids: &Tensor,
-        positions: &Tensor,
-        kv_caches: Option<&Vec<(Tensor, Tensor)>>,
-        input_metadata: &InputMetadata,
-        embeded_inputs: bool,
-    ) -> Result<Tensor> {
-        match self {
-            Self::M2(m) => m.forward_embedding(
-                input_ids,
-                positions,
-                kv_caches,
-                input_metadata,
-                embeded_inputs,
-            ),
-            Self::M3(m) => m.forward_embedding(
-                input_ids,
-                positions,
-                kv_caches,
-                input_metadata,
-                embeded_inputs,
-            ),
-        }
-    }
-
-    pub fn get_vocab_size(&self) -> usize {
-        match self {
-            Self::M2(m) => m.get_vocab_size(),
-            Self::M3(m) => m.get_vocab_size(),
-        }
-    }
-}
-
 impl MiniMax3ForCausalLM {
     pub fn new(
         vb: &VarBuilderX,
@@ -536,7 +421,10 @@ impl MiniMax3ForCausalLM {
         embeded_inputs: bool,
         return_hidden: bool,
     ) -> Result<Tensor> {
-        let seqlens = resolve_input_seqlens(input_metadata)?;
+        // `seqlens` is already host-side scheduler metadata. Never derive it
+        // from `cu_seqlens_q`, which is a CUDA tensor and would force a
+        // device-to-host copy during graph capture.
+        let seqlens = input_metadata.seqlens.clone().unwrap_or_default();
 
         let attention_mask = get_attention_causal_mask(
             &self.device,

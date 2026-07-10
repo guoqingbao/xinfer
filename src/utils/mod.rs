@@ -2314,7 +2314,7 @@ pub fn get_arch_rope(
             "<|im_start|>user\n {} <|im_end|>".to_string(),
         ),
         "MiniMaxM3SparseForConditionalGeneration" | "MiniMaxM3SparseForCausalLM" => (
-            ModelType::MiniMax,
+            ModelType::MiniMax3,
             "<|im_start|>user\n {} <|im_end|>".to_string(),
         ),
         _ => candle_core::bail!("Unsupported architecture: {}", architectures),

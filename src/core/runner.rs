@@ -28,7 +28,8 @@ use crate::{
     models::glm4_moe_lite::GLM4MoeLiteForCausalLM,
     models::llama::LLaMaForCausalLM,
     models::llama4::LLama4ForConditionalGeneration,
-    models::minimax3::MiniMaxModel,
+    models::minimax::MiniMaxForCausalLM,
+    models::minimax3::MiniMax3ForCausalLM,
     models::mistral3_vl::Mistral3ForConditionalGeneration,
     models::phi4::Phi4ForCausalLM,
     models::qwen3::Qwen3ForCausalLM,
@@ -107,7 +108,8 @@ pub enum Model {
     Gemma3(Arc<Gemma3ForConditionalGeneration>),
     Gemma4(Arc<Gemma4ForCausalLM>),
     Qwen3VL(Arc<Qwen3VLForConditionalGeneration>),
-    MiniMax(Arc<MiniMaxModel>),
+    MiniMax(Arc<MiniMaxForCausalLM>),
+    MiniMax3(Arc<MiniMax3ForCausalLM>),
 }
 
 pub enum RunnerType {
@@ -319,7 +321,8 @@ impl ModelRunner {
                 Gemma3 => Gemma3ForConditionalGeneration,
                 Gemma4 => Gemma4ForCausalLM,
                 Qwen3VL => Qwen3VLForConditionalGeneration,
-                MiniMax => MiniMaxModel,
+                MiniMax => MiniMaxForCausalLM,
+                MiniMax3 => MiniMax3ForCausalLM,
             }
         )?;
 
@@ -346,6 +349,7 @@ impl ModelRunner {
                 Gemma4 => EmbedInputs,
                 Qwen3VL => NoneArg,
                 MiniMax => EmbedInputs,
+                MiniMax3 => EmbedInputs,
             }
         );
 
@@ -371,8 +375,9 @@ impl ModelRunner {
                     Mistral3VL => NoneArg,
                     Gemma3 => NoneArg,
                     Gemma4 => EmbedInputs,
-                    Qwen3VL => NoneArg,
-                    MiniMax => EmbedInputs,
+                Qwen3VL => NoneArg,
+                MiniMax => EmbedInputs,
+                MiniMax3 => EmbedInputs,
                 }
             ))
         } else {
@@ -1016,6 +1021,7 @@ impl ModelRunner {
                 Gemma4 => false,
                 Qwen3VL => images,
                 MiniMax => false,
+                MiniMax3 => false,
             }
         )?;
         drop(kv_guard);
@@ -1047,6 +1053,7 @@ impl ModelRunner {
                 Gemma3 => None,
                 Gemma4 => false,
                 MiniMax => false,
+                MiniMax3 => false,
             },
             candle_core::bail!("Embedding is not supported for this model type")
         )?;
@@ -1809,6 +1816,7 @@ impl ModelRunner {
             Model::Gemma4(model) => model.get_vocab_size(),
             Model::Qwen3VL(model) => model.get_vocab_size(),
             Model::MiniMax(model) => model.get_vocab_size(),
+            Model::MiniMax3(model) => model.get_vocab_size(),
         }
     }
 

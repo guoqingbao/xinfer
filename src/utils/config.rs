@@ -965,6 +965,7 @@ pub enum ModelType {
     Qwen3VL,
     LLaMa4,
     MiniMax,
+    MiniMax3,
 }
 impl ModelType {
     /// Convert architecture string to ModelType
@@ -988,6 +989,10 @@ impl ModelType {
             "YiForCausalLM" => Some(ModelType::Yi),
             "StableLmForCausalLM" => Some(ModelType::StableLM),
             "DeepSeekForCausalLM" => Some(ModelType::DeepSeek),
+            "MiniMaxM2ForCausalLM" => Some(ModelType::MiniMax),
+            "MiniMaxM3SparseForConditionalGeneration" | "MiniMaxM3SparseForCausalLM" => {
+                Some(ModelType::MiniMax3)
+            }
             "Mistral3VForConditionalGeneration" => Some(ModelType::Mistral3VL),
             "Qwen3VLMoEForConditionalGeneration" => Some(ModelType::Qwen3VL),
             _ => None,

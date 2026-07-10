@@ -135,7 +135,7 @@ impl MoeRouting {
             topk_weights = topk_weights.broadcast_div(&topk_weights.sum_keepdim(D::Minus1)?)?;
         }
         if let Some(factor) = self.routed_scaling_factor {
-            topk_weights = (topk_weights * factor)?;
+            topk_weights = topk_weights.affine(factor, 0.0)?;
         }
 
         Ok((topk_weights, topk_ids))

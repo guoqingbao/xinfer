@@ -95,14 +95,19 @@ impl GatedActivation {
         beta: f32,
         limit: f32,
     ) -> Result<Tensor> {
-        // M3 clamps the gate only from above and the up projection on both
-        // sides. Candle's clamp API requires finite endpoints.
-        let gate = gate.clamp(-(f32::MAX as f64), limit as f64)?;
-        let up = up.clamp(-(limit as f64), limit as f64)?;
+        // Build scalar bounds from device tensors. Using Tensor::clamp or
+        // scalar `+`/`*` operands would create CPU scalar tensors and enqueue
+        // host-to-device copies during CUDA graph capture.
+        let gate_limit = gate.ones_like()?.affine(0.0, limit as f64)?;
+        let gate = gate.minimum(&gate_limit)?;
+        let up_limit = up.ones_like()?.affine(0.0, limit as f64)?;
+        let up_floor = up.ones_like()?.affine(0.0, -(limit as f64))?;
+        let up = up.minimum(&up_limit)?.maximum(&up_floor)?;
         let gate_dtype = gate.dtype();
-        let sigmoid = candle_nn::ops::sigmoid(&(gate.to_dtype(DType::F32)? * alpha as f64)?)?
-            .to_dtype(gate_dtype)?;
+        let sigmoid =
+            candle_nn::ops::sigmoid(&gate.to_dtype(DType::F32)?.affine(alpha as f64, 0.0)?)?
+                .to_dtype(gate_dtype)?;
         gate.broadcast_mul(&sigmoid)?
-            .broadcast_mul(&(up + beta as f64)?)
+            .broadcast_mul(&up.affine(1.0, beta as f64)?)
     }
 }
