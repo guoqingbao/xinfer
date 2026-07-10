@@ -147,6 +147,7 @@ impl GatedDeltaNet {
         } else {
             (None, None)
         };
+        let mut load_errors = Vec::new();
         let projection_pairs = [
             ("in_proj_qkv", "attn_qkv"),
             ("in_proj_z", "attn_gate"),
@@ -186,11 +187,21 @@ impl GatedDeltaNet {
             dtype,
         );
 
-        if let (Ok(in_proj_qkvz), Ok(in_proj_ba)) = (fused_qkvz, fused_ba) {
-            return Ok(GdnProjection::FusedQkvzBa {
-                in_proj_qkvz,
-                in_proj_ba,
-            });
+        match (fused_qkvz, fused_ba) {
+            (Ok(in_proj_qkvz), Ok(in_proj_ba)) => {
+                return Ok(GdnProjection::FusedQkvzBa {
+                    in_proj_qkvz,
+                    in_proj_ba,
+                });
+            }
+            (qkvz, ba) => {
+                if let Err(err) = qkvz {
+                    load_errors.push(format!("in_proj_qkvz: {err}"));
+                }
+                if let Err(err) = ba {
+                    load_errors.push(format!("in_proj_ba: {err}"));
+                }
+            }
         };
 
         // Qwen3.5 format: split qkv, z, b, a
@@ -275,12 +286,14 @@ impl GatedDeltaNet {
             )
         };
 
-        if let (Ok(in_proj_z), Ok(in_proj_b), Ok(in_proj_a)) = (split_z, split_b, split_a) {
-            if comm.world_size() > 1 {
-                // TP-safe path for packed in_proj_qkv [q|k|v]:
-                // shard each semantic chunk independently (q, k, v), not as one contiguous block.
-                let split_qkv_merged =
-                    if vb.is_qvar_builder() && num_k_heads_global != num_v_heads_global {
+        match (split_z, split_b, split_a) {
+            (Ok(in_proj_z), Ok(in_proj_b), Ok(in_proj_a)) => {
+                if comm.world_size() > 1 {
+                    // TP-safe path for packed in_proj_qkv [q|k|v]:
+                    // shard each semantic chunk independently (q, k, v), not as one contiguous block.
+                    let split_qkv_merged = if vb.is_qvar_builder()
+                        && num_k_heads_global != num_v_heads_global
+                    {
                         load_restored_gguf_merged_qkv_linear(
                             vb,
                             hidden_size,
@@ -311,73 +324,90 @@ impl GatedDeltaNet {
                         )
                     };
 
-                match split_qkv_merged {
-                    Ok(in_proj_qkv) => {
-                        return Ok(GdnProjection::SplitQkvZaMerged {
-                            in_proj_qkv,
-                            in_proj_z,
-                            in_proj_b,
-                            in_proj_a,
-                        });
-                    }
-                    Err(err) => {
-                        if is_quantized && !vb.is_qvar_builder() {
-                            candle_core::bail!(
+                    match split_qkv_merged {
+                        Ok(in_proj_qkv) => {
+                            return Ok(GdnProjection::SplitQkvZaMerged {
+                                in_proj_qkv,
+                                in_proj_z,
+                                in_proj_b,
+                                in_proj_a,
+                            });
+                        }
+                        Err(err) => {
+                            if is_quantized && !vb.is_qvar_builder() {
+                                candle_core::bail!(
                                 "Unable to load TP-safe quantized Qwen3.5 split in_proj_qkv: {}",
                                 err
                             );
+                            }
                         }
                     }
                 }
+
+                // Single GPU (or non-FP8 fallback): use legacy split loader.
+                let split_qkv_legacy =
+                    if vb.is_qvar_builder() && num_k_heads_global != num_v_heads_global {
+                        load_restored_gguf_column_linear(
+                            vb,
+                            hidden_size,
+                            key_dim_global * 2 + value_dim_global,
+                            projection_key_map["in_proj_qkv"],
+                            comm.clone(),
+                            DType::F32,
+                            |w| {
+                                restore_qwen35_qkv_weight(
+                                    &w,
+                                    key_dim_global,
+                                    num_k_heads_global,
+                                    num_v_heads_global,
+                                    head_v_dim,
+                                )
+                            },
+                        )
+                    } else {
+                        let vb_qkv = vb.pp(projection_key_map["in_proj_qkv"]);
+                        let (qc_qkv, q_qkv) =
+                            Self::resolve_quant_for_weight(&vb_qkv, &quantization_config, &quant);
+                        TensorParallelColumnLinear::load_with_hints(
+                            hidden_size,
+                            key_dim_global * 2 + value_dim_global,
+                            false,
+                            vb_qkv,
+                            comm.clone(),
+                            &qc_qkv,
+                            &q_qkv,
+                            dtype,
+                        )
+                    };
+
+                if let Ok(in_proj_qkv) = split_qkv_legacy {
+                    return Ok(GdnProjection::SplitQkvZaLegacy {
+                        in_proj_qkv,
+                        in_proj_z,
+                        in_proj_b,
+                        in_proj_a,
+                    });
+                } else if let Err(err) = split_qkv_legacy {
+                    load_errors.push(format!("in_proj_qkv: {err}"));
+                }
             }
-
-            // Single GPU (or non-FP8 fallback): use legacy split loader.
-            let split_qkv_legacy =
-                if vb.is_qvar_builder() && num_k_heads_global != num_v_heads_global {
-                    load_restored_gguf_column_linear(
-                        vb,
-                        hidden_size,
-                        key_dim_global * 2 + value_dim_global,
-                        projection_key_map["in_proj_qkv"],
-                        comm.clone(),
-                        DType::F32,
-                        |w| {
-                            restore_qwen35_qkv_weight(
-                                &w,
-                                key_dim_global,
-                                num_k_heads_global,
-                                num_v_heads_global,
-                                head_v_dim,
-                            )
-                        },
-                    )
-                } else {
-                    let vb_qkv = vb.pp(projection_key_map["in_proj_qkv"]);
-                    let (qc_qkv, q_qkv) =
-                        Self::resolve_quant_for_weight(&vb_qkv, &quantization_config, &quant);
-                    TensorParallelColumnLinear::load_with_hints(
-                        hidden_size,
-                        key_dim_global * 2 + value_dim_global,
-                        false,
-                        vb_qkv,
-                        comm.clone(),
-                        &qc_qkv,
-                        &q_qkv,
-                        dtype,
-                    )
-                };
-
-            if let Ok(in_proj_qkv) = split_qkv_legacy {
-                return Ok(GdnProjection::SplitQkvZaLegacy {
-                    in_proj_qkv,
-                    in_proj_z,
-                    in_proj_b,
-                    in_proj_a,
-                });
+            (z, b, a) => {
+                if let Err(err) = z {
+                    load_errors.push(format!("in_proj_z: {err}"));
+                }
+                if let Err(err) = b {
+                    load_errors.push(format!("in_proj_b: {err}"));
+                }
+                if let Err(err) = a {
+                    load_errors.push(format!("in_proj_a: {err}"));
+                }
             }
         }
 
-        candle_core::bail!("Unable to load Qwen3.5/Qwen3Next linear attention projection weights",)
+        candle_core::bail!(
+            "Unable to load Qwen3.5/Qwen3Next linear attention projection weights: {}",
+            load_errors.join("; ")
+        )
     }
 
     fn fix_qwen3next_projection_order(

@@ -728,12 +728,21 @@ impl MergedParallelColumnLinear {
                         candle_core::bail!("LnFp8: invalid zero in weight_block_size");
                     }
 
-                    let weight = v.get_with_hints_dtype(
-                        (out_dim, in_dim),
-                        "weight",
-                        Shard::default(),
-                        DType::U8,
-                    )?;
+                    let weight = v
+                        .get_with_hints_dtype(
+                            (out_dim, in_dim),
+                            "weight",
+                            Shard::default(),
+                            DType::F8E4M3,
+                        )
+                        .or_else(|_| {
+                            v.get_with_hints_dtype(
+                                (out_dim, in_dim),
+                                "weight",
+                                Shard::default(),
+                                DType::U8,
+                            )
+                        })?;
                     let scale_dim0 = (out_dim + by - 1) / by;
                     let scale_dim1 = (in_dim + bx - 1) / bx;
                     let weight_scale = match v.get_with_hints_dtype(
@@ -913,19 +922,24 @@ impl MergedParallelColumnLinear {
 
                     let scale_block_size: usize = if is_nvfp4_quant { 16 } else { 32 };
                     let scale_cols = in_dim / scale_block_size;
+                    let scale_dtype = if is_nvfp4_quant {
+                        DType::F8E4M3
+                    } else {
+                        DType::U8
+                    };
                     let scales = if v.contains_tensor("weight_scale") {
                         v.get_with_hints_dtype(
                             (out_dim, scale_cols),
                             "weight_scale",
                             Shard::default(),
-                            DType::U8,
+                            scale_dtype,
                         )?
                     } else {
                         v.get_with_hints_dtype(
                             (out_dim, scale_cols),
                             "scales",
                             Shard::default(),
-                            DType::U8,
+                            scale_dtype,
                         )?
                     };
 
