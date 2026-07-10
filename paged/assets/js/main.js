@@ -375,7 +375,7 @@ function initDownloads() {
   const pipGrid = document.getElementById('pip-grid');
   if (!grid) return;
 
-  const XINFER_VER = '0.13.7';
+  const XINFER_VER = '0.13.8';
   const DL_BASE = 'https://github.com/guoqingbao/xinfer/releases/download/v' + XINFER_VER + '/';
   const archs = [
     { sm: 'sm70',  n: '70',  name: 'SM70',  gpu: 'V100',                  cuda: 'CUDA 12.6', arch: 'x64' },
