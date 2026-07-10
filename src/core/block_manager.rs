@@ -31,7 +31,6 @@ impl Block {
 #[derive(Debug, Clone)]
 struct SeqSwapState {
     prefix_block_count: usize,
-    suffix_block_count: usize,
     cpu_block_ids: Vec<usize>,
 }
 
@@ -310,7 +309,7 @@ impl BlockManager {
             };
             self.allocate_block(block_id);
             seq.block_table.push(block_id as u32);
-            if i > seq.num_blocks() - 5 {
+            if i + 5 >= seq.num_blocks() {
                 new_blocks.push(block_id as u32);
             }
         }
@@ -846,6 +845,9 @@ impl BlockManager {
 
     pub fn get_cpu_swap_usage(&self) -> f32 {
         let total_cpu_blocks = self.cpu_blocks.len();
+        if total_cpu_blocks == 0 {
+            return 0.0;
+        }
         (total_cpu_blocks - self.free_cpu_block_ids.len()) as f32 / total_cpu_blocks as f32
     }
 
@@ -1028,7 +1030,7 @@ impl BlockManager {
         #[cfg(feature = "cuda")]
         {
             if let Some(state) = self.seq_swap_states.get(&seq.id) {
-                return self.free_block_ids.len() >= state.suffix_block_count;
+                return self.free_block_ids.len() >= state.cpu_block_ids.len();
             }
             self.free_block_ids.len() > seq.num_blocks()
         }
@@ -1039,7 +1041,7 @@ impl BlockManager {
     pub fn swap_in_required_blocks(&self, seq: &Sequence) -> usize {
         self.seq_swap_states
             .get(&seq.id)
-            .map_or(seq.num_blocks(), |state| state.suffix_block_count)
+            .map_or(seq.num_blocks(), |state| state.cpu_block_ids.len())
     }
 
     pub fn has_partial_cpu_swap(&self, seq_id: usize) -> bool {
@@ -1092,8 +1094,15 @@ impl BlockManager {
             cpu_ids.push(cpu_bid);
         }
 
-        // Actual data copy GPU → CPU
-        self.try_swap_kvcache(mapping.clone(), false)?;
+        // Actual data copy GPU → CPU. Return the CPU blocks to the free list if
+        // the runner cannot complete the copy; otherwise a failed preemption
+        // would permanently consume swap capacity.
+        if let Err(e) = self.copy_kv_cache(mapping.clone(), false) {
+            for cpu_bid in cpu_ids {
+                self.free_cpu_block_ids.push_back(cpu_bid);
+            }
+            return Err(e);
+        }
         seq.swapped_time = Some(
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -1146,7 +1155,7 @@ impl BlockManager {
             cpu_ids.push(cpu_bid);
         }
 
-        if let Err(e) = self.try_swap_kvcache(mapping.clone(), false) {
+        if let Err(e) = self.copy_kv_cache(mapping.clone(), false) {
             for cpu_bid in cpu_ids {
                 self.free_cpu_block_ids.push_back(cpu_bid);
             }
@@ -1168,12 +1177,10 @@ impl BlockManager {
                 .as_millis() as usize,
         );
 
-        self.swapped_map.insert(seq.id, cpu_ids.clone());
         self.seq_swap_states.insert(
             seq.id,
             SeqSwapState {
                 prefix_block_count: prefix_blocks,
-                suffix_block_count: suffix_blocks,
                 cpu_block_ids: cpu_ids,
             },
         );
@@ -1214,7 +1221,7 @@ impl BlockManager {
 
         // Actual data copy CPU → GPU. Keep the CPU ownership record on failure
         // so the scheduler can retry or explicitly release it.
-        if let Err(e) = self.try_swap_kvcache(mapping.clone(), true) {
+        if let Err(e) = self.copy_kv_cache(mapping.clone(), true) {
             self.swapped_map.insert(seq.id, cpu_ids);
             return Err(e);
         }
@@ -1238,7 +1245,7 @@ impl BlockManager {
 
         let required_blocks = state
             .prefix_block_count
-            .saturating_add(state.suffix_block_count);
+            .saturating_add(state.cpu_block_ids.len());
         if seq.block_table.len() < required_blocks {
             candle_core::bail!(
                 "Insufficient GPU suffix blocks to swap in sequence {}",
@@ -1257,11 +1264,11 @@ impl BlockManager {
                 )
             })
             .collect();
+        let swapped_blocks = mapping.len();
 
-        self.try_swap_kvcache(mapping, true)?;
+        self.copy_kv_cache(mapping, true)?;
 
         self.seq_swap_states.remove(&seq.id);
-        self.swapped_map.remove(&seq.id);
         for cpu_bid in state.cpu_block_ids {
             let cpu_block = &mut self.cpu_blocks[cpu_bid];
             cpu_block.ref_count = 0;
@@ -1271,7 +1278,7 @@ impl BlockManager {
         crate::log_warn!(
             "Seq {} suffix swapped in ({} blocks); reused {} GPU prefix block(s).",
             seq.id,
-            state.suffix_block_count,
+            swapped_blocks,
             state.prefix_block_count
         );
 
@@ -1284,7 +1291,13 @@ impl BlockManager {
 
     /// Free CPU-side swap blocks for a seq (if any). Useful for aborts.
     pub fn free_cpu_swap_for_seq(&mut self, seq_id: usize) {
-        self.seq_swap_states.remove(&seq_id);
+        if let Some(state) = self.seq_swap_states.remove(&seq_id) {
+            for cpu_bid in state.cpu_block_ids {
+                let cpu_block = &mut self.cpu_blocks[cpu_bid];
+                cpu_block.ref_count = 0;
+                self.free_cpu_block_ids.push_back(cpu_bid);
+            }
+        }
         if let Some(cpu_ids) = self.swapped_map.remove(&seq_id) {
             for cpu_bid in cpu_ids {
                 let cpu_block = &mut self.cpu_blocks[cpu_bid];
@@ -1292,5 +1305,236 @@ impl BlockManager {
                 self.free_cpu_block_ids.push_back(cpu_bid);
             }
         }
+    }
+
+    fn copy_kv_cache(&self, mappings: HashMap<usize, usize>, swap_in: bool) -> Result<()> {
+        if self.try_swap_kvcache(mappings, swap_in)? {
+            Ok(())
+        } else {
+            candle_core::bail!(
+                "KV cache swap {} was rejected by the runner",
+                if swap_in { "in" } else { "out" }
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BlockManager, PrefixCacheConfig};
+    use crate::core::runner::RunnerType;
+    use crate::core::sequence::Sequence;
+    use crate::runner::{receive_local, send_local, MessageType};
+    use crate::utils::config::SamplingParams;
+    use interprocess::local_socket::traits::{Listener, Stream};
+    use interprocess::local_socket::{
+        GenericNamespaced, ListenerOptions, Stream as LocalStream, ToNsName,
+    };
+    use interprocess::TryClone;
+    use parking_lot::RwLock;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{mpsc, Arc};
+    use std::thread::{self, JoinHandle};
+
+    fn mock_swap_runner(expected_swaps: usize) -> (LocalStream, JoinHandle<()>) {
+        mock_swap_runner_with_result(expected_swaps, true)
+    }
+
+    fn mock_swap_runner_with_result(
+        expected_swaps: usize,
+        swap_success: bool,
+    ) -> (LocalStream, JoinHandle<()>) {
+        static NEXT_SOCKET: AtomicUsize = AtomicUsize::new(0);
+        let socket_name = format!(
+            "xinfer-block-manager-test-{}-{}",
+            std::process::id(),
+            NEXT_SOCKET.fetch_add(1, Ordering::Relaxed)
+        );
+        let server_name = socket_name.clone();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let listener = ListenerOptions::new()
+                .name(
+                    server_name
+                        .to_ns_name::<GenericNamespaced>()
+                        .expect("test socket name"),
+                )
+                .create_sync()
+                .expect("create test socket");
+            ready_tx.send(()).expect("signal test socket ready");
+            let mut stream = listener.accept().expect("accept test runner");
+            let mut swaps = 0;
+            while swaps < expected_swaps {
+                let message = receive_local(&mut stream, false).expect("receive swap request");
+                let response = match message {
+                    MessageType::KVCacheSwap(_) => {
+                        swaps += 1;
+                        MessageType::KVCacheSwapResponse(swap_success)
+                    }
+                    MessageType::ClearBlocks(_) => MessageType::ClearBlocksResponse(true),
+                    other => panic!("unexpected test runner message: {other:?}"),
+                };
+                send_local(
+                    &mut vec![stream.try_clone().expect("clone test runner")],
+                    &response,
+                    false,
+                )
+                .expect("send swap response");
+            }
+        });
+        ready_rx.recv().expect("wait for test socket");
+        let stream = LocalStream::connect(
+            socket_name
+                .to_ns_name::<GenericNamespaced>()
+                .expect("test socket name"),
+        )
+        .expect("connect test runner");
+        (stream, handle)
+    }
+
+    fn manager_with_runner(
+        runner: LocalStream,
+        num_gpu_blocks: usize,
+        num_cpu_blocks: usize,
+    ) -> BlockManager {
+        BlockManager::new(
+            Arc::new(RwLock::new(RunnerType::Process(vec![runner]))),
+            num_gpu_blocks,
+            num_cpu_blocks,
+            4,
+            PrefixCacheConfig {
+                enabled: true,
+                max_cached_blocks: 8,
+            },
+            false,
+            1,
+        )
+    }
+
+    fn sequence(tokens: usize) -> Sequence {
+        Sequence::new(
+            (0..tokens as u32).collect(),
+            4,
+            SamplingParams::default(),
+            &None,
+            0,
+        )
+    }
+
+    #[test]
+    fn partial_prefix_swap_round_trip_reuses_gpu_prefix_and_cpu_suffix() {
+        let (runner, server) = mock_swap_runner(2);
+        let mut manager = manager_with_runner(runner, 8, 4);
+
+        // Seed the prefix cache with two reusable blocks. A full-block hit keeps
+        // the final block uncached so the prefill always has a writable block.
+        let mut seed = sequence(12);
+        manager.allocate(&mut seed).expect("allocate seed");
+        manager.cache_sequence(&seed);
+        manager.deallocate(&seed);
+
+        let mut seq = sequence(12);
+        manager
+            .allocate(&mut seq)
+            .expect("allocate cached sequence");
+        assert_eq!(seq.num_cached_tokens, 8);
+        assert_eq!(seq.block_table.len(), 3);
+
+        let prefix_blocks = seq.block_table[..2].to_vec();
+        manager.swap_out(&mut seq).expect("swap suffix to CPU");
+        assert_eq!(seq.block_table, prefix_blocks);
+        assert!(manager.has_partial_cpu_swap(seq.id));
+        assert_eq!(manager.swap_in_required_blocks(&seq), 1);
+
+        manager
+            .ensure_allocate(&mut seq)
+            .expect("reallocate suffix");
+        manager.swap_in(&mut seq).expect("swap suffix back in");
+        assert_eq!(&seq.block_table[..2], prefix_blocks.as_slice());
+        assert_eq!(seq.block_table.len(), 3);
+        assert!(!manager.has_cpu_swap(seq.id));
+        assert_eq!(manager.get_cpu_swap_usage(), 0.0);
+
+        manager.deallocate(&seq);
+        assert_eq!(manager.get_prefix_cache_match_tokens(&seq), 8);
+        drop(manager);
+        server.join().expect("join test runner");
+    }
+
+    #[test]
+    fn failed_incremental_allocation_rolls_back_all_new_blocks() {
+        let (runner, server) = mock_swap_runner(0);
+        let mut manager = manager_with_runner(runner, 3, 0);
+        let mut seq = sequence(16);
+        for _ in 0..2 {
+            seq.block_table
+                .push(manager.alloc_free_block().expect("allocate test block") as u32);
+        }
+        let free_before = manager.get_num_free_blocks();
+
+        assert!(manager.ensure_allocate(&mut seq).is_err());
+        assert_eq!(seq.block_table.len(), 2);
+        assert_eq!(manager.get_num_free_blocks(), free_before);
+        assert_eq!(manager.get_cpu_swap_usage(), 0.0);
+
+        drop(manager);
+        server.join().expect("join test runner");
+    }
+
+    #[test]
+    fn rejected_swap_does_not_consume_cpu_or_gpu_ownership() {
+        let (runner, server) = mock_swap_runner_with_result(1, false);
+        let mut manager = manager_with_runner(runner, 8, 4);
+        let mut seq = sequence(8);
+        manager.allocate(&mut seq).expect("allocate sequence");
+        let original_blocks = seq.block_table.clone();
+        let free_gpu_before = manager.get_num_free_blocks();
+
+        assert!(manager.swap_out(&mut seq).is_err());
+        assert_eq!(seq.block_table, original_blocks);
+        assert_eq!(manager.get_num_free_blocks(), free_gpu_before);
+        assert_eq!(manager.get_cpu_swap_usage(), 0.0);
+        assert!(!manager.has_cpu_swap(seq.id));
+
+        drop(manager);
+        server.join().expect("join test runner");
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn mamba_prefix_snapshot_spills_to_cpu_and_promotes_on_reuse() {
+        let Ok(device) = candle_core::Device::new_cuda(0) else {
+            return;
+        };
+        let mut cache = attention_rs::mamba_cache::MambaCache::new(
+            1,
+            1,
+            2,
+            2,
+            1,
+            2,
+            2,
+            candle_core::DType::F32,
+            candle_core::DType::F32,
+            &device,
+        )
+        .expect("create mamba cache");
+        cache.set_prefix_cache_capacity(1);
+        cache.allocate_slot(1).expect("allocate first slot");
+        assert!(cache
+            .capture_prefix_state(1, 11, true)
+            .expect("capture first snapshot"));
+        assert!(cache
+            .capture_prefix_state(1, 22, true)
+            .expect("capture second snapshot"));
+
+        // The device tier has capacity one, so the first snapshot must now be
+        // discoverable in the CPU tier and promotable after slot reuse.
+        assert!(cache.has_prefix_state(11));
+        cache.free_slot(1);
+        cache.allocate_slot(2).expect("reuse slot");
+        assert!(cache
+            .restore_prefix_state(2, 11)
+            .expect("promote CPU snapshot"));
     }
 }
