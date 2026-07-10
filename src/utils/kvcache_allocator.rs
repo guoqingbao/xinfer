@@ -29,8 +29,21 @@ const SIZE_IN_MB: f64 = (1024 * 1024) as f64;
 const SIZE_IN_GB: f64 = 1024.0 * 1024.0 * 1024.0;
 const DEFAULT_HYBRID_MAMBA_FRACTION: f64 = 0.20;
 const MAX_HYBRID_MAMBA_FRACTION: f64 = 0.35;
-const HYBRID_MAMBA_ACTIVE_SLOT_MULTIPLIER: usize = 3;
-const HYBRID_MAMBA_MIN_ACTIVE_SLOTS: usize = 8;
+/// The graph planner captures batches 1..=15, then 16 and 32. Keep the active
+/// Mamba pool within that range so every active slot can participate in a
+/// captured decode batch without consuming the entire prefix-state budget.
+pub(crate) const HYBRID_MAMBA_GRAPH_CAPTURE_MIN_BATCH: usize = 16;
+pub(crate) const HYBRID_MAMBA_GRAPH_CAPTURE_MAX_BATCH: usize = 32;
+
+pub(crate) fn hybrid_mamba_graph_capture_max_batch(max_num_seqs: usize) -> usize {
+    if max_num_seqs >= HYBRID_MAMBA_GRAPH_CAPTURE_MAX_BATCH {
+        HYBRID_MAMBA_GRAPH_CAPTURE_MAX_BATCH
+    } else {
+        // planned_graph_capture_batches() captures 16, then advances by 16;
+        // for requested sizes 16..31 its largest captured batch is therefore 16.
+        HYBRID_MAMBA_GRAPH_CAPTURE_MIN_BATCH
+    }
+}
 
 /// Per-category GPU memory budget computed deterministically from model config.
 #[derive(Debug, Clone)]
@@ -580,15 +593,17 @@ impl KVCacheAllocator {
                                 econfig.mamba_cache_capacity = None;
                                 return Ok(());
                             }
-                            let active_mamba_capacity = if econfig.prefix_cache.unwrap_or(false) {
-                                econfig
-                                    .max_num_seqs
-                                    .saturating_mul(HYBRID_MAMBA_ACTIVE_SLOT_MULTIPLIER)
-                                    .max(HYBRID_MAMBA_MIN_ACTIVE_SLOTS)
-                                    .min(mamba_budget_slots)
+                            let active_slot_limit = if econfig.prefix_cache.unwrap_or(false) {
+                                // Keep enough Mamba snapshot slots for prefix reuse to
+                                // remain effective: prefix capacity must be at least
+                                // the active capacity.
+                                (mamba_budget_slots / 2).max(1)
                             } else {
                                 mamba_budget_slots
                             };
+                            let active_mamba_capacity =
+                                hybrid_mamba_graph_capture_max_batch(econfig.max_num_seqs)
+                                    .min(active_slot_limit);
                             if allocation.max_num_seqs > active_mamba_capacity {
                                 crate::log_warn!(
                                     "Clamping max_num_seqs from {} to {} due to hybrid mamba slot capacity.",
