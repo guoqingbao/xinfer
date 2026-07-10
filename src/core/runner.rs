@@ -28,7 +28,7 @@ use crate::{
     models::glm4_moe_lite::GLM4MoeLiteForCausalLM,
     models::llama::LLaMaForCausalLM,
     models::llama4::LLama4ForConditionalGeneration,
-    models::minimax::MiniMaxForCausalLM,
+    models::minimax3::MiniMaxModel,
     models::mistral3_vl::Mistral3ForConditionalGeneration,
     models::phi4::Phi4ForCausalLM,
     models::qwen3::Qwen3ForCausalLM,
@@ -107,7 +107,7 @@ pub enum Model {
     Gemma3(Arc<Gemma3ForConditionalGeneration>),
     Gemma4(Arc<Gemma4ForCausalLM>),
     Qwen3VL(Arc<Qwen3VLForConditionalGeneration>),
-    MiniMax(Arc<MiniMaxForCausalLM>),
+    MiniMax(Arc<MiniMaxModel>),
 }
 
 pub enum RunnerType {
@@ -319,7 +319,7 @@ impl ModelRunner {
                 Gemma3 => Gemma3ForConditionalGeneration,
                 Gemma4 => Gemma4ForCausalLM,
                 Qwen3VL => Qwen3VLForConditionalGeneration,
-                MiniMax => MiniMaxForCausalLM,
+                MiniMax => MiniMaxModel,
             }
         )?;
 

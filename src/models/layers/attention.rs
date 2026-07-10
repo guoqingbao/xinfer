@@ -410,8 +410,11 @@ impl Attention {
                 | "Qwen3NextForCausalLM"
                 | "Qwen3NextForConditionalGeneration"
         );
+        let is_minimax_m3 = arch.starts_with("MiniMaxM3");
         let attention_bias = if is_qwen35_or_next {
             config.qkv_bias.or(config.attention_bias).unwrap_or(false)
+        } else if is_minimax_m3 {
+            false
         } else {
             config.qkv_bias.or(config.attention_bias).unwrap_or(true)
         };
@@ -422,7 +425,8 @@ impl Attention {
         };
         let q_out_dim = num_heads * head_dim * if attn_output_gate { 2 } else { 1 };
         let is_gemma = arch == "Gemma3ForConditionalGeneration".to_string()
-            || arch == "Gemma3ForCausalLM".to_string();
+            || arch == "Gemma3ForCausalLM".to_string()
+            || is_minimax_m3;
         let is_mlx_nvfp4 = config
             .quantization_config
             .as_ref()

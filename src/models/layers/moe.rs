@@ -1,4 +1,5 @@
 // src/models/layers/moe.rs
+use crate::models::layers::activation::GatedActivation;
 use crate::models::layers::distributed::{shard, AllReduce, Comm};
 use crate::models::layers::linear::{linear_no_bias_x as linear_no_bias, LinearX as Linear};
 use crate::models::layers::{isq_high_precision_dtype, VarBuilderX};
@@ -6,7 +7,6 @@ use crate::utils::config::Config;
 use crate::utils::config::QuantConfig;
 use attention_rs::moe;
 use attention_rs::moe::moe_gemm_fp8;
-use attention_rs::silu_and_mul::silu_and_mul;
 use attention_rs::sort::ArgSortOp;
 use candle_core::Module;
 use candle_core::{
@@ -14,7 +14,6 @@ use candle_core::{
     DType, Result, Tensor, D,
 };
 use candle_nn::var_builder::Shard;
-use candle_nn::Activation;
 use either::Either;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -25,19 +24,9 @@ use std::sync::Arc;
 pub(crate) fn gated_activation(
     gate_up: &Tensor,
     half_dim: usize,
-    act: &Activation,
+    act: &GatedActivation,
 ) -> Result<Tensor> {
-    if matches!(act, Activation::Silu) {
-        silu_and_mul(gate_up, half_dim)
-    } else {
-        let gate = gate_up
-            .narrow(candle_core::D::Minus1, 0, half_dim)?
-            .contiguous()?;
-        let up = gate_up
-            .narrow(candle_core::D::Minus1, half_dim, half_dim)?
-            .contiguous()?;
-        (up * gate.apply(act)?)?.contiguous()
-    }
+    act.forward_fused(gate_up, half_dim)
 }
 
 /// Shared MoE routing config extracted from MoEConfig at construction time.
@@ -332,7 +321,7 @@ pub struct FusedMoe {
     gate_up_w: Tensor,
     down_w: Tensor,
     w_size_n: usize,
-    act: candle_nn::Activation,
+    act: GatedActivation,
     routing: MoeRouting,
     all_reduce: AllReduce,
     world_size: usize,
@@ -544,7 +533,10 @@ This usually means packed down_proj / gate_up_proj layout was interpreted incorr
             gate_up_w,
             down_w,
             w_size_n,
-            act: cfg.hidden_act,
+            act: GatedActivation::from_model_config(
+                cfg.hidden_act.clone(),
+                cfg.extra_config_json.as_deref(),
+            ),
             routing: MoeRouting::from_moe_cfg(
                 moe_cfg,
                 try_load_e_score_correction_bias(bias_vb, num_experts),
@@ -2076,7 +2068,7 @@ pub struct FusedMoeFp8 {
     down_experts: Tensor,
     down_experts_scale: Tensor,
     w_size_n: usize,
-    act: candle_nn::Activation,
+    act: GatedActivation,
     routing: MoeRouting,
     all_reduce: AllReduce,
     world_size: usize,
@@ -2339,7 +2331,10 @@ impl FusedMoeFp8 {
             down_experts,
             down_experts_scale,
             w_size_n,
-            act: cfg.hidden_act,
+            act: GatedActivation::from_model_config(
+                cfg.hidden_act.clone(),
+                cfg.extra_config_json.as_deref(),
+            ),
             routing: MoeRouting::from_moe_cfg(
                 moe_cfg,
                 try_load_e_score_correction_bias(bias_vb, num_experts),
@@ -2415,7 +2410,7 @@ pub struct FusedMoeMxfp4 {
     down_blocks: Tensor,
     down_scales: Tensor,
     w_size_n: usize,
-    act: candle_nn::Activation,
+    act: GatedActivation,
     routing: MoeRouting,
     all_reduce: AllReduce,
     world_size: usize,
@@ -2590,7 +2585,10 @@ impl FusedMoeMxfp4 {
             down_blocks,
             down_scales,
             w_size_n,
-            act: cfg.hidden_act,
+            act: GatedActivation::from_model_config(
+                cfg.hidden_act.clone(),
+                cfg.extra_config_json.as_deref(),
+            ),
             routing: MoeRouting::from_moe_cfg(
                 moe_cfg,
                 try_load_e_score_correction_bias(bias_vb, num_experts),
@@ -2726,7 +2724,7 @@ pub struct FusedMoeNvfp4 {
     down_input_scales: Tensor,
     down_scales_swizzled: Option<Tensor>,
     w_size_n: usize,
-    act: Activation,
+    act: GatedActivation,
     routing: MoeRouting,
     all_reduce: AllReduce,
     world_size: usize,
@@ -3283,7 +3281,10 @@ impl FusedMoeNvfp4 {
             down_input_scales,
             down_scales_swizzled,
             w_size_n,
-            act: cfg.hidden_act,
+            act: GatedActivation::from_model_config(
+                cfg.hidden_act.clone(),
+                cfg.extra_config_json.as_deref(),
+            ),
             routing: MoeRouting::from_moe_cfg(moe_cfg, bias),
             all_reduce: AllReduce::new(comm.clone()),
             world_size: comm.world_size(),

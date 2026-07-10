@@ -1221,6 +1221,32 @@ pub(crate) fn load_fp8_input_scale(vb: &VarBuilder) -> Result<Option<f32>> {
     Ok(Some(scale))
 }
 
+/// Load a block-FP8 scale tensor.  ModelOpt's M3 export stores the E4M3
+/// scale bytes as U8 in some shards and as native F8_E4M3 in others.  Candle
+/// cannot convert U8 to F8 by `to_dtype`, so decode that representation on
+/// the host once during model construction.
+fn load_fp8_scale(
+    vb: &VarBuilder,
+    shape: (usize, usize),
+    name: &str,
+    shard: Shard,
+) -> Result<Tensor> {
+    if let Ok(scale) = vb.get_with_hints_dtype(shape, name, shard, DType::F8E4M3) {
+        return scale.to_dtype(DType::F32);
+    }
+
+    if let Ok(raw) = vb.get_with_hints_dtype(shape, name, shard, DType::U8) {
+        let bytes = raw.flatten_all()?.to_vec1::<u8>()?;
+        let values = bytes
+            .into_iter()
+            .map(candle_core::f8e4m3_decode)
+            .collect::<Vec<_>>();
+        return Tensor::from_vec(values, raw.shape().clone(), vb.device());
+    }
+
+    vb.get_with_hints_dtype(shape, name, shard, DType::F32)
+}
+
 impl LnFp8 {
     pub fn new(
         in_dim: usize,
@@ -1259,28 +1285,46 @@ impl LnFp8 {
         } else {
             DType::F32
         };
-        let weight_scale = match vb.get_with_hints_dtype(
-            (scale_dim0, scale_dim1),
-            "weight_scale",
-            shard,
-            scale_dtype,
-        ) {
-            Ok(s) => s,
-            Err(_) => match vb.get_with_hints_dtype(
+        let weight_scale = if block_size == [1, 32] && scale_dtype == DType::F32 {
+            match load_fp8_scale(&vb, (scale_dim0, scale_dim1), "weight_scale", shard) {
+                Ok(s) => s,
+                Err(_) => {
+                    match load_fp8_scale(&vb, (scale_dim0, scale_dim1), "weight_scale_inv", shard) {
+                        Ok(s) => s,
+                        Err(_) => load_fp8_scale(&vb, (scale_dim0, scale_dim1), "scale", shard)
+                            .map_err(|_| {
+                                candle_core::Error::Msg(
+                                    "LnFp8: Missing weight_scale, weight_scale_inv, or scale"
+                                        .into(),
+                                )
+                            })?,
+                    }
+                }
+            }
+        } else {
+            match vb.get_with_hints_dtype(
                 (scale_dim0, scale_dim1),
-                "weight_scale_inv",
+                "weight_scale",
                 shard,
                 scale_dtype,
             ) {
                 Ok(s) => s,
-                Err(_) => vb
-                    .get_with_hints_dtype((scale_dim0, scale_dim1), "scale", shard, scale_dtype)
-                    .map_err(|_| {
-                        candle_core::Error::Msg(
-                            "LnFp8: Missing weight_scale, weight_scale_inv, or scale".into(),
-                        )
-                    })?,
-            },
+                Err(_) => match vb.get_with_hints_dtype(
+                    (scale_dim0, scale_dim1),
+                    "weight_scale_inv",
+                    shard,
+                    scale_dtype,
+                ) {
+                    Ok(s) => s,
+                    Err(_) => vb
+                        .get_with_hints_dtype((scale_dim0, scale_dim1), "scale", shard, scale_dtype)
+                        .map_err(|_| {
+                            candle_core::Error::Msg(
+                                "LnFp8: Missing weight_scale, weight_scale_inv, or scale".into(),
+                            )
+                        })?,
+                },
+            }
         };
         // Keep UE8M0 scales as F8E8M0 bytes; converting to F32 via Candle corrupts them.
         let weight_scale = if scale_dtype == DType::F8E8M0 {
@@ -1298,7 +1342,7 @@ impl LnFp8 {
         let sm_version = 0;
 
         #[cfg(feature = "cutlass")]
-        let weight_scale_cutlass = if scale_dtype == DType::F8E8M0 {
+        let weight_scale_cutlass = if scale_dtype == DType::F8E8M0 || block_size != [128, 128] {
             None
         } else if sm_version >= 100 {
             Some(weight_scale.t()?)
@@ -1520,6 +1564,20 @@ fn load_ln_fp8_with_hints(
                 s
             } else if let Some(s) = load_scale(&vb, "scale", scale_dim0, scale_dim1, shard)? {
                 s
+            } else if block_size == [1, 32] {
+                let load_m3_scale =
+                    |name: &str| load_fp8_scale(&vb, (scale_dim0, scale_dim1), name, shard);
+                if let Ok(s) = load_m3_scale("weight_scale") {
+                    s
+                } else if let Ok(s) = load_m3_scale("weight_scale_inv") {
+                    s
+                } else {
+                    load_m3_scale("scale").map_err(|_| {
+                        candle_core::Error::Msg(
+                            "LnFp8: Missing weight_scale, weight_scale_inv, or scale".into(),
+                        )
+                    })?
+                }
             } else {
                 match vb.get_with_hints_dtype(
                     (scale_dim0, scale_dim1),
@@ -1551,30 +1609,6 @@ fn load_ln_fp8_with_hints(
                     },
                 }
             }
-        } else {
-            match vb.get_with_hints_dtype(
-                (scale_dim0, scale_dim1),
-                "weight_scale",
-                shard,
-                scale_dtype,
-            ) {
-                Ok(s) => s,
-                Err(_) => match vb.get_with_hints_dtype(
-                    (scale_dim0, scale_dim1),
-                    "weight_scale_inv",
-                    shard,
-                    scale_dtype,
-                ) {
-                    Ok(s) => s,
-                    Err(_) => vb
-                        .get_with_hints_dtype((scale_dim0, scale_dim1), "scale", shard, scale_dtype)
-                        .map_err(|_| {
-                            candle_core::Error::Msg(
-                                "LnFp8: Missing weight_scale, weight_scale_inv, or scale".into(),
-                            )
-                        })?,
-                },
-            }
         };
         (weight_scale, shard, (scale_dim0, scale_dim1))
     };
@@ -1595,7 +1629,7 @@ fn load_ln_fp8_with_hints(
     let sm_version = 0;
 
     #[cfg(feature = "cutlass")]
-    let weight_scale_cutlass = if scale_dtype == DType::F8E8M0 {
+    let weight_scale_cutlass = if scale_dtype == DType::F8E8M0 || block_size != [128, 128] {
         None
     } else if sm_version >= 100 {
         // SM100+: Column-major scale layout
