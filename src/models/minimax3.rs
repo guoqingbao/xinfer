@@ -2,6 +2,7 @@ use crate::models::layers::activation::GatedActivation;
 use crate::models::layers::attention::Attention;
 use crate::models::layers::distributed::{Comm, VocabParallelLinear};
 use crate::models::layers::mask::get_attention_causal_mask;
+use crate::models::layers::minimax3_attention::MiniMax3SparseAttention;
 use crate::models::layers::mlp::MLP;
 use crate::models::layers::moe::{
     FusedMoe, FusedMoeFp8, FusedMoeGGUF, FusedMoeISQ, FusedMoeMxfp4, FusedMoeNvfp4,
@@ -26,6 +27,11 @@ struct MiniMax3Config {
     shared_intermediate_size: usize,
     first_k_dense_replace: usize,
     use_gemma_norm: bool,
+    sparse_index_dim: usize,
+    sparse_index_heads: usize,
+    sparse_topk_blocks: usize,
+    sparse_block_size: usize,
+    sparse_attention_freq: Vec<bool>,
 }
 
 impl MiniMax3Config {
@@ -43,6 +49,15 @@ impl MiniMax3Config {
                 .map(|v| v as usize)
                 .unwrap_or(default)
         };
+        let sparse = cfg
+            .get("sparse_attention_config")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        let sparse_attention_freq = sparse
+            .get("sparse_attention_freq")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().map(|v| v.as_u64().unwrap_or(0) != 0).collect())
+            .unwrap_or_default();
         Ok(Self {
             dense_intermediate_size: get_usize("dense_intermediate_size", config.intermediate_size),
             shared_intermediate_size: get_usize(
@@ -54,7 +69,69 @@ impl MiniMax3Config {
                 .get("use_gemma_norm")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(true),
+            sparse_index_dim: sparse
+                .get("sparse_index_dim")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(128) as usize,
+            sparse_index_heads: sparse
+                .get("sparse_num_index_heads")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(config.num_key_value_heads as u64)
+                as usize,
+            sparse_topk_blocks: sparse
+                .get("sparse_topk_blocks")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(16) as usize,
+            sparse_block_size: sparse
+                .get("sparse_block_size")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(128) as usize,
+            sparse_attention_freq,
         })
+    }
+
+    fn is_sparse_layer(&self, layer_idx: usize) -> bool {
+        self.sparse_attention_freq
+            .get(layer_idx)
+            .copied()
+            .unwrap_or(false)
+    }
+}
+
+enum MiniMax3AttentionVariant {
+    Dense(Attention),
+    Sparse(MiniMax3SparseAttention),
+}
+
+impl MiniMax3AttentionVariant {
+    #[allow(clippy::too_many_arguments)]
+    fn forward(
+        &self,
+        xs: &Tensor,
+        rotary_emb: &Option<Arc<dyn ApplyRotaryEmbedding>>,
+        attention_mask: Option<&Vec<Tensor>>,
+        positions: &Tensor,
+        cache: Option<(&Tensor, &Tensor)>,
+        input_metadata: &InputMetadata,
+    ) -> Result<Tensor> {
+        match self {
+            Self::Dense(attn) => attn.forward(
+                xs,
+                rotary_emb,
+                attention_mask,
+                positions,
+                cache,
+                input_metadata,
+            ),
+            Self::Sparse(attn) => attn.forward(
+                xs,
+                rotary_emb,
+                attention_mask,
+                positions,
+                cache,
+                input_metadata,
+            ),
+        }
     }
 }
 
@@ -83,7 +160,7 @@ impl MoeVariant {
 }
 
 pub struct MiniMax3DecoderLayer {
-    self_attn: Attention,
+    self_attn: MiniMax3AttentionVariant,
     moe: MoeVariant,
     shared_expert: Option<MLP>,
     input_layernorm: NormX,
@@ -106,18 +183,33 @@ impl MiniMax3DecoderLayer {
             config.extra_config_json.as_deref(),
         );
         let is_qvar_builder = vb.is_qvar_builder();
-        let self_attn = Attention::new(
-            if is_qvar_builder {
-                vb.clone()
-            } else {
-                vb.pp("self_attn").clone()
-            },
-            comm.clone(),
-            config,
-            None,
-            config.sliding_window,
-            dtype,
-        )?;
+        let self_attn_vb = if is_qvar_builder {
+            vb.clone()
+        } else {
+            vb.pp("self_attn").clone()
+        };
+        let self_attn = if m3_config.is_sparse_layer(_layer_idx) && !is_qvar_builder {
+            MiniMax3AttentionVariant::Sparse(MiniMax3SparseAttention::new(
+                self_attn_vb,
+                comm.clone(),
+                config,
+                m3_config.sparse_index_dim,
+                m3_config.sparse_index_heads,
+                m3_config.sparse_topk_blocks,
+                m3_config.sparse_block_size,
+                m3_config.use_gemma_norm,
+                dtype,
+            )?)
+        } else {
+            MiniMax3AttentionVariant::Dense(Attention::new(
+                self_attn_vb,
+                comm.clone(),
+                config,
+                None,
+                config.sliding_window,
+                dtype,
+            )?)
+        };
 
         let moe_vb = vb.pp("block_sparse_moe");
 

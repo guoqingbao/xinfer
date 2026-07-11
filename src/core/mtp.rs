@@ -314,6 +314,7 @@ impl ModelRunner {
             max_seqlen_k: seq_info.len + q_len,
             max_context_len: seq_info.len + q_len,
             flashinfer_metadata,
+            kv_seqlens: None,
             is_mtp_verify: true,
         })
     }

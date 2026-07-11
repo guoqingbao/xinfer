@@ -1214,6 +1214,7 @@ impl ModelRunner {
         let block_tables = Some(block_tables_t);
         let context_lens = Some(context_lens_t);
         let cu_seqlens_q_vec = cu_seqlens_q.clone();
+        let cu_seqlens_k_vec = cu_seqlens_k.clone();
         let cu_seqlens_q = Tensor::from_vec(cu_seqlens_q, (q_len,), &self.device)?;
         let cu_seqlens_k = Tensor::from_vec(cu_seqlens_k, (k_len,), &self.device)?;
 
@@ -1370,6 +1371,7 @@ impl ModelRunner {
             max_seqlen_k,
             max_context_len,
             seqlens: Some(cu_seqlens_q_vec[1..].to_vec()),
+            kv_seqlens: Some(cu_seqlens_k_vec[1..].to_vec()),
             flashinfer_metadata,
             is_mtp_verify: false,
         };
@@ -1557,6 +1559,7 @@ impl ModelRunner {
             max_seqlen_k: 0,
             max_context_len,
             seqlens: None,
+            kv_seqlens: None,
             flashinfer_metadata,
             is_mtp_verify: false,
         };

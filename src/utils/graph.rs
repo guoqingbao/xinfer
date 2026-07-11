@@ -627,6 +627,7 @@ impl<M: CudaGraphModule> GraphCapturer<M> {
                     max_seqlen_k: 0,
                     max_context_len: self.max_model_len,
                     seqlens: None,
+                    kv_seqlens: None,
                     flashinfer_metadata,
                     is_mtp_verify: false,
                 };
@@ -956,6 +957,7 @@ impl<M: CudaGraphModule> GraphCapturer<M> {
             max_seqlen_k: self.max_model_len,
             max_context_len: self.max_model_len,
             seqlens: None,
+            kv_seqlens: None,
             flashinfer_metadata,
             is_mtp_verify: true,
         };
