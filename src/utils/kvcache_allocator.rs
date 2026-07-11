@@ -277,7 +277,11 @@ impl KVCacheAllocator {
             .unwrap_or(if cfg!(feature = "flashattn") {
                 0.7
             } else {
-                0.6
+                if cfg!(feature = "cuda") {
+                    0.6
+                } else {
+                    0.4
+                }
             }) as f64;
 
         let config_model_len = econfig
@@ -417,7 +421,11 @@ impl KVCacheAllocator {
             },
             config_model_len,
             kv_fraction: if econfig.max_model_len.is_some() && econfig.kv_fraction.is_none() {
-                0.95
+                if cfg!(feature = "cuda") {
+                    0.8
+                } else {
+                    0.6
+                }
             } else {
                 kv_fraction
             },
