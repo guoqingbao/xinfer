@@ -1597,7 +1597,7 @@ mod tests {
             "quantization_status": "compressed",
             "sparsity_config": {},
             "transform_config": {},
-            "version": "0.13.8.dev54+g704d57b"
+            "version": "0.13.9.dev54+g704d57b"
         }"#;
         let mut cfg: QuantConfig = serde_json::from_str(json).unwrap();
         cfg.normalize_compressed_tensors();
