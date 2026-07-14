@@ -38,6 +38,7 @@ pub struct MiniMax3SparseAttention {
     block_size: usize,
     scale: f32,
     dtype: DType,
+    promote_qk_to_f32: bool,
 }
 
 impl MiniMax3SparseAttention {
@@ -184,6 +185,7 @@ impl MiniMax3SparseAttention {
             block_size,
             scale: 1.0 / (head_dim as f32).sqrt(),
             dtype,
+            promote_qk_to_f32: config.higher_precision_required(),
         })
     }
 
@@ -198,14 +200,21 @@ impl MiniMax3SparseAttention {
         rotary_emb: &Option<Arc<dyn ApplyRotaryEmbedding>>,
         positions: &Tensor,
     ) -> Result<(Tensor, Tensor, Tensor, Tensor, Tensor)> {
+        let promote_qk = |x: Tensor| {
+            if self.promote_qk_to_f32 && x.dtype() != DType::F32 {
+                x.to_dtype(DType::F32)
+            } else {
+                Ok(x)
+            }
+        };
         let q = self.norm_heads(
-            self.q_proj.forward(xs)?,
+            promote_qk(self.q_proj.forward(xs)?)?,
             &self.q_norm,
             self.num_heads,
             self.head_dim,
         )?;
         let k = self.norm_heads(
-            self.k_proj.forward(xs)?,
+            promote_qk(self.k_proj.forward(xs)?)?,
             &self.k_norm,
             self.num_kv_heads,
             self.head_dim,
@@ -216,12 +225,13 @@ impl MiniMax3SparseAttention {
             .reshape(((), self.num_kv_heads, self.head_dim))?;
 
         let iq = self.norm_heads(
-            self.index_q_proj.forward(xs)?,
+            promote_qk(self.index_q_proj.forward(xs)?)?,
             &self.index_q_norm,
             self.index_heads,
             self.index_dim,
         )?;
-        let ik = self.index_k_norm.forward(&self.index_k_proj.forward(xs)?)?;
+        let index_k = promote_qk(self.index_k_proj.forward(xs)?)?;
+        let ik = self.index_k_norm.forward(&index_k)?;
 
         let (q, k) = if let Some(rope) = rotary_emb {
             match rope.apply_rotary_emb_qkv(&q, &k, positions)? {
