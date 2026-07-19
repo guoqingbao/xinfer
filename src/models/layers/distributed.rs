@@ -316,6 +316,7 @@ pub struct TensorParallelRowLinear {
     dtype: DType,
 }
 
+#[derive(Clone)]
 #[allow(dead_code)]
 pub struct AllReduce {
     comm: Rc<Comm>,
@@ -327,6 +328,9 @@ unsafe impl Send for AllReduce {}
 impl AllReduce {
     pub fn new(comm: Rc<Comm>) -> Self {
         Self { comm: comm.clone() }
+    }
+    pub fn world_size(&self) -> usize {
+        self.comm.world_size()
     }
     pub fn apply(&self, xs: &Tensor) -> Result<Tensor> {
         xs.apply_op1_no_bwd(self)
@@ -425,6 +429,12 @@ impl CustomOp1 for AllReduce {
 }
 
 impl TensorParallelRowLinear {
+    /// Run the local row-parallel shard without the collective. DeepSeek V4
+    /// performs its output reduction in FP32 immediately before HC post.
+    pub fn forward_local(&self, x: &Tensor) -> Result<Tensor> {
+        self.linear.forward(x)
+    }
+
     #[allow(unused_variables)]
     pub fn new(linear: Linear, comm: Rc<Comm>, dtype: DType) -> Self {
         #[cfg(feature = "nccl")]

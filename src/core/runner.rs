@@ -21,6 +21,7 @@ use crate::utils::FlashInferKvParams;
 use crate::{
     core::sequence::{DecodeSequence, Sequence, ToDecodeInput},
     models::deepseek3::DeepSeekForCausalLM,
+    models::deepseek4::DeepSeekV4ForCausalLM,
     models::glm4::GLM4ForCausalLM,
     models::glm4_moe::GLM4MoEForCausalLM,
     models::glm4_moe_lite::GLM4MoeLiteForCausalLM,
@@ -99,6 +100,7 @@ pub enum Model {
     GLM4MoE(Arc<GLM4MoEForCausalLM>),
     GLM4MoeLite(Arc<GLM4MoeLiteForCausalLM>),
     DeepSeek(Arc<DeepSeekForCausalLM>),
+    DeepSeekV4(Arc<DeepSeekV4ForCausalLM>),
     GLM5(Arc<DeepSeekForCausalLM>),
     Mistral3VL(Arc<Mistral3ForConditionalGeneration>),
     Gemma3(Arc<Gemma3ForConditionalGeneration>),
@@ -157,7 +159,7 @@ impl ModelRunner {
     pub(crate) fn is_mla_model(&self) -> bool {
         matches!(
             self.model_type,
-            ModelType::GLM4MoeLite | ModelType::DeepSeek | ModelType::GLM5
+            ModelType::GLM4MoeLite | ModelType::DeepSeek | ModelType::DeepSeekV4 | ModelType::GLM5
         )
     }
 
@@ -276,11 +278,15 @@ impl ModelRunner {
             && (has_mtp_config || has_mtp_weights)
             && has_mtp_weights;
 
+        let mut model_config = config.clone();
+        if model_config.max_model_len.is_none() {
+            model_config.max_model_len = econfig.max_model_len.or(Some(8192));
+        }
         let model = crate::build_model!(
             model_type,
             vb,
             comm,
-            config,
+            &model_config,
             dtype,
             is_rope_i,
             &device,
@@ -297,6 +303,7 @@ impl ModelRunner {
                 GLM4MoE => GLM4MoEForCausalLM,
                 GLM4MoeLite => GLM4MoeLiteForCausalLM,
                 DeepSeek => DeepSeekForCausalLM,
+                DeepSeekV4 => DeepSeekV4ForCausalLM,
                 GLM5 => DeepSeekForCausalLM,
                 Mistral3VL => Mistral3ForConditionalGeneration,
                 Gemma3 => Gemma3ForConditionalGeneration,
@@ -322,6 +329,7 @@ impl ModelRunner {
                 GLM4MoE => EmbedInputs,
                 GLM4MoeLite => EmbedInputs,
                 DeepSeek => EmbedInputs,
+                DeepSeekV4 => EmbedInputs,
                 GLM5 => EmbedInputs,
                 Mistral3VL => NoneArg,
                 Gemma3 => NoneArg,
@@ -348,6 +356,7 @@ impl ModelRunner {
                     GLM4MoE => EmbedInputs,
                     GLM4MoeLite => EmbedInputs,
                     DeepSeek => EmbedInputs,
+                    DeepSeekV4 => EmbedInputs,
                     GLM5 => EmbedInputs,
                     Mistral3VL => NoneArg,
                     Gemma3 => NoneArg,
@@ -560,7 +569,10 @@ impl ModelRunner {
                 let (_, page_size, num_kv_heads, head_dim) = k_cache.dims4()?;
                 let is_mla = matches!(
                     model_type,
-                    ModelType::GLM4MoeLite | ModelType::DeepSeek | ModelType::GLM5
+                    ModelType::GLM4MoeLite
+                        | ModelType::DeepSeek
+                        | ModelType::DeepSeekV4
+                        | ModelType::GLM5
                 );
                 params = Some(FlashInferKvParams {
                     kv_dtype: k_cache.dtype(),
@@ -689,7 +701,10 @@ impl ModelRunner {
                 &flashinfer_kv_params,
                 matches!(
                     model_type,
-                    ModelType::GLM4MoeLite | ModelType::DeepSeek | ModelType::GLM5
+                    ModelType::GLM4MoeLite
+                        | ModelType::DeepSeek
+                        | ModelType::DeepSeekV4
+                        | ModelType::GLM5
                 ),
             ),
             #[cfg(all(feature = "cuda", feature = "graph"))]
@@ -704,7 +719,10 @@ impl ModelRunner {
                     &flashinfer_kv_params,
                     matches!(
                         model_type,
-                        ModelType::GLM4MoeLite | ModelType::DeepSeek | ModelType::GLM5
+                        ModelType::GLM4MoeLite
+                            | ModelType::DeepSeek
+                            | ModelType::DeepSeekV4
+                            | ModelType::GLM5
                     ),
                 )
             }),
@@ -977,6 +995,7 @@ impl ModelRunner {
                 GLM4MoE => false,
                 GLM4MoeLite => false,
                 DeepSeek => false,
+                DeepSeekV4 => false,
                 GLM5 => false,
                 Mistral3VL => images,
                 Gemma3 => images,
@@ -1753,6 +1772,7 @@ impl ModelRunner {
             Model::GLM4MoE(model) => model.get_vocab_size(),
             Model::GLM4MoeLite(model) => model.get_vocab_size(),
             Model::DeepSeek(model) => model.get_vocab_size(),
+            Model::DeepSeekV4(model) => model.get_vocab_size(),
             Model::GLM5(model) => model.get_vocab_size(),
             Model::Mistral3VL(model) => model.get_vocab_size(),
             Model::Gemma3(model) => model.get_vocab_size(),

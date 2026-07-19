@@ -22,7 +22,11 @@ use std::sync::Arc;
 /// Apply gated activation on fused gate_up tensor.
 /// Uses optimized `silu_and_mul` kernel for SiLU activation, falls back to
 /// generic tensor operations for other activations (e.g., GeluPytorchTanh).
-fn gated_activation(gate_up: &Tensor, half_dim: usize, act: &Activation) -> Result<Tensor> {
+pub(crate) fn gated_activation(
+    gate_up: &Tensor,
+    half_dim: usize,
+    act: &Activation,
+) -> Result<Tensor> {
     if matches!(act, Activation::Silu) {
         silu_and_mul(gate_up, half_dim)
     } else {
@@ -158,7 +162,10 @@ fn select_topk_indices(scores: &Tensor, topk: usize, is_prefill: bool) -> Result
     sorted_idx.narrow(D::Minus1, 0, topk)?.contiguous()
 }
 
-fn sort_expert_assignments(topk_ids: &Tensor, is_prefill: bool) -> Result<(Tensor, Tensor)> {
+pub(crate) fn sort_expert_assignments(
+    topk_ids: &Tensor,
+    is_prefill: bool,
+) -> Result<(Tensor, Tensor)> {
     let flat = topk_ids.flatten_all()?;
     if is_prefill {
         flat.sort(true)
@@ -180,9 +187,12 @@ fn presorted_expert_assignments(
 
 /// Try to load `e_score_correction_bias` from the MoE var-builder.
 /// First tries `gate.e_score_correction_bias` (Qwen style), then falls back
-/// to `e_score_correction_bias` directly (MiniMax style), then tries
-/// `exp_probs_b.bias` (GLM-DSA / GGUF style).
-fn try_load_e_score_correction_bias(vb: &VarBuilderX, num_experts: usize) -> Option<Tensor> {
+/// to `e_score_correction_bias` directly (MiniMax style), then
+/// `exp_probs_b.bias` (GLM-DSA / GGUF style), then `gate.bias`.
+pub(crate) fn try_load_e_score_correction_bias(
+    vb: &VarBuilderX,
+    num_experts: usize,
+) -> Option<Tensor> {
     let vb_gate = vb.pp("gate");
     vb_gate
         .get_with_hints_dtype(
@@ -206,6 +216,11 @@ fn try_load_e_score_correction_bias(vb: &VarBuilderX, num_experts: usize) -> Opt
                 .get_with_hints_dtype(num_experts, "bias", shard(0, 0, 1), DType::F32)
                 .ok()
         })
+        .or_else(|| {
+            vb_gate
+                .get_with_hints_dtype(num_experts, "bias", shard(0, 0, 1), DType::F32)
+                .ok()
+        })
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -226,7 +241,7 @@ enum PackedDownLayout {
 
 /// Resolve per-expert projection sub-prefix. Falls back from standard
 /// `gate_proj`/`up_proj`/`down_proj` to MiniMax-style `w1`/`w3`/`w2`.
-fn resolve_expert_proj_prefix(
+pub(crate) fn resolve_expert_proj_prefix(
     expert_vb: &candle_nn::var_builder::ShardedVarBuilder,
 ) -> (&'static str, &'static str, &'static str) {
     if expert_vb.contains_tensor("gate_proj.weight")
@@ -2420,6 +2435,32 @@ impl FusedMoeMxfp4 {
         }
     }
 
+    fn load_mxfp4_packed(
+        vb: &candle_nn::var_builder::ShardedVarBuilder,
+        shape: (usize, usize),
+        name: &str,
+        shard_hint: Shard,
+    ) -> Result<Tensor> {
+        // Packed FP4/INT8 tensors are byte payloads.  Candle maps safetensors
+        // I8/F4 to U8 without changing the payload, which is what the MXFP4
+        // kernels expect.
+        vb.get_with_hints_dtype(shape, name, shard_hint, DType::U8)
+    }
+
+    fn load_mxfp4_scale(
+        vb: &candle_nn::var_builder::ShardedVarBuilder,
+        shape: (usize, usize),
+        name: &str,
+        shard_hint: Shard,
+    ) -> Result<Tensor> {
+        // Preserve logical F8 scale tensors as U8-backed FP8.  Requesting U8
+        // first would numerically convert F8_E8M0/F8_E4M3 and corrupt the
+        // exponent bytes consumed by the MXFP4 CUDA kernels.
+        vb.get_with_hints_dtype(shape, name, shard_hint, DType::F8E8M0)
+            .or_else(|_| vb.get_with_hints_dtype(shape, name, shard_hint, DType::F8E4M3))
+            .or_else(|_| vb.get_with_hints_dtype(shape, name, shard_hint, DType::U8))
+    }
+
     pub fn new(cfg: &Config, vb: VarBuilderX, comm: Rc<Comm>, dtype: DType) -> Result<Self> {
         Self::new_with_gate(cfg, vb.pp("gate"), vb.pp("experts"), &vb, comm, dtype)
     }
@@ -2467,51 +2508,51 @@ impl FusedMoeMxfp4 {
                     let packed_name = Self::mxfp4_tensor_name_packed(&gate_proj_vb);
                     let scale_name = Self::mxfp4_tensor_name_scale(&gate_proj_vb);
 
-                    let gate_b = gate_proj_vb.get_with_hints_dtype(
+                    let gate_b = Self::load_mxfp4_packed(
+                        &gate_proj_vb,
                         (moe_cfg.moe_intermediate_size, cfg.hidden_size / 2),
                         packed_name,
                         shard(0, comm.rank(), comm.world_size()),
-                        DType::U8,
                     )?;
-                    let gate_s = gate_proj_vb.get_with_hints_dtype(
+                    let gate_s = Self::load_mxfp4_scale(
+                        &gate_proj_vb,
                         (moe_cfg.moe_intermediate_size, cfg.hidden_size / 32),
                         scale_name,
                         shard(0, comm.rank(), comm.world_size()),
-                        DType::U8,
                     )?;
 
                     let up_proj_vb = expert_vb.pp(up_name);
                     let packed_name = Self::mxfp4_tensor_name_packed(&up_proj_vb);
                     let scale_name = Self::mxfp4_tensor_name_scale(&up_proj_vb);
 
-                    let up_b = up_proj_vb.get_with_hints_dtype(
+                    let up_b = Self::load_mxfp4_packed(
+                        &up_proj_vb,
                         (moe_cfg.moe_intermediate_size, cfg.hidden_size / 2),
                         packed_name,
                         shard(0, comm.rank(), comm.world_size()),
-                        DType::U8,
                     )?;
-                    let up_s = up_proj_vb.get_with_hints_dtype(
+                    let up_s = Self::load_mxfp4_scale(
+                        &up_proj_vb,
                         (moe_cfg.moe_intermediate_size, cfg.hidden_size / 32),
                         scale_name,
                         shard(0, comm.rank(), comm.world_size()),
-                        DType::U8,
                     )?;
 
                     let down_proj_vb = expert_vb.pp(down_name);
                     let packed_name = Self::mxfp4_tensor_name_packed(&down_proj_vb);
                     let scale_name = Self::mxfp4_tensor_name_scale(&down_proj_vb);
 
-                    let down_b = down_proj_vb.get_with_hints_dtype(
+                    let down_b = Self::load_mxfp4_packed(
+                        &down_proj_vb,
                         (cfg.hidden_size, moe_cfg.moe_intermediate_size / 2),
                         packed_name,
                         shard(1, comm.rank(), comm.world_size()),
-                        DType::U8,
                     )?;
-                    let down_s = down_proj_vb.get_with_hints_dtype(
+                    let down_s = Self::load_mxfp4_scale(
+                        &down_proj_vb,
                         (cfg.hidden_size, moe_cfg.moe_intermediate_size / 32),
                         scale_name,
                         shard(1, comm.rank(), comm.world_size()),
-                        DType::U8,
                     )?;
 
                     gate_blocks_vec.push(gate_b);

@@ -369,7 +369,21 @@ impl KVCacheAllocator {
                         .unwrap_or(64) as usize;
                     (true, rank as usize, rope_dim)
                 } else {
-                    (false, 0, 0)
+                    // DeepSeek V4: uses head_dim instead of kv_lora_rank for MLA cache
+                    let model_type = extra.get("model_type").and_then(|v| v.as_str());
+                    if model_type == Some("deepseek_v4") {
+                        let head_dim = extra
+                            .get("head_dim")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(512) as usize;
+                        let rope_dim = extra
+                            .get("qk_rope_head_dim")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(64) as usize;
+                        (true, head_dim, rope_dim)
+                    } else {
+                        (false, 0, 0)
+                    }
                 }
             } else {
                 (false, 0, 0)
@@ -385,6 +399,12 @@ impl KVCacheAllocator {
                 mla_kv_lora_rank,
             );
             crate::utils::config::KvCacheDtype::Auto
+        } else if is_mla && econfig.kvcache_dtype.is_nvfp4() {
+            crate::log_warn!(
+                "KV cache dtype nvfp4 selected for MLA/V4. \
+                 Using fp8-compatible allocator sizing for now; expand kernels TBD."
+            );
+            crate::utils::config::KvCacheDtype::Fp8
         } else {
             econfig.kvcache_dtype
         };

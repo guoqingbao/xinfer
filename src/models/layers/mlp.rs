@@ -21,6 +21,7 @@ pub struct MLP {
     gate_up_proj: GateUpProjection,
     down_proj: TensorParallelRowLinear,
     activation: Activation,
+    swiglu_limit: f32,
 }
 
 impl MLP {
@@ -354,7 +355,22 @@ impl MLP {
                 ("down_proj", "ffn_down"),
             ],
         );
-
+        // Detect w1/w2/w3 naming (BF16 weight or FP8 weight+scale)
+        let gate_key = if vb.pp("w1").has_key("weight") || vb.pp("w1").has_key("scale") {
+            "w1"
+        } else {
+            "gate_proj"
+        };
+        let up_key = if vb.pp("w3").has_key("weight") || vb.pp("w3").has_key("scale") {
+            "w3"
+        } else {
+            "up_proj"
+        };
+        let down_key = if vb.pp("w2").has_key("weight") || vb.pp("w2").has_key("scale") {
+            "w2"
+        } else {
+            "down_proj"
+        };
         let gate_up_proj = if let Some(packed) = Self::try_load_packed_gate_up(
             &vb,
             comm.clone(),
@@ -388,7 +404,7 @@ impl MLP {
                     vb.pp(if gate_up_merged {
                         "gate_up_proj"
                     } else {
-                        "gate_proj"
+                        gate_key
                     })
                 },
                 if gate_up_merged {
@@ -415,7 +431,7 @@ impl MLP {
                     vb.pp(if gate_up_merged {
                         "gate_up_proj"
                     } else {
-                        "up_proj"
+                        up_key
                     })
                 },
                 if gate_up_merged {
@@ -436,7 +452,7 @@ impl MLP {
             if is_qvar_builder {
                 vb.pp((key_map["down_proj"].to_string() + suffix).as_str())
             } else {
-                vb.pp("down_proj")
+                vb.pp(down_key)
             },
             comm.clone(),
             quant_cfg,
@@ -448,7 +464,13 @@ impl MLP {
             gate_up_proj,
             down_proj,
             activation: activation.clone(),
+            swiglu_limit: 0.0,
         })
+    }
+
+    pub fn with_swiglu_limit(mut self, limit: f32) -> Self {
+        self.swiglu_limit = limit;
+        self
     }
 
     pub fn forward(&self, xs: &Tensor) -> Result<Tensor> {
@@ -467,8 +489,22 @@ impl MLP {
                 (gate_up[0].clone(), gate_up[1].clone())
             }
         };
-        self.down_proj
-            .forward(&(self.activation.forward(&gate)? * up)?)
+        let activated = if self.swiglu_limit > 0.0 && matches!(self.activation, Activation::Silu) {
+            // DeepSeek V4's reference Expert promotes both projections to
+            // FP32, clamps asymmetrically (gate <= limit, up in [-limit,
+            // limit]), and only casts back immediately before w2.  Doing the
+            // clamp and SiLU in BF16 changes routed/shared expert outputs
+            // enough to perturb later HC and router values.
+            let gate = gate.to_dtype(DType::F32)?.minimum(self.swiglu_limit)?;
+            let up = up
+                .to_dtype(DType::F32)?
+                .clamp(-self.swiglu_limit, self.swiglu_limit)?;
+            let activated = (candle_nn::ops::silu(&gate)? * up)?;
+            activated.to_dtype(xs.dtype())?
+        } else {
+            (self.activation.forward(&gate)? * up)?
+        };
+        self.down_proj.forward(&activated)
     }
 }
 
