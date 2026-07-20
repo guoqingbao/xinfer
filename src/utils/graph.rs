@@ -1,5 +1,6 @@
 #[cfg(feature = "flashinfer")]
 use super::FlashInferKvParams;
+use crate::models::layers::linear::set_linear_is_prefill;
 use attention_rs::InputMetadata;
 use candle_core::cuda_backend::cudarc::driver::sys;
 use candle_core::cuda_backend::cudarc::driver::sys::{
@@ -494,6 +495,10 @@ impl<M: CudaGraphModule> GraphCapturer<M> {
         device: &Device,
         kv_caches: Option<&Vec<(Tensor, Tensor)>>,
     ) -> Result<()> {
+        let _fp8_domain = attention_rs::fp8_linear::set_fp8_execution_domain(
+            attention_rs::fp8_linear::Fp8ExecutionDomain::DecodeGraph,
+        );
+        let _prefill_guard = set_linear_is_prefill(false);
         self.device = Some(device.clone());
         let max_bs = self.graph_bs[self.graph_bs.len() - 1];
         let max_num_blocks = (self.max_model_len + self.block_size - 1) / self.block_size;
@@ -834,6 +839,10 @@ impl<M: CudaGraphModule> GraphCapturer<M> {
             return Ok(());
         }
 
+        let _fp8_domain = attention_rs::fp8_linear::set_fp8_execution_domain(
+            attention_rs::fp8_linear::Fp8ExecutionDomain::MtpGraph,
+        );
+        let _prefill_guard = set_linear_is_prefill(true);
         self.device = Some(device.clone());
         let verify_len = mtp_num_speculative + 1;
         let max_num_blocks = (self.max_model_len + self.block_size - 1) / self.block_size;
@@ -930,11 +939,13 @@ impl<M: CudaGraphModule> GraphCapturer<M> {
         let mut outputs = BTreeMap::<usize, Tensor>::new();
         let _guard = candle_core::cuda_backend::cuda_param_cache_scope(true);
 
-        for is_warmup in [true, false] {
-            if !is_warmup || capture_in_warmup {
+        for phase in CapturePhase::ALL {
+            let should_capture =
+                !phase.is_cache_prewarm() && (!phase.is_warmup() || capture_in_warmup);
+            if should_capture {
                 self.model.start_capture(verify_len)?;
             }
-            if is_warmup {
+            if phase.is_warmup() {
                 let _ = self.model.forward(
                     &input_ids,
                     &positions,
@@ -942,6 +953,10 @@ impl<M: CudaGraphModule> GraphCapturer<M> {
                     &input_metadata,
                     false,
                 )?;
+                #[cfg(feature = "cuda")]
+                if !should_capture {
+                    device.synchronize()?;
+                }
             } else {
                 let out = self.model.forward(
                     &input_ids,
@@ -952,9 +967,11 @@ impl<M: CudaGraphModule> GraphCapturer<M> {
                 )?;
                 outputs.insert(verify_len, out);
             }
-            if !is_warmup || capture_in_warmup {
-                self.model.end_capture(!is_warmup)?;
+            if should_capture {
+                self.model.end_capture(!phase.is_warmup())?;
             }
+            #[cfg(feature = "cuda")]
+            device.synchronize()?;
         }
 
         crate::log_warn!(
