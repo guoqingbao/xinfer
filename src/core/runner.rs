@@ -1508,6 +1508,12 @@ impl ModelRunner {
     }
 
     pub(crate) fn sample(&self, logits: &Tensor, seqs: Seqs, is_prefill: bool) -> Result<Vec<u32>> {
+        // All sampling, including guided decoding, operates on F32 logits.
+        let logits = if logits.dtype() == DType::F32 {
+            logits.clone()
+        } else {
+            logits.to_dtype(DType::F32)?
+        };
         let seq_ids: Vec<usize> = match &seqs {
             Seqs::SeqRefs(seqs) => seqs.iter().map(|s| s.id()).collect(),
             Seqs::DecodeVec(v) => v.iter().map(|s| s.id()).collect(),
@@ -1654,7 +1660,7 @@ impl ModelRunner {
                 .collect();
 
             self.logit_processor.apply_batch_repeat_penalty(
-                logits,
+                &logits,
                 vec![cached_params.frequency_penalty.unwrap_or(0.0); batch_size],
                 vec![cached_params.presence_penalty.unwrap_or(0.0); batch_size],
                 reference_tokens,
@@ -1664,12 +1670,40 @@ impl ModelRunner {
         };
 
         let guided_requests = guided_decoding_requests(&seqs, &seq_ids);
-        let (guided_logits, guided_step) = self.guided_decoding.apply(&logits, &guided_requests)?;
-
-        let mut tokens = self.sample_processed_logits(&guided_logits, &cached_params.sampling)?;
-        self.guided_decoding
-            .apply_fast_forward(&seq_ids, &mut tokens);
-        self.guided_decoding.commit(&seq_ids, &tokens, guided_step);
+        let guided_positions: Vec<usize> = guided_requests
+            .iter()
+            .enumerate()
+            .filter_map(|(index, request)| request.grammar.is_some().then_some(index))
+            .collect();
+        let tokens = if guided_positions.is_empty() {
+            self.sample_processed_logits(&logits, &cached_params.sampling)?
+        } else {
+            let guided_indices = Tensor::from_vec(
+                guided_positions.iter().map(|&index| index as u32).collect(),
+                (guided_positions.len(),),
+                logits.device(),
+            )?;
+            let original_guided_logits = logits.index_select(&guided_indices, 0)?;
+            let guided_requests: Vec<_> = guided_positions
+                .iter()
+                .map(|&index| guided_requests[index])
+                .collect();
+            let (guided_logits, guided_step) = self
+                .guided_decoding
+                .apply(&original_guided_logits, &guided_requests)?;
+            let sample_logits = if guided_positions.len() == seq_ids.len() {
+                guided_logits
+            } else {
+                let guided_delta = (&guided_logits - &original_guided_logits)?;
+                logits.index_add(&guided_indices, &guided_delta, 0)?
+            };
+            let mut tokens =
+                self.sample_processed_logits(&sample_logits, &cached_params.sampling)?;
+            self.guided_decoding
+                .apply_fast_forward(&seq_ids, &mut tokens);
+            self.guided_decoding.commit(&seq_ids, &tokens, guided_step);
+            tokens
+        };
 
         // Track tokens for sequences when penalties are enabled
         if has_any_penalty {

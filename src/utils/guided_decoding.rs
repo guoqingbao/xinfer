@@ -1,12 +1,13 @@
 use crate::utils::env::soft_mask_disabled;
 use crate::utils::guidance::{GuidanceState, ParserFactory};
-use candle_core::{DType, Result, Tensor};
+use candle_core::{Result, Tensor};
 use llguidance::api::TopLevelGrammar;
 use parking_lot::RwLock;
 use std::collections::{hash_map::Entry, HashMap, HashSet};
 use std::sync::Arc;
 use toktrie::SimpleVob;
 
+#[derive(Clone, Copy)]
 pub struct GuidedDecodingRequest<'a> {
     pub seq_id: usize,
     pub grammar: Option<&'a TopLevelGrammar>,
@@ -195,7 +196,6 @@ impl GuidedDecoding {
             );
         }
 
-        let logits = logits.to_dtype(DType::F32)?;
         let allow_mask = Tensor::from_vec(allow_mask, logits.shape().clone(), logits.device())?;
         let masked_logits = if self.soft_mask.enabled {
             let disallowed = logits
