@@ -371,7 +371,9 @@ impl EngineConfig {
             mamba_cache_capacity: None,
             block_size: if cfg!(feature = "metal") { 32 } else { 64 },
             max_num_seqs: max_num_seqs.unwrap_or(32),
-            max_num_batched_tokens: 32768, //placeholder
+            max_num_parallel_reqs: max_num_seqs.unwrap_or(32), // finalized after memory planning
+            max_num_batched_tokens: 32768,                     //placeholder
+            max_kv_cache_tokens: 0,
             config_model_len,
             max_model_len, //placeholder
             max_tokens,

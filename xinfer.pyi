@@ -53,7 +53,12 @@ class EngineConfig:
     hf_token: Optional[str]
     hf_token_path: Optional[str]
     enforce_parser: Optional[str]
+    num_blocks: int
     max_num_seqs: Optional[int]
+    mamba_cache_capacity: Optional[int]
+    max_num_parallel_reqs: int
+    max_num_batched_tokens: int
+    max_kv_cache_tokens: int
     config_model_len: Optional[int]
     max_model_len: Optional[int]
     max_tokens: Optional[int]
@@ -63,6 +68,7 @@ class EngineConfig:
     generation_cfg: Optional[GenerationConfig]
     seed: Optional[int]
     disable_prefix_cache: bool
+    prefix_cache: Optional[bool]
     prefix_cache_max_tokens: Optional[int]
     kvcache_dtype: Optional[str]
     server_mode: Optional[bool]
@@ -80,6 +86,11 @@ class EngineConfig:
     disable_reasoning: bool
     disable_cuda_graph: bool
     prefill_chunk_size: Optional[int]
+    num_nodes: int
+    node_rank: int
+    master_addr: Optional[str]
+    master_port: int
+    enable_tool_grammar: bool
 
     def __init__(
         self,
@@ -116,6 +127,11 @@ class EngineConfig:
         disable_reasoning: bool = False,
         disable_cuda_graph: bool = False,
         prefill_chunk_size: Optional[int] = 8192,
+        num_nodes: int = 1,
+        node_rank: int = 0,
+        master_addr: Optional[str] = None,
+        master_port: int = 29500,
+        enable_tool_grammar: bool = False,
     ) -> None: ...
 
 @dataclass

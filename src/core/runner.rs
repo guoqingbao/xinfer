@@ -14,8 +14,6 @@ use crate::utils::graph::{
 use crate::utils::guidance::ParserFactory;
 use crate::utils::guided_decoding::{GuidedDecoding, GuidedDecodingRequest};
 use crate::utils::image::compute_image_slice;
-#[cfg(all(feature = "cuda", feature = "graph"))]
-use crate::utils::kvcache_allocator::HYBRID_MAMBA_GRAPH_CAPTURE_MIN_BATCH;
 use crate::utils::logits_processor::{LogitsProcessor, Sampling};
 use crate::utils::progress::ProgressLike;
 #[cfg(feature = "flashinfer")]
@@ -369,6 +367,7 @@ impl ModelRunner {
             max_model_len: econfig.max_model_len.unwrap_or(32768),
             kvcache_memory_bytes: econfig.kvcache_memory_bytes,
             max_num_batched_tokens: econfig.max_num_batched_tokens,
+            max_kv_cache_tokens: econfig.max_kv_cache_tokens,
         };
 
         let is_hybrid_mamba_model = match &model {
@@ -379,8 +378,12 @@ impl ModelRunner {
         let mamba_cache_capacity = if is_hybrid_mamba_model {
             econfig
                 .mamba_cache_capacity
-                .unwrap_or_else(|| hybrid_mamba_graph_capture_max_batch(econfig.max_num_seqs))
-                .min(hybrid_mamba_graph_capture_max_batch(econfig.max_num_seqs))
+                .unwrap_or_else(|| {
+                    hybrid_mamba_graph_capture_max_batch(econfig.max_num_parallel_reqs)
+                })
+                .min(hybrid_mamba_graph_capture_max_batch(
+                    econfig.max_num_parallel_reqs,
+                ))
         } else {
             0
         };
@@ -389,9 +392,7 @@ impl ModelRunner {
         let graph_capture_max_num_seqs = if is_hybrid_mamba_model {
             mamba_cache_capacity.max(1)
         } else {
-            econfig
-                .max_num_seqs
-                .max(HYBRID_MAMBA_GRAPH_CAPTURE_MIN_BATCH)
+            econfig.max_num_parallel_reqs.max(1)
         };
 
         #[cfg(all(feature = "cuda", feature = "graph"))]
@@ -439,17 +440,17 @@ impl ModelRunner {
             Model::Qwen3_5(model) => {
                 model.preallocate_mamba_cache(mamba_cache_capacity)?;
                 model.set_mamba_prefix_cache_capacity(mamba_prefix_capacity);
-                model.preallocate_mtp_hidden_buffer(econfig.max_num_seqs.max(8))?;
+                model.preallocate_mtp_hidden_buffer(econfig.max_num_parallel_reqs.max(8))?;
             }
             Model::Qwen3_5MoE(model) => {
                 model.preallocate_mamba_cache(mamba_cache_capacity)?;
                 model.set_mamba_prefix_cache_capacity(mamba_prefix_capacity);
-                model.preallocate_mtp_hidden_buffer(econfig.max_num_seqs.max(8))?;
+                model.preallocate_mtp_hidden_buffer(econfig.max_num_parallel_reqs.max(8))?;
             }
             Model::Qwen3VL(model) => {
                 model.preallocate_mamba_cache(mamba_cache_capacity)?;
                 model.set_mamba_prefix_cache_capacity(mamba_prefix_capacity);
-                model.preallocate_mtp_hidden_buffer(econfig.max_num_seqs.max(8))?;
+                model.preallocate_mtp_hidden_buffer(econfig.max_num_parallel_reqs.max(8))?;
             }
             _ => {}
         }

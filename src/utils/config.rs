@@ -401,7 +401,13 @@ pub struct EngineConfig {
     pub mamba_cache_capacity: Option<usize>,
     pub block_size: usize,
     pub max_num_seqs: usize,
+    /// User-requested request capacity. This is the allocation/preallocation
+    /// limit; the scheduler uses `max_num_parallel_reqs` for active work.
+    #[serde(default)]
+    pub max_num_parallel_reqs: usize,
     pub max_num_batched_tokens: usize,
+    #[serde(default)]
+    pub max_kv_cache_tokens: usize,
     pub config_model_len: Option<usize>,
     pub max_model_len: Option<usize>,
     pub max_tokens: Option<usize>,
@@ -486,7 +492,13 @@ pub struct EngineConfig {
     #[pyo3(get, set)]
     pub max_num_seqs: usize,
     #[pyo3(get, set)]
+    #[serde(default)]
+    pub max_num_parallel_reqs: usize,
+    #[pyo3(get, set)]
     pub max_num_batched_tokens: usize,
+    #[pyo3(get, set)]
+    #[serde(default)]
+    pub max_kv_cache_tokens: usize,
     #[pyo3(get, set)]
     pub max_model_len: Option<usize>,
     #[pyo3(get, set)]
@@ -562,6 +574,11 @@ impl EngineConfig {
             normalize_prefill_chunk_size(self.prefill_chunk_size)
         }
     }
+
+    pub fn with_mtp(mut self, mtp_tokens: Option<usize>) -> Self {
+        self.mtp_num_speculative_tokens = mtp_tokens;
+        self
+    }
 }
 
 #[cfg(not(feature = "python"))]
@@ -628,7 +645,9 @@ impl EngineConfig {
             mamba_cache_capacity: None,
             block_size: if cfg!(feature = "metal") { 32 } else { 64 },
             max_num_seqs: max_num_seqs.unwrap_or(32),
+            max_num_parallel_reqs: max_num_seqs.unwrap_or(32), // placeholder; finalized after memory planning
             max_num_batched_tokens: max_num_seqs.unwrap_or(32) * 1024, //placeholder
+            max_kv_cache_tokens: 0,
             config_model_len,
             max_model_len, //placeholder
             max_tokens,
@@ -665,11 +684,6 @@ impl EngineConfig {
             mtp_num_speculative_tokens: None,
             enable_tool_grammar,
         }
-    }
-
-    pub fn with_mtp(mut self, mtp_tokens: Option<usize>) -> Self {
-        self.mtp_num_speculative_tokens = mtp_tokens;
-        self
     }
 }
 
@@ -1597,7 +1611,7 @@ mod tests {
             "quantization_status": "compressed",
             "sparsity_config": {},
             "transform_config": {},
-            "version": "0.13.9.dev54+g704d57b"
+            "version": "0.14.0.dev54+g704d57b"
         }"#;
         let mut cfg: QuantConfig = serde_json::from_str(json).unwrap();
         cfg.normalize_compressed_tensors();
