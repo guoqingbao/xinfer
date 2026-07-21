@@ -34,7 +34,6 @@ pub struct Attention {
     attn: PagedAttention,
     softcapping: Option<f64>,
     dtype: DType,
-    no_per_head_norm: bool,
     full_dim_qk_norm: bool,
     is_qvar_builder: bool,
     qk_l2_norm: bool,
@@ -422,24 +421,6 @@ impl Attention {
             config.attn_output_gate.unwrap_or(false)
         };
         let q_out_dim = num_heads * head_dim * if attn_output_gate { 2 } else { 1 };
-        let no_per_head_norm_models: Vec<String> = vec![
-            "Gemma3ForConditionalGeneration",
-            "Gemma3ForCausalLM",
-            "Gemma4ForConditionalGeneration",
-            "Gemma4ForCausalLM",
-            "Qwen3VLForConditionalGeneration",
-            "Qwen3VLMoeForConditionalGeneration",
-            "Qwen3_5ForCausalLM",
-            "Qwen3_5ForConditionalGeneration",
-            "Qwen3_5MoeForCausalLM",
-            "Qwen3_5MoeForConditionalGeneration",
-            "Qwen3NextForCausalLM",
-            "Qwen3NextForConditionalGeneration",
-            "MiniMaxM2ForCausalLM",
-        ]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
         let is_gemma = arch == "Gemma3ForConditionalGeneration".to_string()
             || arch == "Gemma3ForCausalLM".to_string();
         let is_mlx_nvfp4 = config
@@ -630,13 +611,54 @@ impl Attention {
             )?,
             softcapping: config.attn_logit_softcapping,
             dtype,
-            no_per_head_norm: no_per_head_norm_models.contains(&arch),
             full_dim_qk_norm,
             is_qvar_builder,
             qk_l2_norm,
             promote_qk_to_f32: is_qvar_builder || config.higher_precision_required() || qk_l2_norm,
             v_norm_eps,
         })
+    }
+
+    /// Promote Q/K to F32 when needed and apply per-token or per-head RMSNorm before RoPE.
+    fn prepare_qk_for_rope(
+        &self,
+        q: Tensor,
+        k: Tensor,
+        seq_len: usize,
+    ) -> Result<(Tensor, Tensor)> {
+        let (q, k) = if self.promote_qk_to_f32 && q.dtype() != DType::F32 {
+            (q.to_dtype(DType::F32)?, k.to_dtype(DType::F32)?)
+        } else {
+            (q, k)
+        };
+
+        let (q, k) = if self.q_norm.is_some() && self.k_norm.is_some() {
+            if self.full_dim_qk_norm {
+                let q_2d = q.reshape((seq_len, self.num_heads * self.head_dim))?;
+                let k_2d = k.reshape((seq_len, self.num_kv_heads * self.head_dim))?;
+                let q_2d = self.q_norm.as_ref().unwrap().forward(&q_2d)?;
+                let k_2d = self.k_norm.as_ref().unwrap().forward(&k_2d)?;
+                (
+                    q_2d.reshape((seq_len, self.num_heads, self.head_dim))?,
+                    k_2d.reshape((seq_len, self.num_kv_heads, self.head_dim))?,
+                )
+            } else {
+                // Per-head RMSNorm: flattening (S,H,D) -> (S*H,D) is equivalent to
+                // applying norm directly on the 3D tensor when weight size is head_dim.
+                let q_flat = q.flatten(0, 1)?;
+                let k_flat = k.flatten(0, 1)?;
+                let q_flat = self.q_norm.as_ref().unwrap().forward(&q_flat)?;
+                let k_flat = self.k_norm.as_ref().unwrap().forward(&k_flat)?;
+                (
+                    q_flat.reshape((seq_len, self.num_heads, self.head_dim))?,
+                    k_flat.reshape((seq_len, self.num_kv_heads, self.head_dim))?,
+                )
+            }
+        } else {
+            (q, k)
+        };
+
+        Ok((q, k))
     }
 
     pub fn forward(
@@ -718,37 +740,7 @@ impl Attention {
         let k = k.reshape((seq_len, self.num_kv_heads, self.head_dim))?;
         let v = v.reshape((seq_len, self.num_kv_heads, self.head_dim))?;
 
-        let (q, k) = if self.promote_qk_to_f32 && q.dtype() != DType::F32 {
-            (q.to_dtype(DType::F32)?, k.to_dtype(DType::F32)?)
-        } else {
-            (q, k)
-        };
-
-        let (q, k) = if self.q_norm.is_some() && self.k_norm.is_some() {
-            if self.full_dim_qk_norm {
-                let q_2d = q.reshape((seq_len, self.num_heads * self.head_dim))?;
-                let k_2d = k.reshape((seq_len, self.num_kv_heads * self.head_dim))?;
-                let q_2d = self.q_norm.as_ref().unwrap().forward(&q_2d)?;
-                let k_2d = self.k_norm.as_ref().unwrap().forward(&k_2d)?;
-                let q = q_2d.reshape((seq_len, self.num_heads, self.head_dim))?;
-                let k = k_2d.reshape((seq_len, self.num_kv_heads, self.head_dim))?;
-                (q, k)
-            } else if self.no_per_head_norm {
-                let q = self.q_norm.as_ref().unwrap().forward(&q)?;
-                let k = self.k_norm.as_ref().unwrap().forward(&k)?;
-                (q, k)
-            } else {
-                let q_flat = q.flatten(0, 1)?;
-                let k_flat = k.flatten(0, 1)?;
-                let q_flat = self.q_norm.as_ref().unwrap().forward(&q_flat)?;
-                let k_flat = self.k_norm.as_ref().unwrap().forward(&k_flat)?;
-                let q = q_flat.reshape((seq_len, self.num_heads, self.head_dim))?;
-                let k = k_flat.reshape((seq_len, self.num_kv_heads, self.head_dim))?;
-                (q, k)
-            }
-        } else {
-            (q, k)
-        };
+        let (q, k) = self.prepare_qk_for_rope(q, k, seq_len)?;
 
         // Apply rotary embeddings
         let (q, k) = if let Some(rotary_emb) = &rotary_emb {
@@ -897,6 +889,8 @@ impl Attention {
         let q = q_linear.reshape((seq_len, self.num_heads, self.head_dim))?;
         let k = k.reshape((seq_len, self.num_kv_heads, self.head_dim))?;
         let v = v.reshape((seq_len, self.num_kv_heads, self.head_dim))?;
+
+        let (q, k) = self.prepare_qk_for_rope(q, k, seq_len)?;
 
         // Apply rotary embeddings (needed even for single token for positional encoding)
         let (_q, _k) = match rotary_emb.apply_rotary_emb_qkv(&q, &k, positions)? {
