@@ -412,12 +412,10 @@ pub struct GraphCapturer<M: CudaGraphModule> {
 }
 
 pub fn planned_graph_capture_batches(max_num_seqs: usize) -> Vec<usize> {
-    let small_max = max_num_seqs.clamp(1, 15);
-    let mut graph_bs = (1..=small_max).collect::<Vec<_>>();
-    if max_num_seqs >= 16 {
-        graph_bs.extend((16..=max_num_seqs.min(32)).step_by(16));
-    }
-    graph_bs
+    // Capture every exact batch up to 32. This is especially important for
+    // hybrid GDN/Mamba models, whose graph replay requires an exact batch size
+    // because the state-slot mapping cannot be padded safely.
+    (1..=max_num_seqs.clamp(1, 32)).collect()
 }
 
 #[cfg(feature = "flashinfer")]

@@ -29,19 +29,20 @@ const SIZE_IN_MB: f64 = (1024 * 1024) as f64;
 const SIZE_IN_GB: f64 = 1024.0 * 1024.0 * 1024.0;
 const DEFAULT_HYBRID_MAMBA_FRACTION: f64 = 0.20;
 const MAX_HYBRID_MAMBA_FRACTION: f64 = 0.35;
-/// The graph planner captures batches 1..=15, then 16 and 32. Keep the active
-/// Mamba pool within that range so every active slot can participate in a
-/// captured decode batch without consuming the entire prefix-state budget.
-pub(crate) const HYBRID_MAMBA_GRAPH_CAPTURE_MIN_BATCH: usize = 16;
+/// CUDA graph capture is planned for every exact batch up to 32. Keep hybrid
+/// GDN/Mamba state capacity aligned with that exact capture limit.
+#[cfg(all(feature = "cuda", feature = "graph"))]
 pub(crate) const HYBRID_MAMBA_GRAPH_CAPTURE_MAX_BATCH: usize = 32;
 
 pub(crate) fn hybrid_mamba_graph_capture_max_batch(max_num_seqs: usize) -> usize {
-    if max_num_seqs >= HYBRID_MAMBA_GRAPH_CAPTURE_MAX_BATCH {
-        HYBRID_MAMBA_GRAPH_CAPTURE_MAX_BATCH
-    } else {
-        // planned_graph_capture_batches() captures 16, then advances by 16;
-        // for requested sizes 16..31 its largest captured batch is therefore 16.
-        HYBRID_MAMBA_GRAPH_CAPTURE_MIN_BATCH
+    let max_num_seqs = max_num_seqs.max(1);
+    #[cfg(all(feature = "cuda", feature = "graph"))]
+    {
+        max_num_seqs.min(HYBRID_MAMBA_GRAPH_CAPTURE_MAX_BATCH)
+    }
+    #[cfg(not(all(feature = "cuda", feature = "graph")))]
+    {
+        max_num_seqs
     }
 }
 
@@ -58,6 +59,8 @@ pub struct GpuMemoryBudget {
     pub flash_splitk_bytes: u64,
     /// Transient activation overhead (largest forward-pass intermediate)
     pub transient_bytes: u64,
+    /// MLA prefill tensors retained per token (query absorption and attention output)
+    pub mla_attention_bytes_per_token: u64,
     /// Total workspace reserve (sum of above)
     pub total_bytes: u64,
 }
@@ -93,6 +96,12 @@ impl GpuMemoryBudget {
             "Transient {:.0}M",
             self.transient_bytes as f64 / SIZE_IN_MB
         ));
+        if self.mla_attention_bytes_per_token > 0 {
+            parts.push(format!(
+                "MLA prefill {:.1}K/token",
+                self.mla_attention_bytes_per_token as f64 / 1024.0
+            ));
+        }
         crate::log_warn!(
             "GPU Memory Budget: {:.2} GB available → {:.2} GB workspace reserve ({}) → {:.2} GB for caches",
             min_available_before as f64 / SIZE_IN_GB,
@@ -116,8 +125,10 @@ pub struct KVCacheAllocation {
     pub max_model_len: usize,
     /// Total GPU memory allocated for KVCache in bytes
     pub kvcache_memory_bytes: usize,
-    /// Maximum number of batched tokens
+    /// Per-step scheduler token budget (vLLM `max_num_batched_tokens`).
     pub max_num_batched_tokens: usize,
+    /// Total KV-cache token capacity (`num_gpu_blocks * block_size`).
+    pub max_kv_cache_tokens: usize,
 }
 
 /// Error types for KVCache allocation
@@ -414,11 +425,11 @@ impl KVCacheAllocator {
             num_shards,
             block_size: econfig.block_size,
             user_max_model_len: econfig.max_model_len,
-            user_max_num_seqs: if econfig.max_model_len.is_some() {
-                Some(econfig.max_num_seqs)
-            } else {
-                None // Auto-decide if max_model_len not specified
-            },
+            // The user request capacity is independent from the automatically
+            // derived parallel-request limit. Auto-sizing may choose a shorter
+            // context, but it must never silently turn the request preallocation
+            // knob into a batching knob.
+            user_max_num_seqs: Some(econfig.max_num_seqs.max(1)),
             config_model_len,
             kv_fraction: if econfig.max_model_len.is_some() && econfig.kv_fraction.is_none() {
                 if cfg!(feature = "cuda") {
@@ -513,11 +524,27 @@ impl KVCacheAllocator {
         let transient_bytes =
             (2 * self.prefill_chunk_size * self.hidden_size * self.model_dtype_size) as u64;
 
+        // MLA prefill materializes large per-token tensors that are not part of
+        // the generic transient estimate: absorbed Q [N, heads, kv_rank], Q_PE,
+        // and the MLA output [N, heads, kv_rank]. These scale with the total
+        // batched prefill tokens, not just the number of requests.
+        let mla_attention_bytes_per_token = if self.is_mla {
+            let heads_per_shard = self.num_attention_heads / self.num_shards.max(1);
+            (3 * heads_per_shard
+                * (self.mla_kv_lora_rank + self.mla_qk_rope_head_dim)
+                * self.model_dtype_size) as u64
+        } else {
+            0
+        };
+        let mla_attention_bytes =
+            mla_attention_bytes_per_token.saturating_mul(self.prefill_chunk_size.max(1) as u64);
+
         let total_bytes = flashinfer_bytes
             + cutlass_bytes
             + moe_pool_bytes
             + flash_splitk_bytes
-            + transient_bytes;
+            + transient_bytes
+            + mla_attention_bytes;
         let total_bytes = total_bytes.max(MIN_ACTIVATION_RESERVE_BYTES);
 
         GpuMemoryBudget {
@@ -526,8 +553,168 @@ impl KVCacheAllocator {
             moe_pool_bytes,
             flash_splitk_bytes,
             transient_bytes,
+            mla_attention_bytes_per_token,
             total_bytes,
         }
+    }
+
+    fn fixed_workspace_bytes(&self, workspace: &GpuMemoryBudget) -> u64 {
+        // Transient estimates scale with the number of prefill tokens. Keep the
+        // fixed backend workspaces and a safety floor separate from that budget.
+        workspace
+            .flashinfer_bytes
+            .saturating_add(workspace.cutlass_bytes)
+            .saturating_add(workspace.flash_splitk_bytes)
+            .saturating_add(MIN_ACTIVATION_RESERVE_BYTES)
+    }
+
+    fn prefill_bytes_per_token(&self, workspace: &GpuMemoryBudget) -> u64 {
+        let chunk = self.prefill_chunk_size.max(1) as u64;
+        workspace
+            .transient_bytes
+            .saturating_add(workspace.moe_pool_bytes)
+            .saturating_add(
+                workspace
+                    .mla_attention_bytes_per_token
+                    .saturating_mul(chunk),
+            )
+            .saturating_add(chunk - 1)
+            / chunk
+    }
+
+    /// Estimate buffers retained by CUDA graph capture for a decode batch.
+    /// Capture happens after KV-cache allocation, so this memory is reserved
+    /// while choosing both the KV pool and the parallel-request limit.
+    fn cuda_graph_bytes(&self, graph_batch: usize, max_model_len: usize) -> u64 {
+        #[cfg(all(feature = "cuda", feature = "graph"))]
+        {
+            if graph_batch == 0 {
+                return 0;
+            }
+            let max_blocks = max_model_len.div_ceil(self.block_size.max(1));
+            crate::utils::graph::planned_graph_capture_batches(graph_batch)
+                .into_iter()
+                .map(|batch| {
+                    let batch = batch as u64;
+                    let metadata = batch * (max_blocks as u64 * 8 + 8 * 1024 * 1024);
+                    let hidden = batch * self.hidden_size as u64 * self.model_dtype_size as u64 * 8;
+                    let logits = batch
+                        * self.num_attention_heads.max(1) as u64
+                        * self.model_dtype_size as u64
+                        * 4;
+                    metadata.saturating_add(hidden).saturating_add(logits)
+                })
+                .sum()
+        }
+
+        #[cfg(not(all(feature = "cuda", feature = "graph")))]
+        {
+            let _ = (graph_batch, max_model_len);
+            0
+        }
+    }
+
+    fn runtime_reserve_bytes(&self, parallel_reqs: usize, max_model_len: usize) -> u64 {
+        let workspace = self.compute_workspace_budget();
+        let fixed = self.fixed_workspace_bytes(&workspace);
+        let per_token = self.prefill_bytes_per_token(&workspace);
+        let prefill_tokens = parallel_reqs
+            .max(1)
+            .saturating_mul(self.prefill_chunk_size.max(1));
+        let graph_batch = hybrid_mamba_graph_capture_max_batch(parallel_reqs);
+        fixed
+            .saturating_add(per_token.saturating_mul(prefill_tokens as u64))
+            .saturating_add(self.cuda_graph_bytes(graph_batch, max_model_len))
+    }
+
+    fn max_parallel_reqs(
+        &self,
+        available_memory: u64,
+        kv_cache_bytes: u64,
+        mamba_bytes: u64,
+        max_kv_cache_tokens: usize,
+        max_num_reqs: usize,
+        max_model_len: usize,
+        mamba_active_limit: usize,
+    ) -> usize {
+        let max_num_reqs = max_num_reqs.max(1);
+        let remaining = available_memory
+            .saturating_sub(kv_cache_bytes)
+            .saturating_sub(mamba_bytes);
+
+        let workspace = self.compute_workspace_budget();
+        let fixed_runtime = self.fixed_workspace_bytes(&workspace);
+        let per_request_prefill = self
+            .prefill_bytes_per_token(&workspace)
+            .saturating_mul(self.prefill_chunk_size.max(1) as u64)
+            .max(1);
+        let kv_parallel_limit = max_kv_cache_tokens / self.prefill_chunk_size.max(1);
+        let memory_parallel_limit = remaining
+            .saturating_sub(fixed_runtime)
+            .checked_div(per_request_prefill)
+            .unwrap_or(0) as usize;
+        let parallel_limit = kv_parallel_limit.min(memory_parallel_limit);
+
+        #[cfg(all(feature = "cuda", feature = "graph"))]
+        // GraphCapturer captures every exact batch up to 32.
+        let parallel_limit = parallel_limit.min(HYBRID_MAMBA_GRAPH_CAPTURE_MAX_BATCH);
+
+        // max_num_seqs is a user KV/preallocation input, not a parallelism
+        // ceiling. If it is above the resource-derived limit, it still has to
+        // fit; otherwise fail instead of silently violating that lower bound.
+        if max_num_reqs > parallel_limit {
+            let graph_capacity = if self.hybrid_mamba_slot_bytes.is_some() {
+                hybrid_mamba_graph_capture_max_batch(max_num_reqs)
+            } else {
+                max_num_reqs
+            };
+            return if graph_capacity <= mamba_active_limit
+                && self.runtime_reserve_bytes(max_num_reqs, max_model_len) <= remaining
+            {
+                max_num_reqs
+            } else {
+                0
+            };
+        }
+
+        for requested in (1..=parallel_limit).rev() {
+            let graph_capacity = if self.hybrid_mamba_slot_bytes.is_some() {
+                hybrid_mamba_graph_capture_max_batch(requested)
+            } else {
+                requested
+            };
+            if graph_capacity > mamba_active_limit {
+                continue;
+            }
+            if self.runtime_reserve_bytes(requested, max_model_len) <= remaining {
+                return requested;
+            }
+        }
+        0
+    }
+
+    /// Per-step scheduler token budget (vLLM `max_num_batched_tokens`).
+    ///
+    /// Distinct from total KV-cache capacity (`num_blocks * block_size`). Accounts
+    /// for activation workspace, FlashInfer / FlashAttention buffers, MoE pools,
+    /// and the configured prefill chunk size so batched prefill does not OOM.
+    pub fn compute_scheduling_token_budget(
+        &self,
+        max_num_seqs: usize,
+        activation_reserve: u64,
+    ) -> usize {
+        let chunk = self.prefill_chunk_size;
+        let workspace = self.compute_workspace_budget();
+        let per_chunk_activation = self
+            .prefill_bytes_per_token(&workspace)
+            .saturating_mul(chunk.max(1) as u64)
+            .max(1);
+        let available = activation_reserve.saturating_sub(self.fixed_workspace_bytes(&workspace));
+        let possible = (available / per_chunk_activation) as usize;
+        possible
+            .min(max_num_seqs.max(1))
+            .max(1)
+            .saturating_mul(chunk)
     }
 
     /// Set per-layer KV cache configuration for models with heterogeneous head dims
@@ -543,11 +730,19 @@ impl KVCacheAllocator {
             Ok(available_before_reserve) => {
                 let workspace_budget = self.compute_workspace_budget();
                 workspace_budget.report(available_before_reserve);
-                let activation_reserve = workspace_budget
-                    .total_bytes
-                    .min(available_before_reserve.saturating_sub(1));
-                let cache_available = available_before_reserve.saturating_sub(activation_reserve);
-                let mut kv_budget = cache_available;
+                // `kv_fraction` limits the physical KV pool. The memory outside
+                // that fraction is runtime headroom for prefill activations,
+                // attention workspaces, and CUDA graph buffers; do not spend it
+                // on KV just to make a one-request estimate fit.
+                let runtime_available = self.get_free_memory(device_ids)?;
+                // The workspace reserve is part of the kv_fraction budget too:
+                // the report above explicitly promises that only the remainder
+                // is available for physical KV blocks. Keep the allocation and
+                // the reported budget consistent, otherwise the KV tensors can
+                // consume FlashInfer/CUTLASS/MoE/MLA memory before scheduling
+                // has even been considered.
+                let mut kv_budget =
+                    available_before_reserve.saturating_sub(workspace_budget.total_bytes);
                 let mut mamba_budget = 0u64;
                 let mut mamba_budget_slots = 0usize;
                 let mut mamba_budget_enabled = false;
@@ -572,16 +767,16 @@ impl KVCacheAllocator {
                             );
                             target_budget = min_one_slot;
                         }
-                        if target_budget >= cache_available {
+
+                        if target_budget >= available_before_reserve {
                             candle_core::bail!(
-                                "Hybrid mamba budget ({:.2} GB) plus workspace reserve ({:.2} GB) leaves no memory for KV cache. Reduce mamba_fraction or max_model_len.",
+                                "Hybrid mamba budget ({:.2} GB) leaves no memory for KV cache. Reduce mamba_fraction.",
                                 target_budget as f64 / SIZE_IN_GB,
-                                activation_reserve as f64 / SIZE_IN_GB
                             );
                         }
 
                         mamba_budget = target_budget;
-                        kv_budget = cache_available.saturating_sub(mamba_budget);
+                        kv_budget = kv_budget.saturating_sub(mamba_budget);
                         mamba_budget_slots = if slot_bytes == 0 {
                             0
                         } else {
@@ -599,47 +794,72 @@ impl KVCacheAllocator {
                                 econfig.mamba_slot_bytes = 0;
                                 econfig.mamba_memory_bytes = 0;
                                 econfig.mamba_cache_capacity = None;
-                                return Ok(());
-                            }
-                            let active_slot_limit = if econfig.prefix_cache.unwrap_or(false) {
-                                // Keep enough Mamba snapshot slots for prefix reuse to
-                                // remain effective: prefix capacity must be at least
-                                // the active capacity.
-                                (mamba_budget_slots / 2).max(1)
                             } else {
-                                mamba_budget_slots
-                            };
-                            let active_mamba_capacity =
-                                hybrid_mamba_graph_capture_max_batch(econfig.max_num_seqs)
-                                    .min(active_slot_limit);
-                            if allocation.max_num_seqs > active_mamba_capacity {
-                                crate::log_warn!(
-                                    "Clamping max_num_seqs from {} to {} due to hybrid mamba slot capacity.",
-                                    allocation.max_num_seqs,
-                                    active_mamba_capacity
-                                );
-                                econfig.max_num_seqs = active_mamba_capacity;
+                                econfig.mamba_slot_bytes = slot_bytes;
+                                econfig.mamba_memory_bytes = mamba_budget as usize;
                             }
-                            let prefix_budget_slots =
-                                mamba_budget_slots.saturating_sub(active_mamba_capacity);
-                            econfig.mamba_slot_bytes = slot_bytes;
-                            econfig.mamba_memory_bytes = mamba_budget as usize;
-                            econfig.mamba_cache_capacity = Some(active_mamba_capacity);
-                            crate::log_warn!(
-                                "Hybrid Mamba Allocation: {} active slot(s), {} prefix slot budget, {} total slot budget, {:.2} GB budget, {:.2} MB/slot, {} linear-attention layer(s), model dtype {} bytes",
-                                active_mamba_capacity,
-                                prefix_budget_slots,
-                                mamba_budget_slots,
-                                mamba_budget as f64 / SIZE_IN_GB,
-                                slot_bytes as f64 / SIZE_IN_MB,
-                                self.hybrid_num_gdn_layers,
-                                self.model_dtype_size
-                            );
                         } else {
                             econfig.mamba_slot_bytes = 0;
                             econfig.mamba_memory_bytes = 0;
                             econfig.mamba_cache_capacity = None;
                         }
+
+                        let prefix_cache_enabled = econfig.prefix_cache.unwrap_or(false);
+                        let mamba_active_limit =
+                            if self.hybrid_mamba_slot_bytes.is_some() && mamba_budget_enabled {
+                                if prefix_cache_enabled {
+                                    (mamba_budget_slots / 2).max(1)
+                                } else {
+                                    mamba_budget_slots.max(1)
+                                }
+                            } else {
+                                usize::MAX
+                            };
+                        let max_parallel = self.max_parallel_reqs(
+                            runtime_available,
+                            allocation.kvcache_memory_bytes as u64,
+                            mamba_budget,
+                            allocation.max_kv_cache_tokens,
+                            econfig.max_num_seqs,
+                            allocation.max_model_len,
+                            mamba_active_limit,
+                        );
+                        if max_parallel == 0 {
+                            candle_core::bail!(
+                                "GPU memory is insufficient for one prefill chunk after KV-cache, Mamba, attention, and graph buffers; reduce max_model_len, max_num_seqs, or prefill_chunk_size."
+                            );
+                        }
+                        econfig.max_num_parallel_reqs = max_parallel;
+                        econfig.max_num_batched_tokens = max_parallel
+                            .saturating_mul(self.prefill_chunk_size.max(1))
+                            .min(allocation.max_kv_cache_tokens)
+                            .max(1);
+                        if self.hybrid_mamba_slot_bytes.is_some() && mamba_budget_enabled {
+                            // GDN/Mamba active state is sized to the largest
+                            // CUDA graph capture, not merely the number of
+                            // requests currently scheduled.
+                            let graph_capture_capacity =
+                                hybrid_mamba_graph_capture_max_batch(max_parallel);
+                            econfig.mamba_cache_capacity = Some(graph_capture_capacity);
+                            let prefix_budget_slots =
+                                mamba_budget_slots.saturating_sub(graph_capture_capacity);
+                            crate::log_warn!(
+                                "Hybrid Mamba Allocation: {} active slot(s), {} prefix slot budget, {} total slot budget, {:.2} GB budget, {:.2} MB/slot, {} linear-attention layer(s), model dtype {} bytes",
+                                graph_capture_capacity,
+                                prefix_budget_slots,
+                                mamba_budget_slots,
+                                mamba_budget as f64 / SIZE_IN_GB,
+                                self.hybrid_mamba_slot_bytes.unwrap_or(0) as f64 / SIZE_IN_MB,
+                                self.hybrid_num_gdn_layers,
+                                self.model_dtype_size
+                            );
+                        }
+                        crate::log_warn!(
+                            "Per-step scheduling budget: {} batched tokens (prefill chunk {}). KV-cache pool: {} tokens.",
+                            econfig.max_num_batched_tokens,
+                            econfig.effective_prefill_chunk_size(),
+                            econfig.max_kv_cache_tokens
+                        );
                         Ok(())
                     }
                     Err(e) => {
@@ -785,6 +1005,27 @@ impl KVCacheAllocator {
         }
     }
 
+    /// Query raw free GPU memory for a single device, before applying
+    /// `kv_fraction`. This is the budget available to runtime allocations after
+    /// the physical KV pool has been planned.
+    #[cfg(feature = "cuda")]
+    pub fn get_rank_free_memory(&self, device_id: usize) -> Result<u64> {
+        use candle_core::backend::BackendDevice;
+        use candle_core::cuda_backend::cudarc::driver::sys;
+        use candle_core::cuda_backend::CudaDevice;
+
+        let _ = CudaDevice::new(device_id)?;
+        unsafe {
+            let mut free: usize = 0;
+            let mut total: usize = 0;
+            sys::lib()
+                .cuMemGetInfo_v2(&mut free as *mut usize, &mut total as *mut usize)
+                .result()
+                .map_err(|e| candle_core::Error::Msg(format!("cuMemGetInfo_v2 failed: {e:?}")))?;
+            Ok(free as u64)
+        }
+    }
+
     /// Query available GPU memory for a single device (non-CUDA platforms)
     #[cfg(not(feature = "cuda"))]
     pub fn get_rank_available_memory(&self, _device_id: usize) -> Result<u64> {
@@ -817,6 +1058,28 @@ impl KVCacheAllocator {
         Ok(usable)
     }
 
+    /// Query raw free memory on a single non-CUDA device.
+    #[cfg(not(feature = "cuda"))]
+    pub fn get_rank_free_memory(&self, _device_id: usize) -> Result<u64> {
+        use sysinfo::System;
+
+        let mut sys = System::new_all();
+        sys.refresh_all();
+
+        #[cfg(feature = "metal")]
+        let avail_mem = {
+            let device = metal::Device::system_default().expect("No Metal device found");
+            let max_mem = device.recommended_max_working_set_size();
+            let alloc_mem = device.current_allocated_size();
+            std::cmp::max(max_mem.saturating_sub(alloc_mem), sys.available_memory())
+        };
+
+        #[cfg(not(feature = "metal"))]
+        let avail_mem = sys.available_memory();
+
+        Ok(avail_mem)
+    }
+
     /// Query available GPU memory across all given device_ids
     /// Returns the MINIMUM usable memory across all devices
     pub fn get_available_memory(&self, device_ids: &[usize]) -> Result<u64> {
@@ -824,6 +1087,18 @@ impl KVCacheAllocator {
 
         for &device_id in device_ids {
             let mem = self.get_rank_available_memory(device_id)?;
+            min_memory = Some(min_memory.map_or(mem, |m| std::cmp::min(m, mem)));
+        }
+
+        min_memory.ok_or_else(|| candle_core::Error::msg("No device IDs provided"))
+    }
+
+    /// Return the minimum raw free memory across ranks.
+    pub fn get_free_memory(&self, device_ids: &[usize]) -> Result<u64> {
+        let mut min_memory: Option<u64> = None;
+
+        for &device_id in device_ids {
+            let mem = self.get_rank_free_memory(device_id)?;
             min_memory = Some(min_memory.map_or(mem, |m| std::cmp::min(m, mem)));
         }
 
@@ -876,7 +1151,10 @@ impl KVCacheAllocator {
             let blocks_per_seq = (max_len + self.block_size - 1) / self.block_size;
             if total_blocks >= blocks_per_seq {
                 let max_possible_seqs = total_blocks / blocks_per_seq;
-                let max_seqs = std::cmp::min(max_possible_seqs, 8);
+                let max_seqs = std::cmp::min(
+                    max_possible_seqs,
+                    self.user_max_num_seqs.unwrap_or(8).max(1),
+                );
                 return Ok((max_seqs, max_len));
             }
         }
@@ -924,11 +1202,9 @@ impl KVCacheAllocator {
             self.auto_decide_params(min_available_memory)?
         };
 
-        // Always allocate blocks from ALL available memory.
-        // max_num_seqs and max_model_len are scheduling limits enforced at runtime,
-        // not memory reservations. Using the full budget lets a single sequence use
-        // up to max_model_len tokens from the shared pool, rather than artificially
-        // capping the pool to max_num_seqs * max_model_len.
+        // The KV pool is a physical token budget shared by all requests. The
+        // request preallocation limit is not a request-count-times-context
+        // reservation: a request consumes blocks only for its actual tokens.
         let num_gpu_blocks = min_available_memory as usize / per_block;
 
         if num_gpu_blocks == 0 {
@@ -939,9 +1215,13 @@ impl KVCacheAllocator {
             });
         }
 
-        // Max usable KVCache tokens = num_blocks * block_size
-        let max_num_batched_tokens = num_gpu_blocks * self.block_size;
+        // Total KV-cache token capacity (shared pool for all configured requests).
+        let max_kv_cache_tokens = num_gpu_blocks * self.block_size;
         let kvcache_memory_bytes = num_gpu_blocks * per_block;
+
+        // Per-step scheduling budget is computed later in `plan()` once
+        // `max_num_seqs` is finalized (including hybrid mamba clamping).
+        let max_num_batched_tokens = 0;
 
         // CPU blocks for swap
         #[cfg(feature = "cuda")]
@@ -965,14 +1245,15 @@ impl KVCacheAllocator {
             max_model_len,
             kvcache_memory_bytes,
             max_num_batched_tokens,
+            max_kv_cache_tokens,
         };
 
         crate::log_warn!(
-            "KVCache Allocation: {} GPU blocks ({:.2} GB x {}), max usable kvcache tokens {} ({}k bytes per token), scheduling limits [{} seqs x {} tokens]",
+            "KVCache Allocation: {} GPU blocks ({:.2} GB x {}), max KV-cache tokens {} ({}k bytes per token), scheduling limits [{} seqs x {} tokens]",
             num_gpu_blocks,
             kvcache_memory_bytes as f64 / SIZE_IN_GB,
             num_shards,
-            max_num_batched_tokens,
+            max_kv_cache_tokens,
             per_block / 1024 / self.block_size,
             max_num_seqs,
             max_model_len
@@ -987,6 +1268,7 @@ impl KVCacheAllocator {
         econfig.max_num_seqs = allocation.max_num_seqs;
         econfig.max_model_len = Some(allocation.max_model_len);
         econfig.kvcache_memory_bytes = allocation.kvcache_memory_bytes;
+        econfig.max_kv_cache_tokens = allocation.max_kv_cache_tokens;
         econfig.max_num_batched_tokens = allocation.max_num_batched_tokens;
     }
 
@@ -1371,5 +1653,28 @@ impl KVCacheAllocator {
             num_cpu_blocks,
         );
         Ok(Some(cpu_tq))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hybrid_mamba_graph_capture_max_batch_scales_with_max_num_seqs() {
+        assert_eq!(hybrid_mamba_graph_capture_max_batch(1), 1);
+        assert_eq!(hybrid_mamba_graph_capture_max_batch(8), 8);
+        #[cfg(all(feature = "cuda", feature = "graph"))]
+        {
+            assert_eq!(hybrid_mamba_graph_capture_max_batch(17), 17);
+            assert_eq!(hybrid_mamba_graph_capture_max_batch(32), 32);
+            assert_eq!(hybrid_mamba_graph_capture_max_batch(64), 32);
+        }
+        #[cfg(not(all(feature = "cuda", feature = "graph")))]
+        {
+            assert_eq!(hybrid_mamba_graph_capture_max_batch(17), 17);
+            assert_eq!(hybrid_mamba_graph_capture_max_batch(32), 32);
+            assert_eq!(hybrid_mamba_graph_capture_max_batch(64), 64);
+        }
     }
 }

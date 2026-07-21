@@ -44,7 +44,6 @@ pub struct Scheduler {
     pending_runner_releases: Vec<usize>,
 }
 
-const MIN_NUM_SCHEDULED_REQS: usize = 5;
 /// Cap on `Scheduler::finished_cached_tokens`. Bounded memory beats LRU
 /// here: dropping reporting on a small population is acceptable.
 const FINISHED_CACHED_TOKENS_MAX: usize = 16_384;
@@ -61,12 +60,11 @@ const PREFIX_CACHE_RATIO_PD_CLIENT: f32 = 0.5;
 const PREFIX_CACHE_PRESSURE_EVICT_PERCENT: f32 = 0.1; // evict 10% of prefix cache when under pressure
 
 fn active_sequence_limit(max_num_seqs: usize, mamba_cache_capacity: Option<usize>) -> usize {
-    if let Some(mamba_cap) = mamba_cache_capacity {
-        if mamba_cap > 0 {
-            return mamba_cap;
-        }
+    match mamba_cache_capacity {
+        Some(mamba_cap) if mamba_cap > 0 => max_num_seqs.min(mamba_cap),
+        _ => max_num_seqs,
     }
-    std::cmp::max(max_num_seqs, MIN_NUM_SCHEDULED_REQS)
+    .max(1)
 }
 
 fn build_prefix_cache_config(econfig: &EngineConfig) -> PrefixCacheConfig {
@@ -227,7 +225,10 @@ impl Scheduler {
     }
 
     fn active_sequence_limit(&self) -> usize {
-        active_sequence_limit(self.cfg.max_num_seqs, self.cfg.mamba_cache_capacity)
+        active_sequence_limit(
+            self.cfg.max_num_parallel_reqs.max(1),
+            self.cfg.mamba_cache_capacity,
+        )
     }
 
     /// Schedule sequences and return their indexes in `running` along with prefill flag
@@ -263,16 +264,15 @@ impl Scheduler {
             }
         }
 
-        // Prefill phase: move sequences from waiting to running if possible
+        // Prefill phase: move sequences from waiting to running if possible.
         // Use effective chunk tokens (not full sequence length) for budget accounting
         // to enable batched prefill of multiple sequences per step.
-        // Capture running count before this batch so the interleave check only
-        // considers pre-existing decode sequences, not ones added in this loop.
+        // Preserve interleaving: when the previous step was prefill and decode
+        // sequences already existed, give those sequences a decode step before
+        // admitting another waiting prefill batch.
         let pre_existing_running = self.running.len();
-
-        // For hybrid mamba models, cap total concurrent sequences to the mamba
-        // cache capacity so the runner never hits "no free slots" at forward time.
         let max_seqs_limit = self.active_sequence_limit();
+        let token_budget = self.cfg.max_num_batched_tokens;
 
         while let Some(mut seq) = self.waiting.pop_front() {
             // Try to transfer prefill requests to PD server when applicable
@@ -284,7 +284,7 @@ impl Scheduler {
 
             if self.running.len() >= max_seqs_limit
                 || scheduled_ids.len() >= max_seqs_limit
-                || num_tokens + effective_tokens >= self.cfg.max_num_batched_tokens - 1
+                || num_tokens + effective_tokens > token_budget
                 || (seq.block_table.is_empty() && !self.block_manager.can_allocate(&seq))
                 // interleaved scheduling: alternate prefill/decode for fairness
                 // only block when there are pre-existing decode sequences
@@ -619,7 +619,11 @@ impl Scheduler {
                 if hit_stop_sequence
                     || self.eos_token_id.contains(&token)
                     || seq.output_len() >= seq.sampling_params.max_tokens.unwrap_or(16384)
-                    || seq.len() > self.cfg.max_num_batched_tokens
+                    || seq.len()
+                        > self
+                            .cfg
+                            .max_model_len
+                            .unwrap_or(self.cfg.max_kv_cache_tokens.max(1))
                 {
                     if hit_stop_sequence {
                         crate::log_info!(
@@ -1456,16 +1460,23 @@ impl Scheduler {
 
 #[cfg(test)]
 mod tests {
-    use super::{active_sequence_limit, MIN_NUM_SCHEDULED_REQS};
+    use super::active_sequence_limit;
 
     #[test]
     fn active_sequence_limit_uses_mamba_capacity_for_hybrid_models() {
-        assert_eq!(active_sequence_limit(5, Some(9)), 9);
+        assert_eq!(active_sequence_limit(8, Some(5)), 5);
+        assert_eq!(active_sequence_limit(5, Some(9)), 5);
     }
 
     #[test]
-    fn active_sequence_limit_preserves_minimum_for_non_hybrid_models() {
-        assert_eq!(active_sequence_limit(1, None), MIN_NUM_SCHEDULED_REQS);
+    fn active_sequence_limit_respects_parallel_limit_for_non_hybrid_models() {
+        assert_eq!(active_sequence_limit(1, None), 1);
+    }
+
+    #[test]
+    fn active_sequence_limit_never_exceeds_mamba_or_parallel_capacity() {
+        assert_eq!(active_sequence_limit(12, Some(4)), 4);
+        assert_eq!(active_sequence_limit(0, None), 1);
     }
 
     #[test]

@@ -512,10 +512,13 @@ impl LLMEngine {
         scheduler.set_tokenizer(Arc::new(tokenizer.clone()));
 
         log_warn!(
-            "Maximum batched tokens {} ({} blocks x Block_Size {} for KV cache). Additional CPU KV Cache blocks {}.",
-            econfig.max_num_batched_tokens,
+            "KV-cache pool {} tokens ({} blocks x block_size {}). Per-step scheduling budget {} tokens (max {} parallel reqs, max {} reqs). Additional CPU KV Cache blocks {}.",
+            econfig.max_kv_cache_tokens,
             econfig.num_blocks,
             econfig.block_size,
+            econfig.max_num_batched_tokens,
+            econfig.max_num_parallel_reqs,
+            econfig.max_num_seqs,
             (econfig.num_blocks as f32 * econfig.cpu_mem_fold.unwrap_or(0.5f32)) as usize
         );
 

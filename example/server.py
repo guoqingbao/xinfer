@@ -9,7 +9,14 @@ from xinfer import Engine, EngineConfig, GenerationConfig, PdConfig, PdMethod, P
 def parse_args():
     parser = argparse.ArgumentParser(description="Run Chat Server")
     parser.add_argument("--host", type=str, default="0.0.0.0")
-    parser.add_argument("--port", type=int, default=None)
+    parser.add_argument(
+        "--port",
+        "--p",
+        dest="port",
+        type=int,
+        default=None,
+        help="server port (alias: --p)",
+    )
     parser.add_argument("--m", help="huggingface model id", type=str, default=None)
     parser.add_argument("--w", help="safetensor weight path", type=str, default=None)
     parser.add_argument("--f", help="gguf file path or gguf file name when model_id is given", type=str, default=None)
