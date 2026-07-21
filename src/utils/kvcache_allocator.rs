@@ -31,6 +31,7 @@ const DEFAULT_HYBRID_MAMBA_FRACTION: f64 = 0.20;
 const MAX_HYBRID_MAMBA_FRACTION: f64 = 0.35;
 /// CUDA graph capture is planned for every exact batch up to 32. Keep hybrid
 /// GDN/Mamba state capacity aligned with that exact capture limit.
+#[cfg(all(feature = "cuda", feature = "graph"))]
 pub(crate) const HYBRID_MAMBA_GRAPH_CAPTURE_MAX_BATCH: usize = 32;
 
 pub(crate) fn hybrid_mamba_graph_capture_max_batch(max_num_seqs: usize) -> usize {
@@ -585,23 +586,32 @@ impl KVCacheAllocator {
     /// Capture happens after KV-cache allocation, so this memory is reserved
     /// while choosing both the KV pool and the parallel-request limit.
     fn cuda_graph_bytes(&self, graph_batch: usize, max_model_len: usize) -> u64 {
-        if !cfg!(all(feature = "cuda", feature = "graph")) || graph_batch == 0 {
-            return 0;
+        #[cfg(all(feature = "cuda", feature = "graph"))]
+        {
+            if graph_batch == 0 {
+                return 0;
+            }
+            let max_blocks = max_model_len.div_ceil(self.block_size.max(1));
+            crate::utils::graph::planned_graph_capture_batches(graph_batch)
+                .into_iter()
+                .map(|batch| {
+                    let batch = batch as u64;
+                    let metadata = batch * (max_blocks as u64 * 8 + 8 * 1024 * 1024);
+                    let hidden = batch * self.hidden_size as u64 * self.model_dtype_size as u64 * 8;
+                    let logits = batch
+                        * self.num_attention_heads.max(1) as u64
+                        * self.model_dtype_size as u64
+                        * 4;
+                    metadata.saturating_add(hidden).saturating_add(logits)
+                })
+                .sum()
         }
-        let max_blocks = max_model_len.div_ceil(self.block_size.max(1));
-        crate::utils::graph::planned_graph_capture_batches(graph_batch)
-            .into_iter()
-            .map(|batch| {
-                let batch = batch as u64;
-                let metadata = batch * (max_blocks as u64 * 8 + 8 * 1024 * 1024);
-                let hidden = batch * self.hidden_size as u64 * self.model_dtype_size as u64 * 8;
-                let logits = batch
-                    * self.num_attention_heads.max(1) as u64
-                    * self.model_dtype_size as u64
-                    * 4;
-                metadata.saturating_add(hidden).saturating_add(logits)
-            })
-            .sum()
+
+        #[cfg(not(all(feature = "cuda", feature = "graph")))]
+        {
+            let _ = (graph_batch, max_model_len);
+            0
+        }
     }
 
     fn runtime_reserve_bytes(&self, parallel_reqs: usize, max_model_len: usize) -> u64 {
@@ -643,13 +653,11 @@ impl KVCacheAllocator {
             .saturating_sub(fixed_runtime)
             .checked_div(per_request_prefill)
             .unwrap_or(0) as usize;
-        let mut parallel_limit = kv_parallel_limit.min(memory_parallel_limit);
+        let parallel_limit = kv_parallel_limit.min(memory_parallel_limit);
 
         #[cfg(all(feature = "cuda", feature = "graph"))]
-        {
-            // GraphCapturer captures every exact batch up to 32.
-            parallel_limit = parallel_limit.min(HYBRID_MAMBA_GRAPH_CAPTURE_MAX_BATCH);
-        }
+        // GraphCapturer captures every exact batch up to 32.
+        let parallel_limit = parallel_limit.min(HYBRID_MAMBA_GRAPH_CAPTURE_MAX_BATCH);
 
         // max_num_seqs is a user KV/preallocation input, not a parallelism
         // ceiling. If it is above the resource-derived limit, it still has to
@@ -847,10 +855,8 @@ impl KVCacheAllocator {
                             );
                         }
                         crate::log_warn!(
-                            "Per-step scheduling budget: {} batched tokens (max {} parallel reqs, max {} reqs, prefill chunk {}). KV-cache pool: {} tokens.",
+                            "Per-step scheduling budget: {} batched tokens (prefill chunk {}). KV-cache pool: {} tokens.",
                             econfig.max_num_batched_tokens,
-                            econfig.max_num_parallel_reqs,
-                            econfig.max_num_seqs,
                             econfig.effective_prefill_chunk_size(),
                             econfig.max_kv_cache_tokens
                         );
