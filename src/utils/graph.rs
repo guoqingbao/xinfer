@@ -858,6 +858,7 @@ impl<M: CudaGraphModule> GraphCapturer<M> {
         let cu_seqlens_q = Tensor::from_vec(vec![0u32, verify_len as u32], (2,), device)?;
         let cu_seqlens_k = Tensor::from_vec(vec![0u32, self.max_model_len as u32], (2,), device)?;
 
+        #[cfg(feature = "flashinfer")]
         let last_page_len = if self.max_model_len == 0 {
             0u32
         } else {

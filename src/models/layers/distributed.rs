@@ -1464,27 +1464,47 @@ impl VocabParallelLinear {
             });
         }
 
-        let padded_vocab = pad_vocab_size(out_dim, world_size);
-        let linear = linear(
-            in_dim,
-            padded_vocab,
-            vb,
-            shard(0, comm.rank(), world_size),
-            quant_cfg,
-            quant,
-            dtype,
-        )?;
-
-        #[cfg(feature = "nccl")]
-        let all_gather = Some(AllGather::new(comm));
-
-        Ok(Self {
-            linear,
+        // Prefer candle-native sharding when vocab is evenly divisible by TP.
+        // Otherwise load full weight, pad, then narrow (e.g. Qwen3-Embedding
+        // vocab 151665 with TP=2).
+        if out_dim % world_size == 0 {
+            let linear = linear(
+                in_dim,
+                out_dim,
+                vb,
+                shard(0, comm.rank(), world_size),
+                quant_cfg,
+                quant,
+                dtype,
+            )?;
             #[cfg(feature = "nccl")]
-            all_gather,
-            org_vocab_size: out_dim,
-            dtype,
-        })
+            let all_gather = Some(AllGather::new(comm));
+            return Ok(Self {
+                linear,
+                #[cfg(feature = "nccl")]
+                all_gather,
+                org_vocab_size: out_dim,
+                dtype,
+            });
+        }
+
+        let full = linear(in_dim, out_dim, vb, shard(0, 0, 1), quant_cfg, quant, dtype)?;
+        let (weight, bias) = match full {
+            Linear::Linear(ln) => (ln.weight().clone(), ln.bias().cloned()),
+            Linear::QLinear(qln) => {
+                let weight = qln.dequantize()?;
+                let weight = if weight.dtype() != dtype {
+                    weight.to_dtype(dtype)?
+                } else {
+                    weight
+                };
+                (weight, qln.bias().cloned())
+            }
+            other => candle_core::bail!(
+                "VocabParallelLinear TP padding path requires dense/GGUF lm_head weights, got {other:?}"
+            ),
+        };
+        Self::from_weight_bias(weight, bias, comm, out_dim, dtype)
     }
 
     pub fn from_weight_bias(
