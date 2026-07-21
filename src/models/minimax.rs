@@ -9,6 +9,7 @@ use crate::models::layers::rotary_emb::{ApplyRotaryEmbedding, ScalingRotaryEmbed
 use crate::models::layers::VarBuilderX;
 use crate::utils::config::Config;
 use crate::utils::progress::ProgressLike;
+use crate::utils::InputMetadataExt;
 use attention_rs::InputMetadata;
 use candle_core::{DType, Device, Result, Tensor};
 use candle_nn::Module;
@@ -200,7 +201,7 @@ impl MiniMaxDecoderLayer {
         let xs = (attn_output + residual)?;
         let residual = &xs;
         let xs = self.post_attention_layernorm.forward(&xs)?;
-        let mlp_output = self.moe.forward(&xs, input_metadata.is_prefill)?;
+        let mlp_output = self.moe.forward(&xs, input_metadata.moe_is_prefill())?;
         residual + mlp_output
     }
 }

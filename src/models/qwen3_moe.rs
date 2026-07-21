@@ -12,6 +12,7 @@ use crate::models::layers::rotary_emb::{ApplyRotaryEmbedding, ScalingRotaryEmbed
 use crate::models::layers::VarBuilderX;
 use crate::utils::config::Config;
 use crate::utils::progress::ProgressLike;
+use crate::utils::InputMetadataExt;
 use attention_rs::InputMetadata;
 use candle_core::{DType, Device, Result, Tensor};
 use candle_nn::Module;
@@ -283,7 +284,7 @@ impl Qwen3DecoderLayer {
             }
             _ => None,
         };
-        let mlp_output = self.mlp.forward(&xs, input_metadata.is_prefill)?;
+        let mlp_output = self.mlp.forward(&xs, input_metadata.moe_is_prefill())?;
         if let Some(shared_output) = shared_output {
             residual + (mlp_output + shared_output)?
         } else {
