@@ -10,6 +10,7 @@ use crate::models::layers::rotary_emb::{ApplyRotaryEmbedding, RotaryEmbedding};
 use crate::models::layers::VarBuilderX;
 use crate::utils::config::Config;
 use crate::utils::progress::ProgressLike;
+use crate::utils::InputMetadataExt;
 use attention_rs::InputMetadata;
 use candle_core::{DType, Device, Module, Result, Tensor};
 use candle_nn::Linear;
@@ -531,7 +532,7 @@ impl Gemma4DecoderLayer {
                     &moe_input,
                     topk_weights,
                     topk_ids,
-                    input_metadata.is_prefill,
+                    input_metadata.moe_is_prefill(),
                 )?
             } else {
                 let moe_input = self
@@ -539,7 +540,7 @@ impl Gemma4DecoderLayer {
                     .as_ref()
                     .unwrap()
                     .forward(&residual_flat)?;
-                moe.forward(&moe_input, input_metadata.is_prefill)?
+                moe.forward(&moe_input, input_metadata.moe_is_prefill())?
             };
             let moe_output = moe_output.reshape(residual.shape())?;
 

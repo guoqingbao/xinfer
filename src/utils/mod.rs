@@ -29,9 +29,25 @@ use crate::utils::config::QuantConfig;
 use crate::utils::config::RopeScalingValue;
 use crate::utils::downloader::ModelPaths;
 use crate::utils::gguf_helper::{load_gguf_info_from_files, GGUFInfo};
+use attention_rs::InputMetadata;
 use candle_core::utils::{cuda_is_available, metal_is_available};
 use candle_core::{DType, Device, Result};
 use config::{Config, EngineConfig, EosTokenId, GenerationConfig, TokenizerConfig};
+
+pub trait InputMetadataExt {
+    /// Whether MoE layers should use the prefill (grouped GEMM) kernel path.
+    ///
+    /// MTP verify sets `is_prefill=true` for attention/GDN varlen prefill, but only
+    /// processes a handful of tokens. MoE must use the decode/GEMV path in that case
+    /// to stay CUDA-graph safe and avoid ephemeral CUTLASS scratch on SM100+.
+    fn moe_is_prefill(&self) -> bool;
+}
+
+impl InputMetadataExt for InputMetadata {
+    fn moe_is_prefill(&self) -> bool {
+        self.is_prefill && !self.is_mtp_verify
+    }
+}
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tokenizers::Tokenizer;
