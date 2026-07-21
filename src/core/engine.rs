@@ -1177,6 +1177,44 @@ impl LLMEngine {
         }
     }
 
+    fn run_mtp_on_local_streams(
+        runner_streams: &mut Vec<LocalStream>,
+        request: &MessageType,
+    ) -> Result<Vec<Vec<u32>>> {
+        // MTP executes tensor-parallel attention/MoE kernels and therefore every
+        // local runner must enter the same NCCL collectives. Send the request to
+        // all ranks before waiting for any response; waiting on rank 0 first would
+        // deadlock while the other ranks are still idle.
+        let cloned_streams: Vec<LocalStream> = runner_streams
+            .iter_mut()
+            .map(|s| s.try_clone().expect("clone failed"))
+            .collect();
+
+        let all_outputs: Result<Vec<Vec<Vec<u32>>>> = cloned_streams
+            .into_par_iter()
+            .map(|mut stream| {
+                send_local(&mut vec![stream.try_clone()?], request, false)?;
+                match receive_local(&mut stream, false)? {
+                    MessageType::RunResponseMTP(multi_tokens) if !multi_tokens.is_empty() => {
+                        Ok(multi_tokens)
+                    }
+                    MessageType::RunResponseMTP(_) => {
+                        candle_core::bail!("MTP runner returned empty response")
+                    }
+                    other => {
+                        candle_core::bail!("Unexpected MTP response type: {:?}", other)
+                    }
+                }
+            })
+            .collect();
+
+        let all_outputs = all_outputs.map_err(candle_core::Error::wrap)?;
+        all_outputs
+            .into_iter()
+            .next()
+            .ok_or_else(|| candle_core::Error::Msg("No response from local MTP runners".into()))
+    }
+
     /// Run MTP speculative decode forward pass.
     /// Returns Vec<Vec<u32>> where each inner vec contains all accepted tokens for that sequence.
     fn run_forward_mtp(
@@ -1189,44 +1227,20 @@ impl LLMEngine {
                 model_runner.run_mtp_decode(Seqs::SeqRefs(&seq_refs))
             }
             RunnerType::Process(ref mut runner_streams) => {
-                use crate::runner::{receive_local, send_local, MessageType};
-                use interprocess::TryClone;
+                use crate::runner::MessageType;
 
                 let sequences = owned_seqs
                     .iter()
                     .map(|s| DecodeSequence::new(s))
                     .collect::<Vec<_>>();
                 let request = MessageType::RunDecodeMTP(sequences);
-
-                let cloned_streams: Vec<LocalStream> = runner_streams
-                    .iter_mut()
-                    .map(|s| s.try_clone().expect("clone failed"))
-                    .collect();
-
-                if let Some(mut stream) = cloned_streams.into_iter().next() {
-                    send_local(&mut vec![stream.try_clone()?], &request, false)?;
-                    let response = receive_local(&mut stream, false)?;
-                    match response {
-                        MessageType::RunResponseMTP(multi_tokens) => {
-                            if multi_tokens.is_empty() {
-                                candle_core::bail!("MTP runner returned empty response")
-                            }
-                            Ok(multi_tokens)
-                        }
-                        other => {
-                            candle_core::bail!("Unexpected MTP response type: {:?}", other)
-                        }
-                    }
-                } else {
-                    candle_core::bail!("No runner streams available for MTP")
-                }
+                Self::run_mtp_on_local_streams(runner_streams, &request)
             }
             RunnerType::MultiNodeMaster {
                 ref mut local_streams,
                 ref mut remote_streams,
             } => {
-                use crate::runner::{receive_local, send_local, MessageType};
-                use interprocess::TryClone;
+                use crate::runner::MessageType;
 
                 let sequences = owned_seqs
                     .iter()
@@ -1242,28 +1256,7 @@ impl LLMEngine {
                     }
                 }
 
-                let cloned_streams: Vec<LocalStream> = local_streams
-                    .iter_mut()
-                    .map(|s| s.try_clone().expect("clone failed"))
-                    .collect();
-
-                let result = if let Some(mut stream) = cloned_streams.into_iter().next() {
-                    send_local(&mut vec![stream.try_clone()?], &request, false)?;
-                    let response = receive_local(&mut stream, false)?;
-                    match response {
-                        MessageType::RunResponseMTP(multi_tokens) => {
-                            if multi_tokens.is_empty() {
-                                candle_core::bail!("MTP runner returned empty response")
-                            }
-                            Ok(multi_tokens)
-                        }
-                        other => {
-                            candle_core::bail!("Unexpected MTP response type: {:?}", other)
-                        }
-                    }
-                } else {
-                    candle_core::bail!("No local runner streams available for MTP")
-                };
+                let result = Self::run_mtp_on_local_streams(local_streams, &request);
 
                 for tcp_stream in remote_streams.iter_mut() {
                     let _ = crate::utils::multi_node::recv_tcp(tcp_stream);

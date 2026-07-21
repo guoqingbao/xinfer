@@ -622,9 +622,19 @@ impl ModelRunner {
                 ModelType::Qwen3_5 | ModelType::Qwen3_5MoE | ModelType::Qwen3VL
             );
             let has_mtp_config = config.mtp_num_hidden_layers.unwrap_or(0) > 0;
-            let has_mtp_weights = vb.pp("mtp").has_key("fc.weight")
-                || vb.pp("mtp").has_key("layers.0.mlp.gate_proj.weight")
-                || vb.pp("mtp").has_key("layers.0.mlp.gate.weight");
+            let mtp_vb = vb.pp("mtp");
+            let has_safetensors_mtp_weights = mtp_vb.has_key("fc.weight")
+                || mtp_vb.has_key("layers.0.mlp.gate_proj.weight")
+                || mtp_vb.has_key("layers.0.mlp.gate.weight");
+            let has_gguf_mtp_weights = if vb.is_qvar_builder() {
+                let gguf_mtp_vb = vb.pp(config.num_hidden_layers.to_string().as_str());
+                gguf_mtp_vb.has_key("nextn.eh_proj.weight")
+                    || gguf_mtp_vb.has_key("attn_q.weight")
+                    || gguf_mtp_vb.has_key("ffn_gate.weight")
+            } else {
+                false
+            };
+            let has_mtp_weights = has_safetensors_mtp_weights || has_gguf_mtp_weights;
 
             if is_mtp_model_type && (has_mtp_config || has_mtp_weights) && has_mtp_weights {
                 match crate::models::qwen3_5_mtp::Qwen3_5MtpHead::new(
