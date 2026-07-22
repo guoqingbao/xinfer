@@ -695,6 +695,15 @@ pub fn linear_x(
                     return Ok(LinearX::LnNvfp4(ln));
                 }
 
+                // compressed-tensors configs may deliberately leave dense
+                // projections in BF16/F16 (for example Qwen3Next's linear
+                // attention and shared expert).  Only enter WNA16 when the
+                // module actually contains packed weights.
+                if cfg.is_compressed_tensors && !vb.contains_tensor("weight_packed") {
+                    let ln = linear(in_dim, out_dim, vb.clone(), shards, dtype)?;
+                    return Ok(LinearX::Linear(ln));
+                }
+
                 let wna16 = WNA16::new(
                     in_dim,
                     out_dim,
@@ -835,6 +844,11 @@ pub fn linear_no_bias_x(
                         LnNvfp4::load(in_dim, out_dim, vb.clone(), shards, false)?
                     };
                     return Ok(LinearX::LnNvfp4(ln));
+                }
+
+                if cfg.is_compressed_tensors && !vb.contains_tensor("weight_packed") {
+                    let ln = linear_no_bias(in_dim, out_dim, vb.clone(), shards, dtype)?;
+                    return Ok(LinearX::Linear(ln));
                 }
 
                 let wna16 = WNA16::new(

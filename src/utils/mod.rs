@@ -1504,13 +1504,17 @@ pub fn init_config_tokenizer(
             assert!(
                 qcfg.quant_method == "gptq"
                     || qcfg.quant_method == "awq"
+                    || qcfg.quant_method == "compressed-tensors"
                     || qcfg.quant_method == "fp8"
                     || qcfg.quant_method == "mxfp4"
                     || qcfg.quant_method == "nvfp4",
-                "Invalid quantization format! Only `gptq`, `awq`, `fp8`, `mxfp4` and `nvfp4` supported, got `{}`",
+                "Invalid quantization format! Only `gptq`, `awq`, `compressed-tensors`, `fp8`, `mxfp4` and `nvfp4` supported, got `{}`",
                 qcfg.quant_method
             );
-            if qcfg.quant_method == "gptq" || qcfg.quant_method == "awq" {
+            if qcfg.quant_method == "gptq"
+                || qcfg.quant_method == "awq"
+                || qcfg.quant_method == "compressed-tensors"
+            {
                 assert!(
                     (qcfg.bits == 4 || qcfg.bits == 8),
                     "Only 4-bit and 8-bit gptq or awq models supported!"

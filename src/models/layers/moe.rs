@@ -596,6 +596,223 @@ This usually means packed down_proj / gate_up_proj layout was interpreted incorr
     }
 }
 
+/// MoE WNA16 loader for compressed-tensors `pack-quantized` checkpoints.
+///
+/// The checkpoint stores each expert projection independently as
+/// `weight_packed` (`[out, in / pack_factor]`) and `weight_scale`
+/// (`[out, in / group_size]`).  The packed tensors stay packed on device and
+/// are consumed by attention.rs' grouped WNA16 kernel.
+pub struct FusedMoeWNA16 {
+    gate: Linear,
+    gate_up_packed: Tensor,
+    gate_up_scales: Tensor,
+    down_packed: Tensor,
+    down_scales: Tensor,
+    w_size_n: usize,
+    act: Activation,
+    routing: MoeRouting,
+    all_reduce: AllReduce,
+    world_size: usize,
+    dtype: DType,
+    bits: usize,
+    group_size: usize,
+    gate_dtype: DType,
+}
+
+impl FusedMoeWNA16 {
+    pub fn new(
+        cfg: &Config,
+        vb: VarBuilderX,
+        comm: Rc<Comm>,
+        dtype: DType,
+        quant_cfg: &QuantConfig,
+    ) -> Result<Self> {
+        Self::new_with_gate(
+            cfg,
+            vb.pp("gate"),
+            vb.pp("experts"),
+            &vb,
+            comm,
+            dtype,
+            quant_cfg,
+        )
+    }
+
+    pub fn new_with_gate(
+        cfg: &Config,
+        gate_vb: VarBuilderX,
+        experts_vb: VarBuilderX,
+        bias_vb: &VarBuilderX,
+        comm: Rc<Comm>,
+        dtype: DType,
+        quant_cfg: &QuantConfig,
+    ) -> Result<Self> {
+        let moe_cfg = cfg.moe_cfg.as_ref().expect("MoE config is not available!");
+        let num_experts = moe_cfg.num_experts.unwrap();
+        let bits = quant_cfg.bits;
+        let group_size = quant_cfg.group_size as usize;
+        if !matches!(bits, 4 | 8) || group_size == 0 {
+            candle_core::bail!(
+                "compressed-tensors WNA16 MoE requires 4/8 bits and a positive group size, got bits={bits}, group_size={group_size}"
+            );
+        }
+        if quant_cfg.sym == Some(false) {
+            candle_core::bail!("asymmetric compressed-tensors WNA16 MoE is not supported yet");
+        }
+
+        let gate_dtype = if cfg.higher_precision_required() {
+            DType::F32
+        } else {
+            dtype
+        };
+        let gate = linear_no_bias(
+            cfg.hidden_size,
+            num_experts,
+            gate_vb,
+            Shard::default(),
+            &None,
+            &None,
+            gate_dtype,
+        )?;
+
+        let pack_factor = 32 / bits;
+        let mut gate_weights = Vec::with_capacity(num_experts);
+        let mut gate_scales = Vec::with_capacity(num_experts);
+        let mut up_weights = Vec::with_capacity(num_experts);
+        let mut up_scales = Vec::with_capacity(num_experts);
+        let mut down_weights = Vec::with_capacity(num_experts);
+        let mut down_scales = Vec::with_capacity(num_experts);
+        for expert_id in 0..num_experts {
+            let expert = experts_vb.pp(expert_id.to_string().as_str());
+            let (gate_name, up_name, down_name) = resolve_expert_proj_prefix_x(&expert);
+            let gate_vb = expert.pp(gate_name);
+            let up_vb = expert.pp(up_name);
+            let down_vb = expert.pp(down_name);
+
+            gate_weights.push(gate_vb.get_with_hints_dtype(
+                (moe_cfg.moe_intermediate_size, cfg.hidden_size / pack_factor),
+                "weight_packed",
+                shard(0, comm.rank(), comm.world_size()),
+                DType::U32,
+            )?);
+            gate_scales.push(gate_vb.get_with_hints_dtype(
+                (moe_cfg.moe_intermediate_size, cfg.hidden_size / group_size),
+                "weight_scale",
+                shard(0, comm.rank(), comm.world_size()),
+                dtype,
+            )?);
+            up_weights.push(up_vb.get_with_hints_dtype(
+                (moe_cfg.moe_intermediate_size, cfg.hidden_size / pack_factor),
+                "weight_packed",
+                shard(0, comm.rank(), comm.world_size()),
+                DType::U32,
+            )?);
+            up_scales.push(up_vb.get_with_hints_dtype(
+                (moe_cfg.moe_intermediate_size, cfg.hidden_size / group_size),
+                "weight_scale",
+                shard(0, comm.rank(), comm.world_size()),
+                dtype,
+            )?);
+            down_weights.push(down_vb.get_with_hints_dtype(
+                (cfg.hidden_size, moe_cfg.moe_intermediate_size / pack_factor),
+                "weight_packed",
+                shard(1, comm.rank(), comm.world_size()),
+                DType::U32,
+            )?);
+            down_scales.push(down_vb.get_with_hints_dtype(
+                (cfg.hidden_size, moe_cfg.moe_intermediate_size / group_size),
+                "weight_scale",
+                shard(1, comm.rank(), comm.world_size()),
+                dtype,
+            )?);
+        }
+
+        let gate_up_packed = Tensor::cat(
+            &[
+                &Tensor::stack(&gate_weights, 0)?,
+                &Tensor::stack(&up_weights, 0)?,
+            ],
+            1,
+        )?
+        .contiguous()?;
+        let gate_up_scales = Tensor::cat(
+            &[
+                &Tensor::stack(&gate_scales, 0)?,
+                &Tensor::stack(&up_scales, 0)?,
+            ],
+            1,
+        )?
+        .contiguous()?;
+        let down_packed = Tensor::stack(&down_weights, 0)?.contiguous()?;
+        let down_scales = Tensor::stack(&down_scales, 0)?.contiguous()?;
+        let w_size_n = gate_up_packed.dim(1)? / 2;
+
+        Ok(Self {
+            gate,
+            gate_up_packed,
+            gate_up_scales,
+            down_packed,
+            down_scales,
+            w_size_n,
+            act: cfg.hidden_act,
+            routing: MoeRouting::from_moe_cfg(
+                moe_cfg,
+                try_load_e_score_correction_bias(bias_vb, num_experts),
+            ),
+            all_reduce: AllReduce::new(comm.clone()),
+            world_size: comm.world_size(),
+            dtype,
+            bits,
+            group_size,
+            gate_dtype,
+        })
+    }
+
+    pub fn forward(&self, xs: &Tensor, is_prefill: bool) -> Result<Tensor> {
+        let (num_tokens, hidden_dim) = xs.dims2()?;
+        let gate_input = if xs.dtype() != self.gate_dtype {
+            std::borrow::Cow::Owned(xs.to_dtype(self.gate_dtype)?)
+        } else {
+            std::borrow::Cow::Borrowed(xs)
+        };
+        let router_logits = self.gate.forward(&gate_input)?.to_dtype(DType::F32)?;
+        let (topk_weights, topk_ids) = self.routing.route(&router_logits, is_prefill)?;
+        let (expert_ids, sorted_token_ids) = sort_expert_assignments(&topk_ids, is_prefill)?;
+
+        let gate_up = moe::moe_gemm_wna16(
+            xs,
+            &self.gate_up_packed,
+            &self.gate_up_scales,
+            &None,
+            &sorted_token_ids,
+            &expert_ids,
+            self.routing.num_experts_per_tok,
+            self.bits,
+            self.group_size,
+            is_prefill,
+        )?;
+        let down_inputs = gated_activation(&gate_up, self.w_size_n, &self.act)?;
+        let mut ys = moe::moe_gemm_wna16(
+            &down_inputs,
+            &self.down_packed,
+            &self.down_scales,
+            &Some(topk_weights),
+            &sorted_token_ids,
+            &expert_ids,
+            self.routing.num_experts_per_tok,
+            self.bits,
+            self.group_size,
+            is_prefill,
+        )?
+        .reshape((num_tokens, (), hidden_dim))?
+        .sum(D::Minus2)?;
+        if self.world_size > 1 {
+            ys = self.all_reduce.apply(&ys)?;
+        }
+        Ok(ys.to_dtype(self.dtype)?)
+    }
+}
+
 pub struct FusedMoeGGUF {
     gate: Linear,
     gate_experts: Arc<QTensor>,

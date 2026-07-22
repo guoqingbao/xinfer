@@ -95,6 +95,7 @@ impl GatedDeltaNet {
                 (has_packed && has_scale) || (has_nvfp4_second_scale && has_scale) || is_mlx_nvfp4
             }
             "gptq" | "awq" => vb.has_key("qweight") || vb.has_key("B"),
+            "compressed-tensors" => vb.has_key("weight_packed") && vb.has_key("weight_scale"),
             _ => true,
         }
     }
