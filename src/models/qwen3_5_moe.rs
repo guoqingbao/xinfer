@@ -152,7 +152,7 @@ impl Qwen3_5MoEDecoderLayer {
                     comm.clone(),
                     dtype,
                 )?)
-            } else if quant_config.is_compressed_tensors {
+            } else if quant_config.is_compressed_tensors || quant_config.quant_method == "gptq" {
                 MoeOrMlp::FusedMoeWNA16(FusedMoeWNA16::new(
                     config,
                     vb.pp("mlp").clone(),

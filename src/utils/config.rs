@@ -358,10 +358,24 @@ impl Config {
     pub fn higher_precision_required(&self) -> bool {
         self.is_f16_mode
             || self.quant.is_some()
-            || self
-                .quantization_config
-                .as_ref()
-                .is_some_and(|cfg| matches!(cfg.quant_method.as_str(), "mxfp4" | "nvfp4"))
+            || self.quantization_config.as_ref().is_some_and(|cfg| {
+                // Weight-only AWQ/GPTQ and compressed-tensors WNA16
+                // models are especially sensitive to low-precision norm
+                // statistics. Keep norm weights/reductions and Q/K
+                // preparation in F32 while retaining the configured
+                // activation dtype for the surrounding matmuls.
+                cfg.is_compressed_tensors
+                    || matches!(
+                        cfg.quant_method.as_str(),
+                        "awq"
+                            | "gptq"
+                            | "awq_marlin"
+                            | "gptq_marlin"
+                            | "compressed-tensors"
+                            | "mxfp4"
+                            | "nvfp4"
+                    )
+            })
     }
 }
 
