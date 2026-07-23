@@ -202,6 +202,9 @@ pub fn run_runner() -> anyhow::Result<()> {
                     llg_factory,
                     stream_kv,
                 )?;
+                // Async CUDA weight H2D keeps mmap live until this sync.
+                #[cfg(feature = "cuda")]
+                vb.device().synchronize()?;
                 drop(vb);
                 runner
             };
