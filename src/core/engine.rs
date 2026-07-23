@@ -258,6 +258,9 @@ impl LLMEngine {
                     llg_factory.clone(),
                     None,
                 )?;
+                // Async CUDA weight H2D keeps mmap live until this sync.
+                #[cfg(feature = "cuda")]
+                device.synchronize()?;
                 drop(vb);
                 runner
             };
