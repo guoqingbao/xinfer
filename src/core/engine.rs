@@ -249,7 +249,7 @@ impl LLMEngine {
                         .unwrap(),
                     ),
                     &mut econfig,
-                    &config,
+                    &mut config,
                     dtype,
                     is_rope_i,
                     device.clone(),
@@ -412,6 +412,7 @@ impl LLMEngine {
                     let ecfg = engine_config.get_or_init(|| {
                         let mut econfig = econfig.clone();
                         let allocator = KVCacheAllocator::new(&econfig, &config, dtype);
+                        // Propagate resolved dtype (e.g. TurboQuant → Auto on MLA) before plan/IPC.
                         econfig.kvcache_dtype = allocator.resolved_kvcache_dtype();
                         let device_ids = econfig.device_ids.clone().unwrap_or(vec![0]);
                         match allocator.plan(&device_ids, &mut econfig) {
@@ -447,6 +448,7 @@ impl LLMEngine {
             }
             if let Some(cfg) = engine_config.get() {
                 econfig = cfg.clone();
+                config.kvcache_dtype = econfig.kvcache_dtype;
             }
 
             let local_streams = runner_streams?;

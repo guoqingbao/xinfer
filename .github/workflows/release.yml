@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: "Existing release tag to rebuild, for example v0.14.0"
+        description: "Existing release tag to rebuild, for example v0.14.1"
         required: true
-        default: "v0.14.0"
+        default: "v0.14.1"
   push:
     tags:
       - "v*.*.*"

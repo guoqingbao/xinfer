@@ -234,7 +234,7 @@ impl ModelRunner {
         vb: &VarBuilderX,
         comm: Rc<Comm>,
         econfig: &mut EngineConfig,
-        config: &Config,
+        config: &mut Config,
         dtype: DType,
         is_rope_i: bool,
         device: Device,
@@ -340,10 +340,14 @@ impl ModelRunner {
             if let MessageType::UsableMemoryLeft(ecfg) = msg {
                 *econfig = ecfg.clone(); // Update Engine config
             }
+            // Allocator may have fallen back (e.g. TurboQuant → Auto on MLA).
+            // Keep model Config in sync so FlashInfer/backend selection sees the resolved dtype.
+            config.kvcache_dtype = econfig.kvcache_dtype;
             KVCacheAllocator::new(econfig, config, dtype)
         } else {
-            let allocator = KVCacheAllocator::new(&econfig, &config, dtype);
+            let allocator = KVCacheAllocator::new(econfig, config, dtype);
             econfig.kvcache_dtype = allocator.resolved_kvcache_dtype();
+            config.kvcache_dtype = econfig.kvcache_dtype;
             let device_ids = econfig.device_ids.clone().unwrap_or(vec![0]);
             match allocator.plan(&device_ids, econfig) {
                 Ok(_) => {
