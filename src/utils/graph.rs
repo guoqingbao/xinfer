@@ -845,25 +845,45 @@ impl<M: CudaGraphModule> GraphCapturer<M> {
         let verify_len = mtp_num_speculative + 1;
         let max_num_blocks = (self.max_model_len + self.block_size - 1) / self.block_size;
 
+        // Capture must use in-bounds, decode-consistent page metadata. Zeroed
+        // cu_seqlens / last_len=max_model_len previously caused FlashInfer/GDN
+        // OOB during capture; multirank NCCL sync surfaces that as
+        // CUDA_ERROR_ILLEGAL_ADDRESS on InputMetadata drop.
         let input_ids = Tensor::zeros((verify_len,), DType::U32, device)?;
         let positions = Tensor::zeros((verify_len,), DType::I64, device)?;
         let mamba_slot_mapping = Tensor::zeros((1,), DType::I64, device)?;
         let slot_mapping = Tensor::zeros((verify_len,), DType::I64, device)?;
-        let context_lens = Tensor::zeros((1,), DType::U32, device)?;
+        let context_lens = Tensor::from_vec(vec![self.max_model_len as u32], (1,), device)?;
         let block_tables = Tensor::zeros((1, max_num_blocks), DType::U32, device)?;
-        let cu_seqlens_q = Tensor::zeros((2,), DType::U32, device)?;
-        let cu_seqlens_k = Tensor::zeros((2,), DType::U32, device)?;
+        let cu_seqlens_q = Tensor::from_vec(vec![0u32, verify_len as u32], (2,), device)?;
+        let cu_seqlens_k = Tensor::from_vec(vec![0u32, self.max_model_len as u32], (2,), device)?;
 
         #[cfg(feature = "flashinfer")]
-        let flashinfer_indptr = Tensor::zeros((2,), DType::U32, device)?;
+        let last_page_len = if self.max_model_len == 0 {
+            0u32
+        } else {
+            ((self.max_model_len - 1) % self.block_size + 1) as u32
+        };
+
         #[cfg(feature = "flashinfer")]
-        let flashinfer_indices = Tensor::zeros((max_num_blocks,), DType::U32, device)?;
-        #[cfg(feature = "flashinfer")]
-        let flashinfer_last_len = Tensor::zeros((1,), DType::U32, device)?;
+        let (flashinfer_indptr, flashinfer_indices, flashinfer_last_len) = {
+            let indices: Vec<u32> = (0..max_num_blocks as u32).collect();
+            (
+                Tensor::from_vec(vec![0u32, max_num_blocks as u32], (2,), device)?,
+                Tensor::from_vec(indices, (max_num_blocks,), device)?,
+                Tensor::from_vec(vec![last_page_len], (1,), device)?,
+            )
+        };
         #[cfg(feature = "flashinfer")]
         let flashinfer_batch_indices = Tensor::zeros((verify_len,), DType::U32, device)?;
         #[cfg(feature = "flashinfer")]
-        let flashinfer_positions = Tensor::zeros((verify_len,), DType::U32, device)?;
+        let flashinfer_positions = {
+            // Mirror runtime MTP verify append positions at max context:
+            // [max_model_len - verify_len, ..., max_model_len - 1].
+            let start = self.max_model_len.saturating_sub(verify_len) as u32;
+            let pos: Vec<u32> = (0..verify_len as u32).map(|i| start + i).collect();
+            Tensor::from_vec(pos, (verify_len,), device)?
+        };
 
         #[cfg(feature = "flashinfer")]
         let use_flashinfer = self.flashinfer_kv_params.is_some();
@@ -877,6 +897,7 @@ impl<M: CudaGraphModule> GraphCapturer<M> {
             let indptr_host = vec![0u32, max_num_blocks as u32];
             let kv_len_arr_host = vec![self.max_model_len as u32];
             let q_cu_seqlens_host = vec![0u32, verify_len as u32];
+            let last_len_host = vec![last_page_len];
 
             let prefill_plan_info = attention_rs::flashinfer::graph_prefill_plan(
                 device,
@@ -899,7 +920,7 @@ impl<M: CudaGraphModule> GraphCapturer<M> {
                 indptr_host,
                 indices: flashinfer_indices.clone(),
                 last_len: flashinfer_last_len.clone(),
-                last_len_host: Some(vec![self.max_model_len as u32]),
+                last_len_host: Some(last_len_host),
                 kv_len_arr_host: Some(kv_len_arr_host),
                 total_num_rows: Some(verify_len as u32),
                 batch_indices: Some(flashinfer_batch_indices.clone()),
