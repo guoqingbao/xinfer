@@ -2,7 +2,7 @@ use crate::models::layers::attention::Attention;
 use crate::models::layers::distributed::{Comm, VocabParallelLinear};
 use crate::models::layers::mask::get_attention_causal_mask;
 use crate::models::layers::moe::{
-    FusedMoe, FusedMoeFp8, FusedMoeGGUF, FusedMoeISQ, FusedMoeMxfp4, FusedMoeNvfp4,
+    FusedMoe, FusedMoeFp8, FusedMoeGGUF, FusedMoeISQ, FusedMoeMxfp4, FusedMoeNvfp4, FusedMoeWNA16,
 };
 use crate::models::layers::others::{embedding, rms_norm, NormX};
 use crate::models::layers::rotary_emb::{ApplyRotaryEmbedding, ScalingRotaryEmbedding};
@@ -36,6 +36,7 @@ enum MoeVariant {
     FusedMoeFp8(FusedMoeFp8),
     FusedMoeMxfp4(FusedMoeMxfp4),
     FusedMoeNvfp4(FusedMoeNvfp4),
+    FusedMoeWNA16(FusedMoeWNA16),
 }
 
 impl MoeVariant {
@@ -47,6 +48,7 @@ impl MoeVariant {
             Self::FusedMoeFp8(m) => m.forward(xs, is_prefill),
             Self::FusedMoeMxfp4(m) => m.forward(xs, is_prefill),
             Self::FusedMoeNvfp4(m) => m.forward(xs, is_prefill),
+            Self::FusedMoeWNA16(m) => m.forward(xs, is_prefill),
         }
     }
 }
@@ -115,8 +117,18 @@ impl MiniMaxDecoderLayer {
                     comm.clone(),
                     dtype,
                 )?)
+            } else if quant_config.is_compressed_tensors {
+                MoeVariant::FusedMoeWNA16(FusedMoeWNA16::new_with_gate(
+                    config,
+                    moe_vb.pp("gate"),
+                    moe_vb.pp("experts"),
+                    &moe_vb,
+                    comm.clone(),
+                    dtype,
+                    quant_config,
+                )?)
             } else {
-                panic!("Unsupported quantization for MiniMax (use unquantized, gguf, fp8, mxfp4 or nvfp4)!");
+                panic!("Unsupported quantization for MiniMax (use unquantized, gguf, compressed WNA16, fp8, mxfp4 or nvfp4)!");
             }
         } else if config.quant.is_some() {
             MoeVariant::FusedMoeISQ(FusedMoeISQ::new_with_gate(

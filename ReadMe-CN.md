@@ -97,9 +97,10 @@ xinfer --w /home/Qwen3.6-35B-A3B --d 0,1 --ui-server --mtp 2
 | QwQ-32B | Q4_K_M | 32B | **46.02** tokens/s |
 | **Qwen3-30B-A3B** | NVFP4 | **30B (MoE)** | **197.29** tokens/s (**RTX 5090**) |
 | **Qwen3-30B-A3B** | NVFP4 | **30B (MoE)** | **72.86** tokens/s (**V100, Software FP4**) |
+| **Qwen3-Next-80B** | AWQ | **80B (MoE)** | **90** tokens/s (**Hopper**) |
 | **Qwen3.5-27B** (**多模态**) | Q4_K_M | **27B (Dense)** | **49.33** tokens/s |
 | **Qwen3.5-27B/Qwen3.6-27B** | FP8 | **27B (Dense)** | **45** tokens/s (**Hopper**) |
-| **Qwen3.6-35B-A3B** (**多模态**) | FP8 | **35B (MoE)** | **110** tokens/s (**Hopper**) |
+| **Qwen3.6-35B-A3B** (**多模态**) | FP8 | **35B (MoE)** | **120** tokens/s (**Hopper**) |
 | **GLM4.7 Flash** | NVFP4 | **30B (MoE)** | **79** tokens/s (**Hopper, Software FP4**) |
 | **Gemma4-31B** | ISQ (BF16→Q4K) | **31B (Dense)** | **47** tokens/s (**Hopper**) |
 | **Gemma4-26B-A4B** | NVFP4 | **26B (MoE)** | **137.23** tokens/s (**RTX 5090**) |
@@ -233,6 +234,9 @@ xinfer --i --m unsloth/Qwen3.5-27B-GGUF --f Qwen3.5-27B-Q4_K_M.gguf
 
 # Hopper 上加速 GDN 预填充，精度略有损失
 SM90_LOWER_PRECISION_GDN_PREFILL=1 xinfer --m Qwen/Qwen3.5-35B-A3B-FP8
+
+# AWQ (pack-quantized)
+xinfer --m cyankiwi/Qwen3-Coder-Next-AWQ-4bit
 
 # 多节点推理: GLM 5.2（DeepSeek V3.2 架构，FP8）
 # 主节点

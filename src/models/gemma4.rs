@@ -3,7 +3,7 @@ use crate::models::layers::distributed::{Comm, ReplicatedLinear, VocabParallelLi
 use crate::models::layers::mask::get_attention_causal_mask;
 use crate::models::layers::mlp::MLP;
 use crate::models::layers::moe::{
-    FusedMoe, FusedMoeGGUF, FusedMoeISQ, FusedMoeMxfp4, FusedMoeNvfp4,
+    FusedMoe, FusedMoeGGUF, FusedMoeISQ, FusedMoeMxfp4, FusedMoeNvfp4, FusedMoeWNA16,
 };
 use crate::models::layers::others::{embedding, rms_norm, NormX};
 use crate::models::layers::rotary_emb::{ApplyRotaryEmbedding, RotaryEmbedding};
@@ -120,6 +120,7 @@ enum Gemma4MoE {
     FusedMoeISQ(FusedMoeISQ),
     FusedMoeMxfp4(FusedMoeMxfp4),
     FusedMoeNvfp4(FusedMoeNvfp4),
+    FusedMoeWNA16(FusedMoeWNA16),
 }
 
 impl Gemma4MoE {
@@ -130,6 +131,7 @@ impl Gemma4MoE {
             Self::FusedMoeISQ(m) => m.forward(xs, is_prefill),
             Self::FusedMoeMxfp4(m) => m.forward(xs, is_prefill),
             Self::FusedMoeNvfp4(m) => m.forward(xs, is_prefill),
+            Self::FusedMoeWNA16(m) => m.forward(xs, is_prefill),
         }
     }
 
@@ -143,6 +145,9 @@ impl Gemma4MoE {
         match self {
             Self::FusedMoe(m) => m.forward_with_routing(xs, topk_weights, topk_ids, is_prefill),
             Self::FusedMoeNvfp4(m) => {
+                m.forward_with_routing(xs, topk_weights, topk_ids, is_prefill)
+            }
+            Self::FusedMoeWNA16(m) => {
                 m.forward_with_routing(xs, topk_weights, topk_ids, is_prefill)
             }
             _ => self.forward(xs, is_prefill),
@@ -308,6 +313,17 @@ impl Gemma4DecoderLayer {
                         vb.pp("experts").clone(),
                         comm.clone(),
                         dtype,
+                    )?)
+                } else if quant_config.is_compressed_tensors || quant_config.quant_method == "gptq"
+                {
+                    Gemma4MoE::FusedMoeWNA16(FusedMoeWNA16::new_with_gate(
+                        config,
+                        vb.pp("router").pp("proj").clone(),
+                        vb.pp("experts").clone(),
+                        &vb,
+                        comm.clone(),
+                        dtype,
+                        quant_config,
                     )?)
                 } else {
                     panic!(

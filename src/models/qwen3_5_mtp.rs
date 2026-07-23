@@ -126,6 +126,7 @@ fn mtp_quant_config(
         mode: None,
         quantized_layers: None,
         is_mlx_nvfp4: false,
+        is_compressed_tensors: false,
     });
     cfg.quant_method = method.to_string();
     // MTP FP8 checkpoints use the standard 128x128 block layout even when

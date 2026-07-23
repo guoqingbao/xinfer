@@ -358,10 +358,24 @@ impl Config {
     pub fn higher_precision_required(&self) -> bool {
         self.is_f16_mode
             || self.quant.is_some()
-            || self
-                .quantization_config
-                .as_ref()
-                .is_some_and(|cfg| matches!(cfg.quant_method.as_str(), "mxfp4" | "nvfp4"))
+            || self.quantization_config.as_ref().is_some_and(|cfg| {
+                // Weight-only AWQ/GPTQ and compressed-tensors WNA16
+                // models are especially sensitive to low-precision norm
+                // statistics. Keep norm weights/reductions and Q/K
+                // preparation in F32 while retaining the configured
+                // activation dtype for the surrounding matmuls.
+                cfg.is_compressed_tensors
+                    || matches!(
+                        cfg.quant_method.as_str(),
+                        "awq"
+                            | "gptq"
+                            | "awq_marlin"
+                            | "gptq_marlin"
+                            | "compressed-tensors"
+                            | "mxfp4"
+                            | "nvfp4"
+                    )
+            })
     }
 }
 
@@ -939,6 +953,7 @@ impl ModelType {
             "Qwen3MoEForCausalLM" => Some(ModelType::Qwen3MoE),
             "Qwen3_5ForCausalLM" => Some(ModelType::Qwen3_5),
             "Qwen3_5MoEForCausalLM" => Some(ModelType::Qwen3_5MoE),
+            "Qwen3NextForCausalLM" => Some(ModelType::Qwen3_5MoE),
             "LlamaForCausalLM" => Some(ModelType::LLaMa),
             "GemmaForCausalLM" => Some(ModelType::Gemma),
             "Gemma3ForConditionalGeneration" => Some(ModelType::Gemma3),
@@ -1037,6 +1052,10 @@ pub struct QuantConfig {
     /// an MLX-style `"mode": "nvfp4"` config is detected.
     #[serde(default)]
     pub is_mlx_nvfp4: bool,
+    /// compressed-tensors `pack-quantized` WNA16 weights.  This format is
+    /// algorithm-neutral (AWQ/GPTQ recipes use the same packed tensors).
+    #[serde(default)]
+    pub is_compressed_tensors: bool,
 }
 
 impl QuantConfig {
@@ -1136,7 +1155,37 @@ impl QuantConfig {
         if is_mxfp4 {
             self.quant_method = "mxfp4".to_string();
             self.extract_compressed_tensors_params();
+            return;
         }
+
+        // llm-compressor's AWQ/GPTQ WNA16 checkpoints use the generic
+        // compressed-tensors `pack-quantized` format.  Unlike legacy AWQ and
+        // GPTQ files they contain weight_packed/weight_scale/weight_shape
+        // (and optionally weight_zero_point), so preserve that distinction
+        // for the loaders while exposing the common WNA16 parameters.
+        if format_str == "pack-quantized" || self.detect_pack_quantized_from_config_groups() {
+            self.quant_method = "compressed-tensors".to_string();
+            self.is_compressed_tensors = true;
+            self.extract_compressed_tensors_params();
+            if self.sym.is_none() {
+                self.sym = Some(true);
+            }
+        }
+    }
+
+    fn detect_pack_quantized_from_config_groups(&self) -> bool {
+        let groups = match &self.config_groups {
+            Some(v) => v,
+            None => return false,
+        };
+        groups.as_object().is_some_and(|obj| {
+            obj.values().any(|group| {
+                group
+                    .get("format")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|fmt| fmt == "pack-quantized")
+            })
+        })
     }
 
     fn detect_nvfp4_from_config_groups(&self) -> bool {
@@ -1280,6 +1329,7 @@ impl fmt::Debug for QuantConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("QuantConfig")
             .field("quant_method", &self.quant_method)
+            .field("is_compressed_tensors", &self.is_compressed_tensors)
             .field("bits", &self.bits)
             .field("group_size", &self.group_size)
             .field("sym", &self.sym)

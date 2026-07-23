@@ -7,7 +7,7 @@ use crate::models::layers::linear::LinearX as Linear;
 use crate::models::layers::mask::get_attention_causal_mask;
 use crate::models::layers::mlp::MLP;
 use crate::models::layers::moe::{
-    FusedMoe, FusedMoeFp8, FusedMoeGGUF, FusedMoeISQ, FusedMoeMxfp4, FusedMoeNvfp4,
+    FusedMoe, FusedMoeFp8, FusedMoeGGUF, FusedMoeISQ, FusedMoeMxfp4, FusedMoeNvfp4, FusedMoeWNA16,
 };
 use crate::models::layers::others::{embedding, rms_norm, NormX};
 use crate::models::layers::rotary_emb::{ApplyRotaryEmbedding, ScalingRotaryEmbedding};
@@ -37,6 +37,7 @@ enum MoeOrMlp {
     FusedMoeFp8(FusedMoeFp8),
     FusedMoeMxfp4(FusedMoeMxfp4),
     FusedMoeNvfp4(FusedMoeNvfp4),
+    FusedMoeWNA16(FusedMoeWNA16),
 }
 
 impl MoeOrMlp {
@@ -48,6 +49,7 @@ impl MoeOrMlp {
             Self::FusedMoeFp8(m) => m.forward(xs, is_prefill),
             Self::FusedMoeMxfp4(m) => m.forward(xs, is_prefill),
             Self::FusedMoeNvfp4(m) => m.forward(xs, is_prefill),
+            Self::FusedMoeWNA16(m) => m.forward(xs, is_prefill),
         }
     }
 }
@@ -149,6 +151,14 @@ impl Qwen3_5MoEDecoderLayer {
                     vb.pp("mlp").clone(),
                     comm.clone(),
                     dtype,
+                )?)
+            } else if quant_config.is_compressed_tensors || quant_config.quant_method == "gptq" {
+                MoeOrMlp::FusedMoeWNA16(FusedMoeWNA16::new(
+                    config,
+                    vb.pp("mlp").clone(),
+                    comm.clone(),
+                    dtype,
+                    quant_config,
                 )?)
             } else {
                 panic!("Unsupported quant method for MoE (use unquantized, gguf, fp8, mxfp4 or nvfp4)!");
