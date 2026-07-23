@@ -737,7 +737,7 @@ impl FusedMoeWNA16 {
                             (cfg.hidden_size / group_size, moe_cfg.moe_intermediate_size),
                             "scales",
                             shard(1, comm.rank(), comm.world_size()),
-                            dtype,
+                            DType::F32,
                         )?
                         .t()?
                         .contiguous()?;
@@ -755,7 +755,7 @@ impl FusedMoeWNA16 {
                             (cfg.hidden_size / group_size, moe_cfg.moe_intermediate_size),
                             "scales",
                             shard(1, comm.rank(), comm.world_size()),
-                            dtype,
+                            DType::F32,
                         )?
                         .t()?
                         .contiguous()?;
@@ -773,7 +773,7 @@ impl FusedMoeWNA16 {
                             (moe_cfg.moe_intermediate_size / group_size, cfg.hidden_size),
                             "scales",
                             shard(0, comm.rank(), comm.world_size()),
-                            dtype,
+                            DType::F32,
                         )?
                         .t()?
                         .contiguous()?;
@@ -807,7 +807,7 @@ impl FusedMoeWNA16 {
                         (moe_cfg.moe_intermediate_size, cfg.hidden_size / group_size),
                         "weight_scale",
                         shard(0, comm.rank(), comm.world_size()),
-                        dtype,
+                        DType::F32,
                     )?;
                     let up_weight = up_vb.get_with_hints_dtype(
                         (moe_cfg.moe_intermediate_size, cfg.hidden_size / pack_factor),
@@ -819,7 +819,7 @@ impl FusedMoeWNA16 {
                         (moe_cfg.moe_intermediate_size, cfg.hidden_size / group_size),
                         "weight_scale",
                         shard(0, comm.rank(), comm.world_size()),
-                        dtype,
+                        DType::F32,
                     )?;
                     let down_weight = down_vb.get_with_hints_dtype(
                         (cfg.hidden_size, moe_cfg.moe_intermediate_size / pack_factor),
@@ -831,7 +831,7 @@ impl FusedMoeWNA16 {
                         (cfg.hidden_size, moe_cfg.moe_intermediate_size / group_size),
                         "weight_scale",
                         shard(1, comm.rank(), comm.world_size()),
-                        dtype,
+                        DType::F32,
                     )?;
                     (
                         gate_weight,
