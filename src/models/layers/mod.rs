@@ -19,7 +19,8 @@ use candle_core::{Device, Result, Tensor};
 use candle_nn::var_builder::ShardedVarBuilder as VarBuilder;
 use either::Either;
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
 
 pub fn collect_key_map<'a, const N: usize>(
     is_qvar_builder: bool,
@@ -46,12 +47,37 @@ pub fn isq_high_precision_dtype(quant: Option<&str>) -> GgmlDType {
     }
 }
 
+/// Lazily opens a CPU-side safetensors mmap for ISQ / CPU-only weight reads.
+/// Avoids remapping every weight file at startup when ISQ is unused.
+pub struct LazyCpuVb {
+    paths: Vec<PathBuf>,
+    dtype: DType,
+    vb: OnceLock<VarBuilder<'static>>,
+}
+
+impl LazyCpuVb {
+    fn get(&self) -> candle_core::Result<&VarBuilder<'static>> {
+        if let Some(vb) = self.vb.get() {
+            return Ok(vb);
+        }
+        let opened = unsafe {
+            candle_nn::var_builder::ShardedSafeTensors::var_builder(
+                &self.paths,
+                self.dtype,
+                &Device::Cpu,
+            )?
+        };
+        let _ = self.vb.set(opened);
+        Ok(self.vb.get().expect("LazyCpuVb OnceLock set"))
+    }
+}
+
 #[derive(Clone)]
 pub struct VarBuilderX<'a>(
     pub Either<VarBuilder<'a>, QVarBuilder>,
     pub String,
     pub Option<Either<VarBuilder<'a>, QVarBuilder>>,
-    pub Option<VarBuilder<'a>>,
+    pub Option<Arc<LazyCpuVb>>,
     pub Option<Vec<std::path::PathBuf>>,
 );
 
@@ -106,13 +132,11 @@ impl VarBuilderX<'_> {
             let cpu_vb = if matches!(device, Device::Cpu) {
                 None
             } else {
-                Some(unsafe {
-                    candle_nn::var_builder::ShardedSafeTensors::var_builder(
-                        &weight_files,
-                        dtype,
-                        &Device::Cpu,
-                    )?
-                })
+                Some(Arc::new(LazyCpuVb {
+                    paths: weight_files.clone(),
+                    dtype,
+                    vb: OnceLock::new(),
+                }))
             };
             Ok(Self(
                 Either::Left(vb),
@@ -145,7 +169,8 @@ impl VarBuilderX<'_> {
         } else {
             format!("{}.{}", self.1, name)
         };
-        let cpu_vb = self.3.as_ref().map(|vb| vb.pp(name));
+        // Share the lazy CPU mmap cache across pp() views.
+        let cpu_vb = self.3.clone();
         match &self.0 {
             Either::Left(vb) => VarBuilderX(
                 Either::Left(vb.pp(name)),
@@ -183,7 +208,13 @@ impl VarBuilderX<'_> {
     }
 
     pub fn cpu_var_builder(&self) -> Option<VarBuilder<'_>> {
-        self.3.clone()
+        let lazy = self.3.as_ref()?;
+        let root = lazy.get().ok()?;
+        if self.1.is_empty() {
+            Some(root.clone())
+        } else {
+            Some(root.set_prefix(&self.1))
+        }
     }
 
     pub fn module_path(&self) -> &str {
