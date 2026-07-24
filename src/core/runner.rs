@@ -234,7 +234,7 @@ impl ModelRunner {
         vb: &VarBuilderX,
         comm: Rc<Comm>,
         econfig: &mut EngineConfig,
-        config: &Config,
+        config: &mut Config,
         dtype: DType,
         is_rope_i: bool,
         device: Device,
@@ -340,10 +340,14 @@ impl ModelRunner {
             if let MessageType::UsableMemoryLeft(ecfg) = msg {
                 *econfig = ecfg.clone(); // Update Engine config
             }
+            // Allocator may have fallen back (e.g. TurboQuant → Auto on MLA).
+            // Keep model Config in sync so FlashInfer/backend selection sees the resolved dtype.
+            config.kvcache_dtype = econfig.kvcache_dtype;
             KVCacheAllocator::new(econfig, config, dtype)
         } else {
-            let allocator = KVCacheAllocator::new(&econfig, &config, dtype);
+            let allocator = KVCacheAllocator::new(econfig, config, dtype);
             econfig.kvcache_dtype = allocator.resolved_kvcache_dtype();
+            config.kvcache_dtype = econfig.kvcache_dtype;
             let device_ids = econfig.device_ids.clone().unwrap_or(vec![0]);
             match allocator.plan(&device_ids, econfig) {
                 Ok(_) => {
@@ -579,40 +583,6 @@ impl ModelRunner {
                 "Hybrid mamba prefix-state cache enabled: {} entries",
                 mamba_prefix_capacity
             );
-        }
-
-        #[cfg(feature = "cuda")]
-        if dtype == DType::F16 {
-            let sm = device
-                .as_cuda_device()
-                .ok()
-                .and_then(|d| attention_rs::cuda_utils::sm_version(d))
-                .unwrap_or(0);
-            if sm >= 80 {
-                let will_use_native_flash = {
-                    #[cfg(feature = "flashinfer")]
-                    {
-                        skip_flashinfer_init
-                    }
-                    #[cfg(all(feature = "flashattn", not(feature = "flashinfer")))]
-                    {
-                        config.kvcache_dtype.is_turboquant()
-                            || (config.kvcache_dtype.is_fp8_keys() && sm != 90)
-                    }
-                    #[cfg(not(any(feature = "flashinfer", feature = "flashattn")))]
-                    {
-                        true
-                    }
-                };
-                if will_use_native_flash {
-                    candle_core::bail!(
-                        "F16 dtype is not supported with native flash attention on SM80+ (detected SM{}). \
-                         Native flash kernels on SM80+ are compiled for BF16 only. \
-                         Use --dtype bf16 (default), or build with flashinfer/flashattn features which support F16.",
-                        sm
-                    );
-                }
-            }
         }
 
         let (mtp_head, mtp_num_speculative) = if let Some(num_spec) =

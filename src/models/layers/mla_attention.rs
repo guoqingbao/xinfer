@@ -700,6 +700,10 @@ impl MlaAttention {
                 }
 
                 // DSA is prefill-only: dense MLA decode is faster at all practical context lengths.
+                let max_ctx = input_metadata
+                    .max_context_len
+                    .max(input_metadata.max_seqlen_k)
+                    .max(1);
                 let attn_out = attention_rs::mla::mla_paged_decode(
                     &q_absorbed,
                     &q_pe,
@@ -708,6 +712,7 @@ impl MlaAttention {
                     block_tables,
                     context_lens,
                     self.sm_scale,
+                    max_ctx,
                 )?;
                 return self.project_mla_output(&attn_out, seq_len, xs.dtype());
             }

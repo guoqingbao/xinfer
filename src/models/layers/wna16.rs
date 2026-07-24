@@ -73,14 +73,16 @@ impl WNA16 {
             )?;
 
             let scale_and_zero_size = in_dim / (cfg.group_size as usize);
-            let scales = vb
-                .get_with_hints_dtype(
-                    (scale_and_zero_size, out_dim),
-                    if marlin_format { "s" } else { "scales" },
-                    shards,
-                    DType::F16,
-                )?
-                .to_dtype(dtype)?;
+            // Marlin/GPTQ kernels consume scales in the activation dtype. Load
+            // directly as `dtype` (do not force F16 then cast — that truncates
+            // F16→BF16 on SM80+ and can discard F32 checkpoint precision when
+            // upcasting is possible via a future F32 path).
+            let scales = vb.get_with_hints_dtype(
+                (scale_and_zero_size, out_dim),
+                if marlin_format { "s" } else { "scales" },
+                shards,
+                dtype,
+            )?;
 
             let in_dim_partition = if shards.dim == 0 {
                 in_dim / shards.world_size

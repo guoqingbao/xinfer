@@ -540,7 +540,7 @@ pub fn run_runner_process(args: Vec<String>) -> anyhow::Result<()> {
 
     let msg = receive_local(&mut stream, true)?;
     let runner = match msg {
-        MessageType::Init(init_req) => {
+        MessageType::Init(mut init_req) => {
             crate::log_info!("Received init request: {:?}", init_req);
             let device = new_device(init_req.dev_id)?;
 
@@ -657,7 +657,7 @@ pub fn run_runner_process(args: Vec<String>) -> anyhow::Result<()> {
                     &vb,
                     comm,
                     &mut econfig,
-                    &init_req.config,
+                    &mut init_req.config,
                     init_req.dtype.into(),
                     init_req.is_rope_i,
                     device,
