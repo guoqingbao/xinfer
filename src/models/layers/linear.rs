@@ -984,6 +984,8 @@ pub struct LnFp8 {
     pub weight: Tensor,
     pub weight_scale: Tensor,
     pub weight_scale_cutlass: Option<Tensor>,
+    /// Static ModelOpt FP8 activation scale (usually amax / 448).
+    pub input_scale: Option<f32>,
     pub bias: Option<Tensor>,
     pub weight_block_size: Vec<usize>,
     pub sm_version: usize,
@@ -994,6 +996,31 @@ fn load_fp8_weight(vb: &VarBuilder, shape: (usize, usize), shard: Shard) -> Resu
     // checkpoints expose the same bytes as U8, so retain that fallback.
     vb.get_with_hints_dtype(shape, "weight", shard, DType::F8E4M3)
         .or_else(|_| vb.get_with_hints_dtype(shape, "weight", shard, DType::U8))
+}
+
+pub(crate) fn load_fp8_input_scale(vb: &VarBuilder) -> Result<Option<f32>> {
+    if !vb.contains_tensor("input_scale") {
+        return Ok(None);
+    }
+
+    // ModelOpt stores this as a replicated scalar. Never shard it: scalar
+    // tensors have no dimension for the VarBuilder backend to index.
+    let no_shard = Shard::default();
+    let t = vb
+        .get_with_hints_dtype((), "input_scale", no_shard, DType::F32)
+        .or_else(|_| vb.get_with_hints_dtype((1,), "input_scale", no_shard, DType::F32))?;
+    let scale = t
+        .flatten_all()?
+        .to_vec1::<f32>()?
+        .first()
+        .copied()
+        .ok_or_else(|| {
+            candle_core::Error::Msg("LnFp8: input_scale must contain one scalar".into())
+        })?;
+    if !scale.is_finite() || scale <= 0.0 {
+        candle_core::bail!("LnFp8: input_scale must be finite and positive, got {scale}");
+    }
+    Ok(Some(scale))
 }
 
 impl LnFp8 {
@@ -1039,6 +1066,7 @@ impl LnFp8 {
                 })?,
         }
         .to_dtype(DType::F32)?;
+        let input_scale = load_fp8_input_scale(&vb)?;
 
         #[cfg(feature = "cuda")]
         let sm_version = attention_rs::cuda_utils::sm_version(vb.device().as_cuda_device()?)
@@ -1080,6 +1108,7 @@ impl LnFp8 {
             weight,
             weight_scale,
             weight_scale_cutlass,
+            input_scale,
             bias,
             weight_block_size: block_size,
             sm_version,
@@ -1095,6 +1124,43 @@ fn load_ln_fp8_with_hints(
     quant_cfg: &QuantConfig,
     load_bias: bool,
 ) -> Result<LnFp8> {
+    // Some FP8 exporters (notably Qwen3.6 NVFP4/FP8 checkpoints) store a
+    // per-tensor `weight_scale` as a scalar rather than a 2-D block-scale
+    // matrix.  Never pass a scalar tensor through a sharded VarBuilder: the
+    // backend assumes the sharded dimension exists and indexes it directly.
+    // Materialize the scalar as the local scale matrix instead.
+    fn load_scale(
+        vb: &VarBuilder,
+        name: &str,
+        scale_dim0: usize,
+        scale_dim1: usize,
+        shard: Shard,
+    ) -> Result<Option<Tensor>> {
+        let no_shard = Shard::default();
+        let scalar = vb
+            .get_with_hints_dtype((), name, no_shard, DType::F32)
+            .or_else(|_| vb.get_with_hints_dtype((1,), name, no_shard, DType::F32));
+        if let Ok(scalar) = scalar {
+            let local_dim0 = if shard.world_size > 1 && shard.dim == 0 {
+                scale_dim0 / shard.world_size
+            } else {
+                scale_dim0
+            };
+            let local_dim1 = if shard.world_size > 1 && shard.dim == 1 {
+                scale_dim1 / shard.world_size
+            } else {
+                scale_dim1
+            };
+            return Ok(Some(
+                scalar
+                    .broadcast_as((local_dim0, local_dim1))?
+                    .contiguous()?,
+            ));
+        }
+
+        Ok(None)
+    }
+
     fn normalize_sharded_2d(
         t: Tensor,
         shard: Shard,
@@ -1185,23 +1251,28 @@ fn load_ln_fp8_with_hints(
 
     let weight = load_fp8_weight(&vb, (out_dim, in_dim), shard)?;
     let weight = normalize_sharded_2d(weight, shard, out_dim, in_dim, "weight")?;
-    let weight_scale = match vb.get_with_hints_dtype(
-        (scale_dim0, scale_dim1),
-        "weight_scale",
-        shard,
-        DType::F32,
-    ) {
-        Ok(s) => s,
-        Err(_) => vb
-            .get_with_hints_dtype(
-                (scale_dim0, scale_dim1),
-                "weight_scale_inv",
-                shard,
-                DType::F32,
-            )
-            .map_err(|_| {
-                candle_core::Error::Msg("LnFp8: Missing weight_scale or weight_scale_inv".into())
-            })?,
+    let weight_scale = if let Some(s) =
+        load_scale(&vb, "weight_scale", scale_dim0, scale_dim1, shard)?
+    {
+        s
+    } else if let Some(s) = load_scale(&vb, "weight_scale_inv", scale_dim0, scale_dim1, shard)? {
+        s
+    } else {
+        match vb.get_with_hints_dtype((scale_dim0, scale_dim1), "weight_scale", shard, DType::F32) {
+            Ok(s) => s,
+            Err(_) => vb
+                .get_with_hints_dtype(
+                    (scale_dim0, scale_dim1),
+                    "weight_scale_inv",
+                    shard,
+                    DType::F32,
+                )
+                .map_err(|_| {
+                    candle_core::Error::Msg(
+                        "LnFp8: Missing weight_scale or weight_scale_inv".into(),
+                    )
+                })?,
+        }
     };
     let weight_scale = normalize_sharded_2d(
         weight_scale,
@@ -1210,6 +1281,7 @@ fn load_ln_fp8_with_hints(
         scale_dim1,
         "weight_scale(_inv)",
     )?;
+    let input_scale = load_fp8_input_scale(&vb)?;
 
     #[cfg(feature = "cuda")]
     let sm_version =
@@ -1247,6 +1319,7 @@ fn load_ln_fp8_with_hints(
         weight,
         weight_scale,
         weight_scale_cutlass,
+        input_scale,
         bias,
         weight_block_size: block_size,
         sm_version,
@@ -1263,12 +1336,13 @@ impl Module for LnFp8 {
 
         let x_2d = x.reshape((b_sz * seq_len, in_dim))?;
 
-        let out = attention_rs::fp8_linear::fp8_matmul(
+        let out = attention_rs::fp8_linear::fp8_matmul_with_input_scale(
             &x_2d,
             &self.weight,
             &self.weight_scale,
             self.weight_scale_cutlass.as_ref(),
             &self.weight_block_size,
+            self.input_scale,
             linear_is_prefill(),
         )?;
 

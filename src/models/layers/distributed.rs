@@ -185,6 +185,7 @@ impl MergedParallelColumnLinear {
             weight,
             weight_scale,
             weight_scale_cutlass,
+            input_scale: None,
             bias: None,
             weight_block_size,
             sm_version,
@@ -745,26 +746,35 @@ impl MergedParallelColumnLinear {
                         })?;
                     let scale_dim0 = (out_dim + by - 1) / by;
                     let scale_dim1 = (in_dim + bx - 1) / bx;
-                    let weight_scale = match v.get_with_hints_dtype(
-                        (scale_dim0, scale_dim1),
-                        "weight_scale",
-                        Shard::default(),
-                        DType::F32,
-                    ) {
-                        Ok(s) => s,
-                        Err(_) => v
-                            .get_with_hints_dtype(
-                                (scale_dim0, scale_dim1),
-                                "weight_scale_inv",
-                                Shard::default(),
-                                DType::F32,
-                            )
-                            .map_err(|_| {
-                                candle_core::Error::Msg(
-                                    "LnFp8: Missing weight_scale or weight_scale_inv".into(),
+                    let no_shard = Shard::default();
+                    let weight_scale = match v
+                        .get_with_hints_dtype((), "weight_scale", no_shard, DType::F32)
+                        .or_else(|_| {
+                            v.get_with_hints_dtype((1,), "weight_scale", no_shard, DType::F32)
+                        }) {
+                        Ok(s) => s.broadcast_as((scale_dim0, scale_dim1))?.contiguous()?,
+                        Err(_) => match v.get_with_hints_dtype(
+                            (scale_dim0, scale_dim1),
+                            "weight_scale",
+                            no_shard,
+                            DType::F32,
+                        ) {
+                            Ok(s) => s,
+                            Err(_) => v
+                                .get_with_hints_dtype(
+                                    (scale_dim0, scale_dim1),
+                                    "weight_scale_inv",
+                                    no_shard,
+                                    DType::F32,
                                 )
-                            })?,
+                                .map_err(|_| {
+                                    candle_core::Error::Msg(
+                                        "LnFp8: Missing weight_scale or weight_scale_inv".into(),
+                                    )
+                                })?,
+                        },
                     };
+                    let input_scale = crate::models::layers::linear::load_fp8_input_scale(v)?;
 
                     #[cfg(feature = "cuda")]
                     let sm_version =
@@ -871,6 +881,7 @@ impl MergedParallelColumnLinear {
                         weight: merged_weight,
                         weight_scale: merged_scale,
                         weight_scale_cutlass: merged_scale_cutlass,
+                        input_scale,
                         bias: None,
                         weight_block_size: block_size.clone(),
                         sm_version,
@@ -1464,13 +1475,19 @@ impl VocabParallelLinear {
             });
         }
 
-        // Prefer candle-native sharding when vocab is evenly divisible by TP.
-        // Otherwise load full weight, pad, then narrow (e.g. Qwen3-Embedding
-        // vocab 151665 with TP=2).
-        if out_dim % world_size == 0 {
+        // Keep the padded shape for the native sharded path.  Besides making
+        // the local logits width agree with `from_weight_bias`, this is
+        // important for backends which use the requested shape to select a
+        // quantized shard.  Merely checking `out_dim % world_size` is not
+        // sufficient: the vocabulary padding contract is a 64-row contract,
+        // too.  If padding is needed, load the unsharded weight and pad it in
+        // `from_weight_bias` (this is the path used by vocabularies such as
+        // Qwen3-Embedding's 151665 entries).
+        let padded_vocab = pad_vocab_size(out_dim, world_size);
+        if padded_vocab == out_dim {
             let linear = linear(
                 in_dim,
-                out_dim,
+                padded_vocab,
                 vb,
                 shard(0, comm.rank(), world_size),
                 quant_cfg,
