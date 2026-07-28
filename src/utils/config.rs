@@ -1085,6 +1085,15 @@ impl QuantConfig {
                 }
             }
         }
+        // ModelOpt mixed checkpoints are published with both
+        // `quant_method: "modelopt"` and `quant_method: "modelopt_mixed"`.
+        // Treat the latter as an alias so the existing quantized-layer and
+        // config-group detection selects the actual runtime format (NVFP4 or
+        // FP8) instead of rejecting it in the config assertion.
+        if self.quant_method.eq_ignore_ascii_case("modelopt_mixed") {
+            self.quant_method = "modelopt".to_string();
+        }
+
         // modelopt: {"quant_method": "modelopt", "quant_algo": "NVFP4"}
         if self.quant_method == "modelopt" {
             if let Some(algo) = &self.quant_algo {
@@ -1972,6 +1981,23 @@ mod tests {
         let mut cfg: QuantConfig = serde_json::from_str(json).unwrap();
         cfg.normalize_compressed_tensors();
         assert_eq!(cfg.quant_method, "fp8");
+    }
+
+    #[test]
+    fn test_modelopt_mixed_alias_normalization() {
+        let json = r#"{
+            "quant_method": "modelopt_mixed",
+            "quant_algo": "MIXED_PRECISION",
+            "quantized_layers": {
+                "model.layers.0.linear_attn.in_proj_qkv": {"quant_algo": "FP8"},
+                "model.layers.0.mlp.experts": {"quant_algo": "W4A16_NVFP4", "group_size": 16}
+            }
+        }"#;
+        let mut cfg: QuantConfig = serde_json::from_str(json).unwrap();
+        cfg.normalize_compressed_tensors();
+        assert_eq!(cfg.quant_method, "nvfp4");
+        assert_eq!(cfg.group_size, 16);
+        assert_eq!(cfg.bits, 4);
     }
 
     #[test]
