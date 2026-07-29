@@ -169,6 +169,7 @@ impl EngineBuilder {
             None,  // master_addr
             29500, // master_port
             false,
+            None, // mtp_num_speculative_tokens
         );
 
         if let Some(kv_dtype) = self.kvcache_dtype {

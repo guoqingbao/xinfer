@@ -574,6 +574,7 @@ pub struct EngineConfig {
     #[pyo3(get, set)]
     #[serde(default = "default_master_port")]
     pub master_port: u16,
+    #[pyo3(get, set)]
     #[serde(default)]
     pub mtp_num_speculative_tokens: Option<usize>,
     #[pyo3(get, set)]
@@ -639,6 +640,7 @@ impl EngineConfig {
         master_addr: Option<String>,
         master_port: u16,
         enable_tool_grammar: bool,
+        mtp_num_speculative_tokens: Option<usize>,
     ) -> Self {
         let mut device_ids = device_ids.unwrap_or_default();
         if device_ids.is_empty() {
@@ -698,7 +700,7 @@ impl EngineConfig {
             node_rank,
             master_addr,
             master_port,
-            mtp_num_speculative_tokens: None,
+            mtp_num_speculative_tokens,
             enable_tool_grammar,
         }
     }

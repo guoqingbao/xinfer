@@ -90,6 +90,7 @@ class EngineConfig:
     node_rank: int
     master_addr: Optional[str]
     master_port: int
+    mtp_num_speculative_tokens: Optional[int]
     enable_tool_grammar: bool
 
     def __init__(
@@ -132,6 +133,7 @@ class EngineConfig:
         master_addr: Optional[str] = None,
         master_port: int = 29500,
         enable_tool_grammar: bool = False,
+        mtp_num_speculative_tokens: Optional[int] = None,
     ) -> None: ...
 
 @dataclass

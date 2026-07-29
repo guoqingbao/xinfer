@@ -247,6 +247,7 @@ async fn main() -> Result<()> {
         args.master_addr.clone(),
         args.master_port,
         args.enable_tool_grammar,
+        None,
     )
     .with_mtp(args.mtp);
 
