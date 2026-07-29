@@ -224,6 +224,29 @@ impl ModelRunner {
         mamba_cache_capacity.saturating_mul(2)
     }
 
+    fn is_mtp_model_type(model_type: &ModelType) -> bool {
+        matches!(
+            model_type,
+            ModelType::Qwen3_5 | ModelType::Qwen3_5MoE | ModelType::Qwen3VL
+        )
+    }
+
+    fn has_mtp_weights(vb: &VarBuilderX, config: &Config) -> bool {
+        let mtp_vb = vb.pp("mtp");
+        let has_safetensors_mtp_weights = mtp_vb.has_key("fc.weight")
+            || mtp_vb.has_key("layers.0.mlp.gate_proj.weight")
+            || mtp_vb.has_key("layers.0.mlp.gate.weight");
+        let has_gguf_mtp_weights = if vb.is_qvar_builder() {
+            let gguf_mtp_vb = vb.pp(config.num_hidden_layers.to_string().as_str());
+            gguf_mtp_vb.has_key("nextn.eh_proj.weight")
+                || gguf_mtp_vb.has_key("attn_q.weight")
+                || gguf_mtp_vb.has_key("ffn_gate.weight")
+        } else {
+            false
+        };
+        has_safetensors_mtp_weights || has_gguf_mtp_weights
+    }
+
     fn sample_processed_logits(&self, logits: &Tensor, sampling: &Sampling) -> Result<Vec<u32>> {
         self.logit_processor.sample_with_strategy(logits, sampling)
     }
@@ -244,6 +267,15 @@ impl ModelRunner {
         stream: Option<LocalStream>,
     ) -> Result<Self> {
         attention_rs::reset_paged_attention_layer_counter();
+        let requested_mtp_num_speculative = econfig.mtp_num_speculative_tokens.unwrap_or(0);
+        let is_mtp_model_type = Self::is_mtp_model_type(&model_type);
+        let has_mtp_config = config.mtp_num_hidden_layers.unwrap_or(0) > 0;
+        let has_mtp_weights = Self::has_mtp_weights(vb, config);
+        config.mtp_enabled = requested_mtp_num_speculative > 0
+            && is_mtp_model_type
+            && (has_mtp_config || has_mtp_weights)
+            && has_mtp_weights;
+
         let model = crate::build_model!(
             model_type,
             vb,
@@ -434,7 +466,7 @@ impl ModelRunner {
                 );
             }
         }
-        if is_hybrid_mamba_model && econfig.mtp_num_speculative_tokens.unwrap_or(0) > 0 {
+        if is_hybrid_mamba_model && config.mtp_enabled {
             // MTP verification mutates Qwen3.5 linear-attention state speculatively.
             // Keep at least one snapshot per active sequence so rejected drafts can
             // be rolled back before replaying only the accepted prefix.
@@ -444,17 +476,23 @@ impl ModelRunner {
             Model::Qwen3_5(model) => {
                 model.preallocate_mamba_cache(mamba_cache_capacity)?;
                 model.set_mamba_prefix_cache_capacity(mamba_prefix_capacity);
-                model.preallocate_mtp_hidden_buffer(econfig.max_num_parallel_reqs.max(8))?;
+                if config.mtp_enabled {
+                    model.preallocate_mtp_hidden_buffer(econfig.max_num_parallel_reqs.max(8))?;
+                }
             }
             Model::Qwen3_5MoE(model) => {
                 model.preallocate_mamba_cache(mamba_cache_capacity)?;
                 model.set_mamba_prefix_cache_capacity(mamba_prefix_capacity);
-                model.preallocate_mtp_hidden_buffer(econfig.max_num_parallel_reqs.max(8))?;
+                if config.mtp_enabled {
+                    model.preallocate_mtp_hidden_buffer(econfig.max_num_parallel_reqs.max(8))?;
+                }
             }
             Model::Qwen3VL(model) => {
                 model.preallocate_mamba_cache(mamba_cache_capacity)?;
                 model.set_mamba_prefix_cache_capacity(mamba_prefix_capacity);
-                model.preallocate_mtp_hidden_buffer(econfig.max_num_parallel_reqs.max(8))?;
+                if config.mtp_enabled {
+                    model.preallocate_mtp_hidden_buffer(econfig.max_num_parallel_reqs.max(8))?;
+                }
             }
             _ => {}
         }
@@ -588,26 +626,9 @@ impl ModelRunner {
         let (mtp_head, mtp_num_speculative) = if let Some(num_spec) =
             econfig.mtp_num_speculative_tokens
         {
-            let is_mtp_model_type = matches!(
-                model_type,
-                ModelType::Qwen3_5 | ModelType::Qwen3_5MoE | ModelType::Qwen3VL
-            );
-            let has_mtp_config = config.mtp_num_hidden_layers.unwrap_or(0) > 0;
-            let mtp_vb = vb.pp("mtp");
-            let has_safetensors_mtp_weights = mtp_vb.has_key("fc.weight")
-                || mtp_vb.has_key("layers.0.mlp.gate_proj.weight")
-                || mtp_vb.has_key("layers.0.mlp.gate.weight");
-            let has_gguf_mtp_weights = if vb.is_qvar_builder() {
-                let gguf_mtp_vb = vb.pp(config.num_hidden_layers.to_string().as_str());
-                gguf_mtp_vb.has_key("nextn.eh_proj.weight")
-                    || gguf_mtp_vb.has_key("attn_q.weight")
-                    || gguf_mtp_vb.has_key("ffn_gate.weight")
-            } else {
-                false
-            };
-            let has_mtp_weights = has_safetensors_mtp_weights || has_gguf_mtp_weights;
-
-            if is_mtp_model_type && (has_mtp_config || has_mtp_weights) && has_mtp_weights {
+            if requested_mtp_num_speculative == 0 {
+                (None, 0)
+            } else if config.mtp_enabled {
                 match crate::models::qwen3_5_mtp::Qwen3_5MtpHead::new(
                     vb,
                     comm.clone(),

@@ -754,6 +754,7 @@ pub fn config_from_gguf<R: std::io::Seek + std::io::Read>(
             None
         },
         mtp_use_dedicated_embeddings: None,
+        mtp_enabled: false,
     };
 
     if arch == "gemma4" || arch == "gemma3" {
@@ -2590,6 +2591,7 @@ mod tests {
             is_f16_mode: false,
             mtp_num_hidden_layers: None,
             mtp_use_dedicated_embeddings: None,
+            mtp_enabled: false,
         }
     }
 
