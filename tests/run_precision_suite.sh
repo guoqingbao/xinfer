@@ -73,6 +73,25 @@ else
 fi
 
 export CUDA_COMPUTE_CAP="$compute_cap"
+if ((compute_cap == 70 || compute_cap == 75)); then
+  cuda_features="cuda,nccl"
+  run_flashinfer=0
+  # NVFP4 has a software CUDA implementation (decode, prefill/MoE, and
+  # helpers) that must still be compared on legacy GPUs. Only the
+  # Blackwell CUTLASS/FlashInfer NVFP4 cases are unavailable here.
+  run_nvfp4=1
+  if command -v nvcc >/dev/null 2>&1 && nvcc --version 2>/dev/null | grep -q 'release 13\.'; then
+    echo "error: SM${compute_cap} requires an nvcc that supports compute_${compute_cap}; CUDA 13 removed this legacy target. Use CUDA 12.6 or another compatible CUDA 12 toolkit." >&2
+    exit 2
+  fi
+  printf 'SM%s legacy CUDA path: using features %s; FlashInfer/CUTLASS hardware stages are skipped; software FP8/NVFP4 stages remain enabled.\n' \
+    "$compute_cap" "$cuda_features"
+else
+  cuda_features="cuda,nccl,flashinfer,cutlass"
+  run_flashinfer=1
+  run_nvfp4=1
+  printf 'SM%s CUDA path: using features %s.\n' "$compute_cap" "$cuda_features"
+fi
 if [[ -n "${RUSTFLAGS:-}" ]]; then
   export RUSTFLAGS="$RUSTFLAGS -C link-arg=-lstdc++"
 else
@@ -91,6 +110,12 @@ run_stage() {
   if "$@"; then
     echo "[OK] $label"
     return 0
+  else
+    local status=$?
+    if ((status == 77)); then
+      echo "[SKIP] $label (optional golden dependency unavailable)"
+      return 0
+    fi
   fi
   echo "[FAIL] $label" >&2
   failures=$((failures + 1))
@@ -98,7 +123,7 @@ run_stage() {
 }
 
 if ! run_stage "required CUDA build and all Rust probes" \
-  cargo build --release --features cuda,nccl,flashinfer,cutlass --examples; then
+  cargo build --release --features "$cuda_features" --examples; then
   echo "Build failed; probes were not run." >&2
   exit 1
 fi
@@ -136,23 +161,31 @@ if run_stage "GDN probe" env "${gdn_probe_env[@]}" \
     python3 tests/probes/compare_gdn_probe.py "$out_dir/gdn.bin"
 fi
 
-if run_stage "FlashInfer paged-attention probe" env \
-  XINFER_PROBE_DIR="$out_dir/flashinfer" \
-  "$ROOT_DIR/target/release/examples/flashinfer_precision_probe"; then
-  run_stage "FlashInfer/PyTorch/official-FlashInfer comparison" \
-    python3 tests/probes/compare_flashinfer_probe.py "$out_dir/flashinfer"
+if ((run_flashinfer)); then
+  if run_stage "FlashInfer paged-attention probe" env \
+    XINFER_PROBE_DIR="$out_dir/flashinfer" \
+    "$ROOT_DIR/target/release/examples/flashinfer_precision_probe"; then
+    run_stage "FlashInfer/PyTorch/official-FlashInfer comparison" \
+      python3 tests/probes/compare_flashinfer_probe.py "$out_dir/flashinfer"
+  fi
+else
+  echo "SKIP FlashInfer stages: unavailable on SM${compute_cap} legacy feature set"
 fi
 
-if run_stage "NVFP4 all-path probe (SM${compute_cap})" env \
-  XINFER_NVFP4_PROBE="$out_dir/nvfp4.bin" \
-  "$ROOT_DIR/target/release/examples/nvfp4_precision_probe"; then
-  run_stage "NVFP4 independent PyTorch comparison" \
-    python3 tests/probes/compare_nvfp4_probe.py "$out_dir/nvfp4.bin"
+if ((run_nvfp4)); then
+  if run_stage "NVFP4 all-path probe (SM${compute_cap})" env \
+    XINFER_NVFP4_PROBE="$out_dir/nvfp4.bin" \
+    "$ROOT_DIR/target/release/examples/nvfp4_precision_probe"; then
+    run_stage "NVFP4 independent PyTorch comparison" \
+      python3 tests/probes/compare_nvfp4_probe.py "$out_dir/nvfp4.bin"
+  fi
+else
+  echo "SKIP NVFP4 stages: unavailable on SM${compute_cap} legacy feature set"
 fi
 
 printf '\n===== suite result =====\n'
 if ((failures == 0)); then
-  echo "ALL REQUESTED PROBES PASSED"
+  echo "ALL AVAILABLE REQUESTED PROBES PASSED"
   echo "Results retained in: $out_dir"
   exit 0
 fi

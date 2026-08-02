@@ -30,7 +30,14 @@ fn main() -> Result<()> {
     let mut file = std::fs::File::create(&path)?;
     file.write_all(b"XINFFP81")?;
 
-    let input = Tensor::randn(0f32, 1f32, (8, 128), &dev)?.to_dtype(DType::BF16)?;
+    let sm = attention_rs::cuda_utils::sm_version(dev.as_cuda_device()?).unwrap_or(0);
+    // attention.rs disables BF16 CUDA kernels below SM80. Keep the software
+    // FP8 fallback probe active there using F16 instead of a BF16 stub.
+    let dtype = if sm < 80 { DType::F16 } else { DType::BF16 };
+    let sm_tensor = Tensor::new(&[sm as f32], &dev)?;
+    record(&mut file, "meta/sm", &sm_tensor)?;
+
+    let input = Tensor::randn(0f32, 1f32, (8, 128), &dev)?.to_dtype(dtype)?;
     // Raw E4M3FN bytes; 0x38=1, 0xb8=-1, 0x40=2, 0xc0=-2 and nearby values.
     let fp8_values = (0..(128 * 128))
         .map(|i| [0x38u8, 0xb8, 0x40, 0xc0, 0x30, 0xb0, 0x48, 0xc8][i % 8])

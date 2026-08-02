@@ -61,5 +61,6 @@ This flag is only for auditing that optional path; it does not enable or change 
 
 ## Interpreting SM capability results
 
-On SM90, Blackwell-only NVFP4 hardware helpers are reported as `SKIP` because they cannot execute on that GPU. Run the suite on SM100/SM120 hardware to exercise hardware NVFP4 dense, GEMM, and MoE paths. Missing optional Python packages are reported explicitly; install versions matching the CUDA and PyTorch environment when those golden comparisons are required.
+For SM70 and SM75, the runner automatically builds the legacy CUDA path with only `cuda,nccl`. FlashInfer and CUTLASS-dependent attention and hardware-NVFP4 cases are skipped, but the software FP8 and software NVFP4 GEMM/MoE/helper cases still run and are compared with the independent PyTorch golden. Since attention.rs disables BF16 CUDA kernels below SM80, the legacy software probes use F16 there. The CUDA toolkit must also provide an `nvcc` that supports `compute_70`/`compute_75`; CUDA 12.6 is the recommended legacy-toolkit choice. CUDA 13 `nvcc` rejects these targets before Rust compilation begins.
 
+On SM90, Blackwell-only NVFP4 hardware helpers are reported as `SKIP` because they cannot execute on that GPU. Run the suite on SM100/SM120 hardware to exercise hardware NVFP4 dense, GEMM, and MoE paths. Missing optional Python packages are reported explicitly; install versions matching the CUDA and PyTorch environment when those golden comparisons are required.

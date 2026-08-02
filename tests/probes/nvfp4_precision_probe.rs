@@ -4,17 +4,26 @@
 //! attention.rs public/FFI surface. The Python checker is the reference: it
 //! does not use Candle or attention.rs for the golden GEMM.
 //!
-//! On SM90 this runs software decode, WMMA, quantization-helper, and MLX
-//! paths. On SM100/SM120 it additionally runs dense FlashInfer/CUTLASS and
-//! grouped MoE CUTLASS paths. Hardware cases are omitted on older GPUs.
+//! On SM70/SM75/SM90 this runs the software decode, software prefill, grouped
+//! MoE, quantization-helper, and MLX paths. On SM100/SM120 it additionally
+//! runs dense FlashInfer/CUTLASS and grouped MoE CUTLASS paths. Hardware cases
+//! are omitted on older GPUs.
 
-use anyhow::{Context, Result};
+#[cfg(feature = "cuda")]
+use anyhow::Context;
+use anyhow::Result;
+#[cfg(feature = "cuda")]
 use attention_rs::kernels::ffi;
+#[cfg(feature = "cuda")]
 use candle_core::cuda_backend::cudarc::driver::DevicePtr;
+#[cfg(feature = "cuda")]
 use candle_core::{DType, Device, Storage, Tensor};
+#[cfg(feature = "cuda")]
 use std::io::Write;
+#[cfg(feature = "cuda")]
 use std::path::PathBuf;
 
+#[cfg(feature = "cuda")]
 fn record(file: &mut std::fs::File, name: &str, tensor: &Tensor) -> Result<()> {
     let cpu = tensor.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
     let values = cpu.flatten_all()?.to_vec1::<f32>()?;
@@ -31,6 +40,7 @@ fn record(file: &mut std::fs::File, name: &str, tensor: &Tensor) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "cuda")]
 fn cuda_ptr(tensor: &Tensor, dtype: DType) -> Result<u64> {
     let (storage, _) = tensor.storage_and_layout();
     match &*storage {
@@ -46,6 +56,7 @@ fn cuda_ptr(tensor: &Tensor, dtype: DType) -> Result<u64> {
     }
 }
 
+#[cfg(feature = "cuda")]
 fn f32_values(count: usize, salt: usize) -> Vec<f32> {
     (0..count)
         .map(|i| {
@@ -59,6 +70,7 @@ fn f32_values(count: usize, salt: usize) -> Vec<f32> {
         .collect()
 }
 
+#[cfg(feature = "cuda")]
 fn make_weight(device: &Device, e: usize, n: usize, k: usize) -> Result<(Tensor, Tensor, Tensor)> {
     let codes = [
         0x0u8, 0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7, 0x8, 0x9, 0xa, 0xb, 0xc, 0xd, 0xe, 0xf,
@@ -81,6 +93,7 @@ fn make_weight(device: &Device, e: usize, n: usize, k: usize) -> Result<(Tensor,
     ))
 }
 
+#[cfg(feature = "cuda")]
 fn run_dense(
     file: &mut std::fs::File,
     device: &Device,
@@ -195,6 +208,10 @@ fn run_direct_hardware_dense(
                 _ => unreachable!(),
             }
         }
+        // These are direct FFI launches rather than Candle CustomOps. Make
+        // the probe observe completed kernel writes before exporting them;
+        // production callers keep the same stream asynchronous.
+        device.synchronize()?;
         let case = format!(
             "{name}_{}",
             if flashinfer { "flashinfer" } else { "cutlass" }
@@ -219,6 +236,7 @@ fn run_direct_hardware_dense(
     Ok(())
 }
 
+#[cfg(feature = "cuda")]
 fn run_moe(
     file: &mut std::fs::File,
     device: &Device,
@@ -271,6 +289,7 @@ fn run_moe(
     Ok(())
 }
 
+#[cfg(feature = "cuda")]
 fn run_auxiliary_helpers(
     file: &mut std::fs::File,
     device: &Device,
@@ -397,6 +416,10 @@ fn run_auxiliary_helpers(
         );
     }
 
+    // All helper calls above are raw same-stream launches. Synchronization is
+    // intentional here because the probe is reading device outputs to disk.
+    device.synchronize()?;
+
     let prefix = format!("aux_{label}");
     for (suffix, tensor) in [
         ("input", &input),
@@ -466,6 +489,7 @@ fn run_hardware_moe(file: &mut std::fs::File, device: &Device) -> Result<()> {
         true,
         None,
     )?;
+    device.synchronize()?;
     for (suffix, tensor) in [
         ("input", &input),
         ("weight_u8", &weights),
@@ -483,7 +507,8 @@ fn run_hardware_moe(file: &mut std::fs::File, device: &Device) -> Result<()> {
     Ok(())
 }
 
-fn run_mlx(file: &mut std::fs::File, device: &Device) -> Result<()> {
+#[cfg(feature = "cuda")]
+fn run_mlx(file: &mut std::fs::File, device: &Device, include_bf16: bool) -> Result<()> {
     let weights = Tensor::from_vec(
         vec![
             0x01234567u32,
@@ -502,20 +527,28 @@ fn run_mlx(file: &mut std::fs::File, device: &Device) -> Result<()> {
     let packed = attention_rs::nvfp4_linear::mlx_repack_u32_to_u8(&weights)?;
     let f16 =
         attention_rs::nvfp4_linear::mlx_dequant_embedding(&weights, &scales, 2, 32, DType::F16)?;
-    let bf16 =
-        attention_rs::nvfp4_linear::mlx_dequant_embedding(&weights, &scales, 2, 32, DType::BF16)?;
     for (suffix, tensor) in [
         ("weight_u32", &weights),
         ("scale_u8", &scales),
         ("repacked_u8", &packed),
         ("f16", &f16),
-        ("bf16", &bf16),
     ] {
         record(file, &format!("mlx/{suffix}"), tensor)?;
+    }
+    if include_bf16 {
+        let bf16 = attention_rs::nvfp4_linear::mlx_dequant_embedding(
+            &weights,
+            &scales,
+            2,
+            32,
+            DType::BF16,
+        )?;
+        record(file, "mlx/bf16", &bf16)?;
     }
     Ok(())
 }
 
+#[cfg(feature = "cuda")]
 fn main() -> Result<()> {
     let device = Device::new_cuda(0).context("CUDA device 0 is required")?;
     let output = std::env::var_os("XINFER_NVFP4_PROBE")
@@ -532,12 +565,17 @@ fn main() -> Result<()> {
     record(&mut file, "meta/sm", &sm_tensor)?;
 
     let (weights, scales, _) = make_weight(&device, 1, 128, 256)?;
-    for dtype in [DType::F16, DType::BF16] {
-        let label = if dtype == DType::F16 { "f16" } else { "bf16" };
+    let software_dtypes = if sm < 80 {
+        vec![DType::F16]
+    } else {
+        vec![DType::F16, DType::BF16]
+    };
+    for dtype in &software_dtypes {
+        let label = if *dtype == DType::F16 { "f16" } else { "bf16" };
         run_dense(
             &mut file,
             &device,
-            dtype,
+            *dtype,
             &format!("dense_{label}_decode_m1"),
             1,
             128,
@@ -548,7 +586,7 @@ fn main() -> Result<()> {
         run_dense(
             &mut file,
             &device,
-            dtype,
+            *dtype,
             &format!("dense_{label}_prefill_m32"),
             32,
             128,
@@ -559,7 +597,7 @@ fn main() -> Result<()> {
         run_dense(
             &mut file,
             &device,
-            dtype,
+            *dtype,
             &format!("dense_{label}_prefill_m128"),
             128,
             128,
@@ -568,45 +606,62 @@ fn main() -> Result<()> {
             &scales,
         )?;
     }
-    for dtype in [DType::F16, DType::BF16] {
-        let label = if dtype == DType::F16 { "f16" } else { "bf16" };
+    for dtype in &software_dtypes {
+        let label = if *dtype == DType::F16 { "f16" } else { "bf16" };
+        // The GEMM/MoE calls below are software CUDA kernels and are
+        // intentionally run on SM70/SM75 as well. The auxiliary activation
+        // quantizer/metadata FFI is the Blackwell hardware-preparation path;
+        // it is only built when ENABLE_FP4 is enabled.
         if sm >= 100 {
-            run_auxiliary_helpers(&mut file, &device, dtype, label)?;
+            run_auxiliary_helpers(&mut file, &device, *dtype, label)?;
         }
         run_moe(
             &mut file,
             &device,
-            dtype,
+            *dtype,
             &format!("moe_{label}_decode_indexed"),
             false,
         )?;
         run_moe(
             &mut file,
             &device,
-            dtype,
+            *dtype,
             &format!("moe_{label}_prefill_wmma"),
             true,
         )?;
     }
 
     if sm >= 100 {
-        for dtype in [DType::F16, DType::BF16] {
-            let label = if dtype == DType::F16 { "f16" } else { "bf16" };
-            run_direct_hardware_dense(
-                &mut file,
-                &device,
-                dtype,
-                &format!("dense_hw_{label}"),
-                &weights,
-                &scales,
-            )?;
+        #[cfg(all(feature = "flashinfer", feature = "cutlass"))]
+        {
+            for dtype in [DType::F16, DType::BF16] {
+                let label = if dtype == DType::F16 { "f16" } else { "bf16" };
+                run_direct_hardware_dense(
+                    &mut file,
+                    &device,
+                    dtype,
+                    &format!("dense_hw_{label}"),
+                    &weights,
+                    &scales,
+                )?;
+            }
+            run_hardware_moe(&mut file, &device)?;
         }
-        run_hardware_moe(&mut file, &device)?;
+        #[cfg(not(all(feature = "flashinfer", feature = "cutlass")))]
+        eprintln!(
+            "SM{sm}: hardware NVFP4 requires FlashInfer/CUTLASS; software paths were still tested"
+        );
     } else {
         eprintln!("SM{sm}: skipping Blackwell dense CUTLASS/FlashInfer and grouped-MoE execution");
     }
-    run_mlx(&mut file, &device)?;
+    run_mlx(&mut file, &device, sm >= 80)?;
     file.flush()?;
     println!("wrote {} (SM{sm})", output.display());
+    Ok(())
+}
+
+#[cfg(not(feature = "cuda"))]
+fn main() -> Result<()> {
+    println!("SKIP NVFP4 probe: requires the cuda feature");
     Ok(())
 }

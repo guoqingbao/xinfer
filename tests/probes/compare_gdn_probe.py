@@ -43,6 +43,15 @@ def compare(name, got, gold, tol, failures):
     elif name.startswith(("gdn_fused",)):
         ok = report(name, got, gold, dtype=torch.float32, allowed_ulp=None,
                     max_rel=2e-6, abs_tol=2e-7)
+    elif name.endswith(("_state", "_snapshots")):
+        # Recurrent state is FP32, while q/k/v are BF16. The CUDA kernels use
+        # fixed serial/warp reductions; PyTorch's reference uses GEMV
+        # reductions with a different accumulation tree. Compare the actual
+        # FP32 numerical error, not the meaningless ULP distance near zero.
+        # This remains strict enough to catch state corruption or skipped
+        # updates while allowing the expected reduction-order error.
+        ok = report(name, got, gold, dtype=torch.float32, allowed_ulp=None,
+                    max_rel=3e-5, abs_tol=5e-4, rel_floor=0.1)
     elif name.endswith("_out") or "rmsnorm" in name or name == "gdn_l2_norm":
         ok = report(name, got, gold, dtype=torch.bfloat16, allowed_ulp=1)
     else:

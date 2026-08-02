@@ -3,12 +3,19 @@
 //! `tests/probes/compare_flashinfer_probe.py`, where it uses PyTorch FP32 and the
 //! installed official FlashInfer Python package.
 
-use anyhow::{Context, Result};
+#[cfg(feature = "flashinfer")]
+use anyhow::Context;
+use anyhow::Result;
+#[cfg(feature = "flashinfer")]
 use attention_rs::flashinfer;
+#[cfg(feature = "flashinfer")]
 use candle_core::{DType, Device, Tensor};
+#[cfg(feature = "flashinfer")]
 use std::io::Write;
+#[cfg(feature = "flashinfer")]
 use std::path::PathBuf;
 
+#[cfg(feature = "flashinfer")]
 fn write_tensor(file: &mut std::fs::File, tensor: &Tensor) -> Result<()> {
     let cpu = tensor.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
     let values = cpu.flatten_all()?.to_vec1::<f32>()?;
@@ -23,6 +30,7 @@ fn write_tensor(file: &mut std::fs::File, tensor: &Tensor) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "flashinfer")]
 fn run_case(
     device: &Device,
     output_dir: &std::path::Path,
@@ -193,6 +201,7 @@ fn run_case(
     Ok(())
 }
 
+#[cfg(feature = "flashinfer")]
 fn main() -> Result<()> {
     let device = Device::new_cuda(0).context("CUDA device 0 is required")?;
     let output_dir = std::env::var_os("XINFER_PROBE_DIR")
@@ -283,5 +292,11 @@ fn main() -> Result<()> {
         64,
         true,
     )?;
+    Ok(())
+}
+
+#[cfg(not(feature = "flashinfer"))]
+fn main() -> Result<()> {
+    println!("SKIP FlashInfer probe: built without the flashinfer feature");
     Ok(())
 }

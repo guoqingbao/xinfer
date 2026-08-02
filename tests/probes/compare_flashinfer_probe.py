@@ -7,7 +7,11 @@ import pathlib
 import struct
 
 import torch
-import flashinfer
+try:
+    import flashinfer
+except Exception as exc:
+    print(f"SKIP FlashInfer golden: Python flashinfer is unavailable ({exc!r})")
+    raise SystemExit(77)
 from precision_metrics import report
 
 
