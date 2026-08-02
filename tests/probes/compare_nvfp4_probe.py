@@ -143,36 +143,17 @@ def swizzle(linear, rows_padded, cols_padded):
     return out.reshape(rows_padded, cols_padded)
 
 
-def _ordered_fp16_bits(values):
-    """Map finite IEEE-754 half/bfloat16 bits to a monotonic integer order."""
-    bits = values.view(torch.int16).to(torch.int32)
-    return torch.where(bits < 0, 0x8000 - bits, bits + 0x8000)
-
-
-def compare(name, got, golden, tol, *, output_dtype=None, allowed_ulp=0):
-    if output_dtype is not None:
-        got = got.to(output_dtype)
-        golden = golden.to(output_dtype)
+def compare(name, got, golden, tol):
     diff = (got.float() - golden.float()).abs()
     maximum = float(diff.max()) if diff.numel() else 0.0
     mean = float(diff.mean()) if diff.numel() else 0.0
-    max_ulp = 0
-    if output_dtype is not None and diff.numel():
-        max_ulp = int(
-            (_ordered_fp16_bits(got) - _ordered_fp16_bits(golden))
-            .abs()
-            .max()
-        )
-    if maximum > tol and max_ulp > allowed_ulp:
+    if maximum > tol:
         status = "FAIL"
     elif maximum == 0.0:
         status = "PASS_EXACT"
-    elif max_ulp <= allowed_ulp and allowed_ulp:
-        status = f"PASS_ULP{allowed_ulp}"
     else:
         status = "PASS_TOL"
-    ulp_text = f" ulp={max_ulp} allowed_ulp={allowed_ulp}" if output_dtype is not None else ""
-    print(f"{status:10} {name:42} max={maximum:.8g} mean={mean:.8g}{ulp_text} tol={tol}")
+    print(f"{status:4} {name:42} max={maximum:.8g} mean={mean:.8g} tol={tol}")
     return status != "FAIL"
 
 
@@ -256,22 +237,7 @@ def moe_golden(rec, prefix, hardware):
     # Indexed decode must match the CPU/PyTorch route after output dtype
     # conversion. Do not hide one-ULP or larger differences behind a large
     # absolute tolerance.
-    output_dtype = torch.bfloat16 if "bf16" in prefix else torch.float16
-    # CUTLASS grouped MoE accumulates in FP32 but its tensor-core reduction
-    # order is not the same as PyTorch's scalar FP32 reference.  One output
-    # dtype ULP is the strict hardware round-off bound; anything beyond one
-    # ULP remains a failure.  This is deliberately limited to grouped MoE
-    # outputs and is not used to hide activation, scale, routing, or GEMM
-    # metadata mismatches.
-    allowed_ulp = 1 if hardware else 0
-    return compare(
-        f"{prefix}/output",
-        got,
-        golden,
-        0.0,
-        output_dtype=output_dtype,
-        allowed_ulp=allowed_ulp,
-    )
+    return compare(f"{prefix}/output", got, cast_output(golden, prefix), 0.0)
 
 
 def mlx_checks(rec, sm):
