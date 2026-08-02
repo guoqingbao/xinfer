@@ -100,14 +100,18 @@ fi
 
 out_dir="${XINFER_PRECISION_SUITE_DIR:-/tmp/xinfer_precision_suite_sm${compute_cap}_$$}"
 mkdir -p "$out_dir/flashinfer"
+mkdir -p "$out_dir/stages"
+failed_case_log="$out_dir/failed_cases.txt"
+: > "$failed_case_log"
 echo "Probe outputs: $out_dir"
 
 failures=0
 run_stage() {
   local label="$1"
   shift
+  local stage_log="$out_dir/stages/${label//[^[:alnum:]_.-]/_}.log"
   printf '\n===== %s =====\n' "$label"
-  if "$@"; then
+  if "$@" 2>&1 | tee "$stage_log"; then
     echo "[OK] $label"
     return 0
   else
@@ -117,6 +121,9 @@ run_stage() {
       return 0
     fi
   fi
+  while IFS= read -r failed_line; do
+    printf '%s: %s\n' "$label" "$failed_line" >> "$failed_case_log"
+  done < <(grep -E '^[[:space:]]*FAIL[[:space:]]' "$stage_log" || true)
   echo "[FAIL] $label" >&2
   failures=$((failures + 1))
   return 1
@@ -188,6 +195,10 @@ if ((failures == 0)); then
   echo "ALL AVAILABLE REQUESTED PROBES PASSED"
   echo "Results retained in: $out_dir"
   exit 0
+fi
+if [[ -s "$failed_case_log" ]]; then
+  echo "FAILED CASES:"
+  cat "$failed_case_log"
 fi
 echo "$failures probe stage(s) failed; results retained in: $out_dir" >&2
 exit 1
