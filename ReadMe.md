@@ -483,6 +483,7 @@ xinfer --m Qwen/Qwen3.6-27B-FP8 --ui-server --enable-tool-grammar
 | [Rust Crate](docs/rust_crate.md) | Use as a library |
 | [Add a Model](docs/add_model.md) | Port a new architecture (AI-assisted) |
 | [Test a Model](docs/test_model.md) | Validate model quality (AI-assisted) |
+| [CUDA Precision Probes](docs/precision_probes.md) | Isolate CUDA kernel precision problems |
 
 **Using Agents under xInfer backend:** [xbot](docs/xbot.md) · [OpenCode](docs/opencode.md) · [Kilo Code](docs/kilocode.md) · [Claude Code](docs/claude_code.md) · [Goose](docs/goose.md)
 
