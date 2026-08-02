@@ -477,6 +477,7 @@ xinfer --m Qwen/Qwen3.6-27B-FP8 --ui-server --enable-tool-grammar
 | [Rust 库](docs/rust_crate.md) | 作为 Rust 库使用 |
 | [添加模型](docs/add_model.md) | 移植新架构（AI 辅助） |
 | [测试模型](docs/test_model.md) | 验证模型质量（AI 辅助） |
+| [CUDA 精度探针](docs/precision_probes.md) | 定位 CUDA kernel 精度问题 |
 
 **在 xInfer 后端下使用 Agent：** [xbot](docs/xbot.md) · [OpenCode](docs/opencode.md) · [Kilo Code](docs/kilocode.md) · [Claude Code](docs/claude_code.md) · [Goose](docs/goose.md)
 
