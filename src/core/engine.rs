@@ -1597,7 +1597,7 @@ impl LLMEngine {
             .duration_since(UNIX_EPOCH)
             .expect("Time went backwards")
             .as_millis() as usize;
-        if cur_time - self.last_check_throughput_time < 5000 {
+        if cur_time - self.last_check_throughput_time < 10000 {
             return;
         }
         self.last_check_throughput_time = cur_time;

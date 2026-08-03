@@ -2819,25 +2819,39 @@ impl FusedMoeNvfp4 {
 
                 if has_packed_gate_up {
                     // Fused format: gate_up_proj [E, K/2, 2*N], down_proj [E, N/2, K]
-                    // Transpose per expert to [2*N, K/2] / [K, N/2], then split
-                    // gate_up into gate [N, K/2] + up [N, K/2] to reuse the
-                    // standard stack-then-cat assembly below.
+                    // Mirror BF16/FP8 packed MoE: shard the intermediate (dim 2 /
+                    // dim 1 after layout) — never dim 0 (experts).
                     let inter = moe_cfg.moe_intermediate_size;
                     let hidden = cfg.hidden_size;
-                    let sh0 = shard(0, comm.rank(), comm.world_size());
-                    let sh1 = shard(1, comm.rank(), comm.world_size());
+                    let world = comm.world_size().max(1);
+                    let rank = comm.rank();
                     let no_shard = Shard::default();
+                    let sh_gate = shard(2, rank, world * 2);
+                    let sh_up = shard(2, rank + world, world * 2);
+                    let sh_down = shard(1, rank, world);
 
-                    let gu_raw = vb.get_with_hints_dtype(
+                    let gu_gate = vb.get_with_hints_dtype(
                         (num_experts, hidden / 2, 2 * inter),
                         "gate_up_proj",
-                        sh0,
+                        sh_gate,
                         DType::U8,
                     )?;
-                    let gu_sc_raw = vb.get_with_hints_dtype(
+                    let gu_up = vb.get_with_hints_dtype(
+                        (num_experts, hidden / 2, 2 * inter),
+                        "gate_up_proj",
+                        sh_up,
+                        DType::U8,
+                    )?;
+                    let gu_sc_gate = vb.get_with_hints_dtype(
                         (num_experts, hidden / 16, 2 * inter),
                         "gate_up_proj_weight_scale",
-                        sh0,
+                        sh_gate,
+                        DType::U8,
+                    )?;
+                    let gu_sc_up = vb.get_with_hints_dtype(
+                        (num_experts, hidden / 16, 2 * inter),
+                        "gate_up_proj_weight_scale",
+                        sh_up,
                         DType::U8,
                     )?;
                     let gate_up_gscale = if vb.contains_tensor("gate_up_proj_weight_scale_2") {
@@ -2929,12 +2943,12 @@ impl FusedMoeNvfp4 {
                     };
 
                     for i in 0..num_experts {
-                        let gu = gu_raw.get(i)?.t()?.contiguous()?;
-                        let gs = gu_sc_raw.get(i)?.t()?.contiguous()?;
-                        gate_blocks_vec.push(gu.narrow(0, 0, inter)?.contiguous()?);
-                        up_blocks_vec.push(gu.narrow(0, inter, inter)?.contiguous()?);
-                        gate_scales_vec.push(gs.narrow(0, 0, inter)?.contiguous()?);
-                        up_scales_vec.push(gs.narrow(0, inter, inter)?.contiguous()?);
+                        // Each shard already holds local_inter along dim 2;
+                        // transpose to [local_inter, K/2] / [local_inter, K/16].
+                        gate_blocks_vec.push(gu_gate.get(i)?.t()?.contiguous()?);
+                        up_blocks_vec.push(gu_up.get(i)?.t()?.contiguous()?);
+                        gate_scales_vec.push(gu_sc_gate.get(i)?.t()?.contiguous()?);
+                        up_scales_vec.push(gu_sc_up.get(i)?.t()?.contiguous()?);
                         gate_gscales_vec.push(gate_up_gscale);
                         up_gscales_vec.push(gate_up_gscale);
                         gate_iscales_vec.push(gate_up_iscale);
@@ -2944,13 +2958,13 @@ impl FusedMoeNvfp4 {
                     let d_raw = vb.get_with_hints_dtype(
                         (num_experts, inter / 2, hidden),
                         "down_proj",
-                        sh1,
+                        sh_down,
                         DType::U8,
                     )?;
                     let d_sc_raw = vb.get_with_hints_dtype(
                         (num_experts, inter / 16, hidden),
                         "down_proj_weight_scale",
-                        sh1,
+                        sh_down,
                         DType::U8,
                     )?;
                     let down_gscale = if vb.contains_tensor("down_proj_weight_scale_2") {
