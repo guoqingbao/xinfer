@@ -33,6 +33,8 @@ impl IndexerWeights {
         _rope_head_dim: usize,
         _n_shards: usize,
         comm: std::rc::Rc<Comm>,
+        _layer_idx: usize,
+        _rope_base: f64,
     ) -> Result<Option<Self>> {
         if index_n_heads % comm.world_size() != 0 {
             candle_core::bail!(
@@ -107,16 +109,9 @@ impl IndexerWeights {
         }))
     }
 
-    fn project_q(&self, qr: &Tensor, is_prefill: bool) -> Result<Tensor> {
+    fn project_q(&self, qr: &Tensor, _is_prefill: bool) -> Result<Tensor> {
         if let Some(scale) = &self.wq_b_scale {
-            attention_rs::fp8_linear::fp8_matmul(
-                qr,
-                &self.wq_b,
-                scale,
-                None,
-                &[128, 128],
-                is_prefill,
-            )
+            attention_rs::fp8_linear::fp8_matmul_ue8m0(qr, &self.wq_b, scale, &[128, 128])
         } else {
             qr.matmul(&self.wq_b.t()?)
         }
@@ -149,10 +144,8 @@ impl IndexerWeights {
             self.index_n_heads,
             self.index_head_dim,
         )?;
-        let q = q
-            .reshape((seq_len, self.index_n_heads, self.index_head_dim))?
-            .contiguous()?;
-        Ok(q)
+        q.reshape((seq_len, self.index_n_heads, self.index_head_dim))?
+            .contiguous()
     }
 
     pub fn scores_prefill(
@@ -298,14 +291,22 @@ impl IndexerDecodeState {
     }
 
     pub fn append_compressed(&mut self, row: &Tensor) -> Result<()> {
-        if self.compressed_len >= self.max_compressed_len {
-            candle_core::bail!("indexer kv cache full");
-        }
         let i = self.compressed_len;
+        self.write_compressed_at(row, i)
+    }
+
+    /// Official decode writes at `start_pos // ratio` (assignment, not append).
+    pub fn write_compressed_at(&mut self, row: &Tensor, index: usize) -> Result<()> {
+        if index >= self.max_compressed_len {
+            candle_core::bail!(
+                "indexer compressed index {index} exceeds capacity {}",
+                self.max_compressed_len
+            );
+        }
         let dim = row.dim(D::Minus1)?;
         let row = row.reshape((1, dim))?.contiguous()?;
-        attention_rs::deepseek_v4::copy_contiguous_into(&self.kv_cache, &row, i * dim)?;
-        self.compressed_len += 1;
+        attention_rs::deepseek_v4::copy_contiguous_into(&self.kv_cache, &row, index * dim)?;
+        self.compressed_len = self.compressed_len.max(index + 1);
         Ok(())
     }
 }

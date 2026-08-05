@@ -7,15 +7,14 @@
 use crate::models::layers::distributed::{shard, AllReduce, Comm};
 use crate::models::layers::linear::LinearX as Linear;
 use crate::models::layers::moe::{
-    gated_activation, resolve_expert_proj_prefix, sort_expert_assignments,
-    try_load_e_score_correction_bias,
+    gated_activation, resolve_expert_proj_prefix, try_load_e_score_correction_bias,
 };
 use crate::models::layers::VarBuilderX;
 use crate::utils::config::Config;
 use attention_rs::moe;
 use attention_rs::sort::ArgSortOp;
 use candle_core::Module;
-use candle_core::{DType, Device, Result, Tensor, D};
+use candle_core::{DType, Result, Tensor, D};
 use candle_nn::var_builder::Shard;
 use candle_nn::Activation;
 use either::Either;
@@ -150,6 +149,10 @@ impl V4Router {
 
 /// DeepSeek-V4 MXFP4 MoE (hash or score router + FP4 experts).
 pub struct FusedMoeMxfp4 {
+    #[allow(dead_code)]
+    layer_idx: usize,
+    #[allow(dead_code)]
+    rank: usize,
     pub(crate) router: V4Router,
     pub(crate) gate_up_blocks: Tensor,
     pub(crate) gate_up_scales: Tensor,
@@ -213,8 +216,22 @@ impl FusedMoeMxfp4 {
             .or_else(|_| vb.get_with_hints_dtype(shape, name, shard_hint, DType::U8))
     }
 
-    pub fn new(cfg: &Config, vb: VarBuilderX, comm: Rc<Comm>, dtype: DType) -> Result<Self> {
-        Self::new_with_gate(cfg, vb.pp("gate"), vb.pp("experts"), &vb, comm, dtype)
+    pub fn new(
+        cfg: &Config,
+        vb: VarBuilderX,
+        comm: Rc<Comm>,
+        dtype: DType,
+        layer_idx: usize,
+    ) -> Result<Self> {
+        Self::new_with_gate(
+            cfg,
+            vb.pp("gate"),
+            vb.pp("experts"),
+            &vb,
+            comm,
+            dtype,
+            layer_idx,
+        )
     }
 
     pub fn new_with_gate(
@@ -224,6 +241,7 @@ impl FusedMoeMxfp4 {
         bias_vb: &VarBuilderX,
         comm: Rc<Comm>,
         dtype: DType,
+        layer_idx: usize,
     ) -> Result<Self> {
         let moe_cfg = cfg.moe_cfg.as_ref().expect("MoE config is not available!");
         let num_experts = moe_cfg.num_experts.unwrap();
@@ -431,6 +449,8 @@ impl FusedMoeMxfp4 {
         }
 
         Ok(Self {
+            layer_idx,
+            rank: comm.rank(),
             router,
             gate_up_blocks,
             gate_up_scales,
@@ -520,18 +540,18 @@ impl FusedMoeMxfp4 {
         } else {
             gated_activation(&gate_up, self.w_size_n, &self.act)?
         };
-        let down_inputs = if down_inputs.dtype() != moe_dtype {
-            down_inputs.to_dtype(moe_dtype)?
-        } else {
-            down_inputs
-        }
-        .contiguous()?;
+        // Match official Expert.forward exactly: route weights multiply the
+        // F32 SwiGLU activation before the BF16 boundary and W2's dynamic FP8
+        // quantizer. Moving this scalar multiplication after W2 is only valid
+        // for an unquantized linear; here it changes the per-route UE8M0 scale.
+        let down_inputs = down_inputs
+            .to_dtype(DType::F32)?
+            .broadcast_mul(&topk_weights.unsqueeze(D::Minus1)?)?
+            .to_dtype(moe_dtype)?
+            .contiguous()?;
 
-        // W2 sees the unweighted SwiGLU output.  Route weights are applied
-        // after W2; applying them before this quantizer changes the FP8
-        // activation scale per route and is not algebraically equivalent.
-        // The same official FP8 activation quantizer is used for W2, over the
-        // local tensor-parallel slice (which is 128-aligned).
+        // W2 uses the official FP8 activation quantizer over the local
+        // tensor-parallel slice (which is 128-aligned).
         let down_inputs = if moe_dtype == DType::BF16 {
             let flat_down = down_inputs.reshape((num_tokens * topk, self.w_size_n))?;
             attention_rs::deepseek_v4::fp8_act_quant_nope_bf16(
@@ -557,7 +577,6 @@ impl FusedMoeMxfp4 {
         )?
         .reshape((num_tokens, topk, hidden_dim))?
         .to_dtype(DType::F32)?
-        .broadcast_mul(&topk_weights.unsqueeze(D::Minus1)?)?
         .sum(1)?;
 
         if self.world_size > 1 {
@@ -567,265 +586,273 @@ impl FusedMoeMxfp4 {
     }
 }
 
-/// DeepSeek-V4 2-bit MoE (optional FP4 restore). Uses the same V4Router.
-pub struct FusedMoeW2 {
-    router: V4Router,
-    /// [E, N*K/4] U8 row-major 2-bit planes for fused gate+up (N = 2*inter)
-    gate_up_planes: Tensor,
-    /// [E, N*(K/32)] U8 UE8M0 scales
-    gate_up_scales: Tensor,
-    /// [E, H*(I/4)] U8 planes for down
-    down_planes: Tensor,
-    down_scales: Tensor,
-    gate_up_n: usize,
-    gate_up_k: usize,
-    down_n: usize,
-    down_k: usize,
-    act: Activation,
-    all_reduce: AllReduce,
-    world_size: usize,
-    dtype: DType,
-    swiglu_limit: f32,
-    restore_mxfp4: Option<FusedMoeMxfp4>,
-    restore_gate_enabled: bool,
-    restore_gate_tau: f32,
-}
+// /// DeepSeek-V4 2-bit MoE (optional FP4 restore). Uses the same V4Router.
+// pub struct FusedMoeW2 {
+//     router: V4Router,
+//     /// [E, N*K/4] U8 row-major 2-bit planes for fused gate+up (N = 2*inter)
+//     gate_up_planes: Tensor,
+//     /// [E, N*(K/32)] U8 UE8M0 scales
+//     gate_up_scales: Tensor,
+//     /// [E, H*(I/4)] U8 planes for down
+//     down_planes: Tensor,
+//     down_scales: Tensor,
+//     gate_up_n: usize,
+//     gate_up_k: usize,
+//     down_n: usize,
+//     down_k: usize,
+//     act: Activation,
+//     all_reduce: AllReduce,
+//     world_size: usize,
+//     dtype: DType,
+//     swiglu_limit: f32,
+//     restore_mxfp4: Option<FusedMoeMxfp4>,
+//     restore_gate_enabled: bool,
+//     restore_gate_tau: f32,
+// }
 
-impl FusedMoeW2 {
-    /// Build W2 experts by GPU-side re-quant of MXFP4/e2m1 expert tensors.
-    /// No host D2H pack — uses `attention_rs::moe_w2::moe_w2_pack_from_mxfp4`.
-    pub fn from_mxfp4(mx: FusedMoeMxfp4, _device: &Device) -> Result<Self> {
-        let restore_gate_enabled = std::env::var("XINFER_MOE_W2_GATE")
-            .map(|value| value != "0" && !value.eq_ignore_ascii_case("false"))
-            .unwrap_or(true);
-        let restore_gate_tau = std::env::var("XINFER_MOE_W2_GATE_TAU")
-            .ok()
-            .and_then(|value| value.parse::<f32>().ok())
-            .unwrap_or(0.60);
-        let restore_mxfp4 = FusedMoeMxfp4 {
-            router: match &mx.router {
-                V4Router::Hash {
-                    gate_weight,
-                    tid2eid,
-                    n_experts,
-                    topk,
-                    route_scale,
-                } => V4Router::Hash {
-                    gate_weight: gate_weight.clone(),
-                    tid2eid: tid2eid.clone(),
-                    n_experts: *n_experts,
-                    topk: *topk,
-                    route_scale: *route_scale,
-                },
-                V4Router::Score {
-                    gate,
-                    bias,
-                    topk,
-                    route_scale,
-                } => V4Router::Score {
-                    gate: gate.clone(),
-                    bias: bias.clone(),
-                    topk: *topk,
-                    route_scale: *route_scale,
-                },
-            },
-            gate_up_blocks: mx.gate_up_blocks.clone(),
-            gate_up_scales: mx.gate_up_scales.clone(),
-            down_blocks: mx.down_blocks.clone(),
-            down_scales: mx.down_scales.clone(),
-            w_size_n: mx.w_size_n,
-            act: mx.act.clone(),
-            all_reduce: mx.all_reduce.clone(),
-            world_size: mx.world_size,
-            dtype: mx.dtype,
-            swiglu_limit: mx.swiglu_limit,
-        };
+// impl FusedMoeW2 {
+//     /// Build W2 experts by GPU-side re-quant of MXFP4/e2m1 expert tensors.
+//     /// No host D2H pack — uses `attention_rs::moe_w2::moe_w2_pack_from_mxfp4`.
+//     pub fn from_mxfp4(mx: FusedMoeMxfp4, _device: &Device) -> Result<Self> {
+//         let restore_gate_enabled = std::env::var("XINFER_MOE_W2_GATE")
+//             .map(|value| value != "0" && !value.eq_ignore_ascii_case("false"))
+//             .unwrap_or(true);
+//         let restore_gate_tau = std::env::var("XINFER_MOE_W2_GATE_TAU")
+//             .ok()
+//             .and_then(|value| value.parse::<f32>().ok())
+//             .unwrap_or(0.60);
+//         let restore_mxfp4 = FusedMoeMxfp4 {
+//             layer_idx: mx.layer_idx,
+//             rank: mx.rank,
+//             router: match &mx.router {
+//                 V4Router::Hash {
+//                     gate_weight,
+//                     tid2eid,
+//                     n_experts,
+//                     topk,
+//                     route_scale,
+//                 } => V4Router::Hash {
+//                     gate_weight: gate_weight.clone(),
+//                     tid2eid: tid2eid.clone(),
+//                     n_experts: *n_experts,
+//                     topk: *topk,
+//                     route_scale: *route_scale,
+//                 },
+//                 V4Router::Score {
+//                     gate,
+//                     bias,
+//                     topk,
+//                     route_scale,
+//                 } => V4Router::Score {
+//                     gate: gate.clone(),
+//                     bias: bias.clone(),
+//                     topk: *topk,
+//                     route_scale: *route_scale,
+//                 },
+//             },
+//             gate_up_blocks: mx.gate_up_blocks.clone(),
+//             gate_up_scales: mx.gate_up_scales.clone(),
+//             down_blocks: mx.down_blocks.clone(),
+//             down_scales: mx.down_scales.clone(),
+//             w_size_n: mx.w_size_n,
+//             act: mx.act.clone(),
+//             all_reduce: mx.all_reduce.clone(),
+//             world_size: mx.world_size,
+//             dtype: mx.dtype,
+//             swiglu_limit: mx.swiglu_limit,
+//         };
 
-        let e = mx.gate_up_blocks.dim(0)?;
-        let n = mx.gate_up_blocks.dim(1)?;
-        let k_packed = mx.gate_up_blocks.dim(2)?; // K/2
-        let k = k_packed * 2;
+//         let e = mx.gate_up_blocks.dim(0)?;
+//         let n = mx.gate_up_blocks.dim(1)?;
+//         let k_packed = mx.gate_up_blocks.dim(2)?; // K/2
+//         let k = k_packed * 2;
 
-        let gu_blocks = mx.gate_up_blocks.contiguous()?;
-        let gu_scales = mx.gate_up_scales.contiguous()?;
-        // Accept [E,N,K/32] or [E, N*(K/32)]
-        let gu_scales = match gu_scales.dims().len() {
-            3 => gu_scales,
-            2 => gu_scales.reshape((e, n, k / 32))?,
-            _ => candle_core::bail!(
-                "FusedMoeW2: unexpected gate_up_scales dims {:?}",
-                gu_scales.dims()
-            ),
-        };
+//         let gu_blocks = mx.gate_up_blocks.contiguous()?;
+//         let gu_scales = mx.gate_up_scales.contiguous()?;
+//         // Accept [E,N,K/32] or [E, N*(K/32)]
+//         let gu_scales = match gu_scales.dims().len() {
+//             3 => gu_scales,
+//             2 => gu_scales.reshape((e, n, k / 32))?,
+//             _ => candle_core::bail!(
+//                 "FusedMoeW2: unexpected gate_up_scales dims {:?}",
+//                 gu_scales.dims()
+//             ),
+//         };
 
-        let (gate_up_planes, gate_up_scales) =
-            attention_rs::moe_w2::moe_w2_pack_from_mxfp4(&gu_blocks, &gu_scales, n, k)?;
+//         let (gate_up_planes, gate_up_scales) =
+//             attention_rs::moe_w2::moe_w2_pack_from_mxfp4(&gu_blocks, &gu_scales, n, k)?;
 
-        let dn_n = mx.down_blocks.dim(1)?;
-        let dn_k_packed = mx.down_blocks.dim(2)?;
-        let dn_k = dn_k_packed * 2;
-        let dn_blocks = mx.down_blocks.contiguous()?;
-        let dn_scales = mx.down_scales.contiguous()?;
-        let dn_scales = match dn_scales.dims().len() {
-            3 => dn_scales,
-            2 => dn_scales.reshape((e, dn_n, dn_k / 32))?,
-            _ => candle_core::bail!(
-                "FusedMoeW2: unexpected down_scales dims {:?}",
-                dn_scales.dims()
-            ),
-        };
+//         let dn_n = mx.down_blocks.dim(1)?;
+//         let dn_k_packed = mx.down_blocks.dim(2)?;
+//         let dn_k = dn_k_packed * 2;
+//         let dn_blocks = mx.down_blocks.contiguous()?;
+//         let dn_scales = mx.down_scales.contiguous()?;
+//         let dn_scales = match dn_scales.dims().len() {
+//             3 => dn_scales,
+//             2 => dn_scales.reshape((e, dn_n, dn_k / 32))?,
+//             _ => candle_core::bail!(
+//                 "FusedMoeW2: unexpected down_scales dims {:?}",
+//                 dn_scales.dims()
+//             ),
+//         };
 
-        let (down_planes, down_scales) =
-            attention_rs::moe_w2::moe_w2_pack_from_mxfp4(&dn_blocks, &dn_scales, dn_n, dn_k)?;
+//         let (down_planes, down_scales) =
+//             attention_rs::moe_w2::moe_w2_pack_from_mxfp4(&dn_blocks, &dn_scales, dn_n, dn_k)?;
 
-        Ok(Self {
-            router: mx.router,
-            gate_up_planes,
-            gate_up_scales: gate_up_scales.reshape((e, n * (k / 32)))?,
-            down_planes,
-            down_scales: down_scales.reshape((e, dn_n * (dn_k / 32)))?,
-            gate_up_n: n,
-            gate_up_k: k,
-            down_n: dn_n,
-            down_k: dn_k,
-            act: mx.act,
-            all_reduce: mx.all_reduce,
-            world_size: mx.world_size,
-            dtype: mx.dtype,
-            swiglu_limit: if mx.swiglu_limit > 0.0 {
-                mx.swiglu_limit
-            } else {
-                10.0
-            },
-            restore_mxfp4: restore_gate_enabled.then_some(restore_mxfp4),
-            restore_gate_enabled,
-            restore_gate_tau,
-        })
-    }
+//         Ok(Self {
+//             router: mx.router,
+//             gate_up_planes,
+//             gate_up_scales: gate_up_scales.reshape((e, n * (k / 32)))?,
+//             down_planes,
+//             down_scales: down_scales.reshape((e, dn_n * (dn_k / 32)))?,
+//             gate_up_n: n,
+//             gate_up_k: k,
+//             down_n: dn_n,
+//             down_k: dn_k,
+//             act: mx.act,
+//             all_reduce: mx.all_reduce,
+//             world_size: mx.world_size,
+//             dtype: mx.dtype,
+//             swiglu_limit: if mx.swiglu_limit > 0.0 {
+//                 mx.swiglu_limit
+//             } else {
+//                 10.0
+//             },
+//             restore_mxfp4: restore_gate_enabled.then_some(restore_mxfp4),
+//             restore_gate_enabled,
+//             restore_gate_tau,
+//         })
+//     }
 
-    pub fn new(cfg: &Config, vb: VarBuilderX, comm: Rc<Comm>, dtype: DType) -> Result<Self> {
-        let mx = FusedMoeMxfp4::new(cfg, vb, comm, dtype)?;
-        let device = mx.gate_up_blocks.device().clone();
-        let mut out = Self::from_mxfp4(mx, &device)?;
-        if let Some(extra) = &cfg.extra_config_json {
-            if let Ok(extra) = serde_json::from_str::<serde_json::Value>(extra) {
-                out.swiglu_limit = extra
-                    .get("swiglu_limit")
-                    .and_then(|v| v.as_f64())
-                    .unwrap_or(out.swiglu_limit as f64) as f32;
-            }
-        }
-        Ok(out)
-    }
+//     pub fn new(
+//         cfg: &Config,
+//         vb: VarBuilderX,
+//         comm: Rc<Comm>,
+//         dtype: DType,
+//         layer_idx: usize,
+//     ) -> Result<Self> {
+//         let mx = FusedMoeMxfp4::new(cfg, vb, comm, dtype, layer_idx)?;
+//         let device = mx.gate_up_blocks.device().clone();
+//         let mut out = Self::from_mxfp4(mx, &device)?;
+//         if let Some(extra) = &cfg.extra_config_json {
+//             if let Ok(extra) = serde_json::from_str::<serde_json::Value>(extra) {
+//                 out.swiglu_limit = extra
+//                     .get("swiglu_limit")
+//                     .and_then(|v| v.as_f64())
+//                     .unwrap_or(out.swiglu_limit as f64) as f32;
+//             }
+//         }
+//         Ok(out)
+//     }
 
-    fn forward_fp4_restore(
-        &self,
-        xs: &Tensor,
-        input_ids: Option<&Tensor>,
-        is_prefill: bool,
-    ) -> Result<Tensor> {
-        let Some(restore) = self.restore_mxfp4.as_ref() else {
-            return self.forward_with_ids_2bit(xs, input_ids, is_prefill);
-        };
-        restore.forward_with_ids(xs, input_ids, is_prefill)
-    }
+//     fn forward_fp4_restore(
+//         &self,
+//         xs: &Tensor,
+//         input_ids: Option<&Tensor>,
+//         is_prefill: bool,
+//     ) -> Result<Tensor> {
+//         let Some(restore) = self.restore_mxfp4.as_ref() else {
+//             return self.forward_with_ids_2bit(xs, input_ids, is_prefill);
+//         };
+//         restore.forward_with_ids(xs, input_ids, is_prefill)
+//     }
 
-    pub fn forward(&self, xs: &Tensor, is_prefill: bool) -> Result<Tensor> {
-        self.forward_with_ids(xs, None, is_prefill)
-    }
+//     pub fn forward(&self, xs: &Tensor, is_prefill: bool) -> Result<Tensor> {
+//         self.forward_with_ids(xs, None, is_prefill)
+//     }
 
-    pub fn forward_with_ids(
-        &self,
-        xs: &Tensor,
-        input_ids: Option<&Tensor>,
-        is_prefill: bool,
-    ) -> Result<Tensor> {
-        if self.restore_gate_enabled && !is_prefill && self.restore_mxfp4.is_some() {
-            let (topk_weights, _) = self.router.route(xs, input_ids, is_prefill)?;
-            let max_prob = topk_weights.max(1)?.max(0)?.to_vec0::<f32>()?;
-            if max_prob <= self.restore_gate_tau {
-                return self.forward_fp4_restore(xs, input_ids, is_prefill);
-            }
-        }
-        self.forward_with_ids_2bit(xs, input_ids, is_prefill)
-    }
+//     pub fn forward_with_ids(
+//         &self,
+//         xs: &Tensor,
+//         input_ids: Option<&Tensor>,
+//         is_prefill: bool,
+//     ) -> Result<Tensor> {
+//         if self.restore_gate_enabled && !is_prefill && self.restore_mxfp4.is_some() {
+//             let (topk_weights, _) = self.router.route(xs, input_ids, is_prefill)?;
+//             let max_prob = topk_weights.max(1)?.max(0)?.to_vec0::<f32>()?;
+//             if max_prob <= self.restore_gate_tau {
+//                 return self.forward_fp4_restore(xs, input_ids, is_prefill);
+//             }
+//         }
+//         self.forward_with_ids_2bit(xs, input_ids, is_prefill)
+//     }
 
-    fn forward_with_ids_2bit(
-        &self,
-        xs: &Tensor,
-        input_ids: Option<&Tensor>,
-        is_prefill: bool,
-    ) -> Result<Tensor> {
-        let (num_tokens, hidden_dim) = xs.dims2()?;
-        let topk = self.router.num_experts_per_tok();
-        let (topk_weights, topk_ids) = self.router.route(xs, input_ids, is_prefill)?;
+//     fn forward_with_ids_2bit(
+//         &self,
+//         xs: &Tensor,
+//         input_ids: Option<&Tensor>,
+//         is_prefill: bool,
+//     ) -> Result<Tensor> {
+//         let (num_tokens, hidden_dim) = xs.dims2()?;
+//         let topk = self.router.num_experts_per_tok();
+//         let (topk_weights, topk_ids) = self.router.route(xs, input_ids, is_prefill)?;
 
-        let moe_dtype = if self.dtype == DType::F32 {
-            DType::BF16
-        } else {
-            self.dtype
-        };
-        let xs = if xs.dtype() != moe_dtype {
-            xs.to_dtype(moe_dtype)?
-        } else {
-            xs.clone()
-        };
+//         let moe_dtype = if self.dtype == DType::F32 {
+//             DType::BF16
+//         } else {
+//             self.dtype
+//         };
+//         let xs = if xs.dtype() != moe_dtype {
+//             xs.to_dtype(moe_dtype)?
+//         } else {
+//             xs.clone()
+//         };
 
-        let (expert_ids, sorted_token_ids) = sort_expert_assignments(&topk_ids, is_prefill)?;
+//         let (expert_ids, sorted_token_ids) = sort_expert_assignments(&topk_ids, is_prefill)?;
 
-        let gate_up = moe::moe_gemm_w2(
-            &xs,
-            &self.gate_up_planes,
-            &self.gate_up_scales,
-            &None,
-            &sorted_token_ids,
-            &expert_ids,
-            topk,
-            self.gate_up_n,
-            self.gate_up_k,
-            is_prefill,
-        )?;
+//         let gate_up = moe::moe_gemm_w2(
+//             &xs,
+//             &self.gate_up_planes,
+//             &self.gate_up_scales,
+//             &None,
+//             &sorted_token_ids,
+//             &expert_ids,
+//             topk,
+//             self.gate_up_n,
+//             self.gate_up_k,
+//             is_prefill,
+//         )?;
 
-        let down_inputs = if matches!(self.act, Activation::Silu) {
-            attention_rs::moe_w2::moe_w2_swiglu_clamp_bf16(
-                &gate_up,
-                self.gate_up_n / 2,
-                self.swiglu_limit,
-            )?
-        } else {
-            gated_activation(&gate_up, self.gate_up_n / 2, &self.act)?
-        };
-        let down_inputs = if down_inputs.dtype() != moe_dtype {
-            down_inputs.to_dtype(moe_dtype)?
-        } else {
-            down_inputs
-        };
+//         let down_inputs = if matches!(self.act, Activation::Silu) {
+//             attention_rs::moe_w2::moe_w2_swiglu_clamp_bf16(
+//                 &gate_up,
+//                 self.gate_up_n / 2,
+//                 self.swiglu_limit,
+//             )?
+//         } else {
+//             gated_activation(&gate_up, self.gate_up_n / 2, &self.act)?
+//         };
+//         let down_inputs = if down_inputs.dtype() != moe_dtype {
+//             down_inputs.to_dtype(moe_dtype)?
+//         } else {
+//             down_inputs
+//         };
 
-        let mut ys = moe::moe_gemm_w2(
-            &down_inputs,
-            &self.down_planes,
-            &self.down_scales,
-            &Some(topk_weights),
-            &sorted_token_ids,
-            &expert_ids,
-            topk,
-            self.down_n,
-            self.down_k,
-            is_prefill,
-        )?
-        .reshape((num_tokens, topk, hidden_dim))?
-        .sum(1)?;
+//         let mut ys = moe::moe_gemm_w2(
+//             &down_inputs,
+//             &self.down_planes,
+//             &self.down_scales,
+//             &Some(topk_weights),
+//             &sorted_token_ids,
+//             &expert_ids,
+//             topk,
+//             self.down_n,
+//             self.down_k,
+//             is_prefill,
+//         )?
+//         .reshape((num_tokens, topk, hidden_dim))?
+//         .sum(1)?;
 
-        if self.world_size > 1 {
-            ys = self.all_reduce.apply(&ys)?;
-        }
-        Ok(ys.to_dtype(self.dtype)?)
-    }
+//         if self.world_size > 1 {
+//             ys = self.all_reduce.apply(&ys)?;
+//         }
+//         Ok(ys.to_dtype(self.dtype)?)
+//     }
 
-    /// Max sqrt-softplus router score — used by confidence gate for FP4 restore.
-    pub fn max_router_prob(router_logits: &Tensor) -> Result<f32> {
-        let scores = stable_softplus(router_logits)?.sqrt()?;
-        let mx = scores.max_all()?.to_scalar::<f32>()?;
-        Ok(mx)
-    }
-}
+//     /// Max sqrt-softplus router score — used by confidence gate for FP4 restore.
+//     pub fn max_router_prob(router_logits: &Tensor) -> Result<f32> {
+//         let scores = stable_softplus(router_logits)?.sqrt()?;
+//         let mx = scores.max_all()?.to_scalar::<f32>()?;
+//         Ok(mx)
+//     }
+// }

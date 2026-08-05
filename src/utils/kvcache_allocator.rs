@@ -369,7 +369,11 @@ impl KVCacheAllocator {
                         .unwrap_or(64) as usize;
                     (true, rank as usize, rope_dim)
                 } else {
-                    // DeepSeek V4: uses head_dim instead of kv_lora_rank for MLA cache
+                    // DeepSeek V4 uses layer-local sparse KV (engine MLA buffers
+                    // are unused), but keep is_mla=true for allocator budgeting so
+                    // the MLA prefill workspace estimate leaves headroom for MoE
+                    // activations under 2-GPU tight VRAM. FlashInfer MLA planning
+                    // is skipped separately in ModelRunner::is_mla_model().
                     let model_type = extra.get("model_type").and_then(|v| v.as_str());
                     if model_type == Some("deepseek_v4") {
                         let head_dim = extra

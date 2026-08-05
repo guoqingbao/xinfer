@@ -6,10 +6,18 @@ use either::Either;
 
 pub struct NormX {
     norm: Either<RmsNorm, LayerNorm>,
+    /// When set, forward uses DeepSeek-V4 ATen-order RMSNorm CUDA kernel
+    /// (`rms_norm_v4`) instead of Candle's generic reduction. V4's 86 HC
+    /// updates amplify last-bit F32 differences from the mean reduction.
+    v4_weight: Option<Tensor>,
+    v4_eps: f32,
     dtype: DType,
 }
 impl NormX {
     pub fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        if let Some(weight) = &self.v4_weight {
+            return self.forward_v4(xs, weight);
+        }
         let in_dtype = xs.dtype();
         if xs.dtype() != self.dtype {
             let converted = xs.to_dtype(self.dtype)?;
@@ -26,6 +34,43 @@ impl NormX {
             Ok(out)
         }
     }
+
+    fn forward_v4(&self, xs: &Tensor, weight: &Tensor) -> Result<Tensor> {
+        let in_dtype = xs.dtype();
+        let dims = xs.dims().to_vec();
+        let dim = *dims
+            .last()
+            .ok_or_else(|| candle_core::Error::Msg("NormX V4: expected non-empty dims".into()))?;
+        let rows: usize = dims[..dims.len().saturating_sub(1)].iter().product();
+        let rows = if dims.len() == 1 { 1 } else { rows.max(1) };
+        // Kernel expects BF16 activations and F32 weights.
+        let x_bf16 = if xs.dtype() == DType::BF16 {
+            xs.clone()
+        } else {
+            xs.to_dtype(DType::BF16)?
+        };
+        let x_2d = if dims.len() == 2 && dims[0] == rows && dims[1] == dim {
+            x_bf16
+        } else {
+            x_bf16.reshape((rows, dim))?
+        };
+        let weight_f32 = if weight.dtype() == DType::F32 {
+            weight.clone()
+        } else {
+            weight.to_dtype(DType::F32)?
+        };
+        let out = attention_rs::deepseek_v4::rms_norm_v4(&x_2d, &weight_f32, dim, self.v4_eps)?;
+        let out = if dims.len() == 2 && dims[0] == rows && dims[1] == dim {
+            out
+        } else {
+            out.reshape(dims)?
+        };
+        if in_dtype == DType::BF16 {
+            Ok(out)
+        } else {
+            out.to_dtype(in_dtype)
+        }
+    }
 }
 
 pub fn rms_norm(
@@ -36,6 +81,39 @@ pub fn rms_norm(
     is_gemma: bool,
 ) -> Result<NormX> {
     rms_norm_sharded(size, eps, vb, dtype, is_gemma, Shard::default())
+}
+
+/// DeepSeek-V4 RMSNorm with ATen (128,4) mean-reduction order.
+pub fn rms_norm_v4(size: usize, eps: f64, vb: VarBuilderX, dtype: DType) -> Result<NormX> {
+    rms_norm_v4_sharded(size, eps, vb, dtype, Shard::default())
+}
+
+pub fn rms_norm_v4_sharded(
+    size: usize,
+    eps: f64,
+    vb: VarBuilderX,
+    dtype: DType,
+    shard: Shard,
+) -> Result<NormX> {
+    let (weight, dtype) = match &vb.0 {
+        Either::Left(vb) => {
+            let ws = vb.get_with_hints(size, "weight", shard)?;
+            if ws.dtype() != dtype {
+                (ws.to_dtype(dtype)?, dtype)
+            } else {
+                (ws, dtype)
+            }
+        }
+        Either::Right(vb) => (vb.get(size, "weight")?.dequantize(vb.device())?, DType::F32),
+    };
+    let weight_f32 = weight.to_dtype(DType::F32)?;
+    Ok(NormX {
+        // Keep a candle RmsNorm as unused fallback placeholder so Either stays populated.
+        norm: Either::Left(RmsNorm::new(weight_f32.clone(), eps)),
+        v4_weight: Some(weight_f32),
+        v4_eps: eps as f32,
+        dtype,
+    })
 }
 
 pub fn rms_norm_sharded(
@@ -61,6 +139,8 @@ pub fn rms_norm_sharded(
     let weight = if is_gemma { (weight + 1.0)? } else { weight };
     Ok(NormX {
         norm: Either::Left(RmsNorm::new(weight, eps)),
+        v4_weight: None,
+        v4_eps: eps as f32,
         dtype,
     })
 }
@@ -87,11 +167,15 @@ pub fn layer_norm(
         };
         Ok(NormX {
             norm: Either::Right(LayerNorm::new(weight, bias, eps)),
+            v4_weight: None,
+            v4_eps: eps as f32,
             dtype,
         })
     } else {
         Ok(NormX {
             norm: Either::Right(LayerNorm::new_no_bias(weight, eps)),
+            v4_weight: None,
+            v4_eps: eps as f32,
             dtype,
         })
     }

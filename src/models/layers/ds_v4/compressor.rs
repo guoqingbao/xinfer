@@ -190,6 +190,75 @@ impl CompressorWeights {
         }
         Ok(Some(out))
     }
+
+    /// Seed decode accumulators to match official Compressor.forward prefill
+    /// (`start_pos == 0`) state copy — NOT by replaying decode steps.
+    ///
+    /// Official layout after prefill:
+    /// - Overlap: `kv_state[:ratio] = last full block`, then remainder into
+    ///   `kv_state[ratio:ratio+remainder]` (second half stays 0 / -inf).
+    /// - NonOverlap: remainder into `kv_state[:remainder]`.
+    ///
+    /// Decode-replay seeding leaves dirty second-half slots (shift does not
+    /// clear them) and diverges when `seq_len % ratio == 0`.
+    pub fn seed_decode_state_after_prefill(
+        &self,
+        x: &Tensor,
+        state: &mut CompressorDecodeState,
+        seq_len: usize,
+    ) -> Result<()> {
+        state.reset()?;
+
+        if seq_len == 0 {
+            return Ok(());
+        }
+
+        let out_dim = if self.is_overlap() {
+            2 * self.head_dim
+        } else {
+            self.head_dim
+        };
+        let values = attention_rs::deepseek_v4::compressor_bf16_linear_f32(
+            x,
+            &self.wkv,
+            seq_len,
+            self.hidden_dim,
+            out_dim,
+        )?;
+        let scores = attention_rs::deepseek_v4::compressor_bf16_linear_f32(
+            x,
+            &self.wgate,
+            seq_len,
+            self.hidden_dim,
+            out_dim,
+        )?;
+
+        let ratio = self.ratio;
+        let remainder = seq_len % ratio;
+        let cutoff = seq_len - remainder;
+        let offset = if self.is_overlap() { ratio } else { 0 };
+        let ape = self.ape.contiguous()?;
+
+        if self.is_overlap() && cutoff >= ratio {
+            let kv_block = values.narrow(0, cutoff - ratio, ratio)?.contiguous()?;
+            let score_block = (scores.narrow(0, cutoff - ratio, ratio)? + &ape)?.contiguous()?;
+            attention_rs::deepseek_v4::copy_contiguous_into(&state.kv_state, &kv_block, 0)?;
+            attention_rs::deepseek_v4::copy_contiguous_into(&state.score_state, &score_block, 0)?;
+        }
+        if remainder > 0 {
+            let kv_rem = values.narrow(0, cutoff, remainder)?.contiguous()?;
+            let ape_rem = ape.narrow(0, 0, remainder)?.contiguous()?;
+            let score_rem = (scores.narrow(0, cutoff, remainder)? + ape_rem)?.contiguous()?;
+            let elem_off = offset * out_dim;
+            attention_rs::deepseek_v4::copy_contiguous_into(&state.kv_state, &kv_rem, elem_off)?;
+            attention_rs::deepseek_v4::copy_contiguous_into(
+                &state.score_state,
+                &score_rem,
+                elem_off,
+            )?;
+        }
+        Ok(())
+    }
 }
 
 /// Per-request compressor decode state (F32 accumulators on GPU).
@@ -211,8 +280,9 @@ impl CompressorDecodeState {
             (ratio, head_dim)
         };
 
-        let kv_state = Tensor::zeros((slots, state_dim), DType::F32, device)?;
-        let score_state = Tensor::full(f32::NEG_INFINITY, (slots, state_dim), device)?;
+        let kv_state = Tensor::zeros((slots, state_dim), DType::F32, device)?.contiguous()?;
+        let score_state =
+            Tensor::full(f32::NEG_INFINITY, (slots, state_dim), device)?.contiguous()?;
 
         Ok(Self {
             kv_state,
@@ -223,12 +293,18 @@ impl CompressorDecodeState {
     }
 
     pub fn reset(&mut self) -> Result<()> {
-        self.kv_state = self.kv_state.zeros_like()?;
+        self.kv_state = Tensor::zeros(
+            (self.slots, self.state_dim),
+            DType::F32,
+            self.kv_state.device(),
+        )?
+        .contiguous()?;
         self.score_state = Tensor::full(
             f32::NEG_INFINITY,
-            self.score_state.shape(),
+            (self.slots, self.state_dim),
             self.score_state.device(),
-        )?;
+        )?
+        .contiguous()?;
         Ok(())
     }
 }

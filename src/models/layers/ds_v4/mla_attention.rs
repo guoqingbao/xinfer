@@ -3,7 +3,7 @@ use crate::models::layers::distributed::{
     shard, Comm, ReplicatedLinear, TensorParallelColumnLinear, TensorParallelRowLinear,
 };
 use crate::models::layers::linear::{linear_is_prefill, linear_no_bias_x, Linear, LinearX};
-use crate::models::layers::others::{rms_norm, NormX};
+use crate::models::layers::others::{rms_norm_v4, NormX};
 use crate::models::layers::VarBuilderX;
 use crate::utils::config::Config;
 use attention_rs::InputMetadata;
@@ -61,6 +61,7 @@ impl MlaV4Config {
 #[allow(unused)]
 pub struct MlaV4Attention {
     layer_idx: usize,
+    rank: usize,
     wq_a: ReplicatedLinear,
     q_norm: NormX,
     wq_b: TensorParallelColumnLinear,
@@ -91,9 +92,9 @@ pub struct MlaV4Attention {
 
 impl MlaV4Attention {
     /// DeepSeek V4 stores `wo_a` as FP8, but the reference implementation
-    /// intentionally materializes this grouped projection as BF16.  Expand
-    /// the per-[128,128] UE8M0 scales while loading it so the grouped output
-    /// path uses the same BF16 GEMM as the reference model.
+    /// intentionally materializes this grouped projection as BF16.  Match
+    /// `convert.py`: dequant in F32 (`weight.float() * scale.float()`), then
+    /// cast to BF16 — never multiply UE8M0/FP8 scales in BF16/F8 space.
     fn materialize_wo_a_bf16(wo_a: LinearX) -> Result<LinearX> {
         let LinearX::LnFp8(fp8) = wo_a else {
             return Ok(wo_a);
@@ -108,19 +109,22 @@ impl MlaV4Attention {
         }
         let blocks_y = out_dim / block_size[0];
         let blocks_x = in_dim / block_size[1];
-        let weight = fp8.weight.to_dtype(DType::BF16)?.reshape((
+        // F8E4M3 → F32 via Candle's native convert (correct path).
+        let weight = fp8.weight.to_dtype(DType::F32)?.reshape((
             blocks_y,
             block_size[0],
             blocks_x,
             block_size[1],
         ))?;
+        // UE8M0 / F32 scales → F32 via Candle (uses f8e8m0_to_dtype on CUDA).
         let scales = fp8
             .weight_scale
-            .to_dtype(DType::BF16)?
+            .to_dtype(DType::F32)?
             .reshape((blocks_y, 1, blocks_x, 1))?;
         let weight = weight
             .broadcast_mul(&scales)?
             .reshape((out_dim, in_dim))?
+            .to_dtype(DType::BF16)?
             .contiguous()?;
         Ok(LinearX::Linear(Linear::new(weight, None)))
     }
@@ -174,12 +178,11 @@ impl MlaV4Attention {
             dtype,
         )?;
 
-        let q_norm = rms_norm(
+        let q_norm = rms_norm_v4(
             q_lora_rank,
             mla_cfg.rms_norm_eps,
             vb.pp("q_norm"),
             norm_dtype,
-            false,
         )?;
 
         let wq_b = TensorParallelColumnLinear::load_with_hints(
@@ -204,13 +207,7 @@ impl MlaV4Attention {
             dtype,
         )?;
 
-        let kv_norm = rms_norm(
-            head_dim,
-            mla_cfg.rms_norm_eps,
-            vb.pp("kv_norm"),
-            norm_dtype,
-            false,
-        )?;
+        let kv_norm = rms_norm_v4(head_dim, mla_cfg.rms_norm_eps, vb.pp("kv_norm"), norm_dtype)?;
 
         // Output path: wo_a (grouped FP8/BF16) -> wo_b (FP8)
         // wo_a is a block-diagonal grouped linear: weight shape [o_groups * o_lora_rank, per_group_dim]
@@ -304,6 +301,7 @@ impl MlaV4Attention {
 
         Ok(Self {
             layer_idx,
+            rank: comm.rank(),
             wq_a,
             q_norm,
             wq_b,
@@ -488,7 +486,13 @@ impl MlaV4Attention {
             }
         };
 
-        self.wo_b.forward(&low_rank)
+        // Row-parallel all-reduce in FP32 and retain FP32 for hc_post_f32_branch.
+        // Casting back to BF16 here reused intermediate storage that later looked
+        // like NaN/garbage by the time hc_post ran on compressed layers.
+        let local = self.wo_b.forward_local(&low_rank)?;
+        let output = self.wo_b.reduce_local_f32(local, DType::F32)?;
+        output.device().synchronize()?;
+        Ok(output)
     }
 
     /// Per-head RMSNorm on Q output via CUDA kernel.
@@ -500,8 +504,7 @@ impl MlaV4Attention {
     /// Compute the shared Q bottleneck (wq_a -> q_norm) for indexer and sparse attention.
     pub fn compute_qr(&self, xs: &Tensor) -> Result<Tensor> {
         let q_a_out = self.wq_a.forward(xs)?;
-        let qr = self.q_norm.forward(&q_a_out)?;
-        Ok(qr)
+        self.q_norm.forward(&q_a_out)
     }
 
     /// Sparse attention forward for DeepSeek V4 prefill and decode.
@@ -562,7 +565,7 @@ impl MlaV4Attention {
             topk,
             self.sm_scale,
         )?;
-        // self.trace_stage("sparse_raw", &out, seq_len)?;
+        out.device().synchronize()?;
 
         // Inverse RoPE on the rope dimensions of the output (conjugate / -sin).
         let out_nope = out.narrow(D::Minus1, 0, self.qk_nope_head_dim)?;
@@ -575,7 +578,6 @@ impl MlaV4Attention {
             &[&out_nope.contiguous()?, &out_pe_inv.to_dtype(self.dtype)?],
             D::Minus1,
         )?;
-        // self.trace_stage("inverse_rope", &out_full, seq_len)?;
 
         let y = out_full
             .reshape((seq_len, self.num_heads * self.head_dim))?

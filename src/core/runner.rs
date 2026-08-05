@@ -157,9 +157,12 @@ impl ModelRunner {
     // Mamba slots track concurrent sequence states (not KV token blocks).
 
     pub(crate) fn is_mla_model(&self) -> bool {
+        // DeepSeek V4 uses layer-local sparse KV + custom sparse_attn kernels.
+        // Treating it as classical FlashInfer MLA allocates unreachable plan
+        // workspaces at head_dim=512 and OOMs under tight VRAM (2×H800 fit).
         matches!(
             self.model_type,
-            ModelType::GLM4MoeLite | ModelType::DeepSeek | ModelType::DeepSeekV4 | ModelType::GLM5
+            ModelType::GLM4MoeLite | ModelType::DeepSeek | ModelType::GLM5
         )
     }
 
@@ -556,7 +559,9 @@ impl ModelRunner {
         #[cfg(feature = "flashinfer")]
         let skip_flashinfer_init = config.kvcache_dtype.is_turboquant()
             || (config.kvcache_dtype.is_fp8_keys() && !attention_rs::has_flashinfer_fp8_e4m3())
-            || has_heterogeneous_head_dim;
+            || has_heterogeneous_head_dim
+            // V4 never consumes FlashInfer attention; skip its MLA workspace.
+            || matches!(model_type, ModelType::DeepSeekV4);
         #[cfg(feature = "flashinfer")]
         let flashinfer_kv_params = if skip_flashinfer_init {
             None
@@ -569,10 +574,7 @@ impl ModelRunner {
                 let (_, page_size, num_kv_heads, head_dim) = k_cache.dims4()?;
                 let is_mla = matches!(
                     model_type,
-                    ModelType::GLM4MoeLite
-                        | ModelType::DeepSeek
-                        | ModelType::DeepSeekV4
-                        | ModelType::GLM5
+                    ModelType::GLM4MoeLite | ModelType::DeepSeek | ModelType::GLM5
                 );
                 params = Some(FlashInferKvParams {
                     kv_dtype: k_cache.dtype(),
@@ -701,10 +703,7 @@ impl ModelRunner {
                 &flashinfer_kv_params,
                 matches!(
                     model_type,
-                    ModelType::GLM4MoeLite
-                        | ModelType::DeepSeek
-                        | ModelType::DeepSeekV4
-                        | ModelType::GLM5
+                    ModelType::GLM4MoeLite | ModelType::DeepSeek | ModelType::GLM5
                 ),
             ),
             #[cfg(all(feature = "cuda", feature = "graph"))]
@@ -719,10 +718,7 @@ impl ModelRunner {
                     &flashinfer_kv_params,
                     matches!(
                         model_type,
-                        ModelType::GLM4MoeLite
-                            | ModelType::DeepSeek
-                            | ModelType::DeepSeekV4
-                            | ModelType::GLM5
+                        ModelType::GLM4MoeLite | ModelType::DeepSeek | ModelType::GLM5
                     ),
                 )
             }),

@@ -16,5 +16,5 @@ pub use hyper_connection::{
 };
 pub use indexer::{IndexerDecodeState, IndexerWeights};
 pub use mla_attention::{MlaV4Attention, MlaV4Config};
-pub use moe_v4::{FusedMoeMxfp4, FusedMoeW2, V4Router};
+pub use moe_v4::{FusedMoeMxfp4, V4Router};
 pub use rope_cache::{LayerSparseKvCache, V4RopeTables};

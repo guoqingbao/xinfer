@@ -1056,6 +1056,8 @@ pub struct QuantConfig {
     pub checkpoint_format: Option<String>,
     pub fmt: Option<String>,
     #[serde(default)]
+    pub scale_fmt: Option<String>,
+    #[serde(default)]
     pub format: Option<String>,
     pub weight_block_size: Option<Vec<usize>>,
     #[serde(default, alias = "ignore")]
@@ -1366,6 +1368,7 @@ impl fmt::Debug for QuantConfig {
             .field("desc_act", &self.desc_act)
             .field("checkpoint_format", &self.checkpoint_format)
             .field("fmt", &self.fmt)
+            .field("scale_fmt", &self.scale_fmt)
             .field("format", &self.format)
             .field("weight_block_size", &self.weight_block_size)
             .field("is_mlx_nvfp4", &self.is_mlx_nvfp4)
@@ -1516,6 +1519,7 @@ mod tests {
             desc_act: None,
             checkpoint_format: None,
             fmt: None,
+            scale_fmt: None,
             format: Some("mxfp4-pack-quantized".to_string()),
             weight_block_size: None,
             modules_to_not_convert: vec![

@@ -527,6 +527,11 @@ impl LLMEngine {
             (econfig.num_blocks as f32 * econfig.cpu_mem_fold.unwrap_or(0.5f32)) as usize
         );
 
+        // The official DeepSeek-V4 `chat` encoding starts generation after
+        // `</think>`; thinking mode is opt-in for this model. Other reasoning
+        // models retain the existing enabled-by-default behavior.
+        let default_enable_thinking =
+            !econfig.disable_reasoning && !matches!(model_type, ModelType::DeepSeekV4);
         let mut template = ChatTemplate::new(
             None,
             config_tokenizer.chat_template.clone(),
@@ -534,7 +539,7 @@ impl LLMEngine {
             config_tokenizer.eos_token.clone(),
             None,
             true,
-            true,
+            default_enable_thinking,
         );
         let escaped_special_tokens = ChatTemplate::collect_escape_tokens(
             &tokenizer,
@@ -1656,6 +1661,7 @@ impl LLMEngine {
     ) -> (String, i32) {
         // let mut collected_images = Vec::new();
         let mut prompt_template = self.template.clone();
+        let default_enable_thinking = self.template.enable_thinking();
         if let Some(grammar) = &params.grammar {
             if is_reasoning_grammar(&grammar) {
                 prompt_template.set_enable_thinking(true);
@@ -1663,13 +1669,11 @@ impl LLMEngine {
                 // Grammar without reasoning rules: thinking is handled at the mask
                 // level (GuidanceState defers grammar until after </think>), so use
                 // the default thinking setting — same as the no-grammar path.
-                prompt_template.set_enable_thinking(
-                    params.thinking.unwrap_or(!self.econfig.disable_reasoning),
-                );
+                prompt_template
+                    .set_enable_thinking(params.thinking.unwrap_or(default_enable_thinking));
             }
         } else {
-            prompt_template
-                .set_enable_thinking(params.thinking.unwrap_or(!self.econfig.disable_reasoning));
+            prompt_template.set_enable_thinking(params.thinking.unwrap_or(default_enable_thinking));
         };
         prompt_template.set_messages(messages);
         let image_idx: i32 = 0;

@@ -1,12 +1,12 @@
 use crate::models::layers::distributed::{Comm, VocabParallelLinear};
 use crate::models::layers::ds_v4::{
     hc_expand, hc_head, hc_post, hc_pre, CompressorDecodeState, CompressorWeights, FusedMoeMxfp4,
-    FusedMoeW2, HcBlockWeights, HcHeadWeights, HcHiddenStates, IndexerDecodeState, IndexerWeights,
+    HcBlockWeights, HcHeadWeights, HcHiddenStates, IndexerDecodeState, IndexerWeights,
     LayerCompressionType, LayerSparseKvCache, MlaV4Attention, MlaV4Config, V4RopeTables,
 };
 use crate::models::layers::mask::get_attention_causal_mask;
 use crate::models::layers::mlp::MLP;
-use crate::models::layers::others::{embedding, rms_norm, NormX};
+use crate::models::layers::others::{embedding, rms_norm_v4, NormX};
 use crate::models::layers::VarBuilderX;
 use crate::utils::config::Config;
 use crate::utils::progress::ProgressLike;
@@ -17,6 +17,31 @@ use parking_lot::{Mutex, RwLock};
 use std::iter::zip;
 use std::rc::Rc;
 use std::sync::Arc;
+
+/// Pin a tensor on the host so GPU workspace reuse cannot mutate it.
+fn pin_tensor_host(tensor: &Tensor) -> Result<(Vec<f32>, Vec<usize>, DType, candle_core::Device)> {
+    let shape = tensor.dims().to_vec();
+    let device = tensor.device().clone();
+    let dtype = tensor.dtype();
+    let host = tensor
+        .to_dtype(DType::F32)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    Ok((host, shape, dtype, device))
+}
+
+fn restore_pinned_tensor(
+    host: &[f32],
+    shape: &[usize],
+    dtype: DType,
+    device: &candle_core::Device,
+) -> Result<Tensor> {
+    let pinned = Tensor::from_slice(host, shape, device)?;
+    match dtype {
+        DType::F32 => Ok(pinned),
+        other => pinned.to_dtype(other),
+    }
+}
 
 /// DeepSeek V4 specific config fields parsed from extra_config_json
 pub struct DeepSeekV4Config {
@@ -100,7 +125,7 @@ impl DeepSeekV4Config {
 #[allow(dead_code)]
 enum MoeOrMlp {
     FusedMoeMxfp4(FusedMoeMxfp4),
-    FusedMoeW2(FusedMoeW2),
+    // FusedMoeW2(FusedMoeW2),
     Mlp(MLP),
 }
 
@@ -114,7 +139,7 @@ impl MoeOrMlp {
         match self {
             Self::Mlp(m) => m.forward(xs),
             Self::FusedMoeMxfp4(m) => m.forward_with_ids_f32(xs, input_ids, is_prefill),
-            Self::FusedMoeW2(m) => m.forward_with_ids(xs, input_ids, is_prefill),
+            // Self::FusedMoeW2(m) => m.forward_with_ids(xs, input_ids, is_prefill),
         }
     }
 }
@@ -122,24 +147,15 @@ impl MoeOrMlp {
 fn seed_compressor_decode_state(
     compressor: &CompressorWeights,
     input: &Tensor,
-    state: &CompressorDecodeState,
-    rope: &V4RopeTables,
+    state: &mut CompressorDecodeState,
+    _rope: &V4RopeTables,
     seq_len: usize,
-    rotate_fp4: bool,
+    _rotate_fp4: bool,
 ) -> Result<()> {
-    let replay_start = if compressor.is_overlap() {
-        // The overlap kernel keeps an eight-token rolling window, not only
-        // the final partial block.  Seed exactly the same tail as the
-        // reference runtime before the first decode step.
-        seq_len.saturating_sub(2 * compressor.ratio)
-    } else {
-        seq_len - seq_len % compressor.ratio
-    };
-    for position in replay_start..seq_len {
-        let token = input.narrow(0, position, 1)?;
-        let _ = compressor.decode(&token, state, position, Some(rope), rotate_fp4)?;
-    }
-    Ok(())
+    // Match official Compressor.forward prefill state copy. Decode-replay
+    // seeding leaves dirty overlap second-half slots and diverges on
+    // seq_len % ratio == 0; that poisons longer generations.
+    compressor.seed_decode_state_after_prefill(input, state, seq_len)
 }
 
 pub struct DeepSeekV4DecoderLayer {
@@ -209,14 +225,7 @@ impl DeepSeekV4DecoderLayer {
             .as_deref()
             .is_none_or(|dtype| matches!(dtype.to_ascii_lowercase().as_str(), "fp4" | "mxfp4"));
 
-        let mlp = if use_w2 {
-            MoeOrMlp::FusedMoeW2(FusedMoeW2::new(
-                config,
-                vb.pp("ffn").clone(),
-                comm.clone(),
-                dtype,
-            )?)
-        } else if is_qvar_builder {
+        let mlp = if is_qvar_builder {
             candle_core::bail!(
                 "DeepSeek V4 does not support GGUF MoE; use MXFP4 safetensors or --quant w2"
             );
@@ -240,6 +249,7 @@ impl DeepSeekV4DecoderLayer {
                 vb.pp("ffn").clone(),
                 comm.clone(),
                 dtype,
+                layer_idx,
             )?)
         };
 
@@ -283,20 +293,20 @@ impl DeepSeekV4DecoderLayer {
             None
         };
 
-        let attn_norm = rms_norm(
+        // Match official ATen (128,4) mean-reduction order. Candle's generic
+        // RMSNorm drifts enough that HC amplification blows up by mid layers.
+        let attn_norm = rms_norm_v4(
             config.hidden_size,
             config.rms_norm_eps,
             vb.pp("attn_norm").clone(),
             DType::F32,
-            false,
         )?;
 
-        let ffn_norm = rms_norm(
+        let ffn_norm = rms_norm_v4(
             config.hidden_size,
             config.rms_norm_eps,
             vb.pp("ffn_norm").clone(),
             DType::F32,
-            false,
         )?;
 
         // HC weights for attention and FFN branches
@@ -340,6 +350,8 @@ impl DeepSeekV4DecoderLayer {
                 mla_cfg.qk_rope_head_dim,
                 comm.world_size(),
                 comm.clone(),
+                layer_idx,
+                v4_cfg.compress_rope_theta,
             )?
         } else {
             None
@@ -387,6 +399,12 @@ impl DeepSeekV4DecoderLayer {
             self.hc_sinkhorn_iters,
             self.hc_eps,
         )?;
+        // Pin HC residual + post/comb on host BEFORE attention/MoE. Device-side
+        // Tensor::copy is not enough: GPU scratch has been observed overwriting
+        // those CUDA buffers before hc_post. Re-upload immediately before hc_post.
+        let resid_snap = pin_tensor_host(&hc_hidden.data)?;
+        let post_snap = pin_tensor_host(&attn_hc_state.post)?;
+        let comb_snap = pin_tensor_host(&attn_hc_state.comb)?;
         let attn_normed = self.attn_norm.forward(&attn_input)?;
         let qr = self.self_attn.compute_qr(&attn_normed)?;
         let seq_len = attn_normed.dims()[0];
@@ -439,9 +457,7 @@ impl DeepSeekV4DecoderLayer {
                             compressed_len,
                             &self.rope,
                         )?;
-                        let selected =
-                            indexer.topk_prefill(&scores, seq_len, compressed_len, offset)?;
-                        selected
+                        indexer.topk_prefill(&scores, seq_len, compressed_len, offset)?
                     } else {
                         attention_rs::deepseek_v4::compress_topk_indices(
                             seq_len,
@@ -465,6 +481,7 @@ impl DeepSeekV4DecoderLayer {
                 }
             }
 
+            attn_normed.device().synchronize()?;
             let output = self.self_attn.sparse_attn(
                 &attn_normed,
                 &qr,
@@ -489,7 +506,7 @@ impl DeepSeekV4DecoderLayer {
             *self.sparse_kv.lock() = Some(sparse_cache);
 
             *self.compressor_state.lock() = if let Some(compressor) = &self.compressor {
-                let state = CompressorDecodeState::new(
+                let mut state = CompressorDecodeState::new(
                     compressor.ratio,
                     compressor.head_dim,
                     attn_normed.device(),
@@ -497,7 +514,7 @@ impl DeepSeekV4DecoderLayer {
                 seed_compressor_decode_state(
                     compressor,
                     &attn_normed,
-                    &state,
+                    &mut state,
                     &self.rope,
                     seq_len,
                     false,
@@ -535,7 +552,7 @@ impl DeepSeekV4DecoderLayer {
                 seed_compressor_decode_state(
                     &indexer.compressor,
                     &attn_normed,
-                    &state.compressor_state,
+                    &mut state.compressor_state,
                     &self.rope,
                     seq_len,
                     true,
@@ -632,11 +649,12 @@ impl DeepSeekV4DecoderLayer {
                     )?
                 };
                 if let Some(row) = emitted {
+                    let row_idx = start_pos / indexer.compressor.ratio;
                     self.indexer_state
                         .lock()
                         .as_mut()
                         .expect("indexer state initialized")
-                        .append_compressed(&row)?;
+                        .write_compressed_at(&row, row_idx)?;
                 }
             }
 
@@ -657,11 +675,16 @@ impl DeepSeekV4DecoderLayer {
                 .as_ref()
                 .expect("sparse cache initialized")
                 .compressed_len;
-            if compressed_len > 0 {
+            // Official indexer scores `:end_pos // ratio` (decode: start_pos+1).
+            let end_compressed = (start_pos + 1) / self.compression.ratio().max(1);
+            if end_compressed > 0 && compressed_len > 0 {
                 let compress_idxs = if let Some(indexer) = &self.indexer {
                     let state = self.indexer_state.lock();
                     let state = state.as_ref().expect("indexer state initialized");
-                    let score_len = compressed_len.min(state.compressed_len);
+                    let score_len = end_compressed
+                        .min(compressed_len)
+                        .min(state.compressed_len)
+                        .max(1);
                     let scores = indexer.scores_decode(
                         &attn_normed,
                         &qr,
@@ -697,24 +720,51 @@ impl DeepSeekV4DecoderLayer {
             // Official decode attends over the full cache buffer (unused
             // compressed slots stay zero / are skipped via -1 topk).
             let kv_len = sparse_cache.total_slots().max(1);
-            let attn_out = self.self_attn.sparse_attn(
+            let attention_kv = sparse_cache.kv.clone();
+            attn_normed.device().synchronize()?;
+            self.self_attn.sparse_attn(
                 &attn_normed,
                 &qr,
                 &self.rope,
                 start_pos,
-                &sparse_cache.kv,
+                &attention_kv,
                 &topk_idxs.contiguous()?,
                 kv_len,
                 total_topk,
-            )?;
-            attn_out
+            )?
         };
+        attn_output.device().synchronize()?;
 
-        let after_attn = hc_post(
-            &attn_output.to_dtype(DType::F32)?,
-            hc_hidden,
-            &attn_hc_state,
-        )?;
+        // Re-upload host pins immediately before hc_post.
+        let residual_for_post = HcHiddenStates {
+            data: restore_pinned_tensor(&resid_snap.0, &resid_snap.1, resid_snap.2, &resid_snap.3)?,
+            seq_len: hc_hidden.seq_len,
+            hidden_dim: hc_hidden.hidden_dim,
+            hc: hc_hidden.hc,
+        };
+        let attn_hc_state = crate::models::layers::ds_v4::HcPreState {
+            post: restore_pinned_tensor(&post_snap.0, &post_snap.1, post_snap.2, &post_snap.3)?,
+            comb: restore_pinned_tensor(&comb_snap.0, &comb_snap.1, comb_snap.2, &comb_snap.3)?,
+            seq_len: attn_hc_state.seq_len,
+            hc: attn_hc_state.hc,
+            hidden_dim: attn_hc_state.hidden_dim,
+        };
+        // Pin branch output before hc_post so workspace reuse cannot clobber it.
+        let attn_branch = {
+            let branch_f32 = attn_output.to_dtype(DType::F32)?;
+            let snap = pin_tensor_host(&branch_f32)?;
+            restore_pinned_tensor(&snap.0, &snap.1, snap.2, &snap.3)?
+        };
+        residual_for_post.data.device().synchronize()?;
+        let after_attn = hc_post(&attn_branch, &residual_for_post, &attn_hc_state)?;
+        after_attn.data.device().synchronize()?;
+        let after_attn = HcHiddenStates {
+            data: after_attn.data.contiguous()?.copy()?,
+            seq_len: after_attn.seq_len,
+            hidden_dim: after_attn.hidden_dim,
+            hc: after_attn.hc,
+        };
+        after_attn.data.device().synchronize()?;
         // FFN branch: hc_pre -> norm -> MoE -> hc_post
         let (ffn_input, ffn_hc_state) = hc_pre(
             &after_attn,
@@ -724,14 +774,17 @@ impl DeepSeekV4DecoderLayer {
             self.hc_sinkhorn_iters,
             self.hc_eps,
         )?;
+        // Pin FFN residual + post/comb on host before MoE / shared experts.
+        let ffn_resid_snap = pin_tensor_host(&after_attn.data)?;
+        let ffn_post_snap = pin_tensor_host(&ffn_hc_state.post)?;
+        let ffn_comb_snap = pin_tensor_host(&ffn_hc_state.comb)?;
+        ffn_resid_snap.3.synchronize()?;
         let ffn_normed = self.ffn_norm.forward(&ffn_input)?;
         let shared_output = if let Some(shared_expert) = &self.shared_expert {
-            let so = shared_expert.forward(&ffn_normed)?;
-            Some(so)
+            Some(shared_expert.forward(&ffn_normed)?)
         } else {
             None
         };
-
         let mlp_output =
             self.mlp
                 .forward_with_ids(&ffn_normed, input_ids, input_metadata.is_prefill)?;
@@ -742,7 +795,49 @@ impl DeepSeekV4DecoderLayer {
         } else {
             mlp_output
         };
-        hc_post(&ffn_output, &after_attn, &ffn_hc_state)
+        let ffn_branch = {
+            let branch_f32 = ffn_output.to_dtype(DType::F32)?;
+            let snap = pin_tensor_host(&branch_f32)?;
+            restore_pinned_tensor(&snap.0, &snap.1, snap.2, &snap.3)?
+        };
+        let residual_for_ffn = HcHiddenStates {
+            data: restore_pinned_tensor(
+                &ffn_resid_snap.0,
+                &ffn_resid_snap.1,
+                ffn_resid_snap.2,
+                &ffn_resid_snap.3,
+            )?,
+            seq_len: after_attn.seq_len,
+            hidden_dim: after_attn.hidden_dim,
+            hc: after_attn.hc,
+        };
+        let ffn_hc_state = crate::models::layers::ds_v4::HcPreState {
+            post: restore_pinned_tensor(
+                &ffn_post_snap.0,
+                &ffn_post_snap.1,
+                ffn_post_snap.2,
+                &ffn_post_snap.3,
+            )?,
+            comb: restore_pinned_tensor(
+                &ffn_comb_snap.0,
+                &ffn_comb_snap.1,
+                ffn_comb_snap.2,
+                &ffn_comb_snap.3,
+            )?,
+            seq_len: ffn_hc_state.seq_len,
+            hc: ffn_hc_state.hc,
+            hidden_dim: ffn_hc_state.hidden_dim,
+        };
+        ffn_branch.device().synchronize()?;
+        let output = hc_post(&ffn_branch, &residual_for_ffn, &ffn_hc_state)?;
+        let output = HcHiddenStates {
+            data: output.data.contiguous()?.copy()?,
+            seq_len: output.seq_len,
+            hidden_dim: output.hidden_dim,
+            hc: output.hc,
+        };
+        output.data.device().synchronize()?;
+        Ok(output)
     }
 }
 
@@ -884,7 +979,7 @@ impl DeepSeekV4ForCausalLM {
             reporter.write().set_progress(i + 1);
         }
 
-        let norm = rms_norm(
+        let norm = rms_norm_v4(
             config.hidden_size,
             config.rms_norm_eps,
             if is_qvar_builder {
@@ -893,7 +988,6 @@ impl DeepSeekV4ForCausalLM {
                 vb.pp(&format!("{}norm", prefix))
             },
             DType::F32,
-            false,
         )?;
 
         let tie_word_embeddings = config.tie_word_embeddings;
@@ -1041,7 +1135,6 @@ impl DeepSeekV4ForCausalLM {
                 .index_select(&Tensor::from_vec(indices, (batch,), xs.device())?, 0)?;
         }
         let xs = self.norm.forward(&xs)?;
-        // lm_head weights are model dtype (BF16/FP8); do not promote acts to F32.
         self.lm_head.forward(&xs)
     }
 

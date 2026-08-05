@@ -63,6 +63,10 @@ impl TensorParallelColumnLinear {
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         self.linear.forward(x)
     }
+
+    pub fn fp8_weight_scale(&self) -> Option<(&Tensor, &Tensor)> {
+        self.linear.fp8_weight_scale()
+    }
 }
 
 pub fn tensor_parallel_chunk(
@@ -189,6 +193,7 @@ impl MergedParallelColumnLinear {
             bias: None,
             weight_block_size,
             sm_version,
+            ue8m0: false,
         });
         let tp_linear = TensorParallelColumnLinear { linear };
         Ok(Self {
@@ -433,6 +438,30 @@ impl TensorParallelRowLinear {
     /// performs its output reduction in FP32 immediately before HC post.
     pub fn forward_local(&self, x: &Tensor) -> Result<Tensor> {
         self.linear.forward(x)
+    }
+
+    /// Match the official DeepSeek row-parallel linear: compute each local
+    /// shard, promote it to FP32 for the collective and bias, then cast the
+    /// reduced result back to the input dtype.
+    pub fn forward_f32_reduce(&self, x: &Tensor) -> Result<Tensor> {
+        let input_dtype = x.dtype();
+        let xs = self.linear.forward(x)?;
+        self.reduce_local_f32(xs, input_dtype)
+    }
+
+    /// Complete a row-parallel projection when the local GEMM was supplied by
+    /// a precision oracle.  Keeping the collective here guarantees callbacks
+    /// replace only the mathematical shard, not xInfer's TP synchronization.
+    pub fn reduce_local_f32(&self, xs: Tensor, output_dtype: DType) -> Result<Tensor> {
+        let mut xs = xs.to_dtype(DType::F32)?;
+        #[cfg(feature = "nccl")]
+        if let Some(all_reduce) = &self.all_reduce {
+            xs = xs.apply_op1_no_bwd(all_reduce)?;
+        }
+        if let Some(bias) = &self.bias {
+            xs = xs.broadcast_add(&bias.to_dtype(DType::F32)?)?;
+        }
+        xs.to_dtype(output_dtype)
     }
 
     #[allow(unused_variables)]
@@ -895,6 +924,7 @@ impl MergedParallelColumnLinear {
                         bias: None,
                         weight_block_size: block_size.clone(),
                         sm_version,
+                        ue8m0: quant_cfg.scale_fmt.as_deref() == Some("ue8m0"),
                     });
                     let ln = TensorParallelColumnLinear { linear };
                     vec_linear.push(ln);
@@ -1588,6 +1618,71 @@ impl VocabParallelLinear {
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let logits = self.linear.forward(x)?;
 
+        self.finish_logits(logits, x.dims())
+    }
+
+    /// BF16 input/weight projection with FP32 accumulation and FP32 logits.
+    ///
+    /// DeepSeek-V4 declares its vocabulary head as FP32 even though the
+    /// checkpoint stores BF16 values. Keeping the stored weight in BF16 avoids
+    /// a second, very large GPU allocation while cuBLAS still reproduces the
+    /// official BF16-value x BF16-value -> FP32 projection semantics.
+    pub fn forward_bf16_weight_f32(&self, x: &Tensor) -> Result<Tensor> {
+        let logits = self.forward_bf16_weight_f32_local(x)?;
+        self.finish_logits(logits, x.dims())
+    }
+
+    /// Compute only this rank's DeepSeek-V4 vocabulary shard.
+    pub fn forward_bf16_weight_f32_local(&self, x: &Tensor) -> Result<Tensor> {
+        let weight = self.linear.dense_weight()?;
+        if x.dtype() != DType::BF16 || weight.dtype() != DType::BF16 {
+            candle_core::bail!(
+                "FP32 vocabulary projection expects BF16 input/weight, got {:?}/{:?}",
+                x.dtype(),
+                weight.dtype()
+            );
+        }
+        let in_dim = weight.dim(1)?;
+        let local_vocab = weight.dim(0)?;
+        let batch = x.elem_count() / in_dim;
+        let input = x.reshape((batch, in_dim))?.contiguous()?;
+        attention_rs::deepseek_v4::compressor_bf16_linear_f32(
+            &input,
+            weight,
+            batch,
+            in_dim,
+            local_vocab,
+        )
+    }
+
+    /// Official DeepSeek-V4 ParallelHead: `F.linear(x.float(), weight.float())`.
+    ///
+    /// Run on CPU like the Python oracle: the rank-local head is ~0.5 GiB BF16
+    /// and a temporary FP32 copy is ~1 GiB — doing that on GPU after V4 load
+    /// leaves no KV budget. CPU F32 GEMM matches the golden path exactly.
+    pub fn forward_f32_weight_f32_local(&self, x: &Tensor) -> Result<Tensor> {
+        let weight = self.linear.dense_weight()?;
+        let device = x.device();
+        let in_dim = weight.dim(1)?;
+        let batch = x.elem_count() / in_dim;
+        let input = x
+            .to_dtype(DType::F32)?
+            .reshape((batch, in_dim))?
+            .to_device(&candle_core::Device::Cpu)?
+            .contiguous()?;
+        let weight_f32 = weight
+            .to_dtype(DType::F32)?
+            .to_device(&candle_core::Device::Cpu)?
+            .contiguous()?;
+        input.matmul(&weight_f32.t()?)?.to_device(device)
+    }
+
+    /// Gather local vocabulary logits supplied by either Rust or the oracle.
+    pub fn finish_local_logits(&self, logits: Tensor, input_dims: &[usize]) -> Result<Tensor> {
+        self.finish_logits(logits, input_dims)
+    }
+
+    fn finish_logits(&self, logits: Tensor, input_dims: &[usize]) -> Result<Tensor> {
         #[cfg(feature = "nccl")]
         if let Some(all_gather) = &self.all_gather {
             // logits shape: [batch, local_vocab]
@@ -1613,7 +1708,7 @@ impl VocabParallelLinear {
             let logits = gathered.reshape((batch, full_vocab))?;
 
             // Restore original batch dimensions if input was multi-dimensional
-            let orig_dims = &x.dims()[..x.dims().len() - 1];
+            let orig_dims = &input_dims[..input_dims.len() - 1];
             let logits = if orig_dims.len() > 1 {
                 let mut shape = orig_dims.to_vec();
                 shape.push(full_vocab);
