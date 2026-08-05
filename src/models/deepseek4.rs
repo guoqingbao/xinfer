@@ -18,31 +18,6 @@ use std::iter::zip;
 use std::rc::Rc;
 use std::sync::Arc;
 
-/// Pin a tensor on the host so GPU workspace reuse cannot mutate it.
-fn pin_tensor_host(tensor: &Tensor) -> Result<(Vec<f32>, Vec<usize>, DType, candle_core::Device)> {
-    let shape = tensor.dims().to_vec();
-    let device = tensor.device().clone();
-    let dtype = tensor.dtype();
-    let host = tensor
-        .to_dtype(DType::F32)?
-        .flatten_all()?
-        .to_vec1::<f32>()?;
-    Ok((host, shape, dtype, device))
-}
-
-fn restore_pinned_tensor(
-    host: &[f32],
-    shape: &[usize],
-    dtype: DType,
-    device: &candle_core::Device,
-) -> Result<Tensor> {
-    let pinned = Tensor::from_slice(host, shape, device)?;
-    match dtype {
-        DType::F32 => Ok(pinned),
-        other => pinned.to_dtype(other),
-    }
-}
-
 /// DeepSeek V4 specific config fields parsed from extra_config_json
 pub struct DeepSeekV4Config {
     pub hc_mult: usize,
@@ -399,12 +374,6 @@ impl DeepSeekV4DecoderLayer {
             self.hc_sinkhorn_iters,
             self.hc_eps,
         )?;
-        // Pin HC residual + post/comb on host BEFORE attention/MoE. Device-side
-        // Tensor::copy is not enough: GPU scratch has been observed overwriting
-        // those CUDA buffers before hc_post. Re-upload immediately before hc_post.
-        let resid_snap = pin_tensor_host(&hc_hidden.data)?;
-        let post_snap = pin_tensor_host(&attn_hc_state.post)?;
-        let comb_snap = pin_tensor_host(&attn_hc_state.comb)?;
         let attn_normed = self.attn_norm.forward(&attn_input)?;
         let qr = self.self_attn.compute_qr(&attn_normed)?;
         let seq_len = attn_normed.dims()[0];
@@ -481,7 +450,6 @@ impl DeepSeekV4DecoderLayer {
                 }
             }
 
-            attn_normed.device().synchronize()?;
             let output = self.self_attn.sparse_attn(
                 &attn_normed,
                 &qr,
@@ -721,7 +689,6 @@ impl DeepSeekV4DecoderLayer {
             // compressed slots stay zero / are skipped via -1 topk).
             let kv_len = sparse_cache.total_slots().max(1);
             let attention_kv = sparse_cache.kv.clone();
-            attn_normed.device().synchronize()?;
             self.self_attn.sparse_attn(
                 &attn_normed,
                 &qr,
@@ -733,38 +700,9 @@ impl DeepSeekV4DecoderLayer {
                 total_topk,
             )?
         };
-        attn_output.device().synchronize()?;
 
-        // Re-upload host pins immediately before hc_post.
-        let residual_for_post = HcHiddenStates {
-            data: restore_pinned_tensor(&resid_snap.0, &resid_snap.1, resid_snap.2, &resid_snap.3)?,
-            seq_len: hc_hidden.seq_len,
-            hidden_dim: hc_hidden.hidden_dim,
-            hc: hc_hidden.hc,
-        };
-        let attn_hc_state = crate::models::layers::ds_v4::HcPreState {
-            post: restore_pinned_tensor(&post_snap.0, &post_snap.1, post_snap.2, &post_snap.3)?,
-            comb: restore_pinned_tensor(&comb_snap.0, &comb_snap.1, comb_snap.2, &comb_snap.3)?,
-            seq_len: attn_hc_state.seq_len,
-            hc: attn_hc_state.hc,
-            hidden_dim: attn_hc_state.hidden_dim,
-        };
-        // Pin branch output before hc_post so workspace reuse cannot clobber it.
-        let attn_branch = {
-            let branch_f32 = attn_output.to_dtype(DType::F32)?;
-            let snap = pin_tensor_host(&branch_f32)?;
-            restore_pinned_tensor(&snap.0, &snap.1, snap.2, &snap.3)?
-        };
-        residual_for_post.data.device().synchronize()?;
-        let after_attn = hc_post(&attn_branch, &residual_for_post, &attn_hc_state)?;
-        after_attn.data.device().synchronize()?;
-        let after_attn = HcHiddenStates {
-            data: after_attn.data.contiguous()?.copy()?,
-            seq_len: after_attn.seq_len,
-            hidden_dim: after_attn.hidden_dim,
-            hc: after_attn.hc,
-        };
-        after_attn.data.device().synchronize()?;
+        let attn_branch = attn_output.to_dtype(DType::F32)?.contiguous()?;
+        let after_attn = hc_post(&attn_branch, hc_hidden, &attn_hc_state)?;
         // FFN branch: hc_pre -> norm -> MoE -> hc_post
         let (ffn_input, ffn_hc_state) = hc_pre(
             &after_attn,
@@ -774,11 +712,6 @@ impl DeepSeekV4DecoderLayer {
             self.hc_sinkhorn_iters,
             self.hc_eps,
         )?;
-        // Pin FFN residual + post/comb on host before MoE / shared experts.
-        let ffn_resid_snap = pin_tensor_host(&after_attn.data)?;
-        let ffn_post_snap = pin_tensor_host(&ffn_hc_state.post)?;
-        let ffn_comb_snap = pin_tensor_host(&ffn_hc_state.comb)?;
-        ffn_resid_snap.3.synchronize()?;
         let ffn_normed = self.ffn_norm.forward(&ffn_input)?;
         let shared_output = if let Some(shared_expert) = &self.shared_expert {
             Some(shared_expert.forward(&ffn_normed)?)
@@ -795,49 +728,8 @@ impl DeepSeekV4DecoderLayer {
         } else {
             mlp_output
         };
-        let ffn_branch = {
-            let branch_f32 = ffn_output.to_dtype(DType::F32)?;
-            let snap = pin_tensor_host(&branch_f32)?;
-            restore_pinned_tensor(&snap.0, &snap.1, snap.2, &snap.3)?
-        };
-        let residual_for_ffn = HcHiddenStates {
-            data: restore_pinned_tensor(
-                &ffn_resid_snap.0,
-                &ffn_resid_snap.1,
-                ffn_resid_snap.2,
-                &ffn_resid_snap.3,
-            )?,
-            seq_len: after_attn.seq_len,
-            hidden_dim: after_attn.hidden_dim,
-            hc: after_attn.hc,
-        };
-        let ffn_hc_state = crate::models::layers::ds_v4::HcPreState {
-            post: restore_pinned_tensor(
-                &ffn_post_snap.0,
-                &ffn_post_snap.1,
-                ffn_post_snap.2,
-                &ffn_post_snap.3,
-            )?,
-            comb: restore_pinned_tensor(
-                &ffn_comb_snap.0,
-                &ffn_comb_snap.1,
-                ffn_comb_snap.2,
-                &ffn_comb_snap.3,
-            )?,
-            seq_len: ffn_hc_state.seq_len,
-            hc: ffn_hc_state.hc,
-            hidden_dim: ffn_hc_state.hidden_dim,
-        };
-        ffn_branch.device().synchronize()?;
-        let output = hc_post(&ffn_branch, &residual_for_ffn, &ffn_hc_state)?;
-        let output = HcHiddenStates {
-            data: output.data.contiguous()?.copy()?,
-            seq_len: output.seq_len,
-            hidden_dim: output.hidden_dim,
-            hc: output.hc,
-        };
-        output.data.device().synchronize()?;
-        Ok(output)
+        let ffn_branch = ffn_output.to_dtype(DType::F32)?.contiguous()?;
+        hc_post(&ffn_branch, &after_attn, &ffn_hc_state)
     }
 }
 

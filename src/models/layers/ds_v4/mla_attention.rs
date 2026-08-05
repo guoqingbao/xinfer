@@ -486,12 +486,8 @@ impl MlaV4Attention {
             }
         };
 
-        // Row-parallel all-reduce in FP32 and retain FP32 for hc_post_f32_branch.
-        // Casting back to BF16 here reused intermediate storage that later looked
-        // like NaN/garbage by the time hc_post ran on compressed layers.
         let local = self.wo_b.forward_local(&low_rank)?;
         let output = self.wo_b.reduce_local_f32(local, DType::F32)?;
-        output.device().synchronize()?;
         Ok(output)
     }
 
@@ -565,7 +561,6 @@ impl MlaV4Attention {
             topk,
             self.sm_scale,
         )?;
-        out.device().synchronize()?;
 
         // Inverse RoPE on the rope dimensions of the output (conjugate / -sin).
         let out_nope = out.narrow(D::Minus1, 0, self.qk_nope_head_dim)?;
