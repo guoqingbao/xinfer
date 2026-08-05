@@ -500,7 +500,14 @@ impl MlaV4Attention {
     /// Compute the shared Q bottleneck (wq_a -> q_norm) for indexer and sparse attention.
     pub fn compute_qr(&self, xs: &Tensor) -> Result<Tensor> {
         let q_a_out = self.wq_a.forward(xs)?;
-        self.q_norm.forward(&q_a_out)
+        // Owned linear output: normalize in-place (single CUDA kernel, no alloc).
+        let q_a_out = if q_a_out.dtype() == DType::BF16 && q_a_out.is_contiguous() {
+            q_a_out
+        } else {
+            q_a_out.to_dtype(DType::BF16)?.contiguous()?
+        };
+        self.q_norm.forward_v4_inplace(&q_a_out)?;
+        Ok(q_a_out)
     }
 
     /// Sparse attention forward for DeepSeek V4 prefill and decode.
@@ -580,10 +587,78 @@ impl MlaV4Attention {
         self.project_output(&y, seq_len, xs.dtype())
     }
 
+    /// CUDA-graph safe sparse attention: RoPE driven by GPU `positions`.
+    pub fn sparse_attn_from_positions(
+        &self,
+        xs: &Tensor,
+        qr: &Tensor,
+        rope: &V4RopeTables,
+        positions: &Tensor,
+        kv_combined: &Tensor,
+        topk_idxs: &Tensor,
+        attn_out: &Tensor,
+        kv_len: usize,
+        topk: usize,
+    ) -> Result<Tensor> {
+        let (seq_len, _) = xs.dims2()?;
+
+        let q_raw = self.wq_b.forward(qr)?;
+        let q = q_raw.reshape((seq_len, self.num_heads, self.head_dim))?;
+        let q = self.per_head_rms_norm(&q, 1e-6_f32)?;
+        let q_nope = q.narrow(D::Minus1, 0, self.qk_nope_head_dim)?;
+        let q_pe = q.narrow(D::Minus1, self.qk_nope_head_dim, self.qk_rope_head_dim)?;
+        let q_pe = q_pe.contiguous()?.to_dtype(DType::BF16)?;
+        rope.apply_from_positions(&q_pe, positions, 0, false)?;
+
+        let q_pe = q_pe.to_dtype(self.dtype)?;
+        let q_nope = q_nope.contiguous()?.to_dtype(self.dtype)?;
+        let q_full = Tensor::cat(&[&q_nope, &q_pe], D::Minus1)?;
+
+        let attn_sink = self
+            .attn_sink
+            .as_ref()
+            .ok_or_else(|| candle_core::Error::msg("V4 sparse attention requires attn_sink"))?;
+
+        attention_rs::deepseek_v4::sparse_attention_into(
+            &q_full.contiguous()?,
+            &kv_combined.contiguous()?,
+            attn_sink,
+            &topk_idxs.contiguous()?,
+            attn_out,
+            seq_len,
+            self.num_heads,
+            self.head_dim,
+            kv_len,
+            topk,
+            self.sm_scale,
+        )?;
+
+        let out = attn_out;
+        let out_nope = out.narrow(D::Minus1, 0, self.qk_nope_head_dim)?;
+        let out_pe = out.narrow(D::Minus1, self.qk_nope_head_dim, self.qk_rope_head_dim)?;
+        let out_pe = out_pe.contiguous()?.to_dtype(DType::BF16)?;
+        rope.apply_from_positions(&out_pe, positions, 0, true)?;
+
+        let out_full = Tensor::cat(
+            &[&out_nope.contiguous()?, &out_pe.to_dtype(self.dtype)?],
+            D::Minus1,
+        )?;
+
+        let y = out_full
+            .reshape((seq_len, self.num_heads * self.head_dim))?
+            .to_dtype(xs.dtype())?;
+        self.project_output(&y, seq_len, xs.dtype())
+    }
+
     /// Compute raw KV: wkv(x) -> kv_norm. Returns [seq_len, head_dim] BF16.
     pub fn wkv_forward(&self, xs: &Tensor) -> Result<Tensor> {
         let kv_raw = self.wkv.forward(xs)?;
-        let kv = self.kv_norm.forward(&kv_raw)?;
+        let kv = if kv_raw.dtype() == DType::BF16 && kv_raw.is_contiguous() {
+            kv_raw
+        } else {
+            kv_raw.to_dtype(DType::BF16)?.contiguous()?
+        };
+        self.kv_norm.forward_v4_inplace(&kv)?;
         kv.to_dtype(self.dtype)
     }
 

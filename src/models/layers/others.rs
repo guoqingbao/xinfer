@@ -35,41 +35,74 @@ impl NormX {
         }
     }
 
+    /// F32 weight tensor for DeepSeek-V4 ATen-order RMSNorm (used by fused HC pre+norm).
+    pub fn v4_weight_f32(&self) -> Option<&Tensor> {
+        self.v4_weight.as_ref()
+    }
+
+    pub fn v4_eps(&self) -> f32 {
+        self.v4_eps
+    }
+
+    /// Single ATen-order CUDA RMSNorm launch. Hot path (contiguous BF16 2D +
+    /// F32 weight) does no dtype/reshape/weight clones around the kernel.
     fn forward_v4(&self, xs: &Tensor, weight: &Tensor) -> Result<Tensor> {
         let in_dtype = xs.dtype();
-        let dims = xs.dims().to_vec();
+        let dims = xs.dims();
         let dim = *dims
             .last()
             .ok_or_else(|| candle_core::Error::Msg("NormX V4: expected non-empty dims".into()))?;
-        let rows: usize = dims[..dims.len().saturating_sub(1)].iter().product();
-        let rows = if dims.len() == 1 { 1 } else { rows.max(1) };
-        // Kernel expects BF16 activations and F32 weights.
-        let x_bf16 = if xs.dtype() == DType::BF16 {
+        let rows: usize = if dims.len() <= 1 {
+            1
+        } else {
+            dims[..dims.len() - 1].iter().product::<usize>().max(1)
+        };
+
+        // Fast path: already BF16 [rows, dim] — one kernel, no host-side glue.
+        if in_dtype == DType::BF16 && dims.len() == 2 && dims[0] == rows && dims[1] == dim {
+            let x = if xs.is_contiguous() {
+                xs.clone()
+            } else {
+                xs.contiguous()?
+            };
+            return attention_rs::deepseek_v4::rms_norm_v4(&x, weight, dim, self.v4_eps);
+        }
+
+        // Slow path: materialize BF16 2D, normalize in-place, restore shape/dtype.
+        let x = if in_dtype == DType::BF16 {
             xs.clone()
         } else {
             xs.to_dtype(DType::BF16)?
         };
-        let x_2d = if dims.len() == 2 && dims[0] == rows && dims[1] == dim {
-            x_bf16
+        let x = x.reshape((rows, dim))?;
+        let x = if x.is_contiguous() {
+            x
         } else {
-            x_bf16.reshape((rows, dim))?
+            x.contiguous()?
         };
-        let weight_f32 = if weight.dtype() == DType::F32 {
-            weight.clone()
-        } else {
-            weight.to_dtype(DType::F32)?
-        };
-        let out = attention_rs::deepseek_v4::rms_norm_v4(&x_2d, &weight_f32, dim, self.v4_eps)?;
+        attention_rs::deepseek_v4::rms_norm_v4_inplace(&x, weight, dim, self.v4_eps)?;
         let out = if dims.len() == 2 && dims[0] == rows && dims[1] == dim {
-            out
+            x
         } else {
-            out.reshape(dims)?
+            x.reshape(dims.to_vec())?
         };
         if in_dtype == DType::BF16 {
             Ok(out)
         } else {
             out.to_dtype(in_dtype)
         }
+    }
+
+    /// In-place V4 RMSNorm on an owned contiguous BF16 `[rows, dim]` buffer.
+    pub fn forward_v4_inplace(&self, xs: &Tensor) -> Result<()> {
+        let weight = self.v4_weight.as_ref().ok_or_else(|| {
+            candle_core::Error::Msg("forward_v4_inplace requires V4 norm weight".into())
+        })?;
+        let dim = *xs
+            .dims()
+            .last()
+            .ok_or_else(|| candle_core::Error::Msg("forward_v4_inplace: empty dims".into()))?;
+        attention_rs::deepseek_v4::rms_norm_v4_inplace(xs, weight, dim, self.v4_eps)
     }
 }
 

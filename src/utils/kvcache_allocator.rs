@@ -211,6 +211,47 @@ pub struct KVCacheAllocator {
     moe_num_experts_per_tok: usize,
     is_moe: bool,
     prefill_chunk_size: usize,
+    /// DeepSeek V4 sparse RoPE/indexer/compressor capacity (None for other models).
+    v4_sparse_max_seq_len: Option<usize>,
+    /// Whether FlashInfer GPU workspace is actually initialized at runtime.
+    /// When false, do not reserve FlashInfer memory in the KV-cache budget.
+    use_flashinfer_workspace: bool,
+}
+
+/// Mirrors `skip_flashinfer_init` in `core/runner.rs`.
+fn uses_flashinfer_workspace(econfig: &EngineConfig, config: &Config) -> bool {
+    #[cfg(not(feature = "flashinfer"))]
+    {
+        let _ = (econfig, config);
+        false
+    }
+    #[cfg(feature = "flashinfer")]
+    {
+        if econfig.kvcache_dtype.is_turboquant() {
+            return false;
+        }
+        if econfig.kvcache_dtype.is_fp8_keys() && !attention_rs::has_flashinfer_fp8_e4m3() {
+            return false;
+        }
+        let arch = config
+            .architectures
+            .as_ref()
+            .and_then(|archs| archs.first())
+            .map(|s| s.as_str())
+            .unwrap_or("");
+        if matches!(
+            arch,
+            "Gemma3ForConditionalGeneration"
+                | "Gemma4ForConditionalGeneration"
+                | "Gemma4ForCausalLM"
+        ) {
+            return false;
+        }
+        if matches!(arch, "DeepseekV4ForCausalLM" | "deepseek_v4" | "deepseek4") {
+            return false;
+        }
+        true
+    }
 }
 
 impl KVCacheAllocator {
@@ -441,6 +482,19 @@ impl KVCacheAllocator {
             .map(|m| m.num_experts_per_tok)
             .unwrap_or(0);
 
+        let v4_sparse_max_seq_len = config
+            .architectures
+            .as_ref()
+            .and_then(|archs| archs.first())
+            .map(|s| s.as_str())
+            .filter(|arch| matches!(*arch, "DeepseekV4ForCausalLM" | "deepseek_v4" | "deepseek4"))
+            .map(|_| {
+                config
+                    .max_model_len
+                    .unwrap_or(8192)
+                    .min(config.max_position_embeddings)
+            });
+
         Self {
             num_hidden_layers: config.num_hidden_layers,
             num_kv_layers,
@@ -480,6 +534,8 @@ impl KVCacheAllocator {
             moe_num_experts_per_tok,
             is_moe,
             prefill_chunk_size: econfig.effective_prefill_chunk_size(),
+            v4_sparse_max_seq_len,
+            use_flashinfer_workspace: uses_flashinfer_workspace(econfig, config),
         }
     }
 
@@ -495,7 +551,8 @@ impl KVCacheAllocator {
     pub fn compute_workspace_budget(&self) -> GpuMemoryBudget {
         // FlashInfer workspace: 512 MiB float + 128 MiB int (GPU) + 128 MiB pinned host (not GPU)
         // Graph capture duplicates the GPU buffers, but those are tracked separately.
-        let flashinfer_bytes: u64 = if cfg!(feature = "flashinfer") {
+        // Only reserve when FlashInfer is actually initialized (not skipped for V4, Gemma, etc.).
+        let flashinfer_bytes: u64 = if self.use_flashinfer_workspace {
             (512 + 128) * 1024 * 1024 // float + int buffers
         } else {
             0
@@ -1210,7 +1267,7 @@ impl KVCacheAllocator {
             });
         }
 
-        let (max_num_seqs, max_model_len) = if let (Some(max_num_seqs), Some(max_model_len)) =
+        let (max_num_seqs, mut max_model_len) = if let (Some(max_num_seqs), Some(max_model_len)) =
             (self.user_max_num_seqs, self.user_max_model_len)
         {
             let required_bytes = self.calculate_required_memory(max_num_seqs, max_model_len);
@@ -1225,6 +1282,17 @@ impl KVCacheAllocator {
         } else {
             self.auto_decide_params(min_available_memory)?
         };
+
+        if let Some(cap) = self.v4_sparse_max_seq_len {
+            if max_model_len > cap {
+                crate::log_warn!(
+                    "DeepSeek V4 sparse cache capacity {} caps max_model_len (was {})",
+                    cap,
+                    max_model_len
+                );
+                max_model_len = cap;
+            }
+        }
 
         // The KV pool is a physical token budget shared by all requests. The
         // request preallocation limit is not a request-count-times-context

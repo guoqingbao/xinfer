@@ -1,8 +1,9 @@
 use crate::models::layers::distributed::{Comm, VocabParallelLinear};
 use crate::models::layers::ds_v4::{
-    hc_expand, hc_head, hc_post, hc_pre, CompressorDecodeState, CompressorWeights, FusedMoeMxfp4,
-    HcBlockWeights, HcHeadWeights, HcHiddenStates, IndexerDecodeState, IndexerWeights,
-    LayerCompressionType, LayerSparseKvCache, MlaV4Attention, MlaV4Config, V4RopeTables,
+    hc_expand, hc_head, hc_post, hc_pre_norm, CompressorDecodeState, CompressorWeights,
+    FusedMoeMxfp4, HcBlockWeights, HcHeadWeights, HcHiddenStates, IndexerDecodeState,
+    IndexerWeights, LayerCompressionType, LayerDecodeBuffers, LayerSparseKvCache, MlaV4Attention,
+    MlaV4Config, V4RopeTables,
 };
 use crate::models::layers::mask::get_attention_causal_mask;
 use crate::models::layers::mlp::MLP;
@@ -145,6 +146,7 @@ pub struct DeepSeekV4DecoderLayer {
     sparse_kv: Mutex<Option<LayerSparseKvCache>>,
     compressor_state: Mutex<Option<CompressorDecodeState>>,
     indexer_state: Mutex<Option<IndexerDecodeState>>,
+    decode_buffers: Mutex<Option<LayerDecodeBuffers>>,
     max_seq_len: usize,
     qk_rope_head_dim: usize,
     #[allow(dead_code)]
@@ -344,6 +346,7 @@ impl DeepSeekV4DecoderLayer {
             sparse_kv: Mutex::new(None),
             compressor_state: Mutex::new(None),
             indexer_state: Mutex::new(None),
+            decode_buffers: Mutex::new(None),
             max_seq_len,
             qk_rope_head_dim: mla_cfg.qk_rope_head_dim,
             hc_mult: v4_cfg.hc_mult,
@@ -356,25 +359,106 @@ impl DeepSeekV4DecoderLayer {
         })
     }
 
+    /// Allocate sparse/indexer/compressor decode buffers once. Required before CUDA
+    /// graph capture and reused across prefill resets so captured kernels keep valid pointers.
+    pub fn ensure_decode_buffers(&self, device: &Device) -> Result<()> {
+        {
+            let mut sparse = self.sparse_kv.lock();
+            if sparse.is_none() {
+                *sparse = Some(LayerSparseKvCache::new(
+                    self.sliding_window,
+                    self.compression.ratio(),
+                    self.max_seq_len,
+                    self.self_attn.get_head_dim(),
+                    device,
+                )?);
+            }
+        }
+        if self.compressor.is_some() {
+            let mut compressor_state = self.compressor_state.lock();
+            if compressor_state.is_none() {
+                let compressor = self.compressor.as_ref().unwrap();
+                *compressor_state = Some(CompressorDecodeState::new(
+                    compressor.ratio,
+                    compressor.head_dim,
+                    device,
+                )?);
+            }
+        }
+        if self.indexer.is_some() {
+            let mut indexer_state = self.indexer_state.lock();
+            if indexer_state.is_none() {
+                *indexer_state = Some(IndexerDecodeState::new(
+                    self.indexer.as_ref().unwrap().index_head_dim,
+                    self.max_seq_len,
+                    device,
+                )?);
+            }
+        }
+        {
+            let mut decode_buffers = self.decode_buffers.lock();
+            if decode_buffers.is_none() {
+                let compress_topk = if let Some(indexer) = &self.indexer {
+                    indexer.index_topk
+                } else if self.compressor.is_some() {
+                    self.max_seq_len / self.compression.ratio().max(1)
+                } else {
+                    0
+                };
+                let compressor_head_dim = self.compressor.as_ref().map(|c| c.head_dim);
+                let indexer_head_dim = self.indexer.as_ref().map(|i| i.compressor.head_dim);
+                *decode_buffers = Some(LayerDecodeBuffers::new(
+                    device,
+                    self.self_attn.get_num_heads(),
+                    self.self_attn.get_head_dim(),
+                    self.sliding_window,
+                    compress_topk,
+                    self.max_seq_len.div_ceil(self.compression.ratio().max(1)),
+                    compressor_head_dim,
+                    indexer_head_dim,
+                )?);
+            }
+        }
+        Ok(())
+    }
+
+    /// Zero sparse/compressor/indexer decode state before CUDA graph capture.
+    pub fn reset_decode_state(&self) -> Result<()> {
+        if let Some(sparse) = self.sparse_kv.lock().as_mut() {
+            sparse.reset()?;
+        }
+        if let Some(state) = self.compressor_state.lock().as_mut() {
+            state.reset()?;
+        }
+        if let Some(state) = self.indexer_state.lock().as_mut() {
+            state.reset()?;
+        }
+        Ok(())
+    }
+
     pub fn forward(
         &mut self,
         hc_hidden: &HcHiddenStates,
         _attention_mask: Option<&Vec<Tensor>>,
-        _positions: &Tensor,
+        positions: &Tensor,
         _cache: Option<(&Tensor, &Tensor)>,
         input_metadata: &InputMetadata,
         input_ids: Option<&Tensor>,
     ) -> Result<HcHiddenStates> {
-        // Attention branch: hc_pre -> norm -> attn -> hc_post
-        let (attn_input, attn_hc_state) = hc_pre(
+        // Attention branch: fused hc_pre + attn_norm -> attn -> hc_post
+        let attn_norm_w = self.attn_norm.v4_weight_f32().ok_or_else(|| {
+            candle_core::Error::Msg("DeepSeek V4 attn_norm missing F32 weight".into())
+        })?;
+        let (attn_normed, attn_hc_state) = hc_pre_norm(
             hc_hidden,
             &self.hc_attn.hc_fn,
             &self.hc_attn.hc_scale,
             &self.hc_attn.hc_base,
+            attn_norm_w,
             self.hc_sinkhorn_iters,
             self.hc_eps,
+            self.attn_norm.v4_eps(),
         )?;
-        let attn_normed = self.attn_norm.forward(&attn_input)?;
         let qr = self.self_attn.compute_qr(&attn_normed)?;
         let seq_len = attn_normed.dims()[0];
         let start_pos = if input_metadata.is_prefill {
@@ -460,44 +544,34 @@ impl DeepSeekV4DecoderLayer {
                 kv_combined.dim(0)?,
                 total_topk,
             )?;
-            let mut sparse_cache = LayerSparseKvCache::new(
-                self.sliding_window,
-                self.compression.ratio(),
-                self.max_seq_len,
-                self.self_attn.get_head_dim(),
-                attn_normed.device(),
-            )?;
-            sparse_cache.seed_window_from_prefill(&kv)?;
-            if let Some(compressed) = &compressed_kv {
-                sparse_cache.seed_compressed_from_prefill(compressed)?;
+            self.ensure_decode_buffers(attn_normed.device())?;
+            {
+                let mut sparse = self.sparse_kv.lock();
+                let sparse = sparse.as_mut().expect("sparse cache ensured");
+                sparse.reset()?;
+                sparse.seed_window_from_prefill(&kv)?;
+                if let Some(compressed) = &compressed_kv {
+                    sparse.seed_compressed_from_prefill(compressed)?;
+                }
             }
-            *self.sparse_kv.lock() = Some(sparse_cache);
 
-            *self.compressor_state.lock() = if let Some(compressor) = &self.compressor {
-                let mut state = CompressorDecodeState::new(
-                    compressor.ratio,
-                    compressor.head_dim,
-                    attn_normed.device(),
-                )?;
+            if let Some(compressor) = &self.compressor {
+                let mut compressor_state = self.compressor_state.lock();
+                let state = compressor_state.as_mut().expect("compressor state ensured");
                 seed_compressor_decode_state(
                     compressor,
                     &attn_normed,
-                    &mut state,
+                    state,
                     &self.rope,
                     seq_len,
                     false,
                 )?;
-                Some(state)
-            } else {
-                None
-            };
+            }
 
-            *self.indexer_state.lock() = if let Some(indexer) = &self.indexer {
-                let mut state = IndexerDecodeState::new(
-                    indexer.index_head_dim,
-                    self.max_seq_len,
-                    attn_normed.device(),
-                )?;
+            if let Some(indexer) = &self.indexer {
+                let mut indexer_state = self.indexer_state.lock();
+                let state = indexer_state.as_mut().expect("indexer state ensured");
+                state.reset()?;
                 if seq_len >= indexer.compressor.ratio {
                     // Prefill compressor leaves BF16 compressed KV; apply the same
                     // Hadamard+FP4 transform used on decode emits so scores_decode
@@ -525,10 +599,7 @@ impl DeepSeekV4DecoderLayer {
                     seq_len,
                     true,
                 )?;
-                Some(state)
-            } else {
-                None
-            };
+            }
             output
         } else {
             if seq_len != 1 {
@@ -543,18 +614,12 @@ impl DeepSeekV4DecoderLayer {
                 );
             }
 
-            if self.sparse_kv.lock().is_none() {
-                *self.sparse_kv.lock() = Some(LayerSparseKvCache::new(
-                    self.sliding_window,
-                    self.compression.ratio(),
-                    self.max_seq_len,
-                    self.self_attn.get_head_dim(),
-                    attn_normed.device(),
-                )?);
-            }
+            self.ensure_decode_buffers(attn_normed.device())?;
+            let bufs = self.decode_buffers.lock();
+            let bufs = bufs.as_ref().expect("decode buffers ensured");
 
             let kv = self.self_attn.wkv_forward(&attn_normed)?.contiguous()?;
-            self.rope.apply_inplace(&kv, start_pos, false)?;
+            self.rope.apply_from_positions(&kv, positions, 0, false)?;
             attention_rs::deepseek_v4::fp8_act_quant_nope_bf16_inplace(
                 &kv,
                 1,
@@ -565,137 +630,142 @@ impl DeepSeekV4DecoderLayer {
             self.sparse_kv
                 .lock()
                 .as_mut()
-                .expect("sparse cache initialized")
-                .write_window_token(&kv, start_pos)?;
+                .expect("sparse cache ensured")
+                .write_window_token_from_pos(&kv, positions)?;
 
             if let Some(compressor) = &self.compressor {
-                if self.compressor_state.lock().is_none() {
-                    *self.compressor_state.lock() = Some(CompressorDecodeState::new(
-                        compressor.ratio,
-                        compressor.head_dim,
-                        attn_normed.device(),
-                    )?);
-                }
+                let weighted = bufs
+                    .compressor_weighted
+                    .as_ref()
+                    .expect("compressor weighted buffer");
+                let out = bufs.compressor_out.as_ref().expect("compressor out buffer");
                 let emitted = {
                     let state = self.compressor_state.lock();
-                    compressor.decode(
+                    let state = state.as_ref().expect("compressor state ensured");
+                    compressor.decode_graph(
                         &attn_normed,
-                        state.as_ref().expect("compressor state initialized"),
-                        start_pos,
+                        state,
+                        positions,
+                        weighted,
+                        out,
                         Some(&self.rope),
                         false,
                     )?
                 };
-                if let Some(row) = emitted {
-                    self.sparse_kv
-                        .lock()
-                        .as_mut()
-                        .expect("sparse cache initialized")
-                        .write_compressed_row(&row, start_pos / compressor.ratio)?;
-                }
+                self.sparse_kv
+                    .lock()
+                    .as_mut()
+                    .expect("sparse cache ensured")
+                    .write_compressed_row_from_pos(&emitted, positions)?;
             }
 
             if let Some(indexer) = &self.indexer {
-                if self.indexer_state.lock().is_none() {
-                    *self.indexer_state.lock() = Some(IndexerDecodeState::new(
-                        indexer.index_head_dim,
-                        self.max_seq_len,
-                        attn_normed.device(),
-                    )?);
-                }
+                let weighted = bufs
+                    .indexer_compressor_weighted
+                    .as_ref()
+                    .expect("indexer compressor weighted buffer");
+                let out = bufs
+                    .indexer_compressor_out
+                    .as_ref()
+                    .expect("indexer compressor out buffer");
                 let emitted = {
                     let state = self.indexer_state.lock();
-                    indexer.compressor.decode(
+                    let state = state.as_ref().expect("indexer state ensured");
+                    indexer.compressor.decode_graph(
                         &attn_normed,
-                        &state
-                            .as_ref()
-                            .expect("indexer state initialized")
-                            .compressor_state,
-                        start_pos,
+                        &state.compressor_state,
+                        positions,
+                        weighted,
+                        out,
                         Some(&self.rope),
                         true,
                     )?
                 };
-                if let Some(row) = emitted {
-                    let row_idx = start_pos / indexer.compressor.ratio;
-                    self.indexer_state
-                        .lock()
-                        .as_mut()
-                        .expect("indexer state initialized")
-                        .write_compressed_at(&row, row_idx)?;
-                }
+                self.indexer_state
+                    .lock()
+                    .as_mut()
+                    .expect("indexer state ensured")
+                    .write_compressed_from_pos(&emitted, positions, indexer.compressor.ratio)?;
             }
 
             let win = self.sliding_window;
-            // Build the ring order and `-1` padding on the device. This runs
-            // once per sparse layer and token, so a host Vec + H2D copy was a
-            // material decode bottleneck.
-            let mut topk_idxs = attention_rs::deepseek_v4::window_topk_indices_decode(
-                start_pos,
+            attention_rs::deepseek_v4::window_topk_indices_decode_from_pos_into(
+                positions,
                 win,
-                attn_normed.device(),
+                &bufs.window_topk,
             )?;
-            let mut total_topk = win;
 
-            let compressed_len = self
-                .sparse_kv
-                .lock()
-                .as_ref()
-                .expect("sparse cache initialized")
-                .compressed_len;
-            // Official indexer scores `:end_pos // ratio` (decode: start_pos+1).
-            let end_compressed = (start_pos + 1) / self.compression.ratio().max(1);
-            if end_compressed > 0 && compressed_len > 0 {
-                let compress_idxs = if let Some(indexer) = &self.indexer {
+            // compress_topk is a per-layer constant (index_topk or compressed slot
+            // capacity). Never branch on it for kernel topology — always fill
+            // compress_topk (when this layer has a compressor) and always concat
+            // into concat_topk so sparse_attn sees a fixed tensor address.
+            let compress_topk = if self.indexer.is_some() {
+                self.indexer.as_ref().unwrap().index_topk
+            } else if self.compressor.is_some() {
+                self.sparse_kv
+                    .lock()
+                    .as_ref()
+                    .expect("sparse cache ensured")
+                    .compressed_slots
+            } else {
+                0
+            };
+
+            if self.compressor.is_some() {
+                if let Some(indexer) = &self.indexer {
                     let state = self.indexer_state.lock();
-                    let state = state.as_ref().expect("indexer state initialized");
-                    let score_len = end_compressed
-                        .min(compressed_len)
-                        .min(state.compressed_len)
-                        .max(1);
-                    let scores = indexer.scores_decode(
+                    let state = state.as_ref().expect("indexer state ensured");
+                    let score_len = state.max_compressed_len.max(1);
+                    let scores = bufs.indexer_scores.as_ref().expect("indexer scores buffer");
+                    indexer.scores_decode_from_positions_into(
                         &attn_normed,
                         &qr,
                         &state.kv_cache,
                         score_len,
                         &self.rope,
-                        start_pos,
+                        positions,
+                        scores,
                     )?;
-                    indexer
-                        .topk_decode(&scores, score_len, self.sliding_window)?
-                        .reshape((1, indexer.index_topk.min(score_len)))?
+                    attention_rs::deepseek_v4::indexer_mask_scores_by_position(
+                        scores,
+                        positions,
+                        self.compression.ratio().max(1),
+                    )?;
+                    let topk_row = bufs.compress_topk.narrow(0, 0, 1)?.squeeze(0)?;
+                    indexer.topk_decode_into(scores, score_len, win, &topk_row)?;
                 } else {
-                    let n = ((start_pos + 1) / self.compression.ratio().max(1)).min(compressed_len);
-                    attention_rs::deepseek_v4::compress_topk_indices_decode(
-                        n,
-                        self.sliding_window,
-                        attn_normed.device(),
-                    )?
-                };
-                let compress_topk = compress_idxs.dim(1)?;
-                topk_idxs = attention_rs::deepseek_v4::concat_topk_indices(
-                    &topk_idxs,
-                    &compress_idxs,
-                    1,
-                    win,
-                    compress_topk,
-                )?;
-                total_topk += compress_topk;
+                    attention_rs::deepseek_v4::compress_topk_indices_decode_from_pos_into(
+                        positions,
+                        compress_topk,
+                        win,
+                        self.compression.ratio().max(1),
+                        &bufs.compress_topk,
+                    )?;
+                }
             }
 
+            attention_rs::deepseek_v4::concat_topk_indices_into(
+                &bufs.window_topk,
+                &bufs.compress_topk,
+                1,
+                win,
+                compress_topk,
+                &bufs.concat_topk,
+            )?;
+            let total_topk = win + compress_topk;
+
             let sparse_cache = self.sparse_kv.lock();
-            let sparse_cache = sparse_cache.as_ref().expect("sparse cache initialized");
-            // Official decode attends over the full cache buffer (unused
-            // compressed slots stay zero / are skipped via -1 topk).
+            let sparse_cache = sparse_cache.as_ref().expect("sparse cache ensured");
             let kv_len = sparse_cache.total_slots().max(1);
             let attention_kv = sparse_cache.kv.clone();
-            self.self_attn.sparse_attn(
+            self.self_attn.sparse_attn_from_positions(
                 &attn_normed,
                 &qr,
                 &self.rope,
-                start_pos,
+                positions,
                 &attention_kv,
-                &topk_idxs.contiguous()?,
+                &bufs.concat_topk,
+                &bufs.attn_out,
                 kv_len,
                 total_topk,
             )?
@@ -703,16 +773,20 @@ impl DeepSeekV4DecoderLayer {
 
         let attn_branch = attn_output.to_dtype(DType::F32)?.contiguous()?;
         let after_attn = hc_post(&attn_branch, hc_hidden, &attn_hc_state)?;
-        // FFN branch: hc_pre -> norm -> MoE -> hc_post
-        let (ffn_input, ffn_hc_state) = hc_pre(
+        // FFN branch: fused hc_pre + ffn_norm -> MoE -> hc_post
+        let ffn_norm_w = self.ffn_norm.v4_weight_f32().ok_or_else(|| {
+            candle_core::Error::Msg("DeepSeek V4 ffn_norm missing F32 weight".into())
+        })?;
+        let (ffn_normed, ffn_hc_state) = hc_pre_norm(
             &after_attn,
             &self.hc_ffn.hc_fn,
             &self.hc_ffn.hc_scale,
             &self.hc_ffn.hc_base,
+            ffn_norm_w,
             self.hc_sinkhorn_iters,
             self.hc_eps,
+            self.ffn_norm.v4_eps(),
         )?;
-        let ffn_normed = self.ffn_norm.forward(&ffn_input)?;
         let shared_output = if let Some(shared_expert) = &self.shared_expert {
             Some(shared_expert.forward(&ffn_normed)?)
         } else {
@@ -1026,7 +1100,13 @@ impl DeepSeekV4ForCausalLM {
                 .contiguous()?
                 .index_select(&Tensor::from_vec(indices, (batch,), xs.device())?, 0)?;
         }
-        let xs = self.norm.forward(&xs)?;
+        // Final RMSNorm: owned buffer, single in-place CUDA kernel.
+        let xs = if xs.dtype() == DType::BF16 && xs.is_contiguous() {
+            xs
+        } else {
+            xs.to_dtype(DType::BF16)?.contiguous()?
+        };
+        self.norm.forward_v4_inplace(&xs)?;
         self.lm_head.forward(&xs)
     }
 
@@ -1064,6 +1144,26 @@ impl DeepSeekV4ForCausalLM {
             input_metadata,
             embeded_inputs,
         )
+    }
+
+    /// Prewarm V4 HC/indexer/compressor scratch pools before CUDA graph capture.
+    pub fn prewarm_cuda_graph_scratch(&self) -> Result<()> {
+        for layer in &self.layers {
+            layer.lock().ensure_decode_buffers(&self.device)?;
+        }
+        let hc = self.v4_cfg.hc_mult;
+        let hidden = self.config.hidden_size;
+        let hc_elems = hc * hidden;
+        let fp4_elems = self.v4_cfg.index_n_heads * self.v4_cfg.index_head_dim.max(128);
+        attention_rs::deepseek_v4::prewarm_decode_scratch(&self.device, hc_elems, fp4_elems)
+    }
+
+    /// Clear per-layer decode accumulators before graph capture warmup.
+    pub fn reset_decode_state_for_graph(&self) -> Result<()> {
+        for layer in &self.layers {
+            layer.lock().reset_decode_state()?;
+        }
+        Ok(())
     }
 
     pub fn get_vocab_size(&self) -> usize {

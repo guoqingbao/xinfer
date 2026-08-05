@@ -4,6 +4,7 @@
 //! routing, MLA, compressor, indexer, and HC do not leak into other models.
 
 pub mod compressor;
+pub mod decode_buffers;
 pub mod hyper_connection;
 pub mod indexer;
 pub mod mla_attention;
@@ -11,8 +12,10 @@ pub mod moe_v4;
 pub mod rope_cache;
 
 pub use compressor::{CompressorDecodeState, CompressorWeights, LayerCompressionType};
+pub use decode_buffers::LayerDecodeBuffers;
 pub use hyper_connection::{
-    hc_expand, hc_head, hc_post, hc_pre, HcBlockWeights, HcHeadWeights, HcHiddenStates, HcPreState,
+    hc_expand, hc_head, hc_post, hc_pre, hc_pre_norm, HcBlockWeights, HcHeadWeights,
+    HcHiddenStates, HcPreState,
 };
 pub use indexer::{IndexerDecodeState, IndexerWeights};
 pub use mla_attention::{MlaV4Attention, MlaV4Config};

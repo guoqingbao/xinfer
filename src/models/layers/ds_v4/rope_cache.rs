@@ -132,6 +132,25 @@ impl V4RopeTables {
         )
     }
 
+    /// CUDA-graph safe RoPE using GPU `positions` (optional per-token offset).
+    pub fn apply_from_positions(
+        &self,
+        x: &Tensor,
+        positions: &Tensor,
+        position_offset: i64,
+        inverse: bool,
+    ) -> Result<()> {
+        attention_rs::deepseek_v4::apply_rope_hidden_from_positions(
+            x,
+            &self.cos,
+            &self.sin,
+            positions,
+            self.rotary_dim,
+            position_offset,
+            inverse,
+        )
+    }
+
     pub fn apply_strided_inplace(
         &self,
         x: &Tensor,
@@ -219,6 +238,13 @@ impl LayerSparseKvCache {
         self.sliding_window + self.compressed_slots
     }
 
+    /// Clear decode progress without reallocating (CUDA graph pointer stability).
+    pub fn reset(&mut self) -> Result<()> {
+        self.kv.zero_()?;
+        self.compressed_len = 0;
+        Ok(())
+    }
+
     /// Seed window ring from prefill token KV (official split copy when seq > window).
     pub fn seed_window_from_prefill(&mut self, token_kv: &Tensor) -> Result<()> {
         let seq_len = token_kv.dim(0)?;
@@ -275,6 +301,21 @@ impl LayerSparseKvCache {
         Ok(())
     }
 
+    pub fn write_window_token_from_pos(
+        &mut self,
+        token_kv: &Tensor,
+        positions: &Tensor,
+    ) -> Result<()> {
+        let row = token_kv.reshape((1, self.head_dim))?.contiguous()?;
+        attention_rs::deepseek_v4::write_kv_row_from_pos(
+            &self.kv,
+            &row,
+            positions,
+            self.sliding_window,
+            self.head_dim,
+        )
+    }
+
     pub fn write_compressed_row(&mut self, compressed: &Tensor, row: usize) -> Result<()> {
         if row >= self.compressed_slots {
             candle_core::bail!(
@@ -290,6 +331,24 @@ impl LayerSparseKvCache {
             (win + row) * self.head_dim,
         )?;
         self.compressed_len = self.compressed_len.max(row + 1);
+        Ok(())
+    }
+
+    pub fn write_compressed_row_from_pos(
+        &mut self,
+        compressed: &Tensor,
+        positions: &Tensor,
+    ) -> Result<()> {
+        let ratio = self.compress_ratio.max(1);
+        let row_t = compressed.reshape((1, self.head_dim))?.contiguous()?;
+        attention_rs::deepseek_v4::write_compressed_row_from_pos(
+            &self.kv,
+            &row_t,
+            positions,
+            self.sliding_window,
+            self.head_dim,
+            ratio,
+        )?;
         Ok(())
     }
 }

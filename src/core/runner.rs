@@ -437,7 +437,9 @@ impl ModelRunner {
         };
 
         #[cfg(all(feature = "cuda", feature = "graph"))]
-        let graph_capture_max_num_seqs = if is_hybrid_mamba_model {
+        let graph_capture_max_num_seqs = if matches!(model_type, ModelType::DeepSeekV4) {
+            1
+        } else if is_hybrid_mamba_model {
             mamba_cache_capacity.max(1)
         } else {
             econfig.max_num_parallel_reqs.max(1)
@@ -685,6 +687,35 @@ impl ModelRunner {
             (None, 0)
         };
 
+        #[cfg(all(feature = "cuda", feature = "graph"))]
+        let graph_capture_max_model_len = if matches!(model_type, ModelType::DeepSeekV4) {
+            // Graph capture positions must stay within V4 sparse RoPE/indexer tables.
+            model_config.max_model_len.unwrap_or(8192)
+        } else {
+            econfig.max_model_len.unwrap_or(32768)
+        };
+
+        #[cfg(all(feature = "cuda", feature = "graph"))]
+        let graph_capture_decode_pos = if matches!(model_type, ModelType::DeepSeekV4) {
+            // Capture at a mid-range decode position: exercises window + compress
+            // topk without the max-position edge cases of pos 8191.
+            Some(511)
+        } else {
+            None
+        };
+
+        #[cfg(all(feature = "cuda", feature = "graph"))]
+        let (graph_persistent_logit_vocab, graph_persistent_logit_dtype) =
+            if matches!(model_type, ModelType::DeepSeekV4) {
+                let vocab = match &model {
+                    Model::DeepSeekV4(m) => m.get_vocab_size(),
+                    _ => unreachable!(),
+                };
+                (Some(vocab), Some(dtype))
+            } else {
+                (None, None)
+            };
+
         Ok(Self {
             model,
             gpu_kv_cache: Arc::new(Mutex::new(gpu_kv_cache)),
@@ -696,7 +727,7 @@ impl ModelRunner {
             decode_capturer: GraphCapturer::new(
                 wrapper,
                 graph_capture_max_num_seqs,
-                econfig.max_model_len.unwrap_or(32768),
+                graph_capture_max_model_len,
                 econfig.block_size,
                 config.hidden_size,
                 #[cfg(feature = "flashinfer")]
@@ -705,13 +736,16 @@ impl ModelRunner {
                     model_type,
                     ModelType::GLM4MoeLite | ModelType::DeepSeek | ModelType::GLM5
                 ),
+                graph_capture_decode_pos,
+                graph_persistent_logit_vocab,
+                graph_persistent_logit_dtype,
             ),
             #[cfg(all(feature = "cuda", feature = "graph"))]
             mtp_capturer: mtp_wrapper.map(|w| {
                 GraphCapturer::new(
                     w,
                     graph_capture_max_num_seqs,
-                    econfig.max_model_len.unwrap_or(32768),
+                    graph_capture_max_model_len,
                     econfig.block_size,
                     config.hidden_size,
                     #[cfg(feature = "flashinfer")]
@@ -720,6 +754,9 @@ impl ModelRunner {
                         model_type,
                         ModelType::GLM4MoeLite | ModelType::DeepSeek | ModelType::GLM5
                     ),
+                    graph_capture_decode_pos,
+                    graph_persistent_logit_vocab,
+                    graph_persistent_logit_dtype,
                 )
             }),
             #[cfg(feature = "flashinfer")]
@@ -909,6 +946,20 @@ impl ModelRunner {
                         .replay(&input_ids, &positions, &input_metadata)?,
                 };
                 let output_ids = self.sample(&logits, seqs, is_prefill)?;
+                if std::env::var_os("XINFER_DEBUG_TOKENS").is_some() && !is_prefill {
+                    if let Ok(flat) = logits.flatten_all()?.to_dtype(DType::F32)?.to_vec1::<f32>() {
+                        let argmax = flat
+                            .iter()
+                            .enumerate()
+                            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                            .map(|(i, v)| (i, *v));
+                        eprintln!(
+                            "graph logits argmax={argmax:?} sum={:.4}",
+                            flat.iter().sum::<f32>()
+                        );
+                    }
+                    eprintln!("graph sample tokens: {:?}", output_ids);
+                }
                 return Ok(output_ids);
             }
         }
@@ -1001,6 +1052,9 @@ impl ModelRunner {
             }
         )?;
         let output_ids = self.sample(&logits, seqs, is_prefill)?;
+        if std::env::var_os("XINFER_DEBUG_TOKENS").is_some() && !is_prefill {
+            eprintln!("eager sample tokens: {:?}", output_ids);
+        }
         #[cfg(feature = "nvtx")]
         nvtx::range_pop!();
         Ok(output_ids)
@@ -1781,8 +1835,18 @@ impl ModelRunner {
     #[cfg(all(feature = "cuda", feature = "graph"))]
     pub fn warmup_capture(&mut self) -> Result<()> {
         let kv_cache_lock = self.gpu_kv_cache.lock().unwrap();
-        self.decode_capturer
-            .capture(&self.device, Some(&kv_cache_lock))?;
+        if let Model::DeepSeekV4(model) = &self.model {
+            model.prewarm_cuda_graph_scratch()?;
+            model.reset_decode_state_for_graph()?;
+            self.decode_capturer.capture(
+                &self.device,
+                Some(&kv_cache_lock),
+                Some(&|| model.reset_decode_state_for_graph()),
+            )?;
+        } else {
+            self.decode_capturer
+                .capture(&self.device, Some(&kv_cache_lock), None)?;
+        }
 
         if self.mtp_num_speculative > 0 {
             // self.decode_capturer.model.sync()?;
@@ -1803,6 +1867,7 @@ impl ModelRunner {
             Model::Qwen3_5(model) => model.reset_mamba_cache()?,
             Model::Qwen3_5MoE(model) => model.reset_mamba_cache()?,
             Model::Qwen3VL(model) => model.reset_mamba_cache()?,
+            Model::DeepSeekV4(model) => model.reset_decode_state_for_graph()?,
             _ => {}
         }
         self.restored_prefix_sequences.write().clear();

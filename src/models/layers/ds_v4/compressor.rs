@@ -191,6 +191,73 @@ impl CompressorWeights {
         Ok(Some(out))
     }
 
+    /// CUDA-graph decode path: fixed kernel topology, position from GPU buffer.
+    pub fn decode_graph(
+        &self,
+        x: &Tensor,
+        state: &CompressorDecodeState,
+        positions: &Tensor,
+        weighted: &Tensor,
+        out: &Tensor,
+        rope: Option<&V4RopeTables>,
+        rotate_fp4: bool,
+    ) -> Result<Tensor> {
+        let eps = 1e-6f32;
+        if self.is_overlap() {
+            attention_rs::deepseek_v4::compressor_overlap_decode_at_graph(
+                x,
+                &self.wkv,
+                &self.wgate,
+                &self.ape,
+                &self.norm,
+                &state.kv_state,
+                &state.score_state,
+                positions,
+                weighted,
+                out,
+                self.hidden_dim,
+                self.head_dim,
+                0,
+                eps,
+            )?;
+        } else {
+            attention_rs::deepseek_v4::compressor_nonoverlap_decode_at_graph(
+                x,
+                &self.wkv,
+                &self.wgate,
+                &self.ape,
+                &self.norm,
+                &state.kv_state,
+                &state.score_state,
+                positions,
+                weighted,
+                out,
+                self.hidden_dim,
+                self.head_dim,
+                self.ratio,
+                0,
+                eps,
+            )?;
+        }
+        let out = out.reshape((1, self.head_dim))?.contiguous()?;
+        if let Some(rope) = rope {
+            let rope_offset = 1_i64 - self.ratio as i64;
+            rope.apply_from_positions(&out, positions, rope_offset, false)?;
+        }
+        if rotate_fp4 {
+            attention_rs::deepseek_v4::hadamard_fp4_quant_bf16_inplace(&out, 1, self.head_dim)?;
+        } else if let Some(rope) = rope {
+            attention_rs::deepseek_v4::fp8_act_quant_nope_bf16_inplace(
+                &out,
+                1,
+                self.head_dim,
+                rope.rotary_dim,
+                64,
+            )?;
+        }
+        Ok(out)
+    }
+
     /// Seed decode accumulators to match official Compressor.forward prefill
     /// (`start_pos == 0`) state copy — NOT by replaying decode steps.
     ///
@@ -293,18 +360,13 @@ impl CompressorDecodeState {
     }
 
     pub fn reset(&mut self) -> Result<()> {
-        self.kv_state = Tensor::zeros(
-            (self.slots, self.state_dim),
-            DType::F32,
-            self.kv_state.device(),
-        )?
-        .contiguous()?;
-        self.score_state = Tensor::full(
+        self.kv_state.zero_()?;
+        let neg_inf = Tensor::full(
             f32::NEG_INFINITY,
             (self.slots, self.state_dim),
             self.score_state.device(),
-        )?
-        .contiguous()?;
+        )?;
+        self.score_state.copy_(&neg_inf, 0)?;
         Ok(())
     }
 }

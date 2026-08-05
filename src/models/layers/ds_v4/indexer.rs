@@ -138,7 +138,24 @@ impl IndexerWeights {
 
     fn rope_query(&self, q: &Tensor, rope: &V4RopeTables, start_pos: usize) -> Result<Tensor> {
         let seq_len = q.dim(0)?;
-        rope.apply_inplace(&q, start_pos, false)?;
+        rope.apply_inplace(q, start_pos, false)?;
+        attention_rs::deepseek_v4::hadamard_fp4_quant_bf16_inplace(
+            q,
+            self.index_n_heads,
+            self.index_head_dim,
+        )?;
+        q.reshape((seq_len, self.index_n_heads, self.index_head_dim))?
+            .contiguous()
+    }
+
+    fn rope_query_from_positions(
+        &self,
+        q: &Tensor,
+        rope: &V4RopeTables,
+        positions: &Tensor,
+    ) -> Result<Tensor> {
+        let seq_len = q.dim(0)?;
+        rope.apply_from_positions(q, positions, 0, false)?;
         attention_rs::deepseek_v4::hadamard_fp4_quant_bf16_inplace(
             q,
             self.index_n_heads,
@@ -217,6 +234,81 @@ impl IndexerWeights {
         Ok(scores)
     }
 
+    pub fn scores_decode_from_positions_into(
+        &self,
+        input: &Tensor,
+        qr: &Tensor,
+        indexer_kv_cache: &Tensor,
+        score_len: usize,
+        rope: &V4RopeTables,
+        positions: &Tensor,
+        scores: &Tensor,
+    ) -> Result<()> {
+        let score_scale =
+            1.0 / (self.index_head_dim as f32).sqrt() / (self.global_index_n_heads as f32).sqrt();
+
+        let q = self
+            .project_q(qr, false)?
+            .reshape((1, self.index_n_heads, self.index_head_dim))?
+            .contiguous()?;
+        let q = self.rope_query_from_positions(&q, rope, positions)?;
+        let q = q.reshape((1, self.index_n_heads * self.index_head_dim))?;
+        let weights = input.matmul(&self.weights_proj.t()?)?;
+
+        attention_rs::deepseek_v4::indexer_scores_decode_into(
+            &q,
+            indexer_kv_cache,
+            &weights,
+            self.index_n_heads,
+            self.index_head_dim,
+            score_len,
+            score_scale,
+            scores,
+        )?;
+        #[cfg(feature = "nccl")]
+        if let Some(all_reduce) = &self.score_all_reduce {
+            let reduced = scores.apply_op1_no_bwd(all_reduce)?;
+            scores.copy_(&reduced, 0)?;
+        }
+        Ok(())
+    }
+
+    pub fn scores_decode_from_positions(
+        &self,
+        input: &Tensor,
+        qr: &Tensor,
+        indexer_kv_cache: &Tensor,
+        score_len: usize,
+        rope: &V4RopeTables,
+        positions: &Tensor,
+    ) -> Result<Tensor> {
+        let score_scale =
+            1.0 / (self.index_head_dim as f32).sqrt() / (self.global_index_n_heads as f32).sqrt();
+
+        let q = self
+            .project_q(qr, false)?
+            .reshape((1, self.index_n_heads, self.index_head_dim))?
+            .contiguous()?;
+        let q = self.rope_query_from_positions(&q, rope, positions)?;
+        let q = q.reshape((1, self.index_n_heads * self.index_head_dim))?;
+        let weights = input.matmul(&self.weights_proj.t()?)?;
+
+        let mut scores = attention_rs::deepseek_v4::indexer_scores_decode(
+            &q,
+            indexer_kv_cache,
+            &weights,
+            self.index_n_heads,
+            self.index_head_dim,
+            score_len,
+            score_scale,
+        )?;
+        #[cfg(feature = "nccl")]
+        if let Some(all_reduce) = &self.score_all_reduce {
+            scores = scores.apply_op1_no_bwd(all_reduce)?;
+        }
+        Ok(scores)
+    }
+
     pub fn topk_prefill(
         &self,
         scores: &Tensor,
@@ -232,6 +324,23 @@ impl IndexerWeights {
             topk,
             4,
             offset,
+        )
+    }
+
+    pub fn topk_decode_into(
+        &self,
+        scores: &Tensor,
+        compressed_len: usize,
+        offset: usize,
+        topk_idxs: &Tensor,
+    ) -> Result<()> {
+        let topk = self.index_topk.min(compressed_len);
+        attention_rs::deepseek_v4::indexer_topk_decode_into(
+            scores,
+            compressed_len,
+            topk,
+            offset,
+            topk_idxs,
         )
     }
 
@@ -269,7 +378,7 @@ impl IndexerDecodeState {
 
     pub fn reset(&mut self) -> Result<()> {
         self.compressor_state.reset()?;
-        self.kv_cache = self.kv_cache.zeros_like()?;
+        self.kv_cache.zero_()?;
         self.compressed_len = 0;
         Ok(())
     }
@@ -307,6 +416,24 @@ impl IndexerDecodeState {
         let row = row.reshape((1, dim))?.contiguous()?;
         attention_rs::deepseek_v4::copy_contiguous_into(&self.kv_cache, &row, index * dim)?;
         self.compressed_len = self.compressed_len.max(index + 1);
+        Ok(())
+    }
+
+    pub fn write_compressed_from_pos(
+        &mut self,
+        row: &Tensor,
+        positions: &Tensor,
+        ratio: usize,
+    ) -> Result<()> {
+        let dim = row.dim(D::Minus1)?;
+        let row = row.reshape((1, dim))?.contiguous()?;
+        attention_rs::deepseek_v4::write_indexer_row_from_pos(
+            &self.kv_cache,
+            &row,
+            positions,
+            dim,
+            ratio,
+        )?;
         Ok(())
     }
 }
