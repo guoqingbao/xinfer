@@ -1,19 +1,20 @@
-use crate::models::layers::distributed::{Comm, VocabParallelLinear};
+use crate::models::layers::distributed::{AllReduce, Comm, VocabParallelLinear};
 use crate::models::layers::ds_v4::{
     hc_expand, hc_head, hc_post, hc_pre_norm, CompressorDecodeState, CompressorWeights,
     FusedMoeMxfp4, HcBlockWeights, HcHeadWeights, HcHiddenStates, IndexerDecodeState,
     IndexerWeights, LayerCompressionType, LayerDecodeBuffers, LayerSparseKvCache, MlaV4Attention,
-    MlaV4Config, V4RopeTables,
+    MlaV4Config, V4RopeTables, V4Router,
 };
 use crate::models::layers::mask::get_attention_causal_mask;
 use crate::models::layers::mlp::MLP;
+use crate::models::layers::moe::MoeW2ExpertWeights;
 use crate::models::layers::others::{embedding, rms_norm_v4, NormX};
 use crate::models::layers::VarBuilderX;
 use crate::utils::config::Config;
 use crate::utils::progress::ProgressLike;
 use attention_rs::InputMetadata;
 use candle_core::{DType, Device, Result, Tensor};
-use candle_nn::Module;
+use candle_nn::{Activation, Module};
 use parking_lot::{Mutex, RwLock};
 use std::iter::zip;
 use std::rc::Rc;
@@ -98,10 +99,81 @@ impl DeepSeekV4Config {
     }
 }
 
+/// DeepSeek V4 W2 MoE: V4 hash/score router + general [`MoeW2ExpertWeights`] from `moe.rs`.
+struct V4MoeW2 {
+    router: V4Router,
+    experts: MoeW2ExpertWeights,
+    act: Activation,
+    all_reduce: AllReduce,
+    world_size: usize,
+    dtype: DType,
+    swiglu_limit: f32,
+}
+
+impl V4MoeW2 {
+    fn from_mxfp4(mx: FusedMoeMxfp4, swiglu_limit: f32) -> Result<Self> {
+        let experts = MoeW2ExpertWeights::pack_from_mxfp4(
+            &mx.gate_up_blocks,
+            &mx.gate_up_scales,
+            &mx.down_blocks,
+            &mx.down_scales,
+        )?;
+        Ok(Self {
+            router: mx.router,
+            experts,
+            act: mx.act,
+            all_reduce: mx.all_reduce,
+            world_size: mx.world_size,
+            dtype: mx.dtype,
+            swiglu_limit: if swiglu_limit > 0.0 {
+                swiglu_limit
+            } else if mx.swiglu_limit > 0.0 {
+                mx.swiglu_limit
+            } else {
+                10.0
+            },
+        })
+    }
+
+    fn new(
+        cfg: &Config,
+        vb: VarBuilderX,
+        comm: Rc<Comm>,
+        dtype: DType,
+        layer_idx: usize,
+        swiglu_limit: f32,
+    ) -> Result<Self> {
+        let mx = FusedMoeMxfp4::new(cfg, vb, comm, dtype, layer_idx)?;
+        Self::from_mxfp4(mx, swiglu_limit)
+    }
+
+    fn forward_with_ids(
+        &self,
+        xs: &Tensor,
+        input_ids: Option<&Tensor>,
+        is_prefill: bool,
+    ) -> Result<Tensor> {
+        let (topk_weights, topk_ids) = self.router.route(xs, input_ids, is_prefill)?;
+        let mut ys = self.experts.forward(
+            xs,
+            &topk_weights,
+            &topk_ids,
+            &self.act,
+            self.swiglu_limit,
+            self.dtype,
+            is_prefill,
+        )?;
+        if self.world_size > 1 {
+            ys = self.all_reduce.apply(&ys)?;
+        }
+        Ok(ys)
+    }
+}
+
 #[allow(dead_code)]
 enum MoeOrMlp {
     FusedMoeMxfp4(FusedMoeMxfp4),
-    // FusedMoeW2(FusedMoeW2),
+    FusedMoeW2(V4MoeW2),
     Mlp(MLP),
 }
 
@@ -115,7 +187,7 @@ impl MoeOrMlp {
         match self {
             Self::Mlp(m) => m.forward(xs),
             Self::FusedMoeMxfp4(m) => m.forward_with_ids_f32(xs, input_ids, is_prefill),
-            // Self::FusedMoeW2(m) => m.forward_with_ids(xs, input_ids, is_prefill),
+            Self::FusedMoeW2(m) => m.forward_with_ids(xs, input_ids, is_prefill),
         }
     }
 }
@@ -204,11 +276,21 @@ impl DeepSeekV4DecoderLayer {
 
         let mlp = if is_qvar_builder {
             candle_core::bail!(
-                "DeepSeek V4 does not support GGUF MoE; use MXFP4 safetensors or --quant w2"
+                "DeepSeek V4 does not support GGUF MoE; use MXFP4 safetensors or --isq w2"
             );
+        } else if use_w2 {
+            // Load MXFP4 experts then GPU-repack via general moe::MoeW2ExpertWeights.
+            MoeOrMlp::FusedMoeW2(V4MoeW2::new(
+                config,
+                vb.pp("ffn").clone(),
+                comm.clone(),
+                dtype,
+                layer_idx,
+                v4_cfg.swiglu_limit,
+            )?)
         } else if config.quant.is_some() {
             candle_core::bail!(
-                "DeepSeek V4 only supports MXFP4 MoE or --quant w2/moe_w2 (got quant={:?})",
+                "DeepSeek V4 only supports MXFP4 MoE or --isq w2/moe_w2 (got quant={:?})",
                 config.quant
             );
         } else if !expert_dtype_is_fp4 {
@@ -715,7 +797,10 @@ impl DeepSeekV4DecoderLayer {
                 if let Some(indexer) = &self.indexer {
                     let state = self.indexer_state.lock();
                     let state = state.as_ref().expect("indexer state ensured");
-                    let score_len = state.max_compressed_len.max(1);
+                    // Score/topk over the live compressed length, not the config
+                    // capacity. Capacity can be max_position_embeddings (1M+) and
+                    // must not be passed into shared-memory topk kernels.
+                    let score_len = state.compressed_len.max(1).min(state.max_compressed_len);
                     let scores = bufs.indexer_scores.as_ref().expect("indexer scores buffer");
                     indexer.scores_decode_from_positions_into(
                         &attn_normed,
@@ -862,15 +947,10 @@ impl DeepSeekV4ForCausalLM {
             }
         };
 
-        let max_seq_len = config
-            .max_model_len
-            // Prefer engine scheduling length; never default to the model's 1M+
-            // `max_position_embeddings` (that blows up sparse KV / RoPE tables and
-            // breaks decode shared-memory top-k for large compressed_len).
-            // When unset, keep a modest default so `--kv-fraction` still has room
-            // for the paged KV cache after V4 private sparse buffers are allocated.
-            .unwrap_or(8192)
-            .min(config.max_position_embeddings);
+        // Sparse RoPE / indexer / compressor capacity comes from the model
+        // config (`max_position_embeddings`), not engine `max_model_len`.
+        // Scheduling length is planned later by the KV allocator like other models.
+        let sparse_max_seq_len = config.max_position_embeddings.max(1);
         let rope_scaling = config.rope_scaling.as_ref();
         let yarn_factor = rope_scaling
             .and_then(|m| m.get("factor"))
@@ -898,7 +978,7 @@ impl DeepSeekV4ForCausalLM {
         let rope_theta = config.rope_theta.unwrap_or(10000.0);
         let rope_compress = Arc::new(V4RopeTables::precompute(
             &vb.device(),
-            max_seq_len,
+            sparse_max_seq_len,
             mla_cfg.qk_rope_head_dim,
             v4_cfg.compress_rope_theta,
             original_seq_len,
@@ -908,7 +988,7 @@ impl DeepSeekV4ForCausalLM {
         )?);
         let rope_swa = Arc::new(V4RopeTables::precompute(
             &vb.device(),
-            max_seq_len,
+            sparse_max_seq_len,
             mla_cfg.qk_rope_head_dim,
             rope_theta,
             0,
@@ -934,7 +1014,7 @@ impl DeepSeekV4ForCausalLM {
                 layer_vb,
                 comm.clone(),
                 rope,
-                max_seq_len,
+                sparse_max_seq_len,
                 config,
                 &mla_cfg,
                 &v4_cfg,
@@ -943,6 +1023,12 @@ impl DeepSeekV4ForCausalLM {
             )?;
             layers.push(Mutex::new(layer));
             reporter.write().set_progress(i + 1);
+        }
+
+        // Allocate sparse/indexer buffers during model load so KV planning sees
+        // the real free VRAM (these are private caches, not the paged KV pool).
+        for layer in &layers {
+            layer.lock().ensure_decode_buffers(&vb.device())?;
         }
 
         let norm = rms_norm_v4(

@@ -3346,3 +3346,303 @@ impl FusedMoeNvfp4 {
         Ok(ys.to_dtype(self.dtype)?)
     }
 }
+
+/// Packed 2-bit MoE expert weights (GPU planes + UE8M0 scales).
+///
+/// Shared by [`FusedMoeW2`] (standard gate routing) and model-specific routers
+/// (e.g. DeepSeek V4 hash/score) that call [`MoeW2ExpertWeights::forward`].
+pub struct MoeW2ExpertWeights {
+    pub gate_up_planes: Tensor,
+    pub gate_up_scales: Tensor,
+    pub down_planes: Tensor,
+    pub down_scales: Tensor,
+    pub gate_up_n: usize,
+    pub gate_up_k: usize,
+    pub down_n: usize,
+    pub down_k: usize,
+}
+
+impl MoeW2ExpertWeights {
+    /// GPU-side re-quant of MXFP4/e2m1 expert tensors into 2-bit planes.
+    pub fn pack_from_mxfp4(
+        gate_up_blocks: &Tensor,
+        gate_up_scales: &Tensor,
+        down_blocks: &Tensor,
+        down_scales: &Tensor,
+    ) -> Result<Self> {
+        let e = gate_up_blocks.dim(0)?;
+        let n = gate_up_blocks.dim(1)?;
+        let k_packed = gate_up_blocks.dim(2)?; // K/2
+        let k = k_packed * 2;
+
+        let gu_blocks = gate_up_blocks.contiguous()?;
+        let gu_scales = gate_up_scales.contiguous()?;
+        let gu_scales = match gu_scales.dims().len() {
+            3 => gu_scales,
+            2 => gu_scales.reshape((e, n, k / 32))?,
+            _ => candle_core::bail!(
+                "MoeW2ExpertWeights: unexpected gate_up_scales dims {:?}",
+                gu_scales.dims()
+            ),
+        };
+
+        let (gate_up_planes, gate_up_scales) =
+            attention_rs::moe_w2::moe_w2_pack_from_mxfp4(&gu_blocks, &gu_scales, n, k)?;
+
+        let dn_n = down_blocks.dim(1)?;
+        let dn_k_packed = down_blocks.dim(2)?;
+        let dn_k = dn_k_packed * 2;
+        let dn_blocks = down_blocks.contiguous()?;
+        let dn_scales = down_scales.contiguous()?;
+        let dn_scales = match dn_scales.dims().len() {
+            3 => dn_scales,
+            2 => dn_scales.reshape((e, dn_n, dn_k / 32))?,
+            _ => candle_core::bail!(
+                "MoeW2ExpertWeights: unexpected down_scales dims {:?}",
+                dn_scales.dims()
+            ),
+        };
+
+        let (down_planes, down_scales) =
+            attention_rs::moe_w2::moe_w2_pack_from_mxfp4(&dn_blocks, &dn_scales, dn_n, dn_k)?;
+
+        Ok(Self {
+            gate_up_planes,
+            gate_up_scales: gate_up_scales.reshape((e, n * (k / 32)))?,
+            down_planes,
+            down_scales: down_scales.reshape((e, dn_n * (dn_k / 32)))?,
+            gate_up_n: n,
+            gate_up_k: k,
+            down_n: dn_n,
+            down_k: dn_k,
+        })
+    }
+
+    /// Expert GEMM path only (caller supplies top-k routing).
+    pub fn forward(
+        &self,
+        xs: &Tensor,
+        topk_weights: &Tensor,
+        topk_ids: &Tensor,
+        act: &Activation,
+        swiglu_limit: f32,
+        dtype: DType,
+        is_prefill: bool,
+    ) -> Result<Tensor> {
+        let (num_tokens, hidden_dim) = xs.dims2()?;
+        let topk = topk_ids.dim(D::Minus1)?;
+
+        let moe_dtype = if dtype == DType::F32 {
+            DType::BF16
+        } else {
+            dtype
+        };
+        let xs = if xs.dtype() != moe_dtype {
+            xs.to_dtype(moe_dtype)?
+        } else {
+            xs.clone()
+        };
+
+        let (expert_ids, sorted_token_ids) = sort_expert_assignments(topk_ids, is_prefill)?;
+
+        let gate_up = moe::moe_gemm_w2(
+            &xs,
+            &self.gate_up_planes,
+            &self.gate_up_scales,
+            &None,
+            &sorted_token_ids,
+            &expert_ids,
+            topk,
+            self.gate_up_n,
+            self.gate_up_k,
+            is_prefill,
+        )?;
+
+        let down_inputs = if matches!(act, Activation::Silu) && swiglu_limit > 0.0 {
+            attention_rs::moe_w2::moe_w2_swiglu_clamp_bf16(
+                &gate_up,
+                self.gate_up_n / 2,
+                swiglu_limit,
+            )?
+        } else {
+            gated_activation(&gate_up, self.gate_up_n / 2, act)?
+        };
+        let down_inputs = if down_inputs.dtype() != moe_dtype {
+            down_inputs.to_dtype(moe_dtype)?
+        } else {
+            down_inputs
+        };
+
+        moe::moe_gemm_w2(
+            &down_inputs,
+            &self.down_planes,
+            &self.down_scales,
+            &Some(topk_weights.clone()),
+            &sorted_token_ids,
+            &expert_ids,
+            topk,
+            self.down_n,
+            self.down_k,
+            is_prefill,
+        )?
+        .reshape((num_tokens, topk, hidden_dim))?
+        .sum(1)?
+        .to_dtype(dtype)
+    }
+}
+
+/// General 2-bit MoE (`--isq w2` / `--isq moe_w2`): standard gate + [`MoeRouting`].
+///
+/// Built by GPU-side re-quant of checkpoint MXFP4 experts. FP4 restore is off by
+/// default so MXFP4 weights are freed after packing; enable with `XINFER_MOE_W2_GATE=1`.
+pub struct FusedMoeW2 {
+    gate: Linear,
+    experts: MoeW2ExpertWeights,
+    act: Activation,
+    routing: MoeRouting,
+    all_reduce: AllReduce,
+    world_size: usize,
+    dtype: DType,
+    gate_dtype: DType,
+    swiglu_limit: f32,
+    restore_mxfp4: Option<FusedMoeMxfp4>,
+    restore_gate_enabled: bool,
+    restore_gate_tau: f32,
+}
+
+impl FusedMoeW2 {
+    /// Pack MXFP4 experts into W2 planes, keeping the MXFP4 gate/routing.
+    pub fn from_mxfp4(mx: FusedMoeMxfp4) -> Result<Self> {
+        let restore_gate_enabled = std::env::var("XINFER_MOE_W2_GATE")
+            .map(|value| value != "0" && !value.eq_ignore_ascii_case("false"))
+            .unwrap_or(false);
+        let restore_gate_tau = std::env::var("XINFER_MOE_W2_GATE_TAU")
+            .ok()
+            .and_then(|value| value.parse::<f32>().ok())
+            .unwrap_or(0.60);
+
+        let experts = MoeW2ExpertWeights::pack_from_mxfp4(
+            &mx.gate_up_blocks,
+            &mx.gate_up_scales,
+            &mx.down_blocks,
+            &mx.down_scales,
+        )?;
+
+        let restore_mxfp4 = if restore_gate_enabled {
+            Some(FusedMoeMxfp4 {
+                gate: mx.gate.clone(),
+                gate_up_blocks: mx.gate_up_blocks.clone(),
+                gate_up_scales: mx.gate_up_scales.clone(),
+                down_blocks: mx.down_blocks.clone(),
+                down_scales: mx.down_scales.clone(),
+                w_size_n: mx.w_size_n,
+                act: mx.act.clone(),
+                routing: mx.routing.clone(),
+                all_reduce: mx.all_reduce.clone(),
+                world_size: mx.world_size,
+                dtype: mx.dtype,
+                gate_dtype: mx.gate_dtype,
+            })
+        } else {
+            None
+        };
+
+        Ok(Self {
+            gate: mx.gate,
+            experts,
+            act: mx.act,
+            routing: mx.routing,
+            all_reduce: mx.all_reduce,
+            world_size: mx.world_size,
+            dtype: mx.dtype,
+            gate_dtype: mx.gate_dtype,
+            swiglu_limit: 0.0,
+            restore_mxfp4,
+            restore_gate_enabled,
+            restore_gate_tau,
+        })
+    }
+
+    pub fn new(cfg: &Config, vb: VarBuilderX, comm: Rc<Comm>, dtype: DType) -> Result<Self> {
+        let mx = FusedMoeMxfp4::new(cfg, vb, comm, dtype)?;
+        let mut out = Self::from_mxfp4(mx)?;
+        if let Some(extra) = &cfg.extra_config_json {
+            if let Ok(extra) = serde_json::from_str::<serde_json::Value>(extra) {
+                out.swiglu_limit = extra
+                    .get("swiglu_limit")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0) as f32;
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn new_with_gate(
+        cfg: &Config,
+        gate_vb: VarBuilderX,
+        experts_vb: VarBuilderX,
+        bias_vb: &VarBuilderX,
+        comm: Rc<Comm>,
+        dtype: DType,
+    ) -> Result<Self> {
+        let mx = FusedMoeMxfp4::new_with_gate(cfg, gate_vb, experts_vb, bias_vb, comm, dtype)?;
+        Self::from_mxfp4(mx)
+    }
+
+    pub fn with_swiglu_limit(mut self, limit: f32) -> Self {
+        self.swiglu_limit = limit;
+        self
+    }
+
+    pub fn forward(&self, xs: &Tensor, is_prefill: bool) -> Result<Tensor> {
+        if self.restore_gate_enabled && !is_prefill {
+            if let Some(restore) = self.restore_mxfp4.as_ref() {
+                let gate_input = if xs.dtype() != self.gate_dtype {
+                    std::borrow::Cow::Owned(xs.to_dtype(self.gate_dtype)?)
+                } else {
+                    std::borrow::Cow::Borrowed(xs)
+                };
+                let router_logits = self.gate.forward(&gate_input)?.to_dtype(DType::F32)?;
+                let (topk_weights, _) = self.routing.route(&router_logits, is_prefill)?;
+                let max_prob = topk_weights.max(1)?.max(0)?.to_vec0::<f32>()?;
+                if max_prob <= self.restore_gate_tau {
+                    return restore.forward(xs, is_prefill);
+                }
+            }
+        }
+        self.forward_2bit(xs, is_prefill)
+    }
+
+    fn forward_2bit(&self, xs: &Tensor, is_prefill: bool) -> Result<Tensor> {
+        let gate_input = if xs.dtype() != self.gate_dtype {
+            std::borrow::Cow::Owned(xs.to_dtype(self.gate_dtype)?)
+        } else {
+            std::borrow::Cow::Borrowed(xs)
+        };
+        let router_logits = self.gate.forward(&gate_input)?.to_dtype(DType::F32)?;
+        let (topk_weights, topk_ids) = self.routing.route(&router_logits, is_prefill)?;
+        self.forward_with_routing(xs, topk_weights, topk_ids, is_prefill)
+    }
+
+    pub fn forward_with_routing(
+        &self,
+        xs: &Tensor,
+        topk_weights: Tensor,
+        topk_ids: Tensor,
+        is_prefill: bool,
+    ) -> Result<Tensor> {
+        let mut ys = self.experts.forward(
+            xs,
+            &topk_weights,
+            &topk_ids,
+            &self.act,
+            self.swiglu_limit,
+            self.dtype,
+            is_prefill,
+        )?;
+        if self.world_size > 1 {
+            ys = self.all_reduce.apply(&ys)?;
+        }
+        Ok(ys)
+    }
+}

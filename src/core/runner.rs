@@ -281,15 +281,11 @@ impl ModelRunner {
             && (has_mtp_config || has_mtp_weights)
             && has_mtp_weights;
 
-        let mut model_config = config.clone();
-        if model_config.max_model_len.is_none() {
-            model_config.max_model_len = econfig.max_model_len.or(Some(8192));
-        }
         let model = crate::build_model!(
             model_type,
             vb,
             comm,
-            &model_config,
+            config,
             dtype,
             is_rope_i,
             &device,
@@ -688,12 +684,7 @@ impl ModelRunner {
         };
 
         #[cfg(all(feature = "cuda", feature = "graph"))]
-        let graph_capture_max_model_len = if matches!(model_type, ModelType::DeepSeekV4) {
-            // Graph capture positions must stay within V4 sparse RoPE/indexer tables.
-            model_config.max_model_len.unwrap_or(8192)
-        } else {
-            econfig.max_model_len.unwrap_or(32768)
-        };
+        let graph_capture_max_model_len = econfig.max_model_len.unwrap_or(32768);
 
         #[cfg(all(feature = "cuda", feature = "graph"))]
         let graph_capture_decode_pos = if matches!(model_type, ModelType::DeepSeekV4) {
