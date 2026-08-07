@@ -1,10 +1,9 @@
 use crate::models::layers::distributed::{AllReduce, Comm, VocabParallelLinear};
 use crate::models::layers::ds_v4::{
-    build_v4_cache_specs, hc_expand, hc_head, hc_post, hc_pre_norm, CompressorDecodeState,
-    CompressorWeights, FusedMoeMxfp4, HcBlockWeights, HcHeadWeights, HcHiddenStates,
-    IndexerDecodeState, IndexerWeights, LayerCompressionType, LayerDecodeBuffers,
-    LayerSparseKvCache, MlaV4Attention, MlaV4Config, V4HybridPagePool, V4RopeTables, V4Router,
-    V4_NATIVE_BLOCK_SIZE,
+    hc_expand, hc_head, hc_post, hc_pre_norm, CompressorDecodeState, CompressorWeights,
+    FusedMoeMxfp4, HcBlockWeights, HcHeadWeights, HcHiddenStates, IndexerDecodeState,
+    IndexerWeights, LayerCompressionType, LayerDecodeBuffers, LayerSparseKvCache, MlaV4Attention,
+    MlaV4Config, V4HybridPagePool, V4RopeTables, V4Router, V4_NATIVE_BLOCK_SIZE,
 };
 use crate::models::layers::mask::get_attention_causal_mask;
 use crate::models::layers::mlp::MLP;
@@ -19,7 +18,6 @@ use candle_nn::{Activation, Module};
 use parking_lot::{Mutex, RwLock};
 use std::iter::zip;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 /// DeepSeek V4 specific config fields parsed from extra_config_json
@@ -233,13 +231,6 @@ pub struct DeepSeekV4DecoderLayer {
     compressor: Option<CompressorWeights>,
     indexer: Option<IndexerWeights>,
     sliding_window: usize,
-    /// False after reset/clear; true after any forward that wrote scratch.
-    /// Prevents SWA-only layers (compressed_len always 0) from hydrating mid-request.
-    scratch_valid: AtomicBool,
-    /// Absolute native length covered by current scratch (for chunked continue).
-    scratch_len: std::sync::atomic::AtomicUsize,
-    /// `block_table[0]` identity for scratch; `u32::MAX` if unset.
-    scratch_page0: std::sync::atomic::AtomicU32,
 }
 
 impl DeepSeekV4DecoderLayer {
@@ -452,9 +443,6 @@ impl DeepSeekV4DecoderLayer {
             compressor,
             indexer,
             sliding_window: v4_cfg.sliding_window,
-            scratch_valid: AtomicBool::new(false),
-            scratch_len: std::sync::atomic::AtomicUsize::new(0),
-            scratch_page0: std::sync::atomic::AtomicU32::new(u32::MAX),
         })
     }
 
@@ -532,19 +520,18 @@ impl DeepSeekV4DecoderLayer {
         if let Some(state) = self.indexer_state.lock().as_mut() {
             state.reset()?;
         }
-        self.scratch_valid.store(false, Ordering::Relaxed);
-        self.scratch_len.store(0, Ordering::Relaxed);
-        self.scratch_page0.store(u32::MAX, Ordering::Relaxed);
         Ok(())
     }
 
     /// Fresh single-shot prefill (Phase 0 golden path). Used when `start_pos==0`.
+    /// Cold prefill (start_pos=0). Returns `(attn_out, token_kv)` so the caller
+    /// can commit the full-sequence SWA into pages (ring alone is not enough).
     fn prefill_fresh(
         &mut self,
         attn_normed: &Tensor,
         qr: &Tensor,
         seq_len: usize,
-    ) -> Result<Tensor> {
+    ) -> Result<(Tensor, Tensor)> {
         let kv = self.self_attn.wkv_forward(attn_normed)?.contiguous()?;
         self.rope.apply_inplace(&kv, 0, false)?;
         attention_rs::deepseek_v4::fp8_act_quant_nope_bf16_inplace(
@@ -675,21 +662,19 @@ impl DeepSeekV4DecoderLayer {
                 true,
             )?;
         }
-        Ok(output)
+        Ok((output, kv))
     }
 
     /// One-token sparse decode step (write KV/compressor then attend).
-    /// Used by decode and by chunked/prefix continue (causal: write→attend per token).
     fn decode_one_token(
         &mut self,
         attn_normed: &Tensor,
         qr: &Tensor,
         positions: &Tensor,
         abs_pos: usize,
+        block_table: &[u32],
     ) -> Result<Tensor> {
         self.ensure_decode_buffers(attn_normed.device())?;
-        let bufs = self.decode_buffers.lock();
-        let bufs = bufs.as_ref().expect("decode buffers ensured");
 
         let kv = self.self_attn.wkv_forward(attn_normed)?.contiguous()?;
         self.rope.apply_from_positions(&kv, positions, 0, false)?;
@@ -706,71 +691,174 @@ impl DeepSeekV4DecoderLayer {
             .expect("sparse cache ensured")
             .write_window_token_from_pos(&kv, positions)?;
 
-        if let Some(compressor) = &self.compressor {
-            let weighted = bufs
-                .compressor_weighted
-                .as_ref()
-                .expect("compressor weighted buffer");
-            let out = bufs.compressor_out.as_ref().expect("compressor out buffer");
-            let emitted = {
-                let state = self.compressor_state.lock();
-                let state = state.as_ref().expect("compressor state ensured");
-                compressor.decode_graph(
-                    attn_normed,
-                    state,
-                    positions,
-                    weighted,
-                    out,
-                    Some(&self.rope),
-                    false,
-                )?
-            };
-            {
-                let mut sparse = self.sparse_kv.lock();
-                let sparse = sparse.as_mut().expect("sparse cache ensured");
-                sparse.write_compressed_row_from_pos(&emitted, positions)?;
-                let ratio = sparse.compress_ratio.max(1);
-                if (abs_pos + 1) % ratio == 0 {
-                    let row = abs_pos / ratio;
-                    sparse.compressed_len = sparse.compressed_len.max(row + 1);
+        let out = {
+            let bufs_guard = self.decode_buffers.lock();
+            let bufs = bufs_guard.as_ref().expect("decode buffers ensured");
+
+            if let Some(compressor) = &self.compressor {
+                let weighted = bufs
+                    .compressor_weighted
+                    .as_ref()
+                    .expect("compressor weighted buffer");
+                let out = bufs.compressor_out.as_ref().expect("compressor out buffer");
+                let emitted = {
+                    let state = self.compressor_state.lock();
+                    let state = state.as_ref().expect("compressor state ensured");
+                    compressor.decode_graph(
+                        attn_normed,
+                        state,
+                        positions,
+                        weighted,
+                        out,
+                        Some(&self.rope),
+                        false,
+                    )?
+                };
+                {
+                    let mut sparse = self.sparse_kv.lock();
+                    let sparse = sparse.as_mut().expect("sparse cache ensured");
+                    sparse.write_compressed_row_from_pos(&emitted, positions)?;
+                    let ratio = sparse.compress_ratio.max(1);
+                    if (abs_pos + 1) % ratio == 0 {
+                        let row = abs_pos / ratio;
+                        sparse.compressed_len = sparse.compressed_len.max(row + 1);
+                    }
                 }
             }
-        }
 
-        if let Some(indexer) = &self.indexer {
-            let weighted = bufs
-                .indexer_compressor_weighted
-                .as_ref()
-                .expect("indexer compressor weighted buffer");
-            let out = bufs
-                .indexer_compressor_out
-                .as_ref()
-                .expect("indexer compressor out buffer");
-            let emitted = {
-                let state = self.indexer_state.lock();
-                let state = state.as_ref().expect("indexer state ensured");
-                indexer.compressor.decode_graph(
-                    attn_normed,
-                    &state.compressor_state,
-                    positions,
-                    weighted,
-                    out,
-                    Some(&self.rope),
-                    true,
-                )?
-            };
-            {
-                let mut istate = self.indexer_state.lock();
-                let istate = istate.as_mut().expect("indexer state ensured");
-                istate.write_compressed_from_pos(&emitted, positions, indexer.compressor.ratio)?;
-                let ratio = indexer.compressor.ratio.max(1);
-                if (abs_pos + 1) % ratio == 0 {
-                    let row = abs_pos / ratio;
-                    istate.compressed_len = istate.compressed_len.max(row + 1);
+            if let Some(indexer) = &self.indexer {
+                let weighted = bufs
+                    .indexer_compressor_weighted
+                    .as_ref()
+                    .expect("indexer compressor weighted buffer");
+                let out = bufs
+                    .indexer_compressor_out
+                    .as_ref()
+                    .expect("indexer compressor out buffer");
+                let emitted = {
+                    let state = self.indexer_state.lock();
+                    let state = state.as_ref().expect("indexer state ensured");
+                    indexer.compressor.decode_graph(
+                        attn_normed,
+                        &state.compressor_state,
+                        positions,
+                        weighted,
+                        out,
+                        Some(&self.rope),
+                        true,
+                    )?
+                };
+                {
+                    let mut istate = self.indexer_state.lock();
+                    let istate = istate.as_mut().expect("indexer state ensured");
+                    istate.write_compressed_from_pos(
+                        &emitted,
+                        positions,
+                        indexer.compressor.ratio,
+                    )?;
+                    let ratio = indexer.compressor.ratio.max(1);
+                    if (abs_pos + 1) % ratio == 0 {
+                        let row = abs_pos / ratio;
+                        istate.compressed_len = istate.compressed_len.max(row + 1);
+                    }
                 }
             }
-        }
 
+            let win = self.sliding_window;
+            attention_rs::deepseek_v4::window_topk_indices_decode_from_pos_into(
+                positions,
+                win,
+                &bufs.window_topk,
+            )?;
+
+            let compress_topk = if self.indexer.is_some() {
+                self.indexer.as_ref().unwrap().index_topk
+            } else if self.compressor.is_some() {
+                self.sparse_kv
+                    .lock()
+                    .as_ref()
+                    .expect("sparse cache ensured")
+                    .compressed_slots
+            } else {
+                0
+            };
+
+            if self.compressor.is_some() {
+                if let Some(indexer) = &self.indexer {
+                    let state = self.indexer_state.lock();
+                    let state = state.as_ref().expect("indexer state ensured");
+                    let score_len = state.compressed_len.max(1).min(state.max_compressed_len);
+                    let scores = bufs.indexer_scores.as_ref().expect("indexer scores buffer");
+                    indexer.scores_decode_from_positions_into(
+                        attn_normed,
+                        qr,
+                        &state.kv_cache,
+                        score_len,
+                        &self.rope,
+                        positions,
+                        scores,
+                    )?;
+                    attention_rs::deepseek_v4::indexer_mask_scores_by_position(
+                        scores,
+                        positions,
+                        self.compression.ratio().max(1),
+                    )?;
+                    let topk_row = bufs.compress_topk.narrow(0, 0, 1)?.squeeze(0)?;
+                    indexer.topk_decode_into(scores, score_len, win, &topk_row)?;
+                } else {
+                    attention_rs::deepseek_v4::compress_topk_indices_decode_from_pos_into(
+                        positions,
+                        compress_topk,
+                        win,
+                        self.compression.ratio().max(1),
+                        &bufs.compress_topk,
+                    )?;
+                }
+            }
+
+            attention_rs::deepseek_v4::concat_topk_indices_into(
+                &bufs.window_topk,
+                &bufs.compress_topk,
+                1,
+                win,
+                compress_topk,
+                &bufs.concat_topk,
+            )?;
+            let total_topk = win + compress_topk;
+
+            let (attention_kv, kv_len) = {
+                let sparse_cache = self.sparse_kv.lock();
+                let sparse_cache = sparse_cache.as_ref().expect("sparse cache ensured");
+                (sparse_cache.kv.clone(), sparse_cache.total_slots().max(1))
+            };
+            self.self_attn.sparse_attn_from_positions(
+                attn_normed,
+                qr,
+                &self.rope,
+                positions,
+                &attention_kv,
+                &bufs.concat_topk,
+                &bufs.attn_out,
+                kv_len,
+                total_topk,
+            )?
+        };
+        // Write-through into engine pages (pages = source of truth).
+        self.commit_pages(abs_pos, 1, block_table, None)?;
+        Ok(out)
+    }
+
+    /// Decode-style sparse attend against the live `[ring | compressed]` buffer.
+    /// Caller must have already written this token's SWA ring slot (and any
+    /// compressed rows this position emits).
+    fn decode_attend_only(
+        &self,
+        attn_normed: &Tensor,
+        qr: &Tensor,
+        positions: &Tensor,
+    ) -> Result<Tensor> {
+        let bufs_guard = self.decode_buffers.lock();
+        let bufs = bufs_guard.as_ref().expect("decode buffers ensured");
         let win = self.sliding_window;
         attention_rs::deepseek_v4::window_topk_indices_decode_from_pos_into(
             positions,
@@ -832,7 +920,6 @@ impl DeepSeekV4DecoderLayer {
             &bufs.concat_topk,
         )?;
         let total_topk = win + compress_topk;
-
         let (attention_kv, kv_len) = {
             let sparse_cache = self.sparse_kv.lock();
             let sparse_cache = sparse_cache.as_ref().expect("sparse cache ensured");
@@ -851,58 +938,15 @@ impl DeepSeekV4DecoderLayer {
         )
     }
 
-    /// Chunked / prefix continue: causal per-token decode (not bulk write-then-attend).
-    fn prefill_continue_via_decode(
-        &mut self,
-        attn_normed: &Tensor,
-        qr: &Tensor,
-        positions: &Tensor,
-        start_pos: usize,
-        seq_len: usize,
-        block_table: &[u32],
-    ) -> Result<Tensor> {
-        let mut outs: Vec<Tensor> = Vec::with_capacity(seq_len);
-        let mut sync_from = start_pos;
-        for t in 0..seq_len {
-            let xs = attn_normed.narrow(0, t, 1)?.contiguous()?;
-            let qr_t = qr.narrow(0, t, 1)?.contiguous()?;
-            let pos = positions.narrow(0, t, 1)?.contiguous()?;
-            outs.push(self.decode_one_token(&xs, &qr_t, &pos, start_pos + t)?);
-            let abs_end = start_pos + t + 1;
-            if abs_end % V4_NATIVE_BLOCK_SIZE == 0 || t + 1 == seq_len {
-                let n = abs_end - sync_from;
-                if n > 0 {
-                    self.sync_to_pages(sync_from, n, block_table)?;
-                }
-                sync_from = abs_end;
-            }
-        }
-        if outs.len() == 1 {
-            Ok(outs.pop().unwrap())
-        } else {
-            let refs: Vec<&Tensor> = outs.iter().collect();
-            Tensor::cat(&refs, 0)
-        }
-    }
-
-    /// Hydrate sparse + compressor residual from hybrid pages when scratch was
-    /// cleared or belongs to a different sequence (prefix-cache hit).
-    /// Same-request chunked continue keeps live scratch via identity match.
-    fn hydrate_from_pages_if_needed(&self, start_pos: usize, block_table: &[u32]) -> Result<()> {
+    /// Load compressor/indexer residual (+ sparse gather) from engine pages at a
+    /// native-block boundary — vLLM prefix/chunk handoff (no mamba snapshot).
+    fn load_residual_from_pages(&self, start_pos: usize, block_table: &[u32]) -> Result<()> {
         if start_pos == 0 || block_table.is_empty() {
             return Ok(());
         }
-        let page0 = block_table[0];
-        if self.scratch_valid.load(Ordering::Relaxed)
-            && self.scratch_len.load(Ordering::Relaxed) == start_pos
-            && self.scratch_page0.load(Ordering::Relaxed) == page0
-        {
-            return Ok(());
-        }
-        // Prefix hits must land on a native-block boundary where residual was frozen.
         if start_pos % V4_NATIVE_BLOCK_SIZE != 0 {
             candle_core::bail!(
-                "DeepSeek V4 prefix hit at {} is not native-block aligned ({})",
+                "DeepSeek V4 page handoff at {} is not native-block aligned ({})",
                 start_pos,
                 V4_NATIVE_BLOCK_SIZE
             );
@@ -916,10 +960,10 @@ impl DeepSeekV4DecoderLayer {
                 let Some(pool) = pool_guard.as_ref() else {
                     return Ok(());
                 };
-                let Some(layer) = pool.layers.first() else {
-                    return Ok(());
-                };
-                layer.swa.device().clone()
+                pool.layers
+                    .first()
+                    .map(|l| l.swa.device().clone())
+                    .ok_or_else(|| candle_core::Error::Msg("V4 hybrid pool empty".into()))?
             }
         };
         self.ensure_decode_buffers(&device)?;
@@ -929,7 +973,7 @@ impl DeepSeekV4DecoderLayer {
         };
         if !pool.residual_frozen_at(start_pos, block_table) {
             candle_core::bail!(
-                "DeepSeek V4 prefix hit at {}: residual was never frozen at this boundary — refusing unsafe continue",
+                "DeepSeek V4 handoff at {}: residual not frozen at boundary",
                 start_pos
             );
         }
@@ -1000,21 +1044,18 @@ impl DeepSeekV4DecoderLayer {
                 }
             }
         }
-        self.scratch_valid.store(true, Ordering::Relaxed);
-        self.scratch_len.store(start_pos, Ordering::Relaxed);
-        self.scratch_page0.store(block_table[0], Ordering::Relaxed);
         Ok(())
     }
 
-    fn mark_scratch_identity(&self, native_len: usize, block_table: &[u32]) {
-        self.scratch_valid.store(true, Ordering::Relaxed);
-        self.scratch_len.store(native_len, Ordering::Relaxed);
-        if let Some(&page0) = block_table.first() {
-            self.scratch_page0.store(page0, Ordering::Relaxed);
-        }
-    }
-
-    fn sync_to_pages(&self, start_pos: usize, seq_len: usize, block_table: &[u32]) -> Result<()> {
+    /// Commit SWA / compressed / residual into engine-owned pages (vLLM write path).
+    /// Called from the same forward that produced the values — not a scratch mirror.
+    fn commit_pages(
+        &self,
+        start_pos: usize,
+        seq_len: usize,
+        block_table: &[u32],
+        token_kv: Option<&Tensor>,
+    ) -> Result<()> {
         if block_table.is_empty() || seq_len == 0 {
             return Ok(());
         }
@@ -1043,7 +1084,6 @@ impl DeepSeekV4DecoderLayer {
                 block_table,
                 true,
             )?;
-            // Mirror indexer compressed rows into indexer pages.
             if state.compressed_len > 0 {
                 if let Some(layer) = pool.layer(self.layer_idx) {
                     if let Some(ic) = &layer.indexer_compressed {
@@ -1076,23 +1116,19 @@ impl DeepSeekV4DecoderLayer {
         let win = sparse.sliding_window;
         let ratio = self.compression.ratio();
 
-        if ratio > 0 && sparse.compressed_slots > 0 {
+        if ratio > 0 && sparse.compressed_slots > 0 && sparse.compressed_len > 0 {
             if start_pos == 0 {
-                if sparse.compressed_len > 0 {
-                    let rows = sparse
-                        .kv
-                        .narrow(0, win, sparse.compressed_len)?
-                        .contiguous()?;
-                    pool.write_compressed_rows(self.layer_idx, &rows, 0, block_table)?;
-                }
+                let rows = sparse
+                    .kv
+                    .narrow(0, win, sparse.compressed_len)?
+                    .contiguous()?;
+                pool.write_compressed_rows(self.layer_idx, &rows, 0, block_table)?;
             } else {
                 let first = start_pos / ratio;
-                let end = if sparse.compressed_len > first {
-                    sparse.compressed_len
-                } else {
-                    // Decode may not bump compressed_len; still mirror the boundary row.
-                    (first + 1).min(sparse.compressed_slots)
-                };
+                let end = sparse
+                    .compressed_len
+                    .max(first + 1)
+                    .min(sparse.compressed_slots);
                 if end > first {
                     let rows = sparse
                         .kv
@@ -1103,22 +1139,32 @@ impl DeepSeekV4DecoderLayer {
             }
         }
 
-        let abs_positions: Vec<i64> = (start_pos..start_pos + seq_len).map(|p| p as i64).collect();
-        let idxs: Vec<u32> = (start_pos..start_pos + seq_len)
-            .map(|p| (p % win) as u32)
-            .collect();
-        let idx_t = Tensor::from_vec(idxs, (seq_len,), sparse.kv.device())?;
-        let token_kv = sparse.kv.narrow(0, 0, win)?.index_select(&idx_t, 0)?;
-        pool.write_swa_rows(self.layer_idx, &token_kv, &abs_positions, block_table)?;
+        if let Some(token_kv) = token_kv {
+            let n = token_kv.dim(0)?;
+            if n != seq_len {
+                candle_core::bail!("commit_pages token_kv len {n} != seq_len {seq_len}");
+            }
+            let abs_positions: Vec<i64> =
+                (start_pos..start_pos + seq_len).map(|p| p as i64).collect();
+            pool.write_swa_rows(self.layer_idx, token_kv, &abs_positions, block_table)?;
+        } else {
+            // Ring holds only `win` slots — write the chronological tail only.
+            let n = seq_len.min(win);
+            let abs_start = start_pos + seq_len - n;
+            let abs_positions: Vec<i64> = (abs_start..abs_start + n).map(|p| p as i64).collect();
+            let idxs: Vec<u32> = (abs_start..abs_start + n)
+                .map(|p| (p % win) as u32)
+                .collect();
+            let idx_t = Tensor::from_vec(idxs, (n,), sparse.kv.device())?;
+            let token_kv = sparse.kv.narrow(0, 0, win)?.index_select(&idx_t, 0)?;
+            pool.write_swa_rows(self.layer_idx, &token_kv, &abs_positions, block_table)?;
+        }
         pool.update_residual_freeze(native_len, block_table);
-        drop(pool_guard);
-        self.mark_scratch_identity(native_len, block_table);
         Ok(())
     }
 
-    /// Snapshot compressor/indexer residual into hybrid pages at every native
-    /// block boundary so later prefix hits can hydrate. Live decode state is
-    /// restored to `seq_len` afterward. Does not change attention output.
+    /// Snapshot residual at every native-block boundary after a cold bulk prefill
+    /// so later prefix hits can hand off (vLLM block-boundary residual).
     fn freeze_residuals_at_boundaries(
         &self,
         attn_normed: &Tensor,
@@ -1168,7 +1214,6 @@ impl DeepSeekV4DecoderLayer {
             pool.update_residual_freeze(boundary, block_table);
             boundary += V4_NATIVE_BLOCK_SIZE;
         }
-        // Restore live residual to full-sequence handoff (matches prefill_fresh seed).
         if let Some(compressor) = &self.compressor {
             let mut state = self.compressor_state.lock();
             let state = state.as_mut().expect("compressor state ensured");
@@ -1186,46 +1231,97 @@ impl DeepSeekV4DecoderLayer {
         Ok(())
     }
 
-    /// Unified prefill for fresh / chunked / prefix-hit.
-    ///
-    /// - `start_pos == 0`: golden `prefill_fresh` (any length) + page sync;
-    ///   residual frozen at each 256 boundary for prefix reuse
-    /// - `start_pos > 0`: decode-loop continue (bulk `prefill_continue` removed)
+    /// Write continued-prefill compressed rows (`prefill_continue` output) into
+    /// the live sparse / indexer caches at absolute compressed-row indices.
+    fn write_continue_compressed(
+        &self,
+        phase_a: &[Tensor],
+        bulk: Option<&Tensor>,
+        bulk_start_row: usize,
+        start_pos: usize,
+        ratio: usize,
+        indexer: bool,
+    ) -> Result<()> {
+        if ratio == 0 {
+            return Ok(());
+        }
+        // Overlap phase-A emits the row that closes the straddling block at
+        // `start_pos / ratio` (only when start_pos % ratio != 0).
+        let phase_a_row = start_pos / ratio;
+        if indexer {
+            let mut istate = self.indexer_state.lock();
+            let istate = istate.as_mut().expect("indexer state");
+            for emitted in phase_a {
+                istate.write_compressed_at(emitted, phase_a_row)?;
+            }
+            if let Some(bulk) = bulk {
+                istate.append_compressed_rows_at(bulk, bulk_start_row)?;
+            }
+        } else {
+            let mut sparse = self.sparse_kv.lock();
+            let sparse = sparse.as_mut().expect("sparse");
+            for emitted in phase_a {
+                sparse.write_compressed_row(emitted, phase_a_row)?;
+            }
+            if let Some(bulk) = bulk {
+                sparse.write_compressed_rows_at(bulk, bulk_start_row)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Unified prefill (vLLM-matched continue):
+    /// - cold: batched `prefill_fresh` + full-KV page commit
+    /// - continue: fused `prefill_continue` + gather workspace matching cold
+    ///   layout `[SWA | compressed]` + chrono window topk + one `sparse_attn`
+    ///   (vLLM gather_len / gather_start; no per-token decode loop)
     fn prefill_unified(
         &mut self,
         attn_normed: &Tensor,
         qr: &Tensor,
         positions: &Tensor,
         start_pos: usize,
-        seq_len: usize,
+        query_len: usize,
         block_table: &[u32],
     ) -> Result<Tensor> {
-        if start_pos > 0 {
-            self.hydrate_from_pages_if_needed(start_pos, block_table)?;
+        self.ensure_decode_buffers(attn_normed.device())?;
+
+        if start_pos == 0 {
+            let (out, kv) = self.prefill_fresh(attn_normed, qr, query_len)?;
+            self.commit_pages(0, query_len, block_table, Some(&kv))?;
+            if query_len >= V4_NATIVE_BLOCK_SIZE {
+                self.freeze_residuals_at_boundaries(attn_normed, query_len, block_table)?;
+                self.commit_pages(0, query_len, block_table, Some(&kv))?;
+            }
+            return Ok(out);
         }
 
-        let output = if start_pos == 0 {
-            let out = self.prefill_fresh(attn_normed, qr, seq_len)?;
-            self.sync_to_pages(0, seq_len, block_table)?;
-            if seq_len >= V4_NATIVE_BLOCK_SIZE {
-                self.freeze_residuals_at_boundaries(attn_normed, seq_len, block_table)?;
-                // Re-sync final residual/SWA after boundary freeze restored live state.
-                self.sync_to_pages(0, seq_len, block_table)?;
-            }
-            out
-        } else {
-            // Causal per-token continue (same path as decode).
-            self.prefill_continue_via_decode(
-                attn_normed,
-                qr,
-                positions,
-                start_pos,
-                seq_len,
-                block_table,
-            )?
+        let ratio = self.compression.ratio(); // 0 = SWA-only
+                                              // Same-request chunked: keep live compressor/sparse (matches working decode path).
+                                              // Prefix-cache hit across requests: hydrate when live does not cover.
+        let live_covers = {
+            let sparse = self.sparse_kv.lock();
+            let r = ratio.max(1);
+            sparse
+                .as_ref()
+                .map(|s| ratio > 0 && s.compressed_len.saturating_mul(r) >= start_pos)
+                .unwrap_or(false)
         };
+        if start_pos % V4_NATIVE_BLOCK_SIZE == 0 && !live_covers {
+            self.load_residual_from_pages(start_pos, block_table)?;
+        }
 
-        Ok(output)
+        // Interleaved write→compress→attend per token is required for correctness.
+        // Batched compressor-then-attend and chrono-gather attend both diverge.
+        let mut outs: Vec<Tensor> = Vec::with_capacity(query_len);
+        for t in 0..query_len {
+            let xs = attn_normed.narrow(0, t, 1)?.contiguous()?;
+            let qr_t = qr.narrow(0, t, 1)?.contiguous()?;
+            let pos = positions.narrow(0, t, 1)?.contiguous()?;
+            outs.push(self.decode_one_token(&xs, &qr_t, &pos, start_pos + t, block_table)?);
+        }
+        let refs: Vec<&Tensor> = outs.iter().collect();
+        Ok(Tensor::cat(&refs, 0)?)
     }
 
     pub fn forward(
@@ -1282,11 +1378,11 @@ impl DeepSeekV4DecoderLayer {
                     self.max_seq_len
                 );
             }
-            // Prefix-hit may land on decode when the new prompt is fully cached.
-            self.hydrate_from_pages_if_needed(start_pos, block_table)?;
-            let attn_out = self.decode_one_token(&attn_normed, &qr, positions, start_pos)?;
-            self.sync_to_pages(start_pos, seq_len, block_table)?;
-            attn_out
+            // Prefix full-hit may land on decode at a native-block boundary.
+            if start_pos > 0 && start_pos % V4_NATIVE_BLOCK_SIZE == 0 {
+                self.load_residual_from_pages(start_pos, block_table)?;
+            }
+            self.decode_one_token(&attn_normed, &qr, positions, start_pos, block_table)?
         };
 
         let attn_branch = attn_output.to_dtype(DType::F32)?.contiguous()?;
@@ -1549,21 +1645,16 @@ impl DeepSeekV4ForCausalLM {
         })
     }
 
-    pub fn init_hybrid_page_pool(&self, num_pages: usize) -> Result<()> {
-        let head_dim = self
-            .layers
-            .first()
-            .map(|l| l.lock().self_attn.get_head_dim())
-            .unwrap_or(512);
-        let specs = build_v4_cache_specs(
-            &self.v4_cfg.compress_ratios,
-            self.v4_cfg.sliding_window,
-            head_dim,
-            self.v4_cfg.index_head_dim,
-        );
-        let pool = V4HybridPagePool::new(&specs, num_pages, &self.device)?;
-        *self.hybrid_pool.lock() = Some(pool);
-        Ok(())
+    pub fn hybrid_pool_arc(&self) -> Arc<Mutex<Option<V4HybridPagePool>>> {
+        self.hybrid_pool.clone()
+    }
+
+    /// Move the engine-allocated pool into the model's shared Arc (layers already
+    /// hold clones of this Arc). Caller should then store `hybrid_pool_arc()` in
+    /// [`GpuKvCache::DeepSeekV4`] so engine and model share one allocation.
+    pub fn attach_hybrid_page_pool(&self, pool: Arc<Mutex<Option<V4HybridPagePool>>>) {
+        let mut src = pool.lock();
+        *self.hybrid_pool.lock() = src.take();
     }
 
     pub fn clear_seq_state(&self, _seq_id: usize) {
@@ -1572,20 +1663,12 @@ impl DeepSeekV4ForCausalLM {
         }
     }
 
-    /// Sync hybrid pages from live scratch after CUDA-graph decode replay
-    /// (graph path skips `forward`, so `sync_to_pages` would otherwise not run).
+    /// No-op: decode write-through already persists into engine-owned pages.
     pub fn sync_hybrid_pages_after_decode(
         &self,
-        block_table: &[u32],
-        native_len: usize,
+        _block_table: &[u32],
+        _native_len: usize,
     ) -> Result<()> {
-        if block_table.is_empty() || native_len == 0 {
-            return Ok(());
-        }
-        let start_pos = native_len.saturating_sub(1);
-        for layer in &self.layers {
-            layer.lock().sync_to_pages(start_pos, 1, block_table)?;
-        }
         Ok(())
     }
 
@@ -1646,6 +1729,8 @@ impl DeepSeekV4ForCausalLM {
         // Expand to HC hidden states
         let mut hc_hidden = hc_expand(&xs, self.v4_cfg.hc_mult)?;
 
+        // Hybrid pages live on `self.hybrid_pool`; Flash/MLA-style `kv_caches`
+        // pairs are unused (engine passes None for DeepSeekV4).
         if let Some(kv_caches) = kv_caches {
             for (layer_idx, ((k_cache, v_cache), layer)) in
                 zip(kv_caches.iter(), self.layers.iter()).enumerate()
@@ -1661,6 +1746,24 @@ impl DeepSeekV4ForCausalLM {
                     attention_mask.as_ref(),
                     positions,
                     Some((k_cache, v_cache)),
+                    input_metadata,
+                    layer_input_ids,
+                    block_table,
+                )?;
+            }
+        } else {
+            for (layer_idx, layer) in self.layers.iter().enumerate() {
+                let mut layer = layer.lock();
+                let layer_input_ids = if layer_idx < self.v4_cfg.n_hash_layers {
+                    Some(input_ids)
+                } else {
+                    None
+                };
+                hc_hidden = layer.forward(
+                    &hc_hidden,
+                    attention_mask.as_ref(),
+                    positions,
+                    None,
                     input_metadata,
                     layer_input_ids,
                     block_table,

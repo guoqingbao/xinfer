@@ -179,6 +179,14 @@ impl V4HybridPagePool {
         }
     }
 
+    /// Zero all layer tensors for a physical page (block recycle).
+    pub fn zero_page(&self, page: usize) -> Result<()> {
+        for layer in &self.layers {
+            layer.zero_page(page)?;
+        }
+        Ok(())
+    }
+
     pub fn layer(&self, idx: usize) -> Option<&V4LayerPages> {
         self.layers.get(idx)
     }

@@ -13,7 +13,9 @@ pub mod guidance_grammar;
 pub mod guided_decoding;
 pub mod heartbeat;
 pub mod image;
+pub mod kv_backend;
 pub mod kvcache_allocator;
+pub use kv_backend::{CpuKvCache, GpuKvCache, KvCacheBackend};
 pub mod logits_processor;
 pub mod multi_node;
 pub mod progress;
@@ -1092,7 +1094,7 @@ fn is_qwen_chat_template_arch_name(arch: &str) -> bool {
     )
 }
 
-fn is_deepseek_v4_arch_name(arch: &str) -> bool {
+pub fn is_deepseek_v4_arch_name(arch: &str) -> bool {
     matches!(arch, "DeepseekV4ForCausalLM" | "deepseek_v4" | "deepseek4")
 }
 

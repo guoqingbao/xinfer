@@ -201,10 +201,14 @@ pub struct KVCacheAllocator {
     is_mla: bool,
     mla_kv_lora_rank: usize,
     mla_qk_rope_head_dim: usize,
-    /// DeepSeek V4: budget hybrid pages (SWA+compressed+residual) instead of MLA.
+    /// First-class KV backend (Flash / Mla / DeepSeekV4).
+    kv_backend: crate::utils::KvCacheBackend,
+    /// DeepSeek V4: budget hybrid pages (SWA+compressed+residual).
     is_deepseek_v4: bool,
     /// Bytes per native page across all V4 layers (0 if not V4).
     v4_bytes_per_native_page: usize,
+    /// Layer specs for constructing [`V4HybridPagePool`] (V4 only).
+    v4_cache_specs: Option<Vec<crate::models::layers::ds_v4::V4LayerCacheSpec>>,
     /// Per-layer KV cache config: (num_kv_heads, head_dim) per KV layer.
     /// When set, overrides uniform num_kv_heads/head_dim for cache allocation.
     per_layer_cache_config: Option<Vec<(usize, usize)>>,
@@ -404,7 +408,10 @@ impl KVCacheAllocator {
             mla_qk_rope_head_dim,
             is_deepseek_v4,
             v4_bytes_per_native_page,
+            v4_cache_specs,
+            kv_backend,
         ) = {
+            use crate::utils::KvCacheBackend;
             let extra: Option<serde_json::Value> = config
                 .extra_config_json
                 .as_ref()
@@ -416,21 +423,30 @@ impl KVCacheAllocator {
                         .get("qk_rope_head_dim")
                         .and_then(|v| v.as_u64())
                         .unwrap_or(64) as usize;
-                    (true, rank as usize, rope_dim, false, 0)
+                    (
+                        true,
+                        rank as usize,
+                        rope_dim,
+                        false,
+                        0,
+                        None,
+                        KvCacheBackend::Mla,
+                    )
                 } else {
-                    // DeepSeek V4: hybrid page pools (SWA + compressed + residual).
-                    // Classical MLA engine buffers are unused for attention — budget
-                    // hybrid pages and allocate 1-block MLA dummies for runner paths.
                     let model_type = extra.get("model_type").and_then(|v| v.as_str());
-                    if model_type == Some("deepseek_v4") {
+                    let arch = config
+                        .architectures
+                        .as_ref()
+                        .and_then(|a| a.first())
+                        .map(|s| s.as_str())
+                        .unwrap_or("");
+                    if model_type == Some("deepseek_v4")
+                        || crate::utils::is_deepseek_v4_arch_name(arch)
+                    {
                         let head_dim = extra
                             .get("head_dim")
                             .and_then(|v| v.as_u64())
                             .unwrap_or(512) as usize;
-                        let rope_dim = extra
-                            .get("qk_rope_head_dim")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(64) as usize;
                         let index_head_dim = extra
                             .get("index_head_dim")
                             .and_then(|v| v.as_u64())
@@ -456,13 +472,21 @@ impl KVCacheAllocator {
                         );
                         let page_bytes =
                             crate::models::layers::ds_v4::v4_bytes_per_native_page(&specs);
-                        (true, head_dim, rope_dim, true, page_bytes)
+                        (
+                            false,
+                            0,
+                            0,
+                            true,
+                            page_bytes,
+                            Some(specs),
+                            KvCacheBackend::DeepSeekV4,
+                        )
                     } else {
-                        (false, 0, 0, false, 0)
+                        (false, 0, 0, false, 0, None, KvCacheBackend::Flash)
                     }
                 }
             } else {
-                (false, 0, 0, false, 0)
+                (false, 0, 0, false, 0, None, KvCacheBackend::Flash)
             }
         };
 
@@ -559,8 +583,10 @@ impl KVCacheAllocator {
             is_mla,
             mla_kv_lora_rank,
             mla_qk_rope_head_dim,
+            kv_backend,
             is_deepseek_v4,
             v4_bytes_per_native_page,
+            v4_cache_specs,
             per_layer_cache_config,
             num_attention_heads: config.num_attention_heads,
             hidden_size: config.hidden_size,
@@ -574,6 +600,10 @@ impl KVCacheAllocator {
 
     pub fn resolved_kvcache_dtype(&self) -> crate::utils::config::KvCacheDtype {
         self.kvcache_dtype
+    }
+
+    pub fn kv_backend(&self) -> crate::utils::KvCacheBackend {
+        self.kv_backend
     }
 
     /// Compute the deterministic workspace budget from model and engine config.
@@ -1004,9 +1034,8 @@ impl KVCacheAllocator {
         let base = if tq_full {
             // turbo4/turbo3: standard K/V cache is NOT allocated per-block
             0
-        } else if self.is_deepseek_v4 {
+        } else if self.kv_backend.is_deepseek_v4() {
             // Hybrid page pool (SWA + compressed + residual + indexer).
-            // Classical MLA tensors are 1-block dummies — budget the real pages.
             self.v4_bytes_per_native_page.max(1)
         } else if self.is_mla {
             self.block_size
@@ -1402,23 +1431,19 @@ impl KVCacheAllocator {
     // Tensor Allocation Methods
     //==========================================================================
 
-    /// Initialize KV cache tensors on GPU and CPU
+    /// Initialize KV cache tensors on GPU and CPU.
     ///
-    /// # Arguments
-    /// * `allocation` - The allocation plan from `plan_allocation()`
-    /// * `dtype` - Data type for the cache (will use U8 for FP8)
-    /// * `device` - The GPU device to allocate on
-    /// * `pd_config` - Optional P/D config for sync allocation
-    ///
-    /// # Returns
-    /// Tuple of (GPU KV cache, CPU KV cache) - each is a Vec of (key_tensor, value_tensor) per layer
+    /// Returns first-class [`GpuKvCache`] / [`CpuKvCache`] backends
+    /// (Flash, Mla, or DeepSeekV4 hybrid pages).
     pub fn init_kv_cache(
         &self,
         allocation: &KVCacheAllocation,
         dtype: DType,
         device: &Device,
         pd_config: Option<&crate::transfer::PdConfig>,
-    ) -> Result<(Vec<(Tensor, Tensor)>, Vec<(Tensor, Tensor)>)> {
+    ) -> Result<(crate::utils::GpuKvCache, crate::utils::CpuKvCache)> {
+        use crate::utils::{CpuKvCache, GpuKvCache, KvCacheBackend};
+
         let num_gpu_blocks = allocation.num_gpu_blocks;
         let num_cpu_blocks = allocation.num_cpu_blocks;
 
@@ -1465,47 +1490,45 @@ impl KVCacheAllocator {
             );
         } else {
             crate::log_warn!(
-                "KV cache dtype: {:?}, cache dtype {:?}",
+                "KV cache dtype: {:?}, cache dtype {:?}, backend {:?}",
                 self.kvcache_dtype,
-                cache_dtype
+                cache_dtype,
+                self.kv_backend
             );
         }
 
-        if self.is_mla {
+        if self.kv_backend == KvCacheBackend::DeepSeekV4 {
+            let specs = self.v4_cache_specs.as_ref().ok_or_else(|| {
+                candle_core::Error::Msg("DeepSeek V4 KV backend missing cache specs at init".into())
+            })?;
+            crate::log_warn!(
+                "DeepSeek V4: allocating engine-owned hybrid page pool ({} native pages, {:.2} GB)",
+                num_gpu_blocks,
+                (num_gpu_blocks * self.v4_bytes_per_native_page) as f64 / SIZE_IN_GB
+            );
+            let pool = crate::models::layers::ds_v4::V4HybridPagePool::new(
+                specs,
+                num_gpu_blocks.max(1),
+                device,
+            )?;
+            let pool = std::sync::Arc::new(parking_lot::Mutex::new(Some(pool)));
+            return Ok((GpuKvCache::DeepSeekV4(pool), CpuKvCache::DeepSeekV4));
+        }
+
+        if self.kv_backend == KvCacheBackend::Mla {
             // MLA cache: (ckv_cache, kpe_cache) per layer
-            // ckv_cache: [num_blocks, block_size, 1, kv_lora_rank]
-            // kpe_cache: [num_blocks, block_size, 1, qk_rope_head_dim]
-            // DeepSeek V4: attention uses hybrid page pools; allocate 1-block
-            // dummies so runner/swap paths stay valid without burning VRAM.
-            let std_gpu_blocks = if self.is_deepseek_v4 {
-                1
-            } else {
-                num_gpu_blocks
-            };
-            let std_cpu_blocks = if self.is_deepseek_v4 {
-                1
-            } else {
-                num_cpu_blocks
-            };
-            if self.is_deepseek_v4 {
-                crate::log_warn!(
-                    "DeepSeek V4: allocating 1-block MLA dummies; hybrid page pool sized to {} native pages ({:.2} GB)",
-                    num_gpu_blocks,
-                    (num_gpu_blocks * self.v4_bytes_per_native_page) as f64 / SIZE_IN_GB
-                );
-            }
             let mut gpu_cache = Vec::new();
             let mut cpu_cache = Vec::new();
             for _ in 0..self.num_kv_layers {
                 let ckv_blocks = Tensor::empty(
-                    (std_gpu_blocks, self.block_size, 1, self.mla_kv_lora_rank),
+                    (num_gpu_blocks, self.block_size, 1, self.mla_kv_lora_rank),
                     cache_dtype,
                     device,
                     Some(sync_alloc),
                 )?;
                 let kpe_blocks = Tensor::empty(
                     (
-                        std_gpu_blocks,
+                        num_gpu_blocks,
                         self.block_size,
                         1,
                         self.mla_qk_rope_head_dim,
@@ -1518,13 +1541,13 @@ impl KVCacheAllocator {
             }
             for _ in 0..self.num_kv_layers {
                 let ckv_blocks = Tensor::zeros(
-                    (std_cpu_blocks, self.block_size, 1, self.mla_kv_lora_rank),
+                    (num_cpu_blocks, self.block_size, 1, self.mla_kv_lora_rank),
                     cache_dtype,
                     &Device::Cpu,
                 )?;
                 let kpe_blocks = Tensor::zeros(
                     (
-                        std_cpu_blocks,
+                        num_cpu_blocks,
                         self.block_size,
                         1,
                         self.mla_qk_rope_head_dim,
@@ -1534,8 +1557,30 @@ impl KVCacheAllocator {
                 )?;
                 cpu_cache.push((ckv_blocks, kpe_blocks));
             }
-            Ok((gpu_cache, cpu_cache))
-        } else if cfg!(feature = "flash")
+            return Ok((GpuKvCache::Mla(gpu_cache), CpuKvCache::Mla(cpu_cache)));
+        }
+
+        // Flash path — rest of the original init_kv_cache body continues below
+        // by falling through... we'll replace the else branch structure.
+        let (gpu_cache, cpu_cache) = self.init_flash_kv_cache(
+            num_gpu_blocks,
+            num_cpu_blocks,
+            cache_dtype,
+            device,
+            sync_alloc,
+        )?;
+        Ok((GpuKvCache::Flash(gpu_cache), CpuKvCache::Flash(cpu_cache)))
+    }
+
+    fn init_flash_kv_cache(
+        &self,
+        num_gpu_blocks: usize,
+        num_cpu_blocks: usize,
+        cache_dtype: DType,
+        device: &Device,
+        sync_alloc: bool,
+    ) -> Result<(Vec<(Tensor, Tensor)>, Vec<(Tensor, Tensor)>)> {
+        if cfg!(feature = "flash")
             || cfg!(feature = "flashinfer")
             || cfg!(feature = "flashattn")
             || cfg!(feature = "metal")
