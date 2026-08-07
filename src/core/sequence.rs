@@ -41,6 +41,9 @@ pub struct Sequence {
     pub mamba_prefix_hash: Option<u64>,
     #[serde(skip)]
     pub mamba_prefix_warmup_tokens: Option<usize>,
+    /// When set (DeepSeek V4), non-final prefill chunks end on this boundary.
+    #[serde(skip)]
+    pub prefill_boundary_align: Option<usize>,
     pub last_token: u32,
     pub block_size: usize,
     pub sampling_params: SamplingParams,
@@ -174,6 +177,8 @@ impl Sequence {
             num_cached_tokens: 0,
             mamba_prefix_hash: None,
             mamba_prefix_warmup_tokens: None,
+            // DeepSeek V4: non-final prefill chunks end on native-token boundaries.
+            prefill_boundary_align: None,
             sampling_params,
             block_size,
             last_token: *token_ids.last().unwrap_or(&0),
@@ -223,7 +228,18 @@ impl Sequence {
         if let Some(target_tokens) = self.active_mamba_prefix_warmup_target() {
             return (target_tokens - self.num_cached_tokens).min(default_chunk_size);
         }
-        remaining.min(default_chunk_size)
+        let mut n = remaining.min(default_chunk_size);
+        // Align intermediate chunk ends so hybrid/V4 residuals land on capturable
+        // boundaries (vLLM-style). The final tail may be unaligned.
+        if let Some(align) = self.prefill_boundary_align {
+            if align > 0 && remaining > align {
+                let next_boundary = (self.num_cached_tokens / align + 1) * align;
+                if next_boundary < self.len() && next_boundary > self.num_cached_tokens {
+                    n = (next_boundary - self.num_cached_tokens).min(n);
+                }
+            }
+        }
+        n
     }
 
     pub fn active_mamba_prefix_warmup_target(&self) -> Option<usize> {

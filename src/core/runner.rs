@@ -530,6 +530,11 @@ impl ModelRunner {
         let (gpu_kv_cache, cpu_kv_cache) =
             allocator.init_kv_cache(&allocation, dtype, &device, econfig.pd_config.as_ref())?;
 
+        if let Model::DeepSeekV4(v4) = &model {
+            // Hybrid page pool sized to engine native blocks (block_size=256).
+            v4.init_hybrid_page_pool(econfig.num_blocks.max(1))?;
+        }
+
         let num_cpu_blocks =
             (econfig.cpu_mem_fold.unwrap_or(0.5f32) * econfig.num_blocks as f32) as usize;
         let cpu_tq_cache = allocator.init_cpu_tq_cache(num_cpu_blocks)?;
@@ -937,6 +942,18 @@ impl ModelRunner {
                         .replay(&input_ids, &positions, &input_metadata)?,
                 };
                 let output_ids = self.sample(&logits, seqs, is_prefill)?;
+                if let Model::DeepSeekV4(model) = &self.model {
+                    // Graph replay skips layer.forward → sync residual/SWA into pages.
+                    let empty: Vec<u32> = Vec::new();
+                    let bt = input_metadata
+                        .block_tables_host
+                        .as_ref()
+                        .and_then(|bts| bts.first())
+                        .map(|v| v.as_slice())
+                        .unwrap_or(&empty);
+                    let _ =
+                        model.sync_hybrid_pages_after_decode(bt, input_metadata.max_context_len);
+                }
                 if std::env::var_os("XINFER_DEBUG_TOKENS").is_some() && !is_prefill {
                     if let Ok(flat) = logits.flatten_all()?.to_dtype(DType::F32)?.to_vec1::<f32>() {
                         let argmax = flat
@@ -1363,6 +1380,12 @@ impl ModelRunner {
         let sequence_ids_vec = seqs.iter().map(|s| s.id()).collect::<Vec<_>>();
         let mamba_slot_mapping = self.prepare_mamba_slot_mapping(&sequence_ids_vec, true)?;
         let sequence_ids = Some(sequence_ids_vec);
+        // Host block tables for V4 hybrid pages (CPU, prepared here — no D2H in forward).
+        let block_tables_host = Some(
+            seqs.iter()
+                .map(|s| s.block_table().to_vec())
+                .collect::<Vec<_>>(),
+        );
 
         let input_metadata = InputMetadata {
             is_prefill: true,
@@ -1371,6 +1394,7 @@ impl ModelRunner {
             mamba_slot_mapping,
             slot_mapping,
             block_tables,
+            block_tables_host,
             context_lens,
             cu_seqlens_q: Some(cu_seqlens_q),
             cu_seqlens_k: Some(cu_seqlens_k),
@@ -1555,6 +1579,7 @@ impl ModelRunner {
             mamba_slot_mapping,
             slot_mapping,
             block_tables: Some(block_tables),
+            block_tables_host: Some(active_block_tables.clone()),
             context_lens: Some(context_lens),
             cu_seqlens_q: None,
             cu_seqlens_k: None,

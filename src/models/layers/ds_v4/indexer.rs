@@ -309,6 +309,48 @@ impl IndexerWeights {
         Ok(scores)
     }
 
+    /// Score queries against an existing indexer compressed cache (continued prefill).
+    pub fn scores_prefill_against_cache(
+        &self,
+        input: &Tensor,
+        qr: &Tensor,
+        indexer_kv: &Tensor,
+        compressed_len: usize,
+        rope: &V4RopeTables,
+        positions: &Tensor,
+    ) -> Result<Tensor> {
+        let seq_len = input.dim(0)?;
+        let score_scale =
+            1.0 / (self.index_head_dim as f32).sqrt() / (self.global_index_n_heads as f32).sqrt();
+
+        let q = self
+            .project_q(qr, true)?
+            .reshape((seq_len, self.index_n_heads, self.index_head_dim))?
+            .contiguous()?;
+        let q = self.rope_query_from_positions(&q, rope, positions)?;
+        let q = q.reshape((seq_len, self.index_n_heads * self.index_head_dim))?;
+        let weights = input.matmul(&self.weights_proj.t()?)?;
+        let kv = indexer_kv
+            .narrow(0, 0, compressed_len.max(1))?
+            .contiguous()?;
+
+        let mut scores = attention_rs::deepseek_v4::indexer_scores_prefill(
+            &q,
+            &kv,
+            &weights,
+            seq_len,
+            self.index_n_heads,
+            self.index_head_dim,
+            compressed_len.max(1),
+            score_scale,
+        )?;
+        #[cfg(feature = "nccl")]
+        if let Some(all_reduce) = &self.score_all_reduce {
+            scores = scores.apply_op1_no_bwd(all_reduce)?;
+        }
+        Ok(scores)
+    }
+
     pub fn topk_prefill(
         &self,
         scores: &Tensor,
@@ -323,6 +365,27 @@ impl IndexerWeights {
             compressed_len,
             topk,
             4,
+            offset,
+        )
+    }
+
+    /// Top-k with per-query absolute positions (continued / fresh prefill).
+    pub fn topk_prefill_from_pos(
+        &self,
+        scores: &Tensor,
+        positions: &Tensor,
+        compressed_len: usize,
+        offset: usize,
+    ) -> Result<Tensor> {
+        let seq_len = scores.dim(0)?;
+        let topk = self.index_topk.min(compressed_len.max(1));
+        attention_rs::deepseek_v4::indexer_topk_prefill_from_pos(
+            scores,
+            positions,
+            seq_len,
+            compressed_len.max(1),
+            topk,
+            self.compressor.ratio,
             offset,
         )
     }
@@ -416,6 +479,28 @@ impl IndexerDecodeState {
         let row = row.reshape((1, dim))?.contiguous()?;
         attention_rs::deepseek_v4::copy_contiguous_into(&self.kv_cache, &row, index * dim)?;
         self.compressed_len = self.compressed_len.max(index + 1);
+        Ok(())
+    }
+
+    pub fn append_compressed_rows_at(&mut self, rows: &Tensor, start_row: usize) -> Result<()> {
+        let n = rows.dim(0)?;
+        if start_row + n > self.max_compressed_len {
+            candle_core::bail!(
+                "indexer rows [{start_row}, {}) exceed capacity {}",
+                start_row + n,
+                self.max_compressed_len
+            );
+        }
+        if n > 0 {
+            let dim = rows.dim(D::Minus1)?;
+            let rows = rows.contiguous()?;
+            attention_rs::deepseek_v4::copy_contiguous_into(
+                &self.kv_cache,
+                &rows,
+                start_row * dim,
+            )?;
+        }
+        self.compressed_len = self.compressed_len.max(start_row + n);
         Ok(())
     }
 

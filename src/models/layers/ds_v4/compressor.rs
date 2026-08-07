@@ -120,6 +120,249 @@ impl CompressorWeights {
         Ok(out)
     }
 
+    /// Continued-prefill: compress a chunk that appends at absolute `start`.
+    ///
+    /// Returns `(phase_a_rows, bulk_rows, bulk_start_row)`:
+    /// - `phase_a_rows`: at most one emitted overlap head-boundary row
+    /// - `bulk_rows`: remaining compressed rows from the cont epilogue
+    /// - `bulk_start_row`: first compressed-row index of the bulk block
+    pub fn prefill_continue(
+        &self,
+        x: &Tensor,
+        state: &mut CompressorDecodeState,
+        _positions: &Tensor,
+        _weighted: &Tensor,
+        _out: &Tensor,
+        rope: Option<&V4RopeTables>,
+        rotate_fp4: bool,
+        start: usize,
+    ) -> Result<(Vec<Tensor>, Option<Tensor>, usize)> {
+        let seq_len = x.dim(0)?;
+        if start == 0 {
+            // Match the committed single-shot guard: nonoverlap ratio=128 (and
+            // any ratio) must not call the epilogue when seq_len < ratio
+            // (cudaErrorInvalidValue). Short prompts still seed decode state.
+            if seq_len < self.ratio {
+                self.seed_decode_state_after_prefill(x, state, seq_len)?;
+                return Ok((Vec::new(), None, 0));
+            }
+            let bulk = self.prefill(x, seq_len, rope, 0, rotate_fp4)?;
+            self.seed_decode_state_after_prefill(x, state, seq_len)?;
+            let n = bulk.dim(0)?;
+            return Ok((Vec::new(), if n > 0 { Some(bulk) } else { None }, 0));
+        }
+
+        let ratio = self.ratio;
+        let eps = 1e-6f32;
+        let mut phase_a_rows: Vec<Tensor> = Vec::new();
+        let r = start % ratio;
+
+        // Phase A (overlap only): finish the incomplete block straddling the
+        // chunk boundary via the decode state machine.
+        if self.is_overlap() && r > 0 {
+            let n = (ratio - r).min(seq_len);
+            for t in 0..n {
+                let x_row = x.narrow(0, t, 1)?.contiguous()?;
+                let abs_pos = start + t;
+                let emitted = self.decode(&x_row, state, abs_pos, rope, rotate_fp4)?;
+                if t == n - 1 {
+                    if let Some(row) = emitted {
+                        phase_a_rows.push(row);
+                    }
+                }
+            }
+        }
+
+        let first_bulk_row = if self.is_overlap() {
+            start / ratio + if r > 0 { 1 } else { 0 }
+        } else {
+            start / ratio
+        };
+        let end_abs = start + seq_len;
+        let bulk_rows = end_abs / ratio - first_bulk_row;
+
+        let bulk_out = if bulk_rows > 0 {
+            let (_weighted, mut bulk) = if self.is_overlap() {
+                attention_rs::deepseek_v4::compressor_overlap_prefill_cont(
+                    x,
+                    &self.wkv,
+                    &self.wgate,
+                    &self.ape,
+                    &self.norm,
+                    &state.kv_state,
+                    &state.score_state,
+                    seq_len,
+                    start,
+                    self.head_dim,
+                    bulk_rows,
+                    eps,
+                )?
+            } else {
+                attention_rs::deepseek_v4::compressor_nonoverlap_prefill_cont(
+                    x,
+                    &self.wkv,
+                    &self.wgate,
+                    &self.ape,
+                    &self.norm,
+                    &state.kv_state,
+                    &state.score_state,
+                    seq_len,
+                    start,
+                    self.head_dim,
+                    ratio,
+                    bulk_rows,
+                    eps,
+                )?
+            };
+            bulk = bulk.contiguous()?;
+            if let Some(rope) = rope {
+                rope.apply_strided_inplace(&bulk, first_bulk_row * ratio, ratio, false)?;
+            }
+            if rotate_fp4 {
+                attention_rs::deepseek_v4::hadamard_fp4_quant_bf16_inplace(
+                    &bulk,
+                    1,
+                    self.head_dim,
+                )?;
+            } else if let Some(rope) = rope {
+                attention_rs::deepseek_v4::fp8_act_quant_nope_bf16_inplace(
+                    &bulk,
+                    1,
+                    self.head_dim,
+                    rope.rotary_dim,
+                    64,
+                )?;
+            }
+            Some(bulk)
+        } else {
+            None
+        };
+
+        // Seed decode state for absolute end position. When `start % ratio == 0`,
+        // chunk-relative remainder matches absolute; otherwise take the trailing
+        // absolute-incomplete block from the end of this chunk.
+        self.seed_decode_state_after_continue(x, state, start, seq_len)?;
+        Ok((phase_a_rows, bulk_out, first_bulk_row))
+    }
+
+    /// Seed compressor decode state after a continued-prefill chunk ending at
+    /// absolute position `start + seq_len`.
+    fn seed_decode_state_after_continue(
+        &self,
+        x: &Tensor,
+        state: &mut CompressorDecodeState,
+        start: usize,
+        seq_len: usize,
+    ) -> Result<()> {
+        let end_abs = start + seq_len;
+        if end_abs == 0 || seq_len == 0 {
+            return state.reset();
+        }
+        // When the chunk starts on a ratio boundary, absolute and chunk-relative
+        // remainders coincide — reuse the standard seed.
+        if start % self.ratio == 0 {
+            return self.seed_decode_state_after_prefill(x, state, seq_len);
+        }
+
+        let ratio = self.ratio;
+        let abs_remainder = end_abs % ratio;
+        let out_dim = if self.is_overlap() {
+            2 * self.head_dim
+        } else {
+            self.head_dim
+        };
+        let values = attention_rs::deepseek_v4::compressor_bf16_linear_f32(
+            x,
+            &self.wkv,
+            seq_len,
+            self.hidden_dim,
+            out_dim,
+        )?;
+        let scores = attention_rs::deepseek_v4::compressor_bf16_linear_f32(
+            x,
+            &self.wgate,
+            seq_len,
+            self.hidden_dim,
+            out_dim,
+        )?;
+        let ape = self.ape.contiguous()?;
+
+        // Overlap old-half may live before `start`. Preserve it from the live
+        // decode state (Phase A / prior chunk) before resetting.
+        let mut saved_old_kv: Option<Tensor> = None;
+        let mut saved_old_score: Option<Tensor> = None;
+        if self.is_overlap() {
+            let old_abs_start = if abs_remainder == 0 {
+                end_abs.saturating_sub(ratio)
+            } else {
+                end_abs.saturating_sub(abs_remainder + ratio)
+            };
+            if old_abs_start < start && end_abs > old_abs_start {
+                // First half of the current state holds the previous complete block
+                // after Phase A emit+shift (or a prior boundary seed).
+                saved_old_kv = Some(state.kv_state.narrow(0, 0, ratio)?.contiguous()?.copy()?);
+                saved_old_score = Some(
+                    state
+                        .score_state
+                        .narrow(0, 0, ratio)?
+                        .contiguous()?
+                        .copy()?,
+                );
+            }
+        }
+
+        state.reset()?;
+
+        let offset = if self.is_overlap() { ratio } else { 0 };
+
+        if self.is_overlap() {
+            let old_abs_start = if abs_remainder == 0 {
+                end_abs.saturating_sub(ratio)
+            } else {
+                end_abs.saturating_sub(abs_remainder + ratio)
+            };
+            if old_abs_start >= start && end_abs > old_abs_start {
+                let local = old_abs_start - start;
+                if local + ratio <= seq_len {
+                    let kv_block = values.narrow(0, local, ratio)?.contiguous()?;
+                    let score_block = (scores.narrow(0, local, ratio)? + &ape)?.contiguous()?;
+                    attention_rs::deepseek_v4::copy_contiguous_into(&state.kv_state, &kv_block, 0)?;
+                    attention_rs::deepseek_v4::copy_contiguous_into(
+                        &state.score_state,
+                        &score_block,
+                        0,
+                    )?;
+                }
+            } else if let (Some(kv), Some(score)) = (saved_old_kv, saved_old_score) {
+                attention_rs::deepseek_v4::copy_contiguous_into(&state.kv_state, &kv, 0)?;
+                attention_rs::deepseek_v4::copy_contiguous_into(&state.score_state, &score, 0)?;
+            }
+        }
+
+        if abs_remainder > 0 {
+            let rem_abs_start = end_abs - abs_remainder;
+            if rem_abs_start >= start {
+                let local = rem_abs_start - start;
+                let kv_rem = values.narrow(0, local, abs_remainder)?.contiguous()?;
+                let ape_rem = ape.narrow(0, 0, abs_remainder)?.contiguous()?;
+                let score_rem =
+                    (scores.narrow(0, local, abs_remainder)? + ape_rem)?.contiguous()?;
+                let elem_off = offset * out_dim;
+                attention_rs::deepseek_v4::copy_contiguous_into(
+                    &state.kv_state,
+                    &kv_rem,
+                    elem_off,
+                )?;
+                attention_rs::deepseek_v4::copy_contiguous_into(
+                    &state.score_state,
+                    &score_rem,
+                    elem_off,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     /// Decode: process a single token, accumulate into state.
     /// Returns Some(compressed_kv) if a compressed token was emitted, None otherwise.
     pub fn decode(

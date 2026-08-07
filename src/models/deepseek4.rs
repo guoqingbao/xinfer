@@ -1,9 +1,10 @@
 use crate::models::layers::distributed::{AllReduce, Comm, VocabParallelLinear};
 use crate::models::layers::ds_v4::{
-    hc_expand, hc_head, hc_post, hc_pre_norm, CompressorDecodeState, CompressorWeights,
-    FusedMoeMxfp4, HcBlockWeights, HcHeadWeights, HcHiddenStates, IndexerDecodeState,
-    IndexerWeights, LayerCompressionType, LayerDecodeBuffers, LayerSparseKvCache, MlaV4Attention,
-    MlaV4Config, V4RopeTables, V4Router,
+    build_v4_cache_specs, hc_expand, hc_head, hc_post, hc_pre_norm, CompressorDecodeState,
+    CompressorWeights, FusedMoeMxfp4, HcBlockWeights, HcHeadWeights, HcHiddenStates,
+    IndexerDecodeState, IndexerWeights, LayerCompressionType, LayerDecodeBuffers,
+    LayerSparseKvCache, MlaV4Attention, MlaV4Config, V4HybridPagePool, V4RopeTables, V4Router,
+    V4_NATIVE_BLOCK_SIZE,
 };
 use crate::models::layers::mask::get_attention_causal_mask;
 use crate::models::layers::mlp::MLP;
@@ -18,6 +19,7 @@ use candle_nn::{Activation, Module};
 use parking_lot::{Mutex, RwLock};
 use std::iter::zip;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 /// DeepSeek V4 specific config fields parsed from extra_config_json
@@ -219,6 +221,8 @@ pub struct DeepSeekV4DecoderLayer {
     compressor_state: Mutex<Option<CompressorDecodeState>>,
     indexer_state: Mutex<Option<IndexerDecodeState>>,
     decode_buffers: Mutex<Option<LayerDecodeBuffers>>,
+    hybrid_pool: Arc<Mutex<Option<V4HybridPagePool>>>,
+    layer_idx: usize,
     max_seq_len: usize,
     qk_rope_head_dim: usize,
     #[allow(dead_code)]
@@ -229,6 +233,13 @@ pub struct DeepSeekV4DecoderLayer {
     compressor: Option<CompressorWeights>,
     indexer: Option<IndexerWeights>,
     sliding_window: usize,
+    /// False after reset/clear; true after any forward that wrote scratch.
+    /// Prevents SWA-only layers (compressed_len always 0) from hydrating mid-request.
+    scratch_valid: AtomicBool,
+    /// Absolute native length covered by current scratch (for chunked continue).
+    scratch_len: std::sync::atomic::AtomicUsize,
+    /// `block_table[0]` identity for scratch; `u32::MAX` if unset.
+    scratch_page0: std::sync::atomic::AtomicU32,
 }
 
 impl DeepSeekV4DecoderLayer {
@@ -242,6 +253,7 @@ impl DeepSeekV4DecoderLayer {
         v4_cfg: &DeepSeekV4Config,
         dtype: DType,
         layer_idx: usize,
+        hybrid_pool: Arc<Mutex<Option<V4HybridPagePool>>>,
     ) -> Result<Self> {
         let is_qvar_builder = vb.is_qvar_builder();
 
@@ -429,6 +441,8 @@ impl DeepSeekV4DecoderLayer {
             compressor_state: Mutex::new(None),
             indexer_state: Mutex::new(None),
             decode_buffers: Mutex::new(None),
+            hybrid_pool,
+            layer_idx,
             max_seq_len,
             qk_rope_head_dim: mla_cfg.qk_rope_head_dim,
             hc_mult: v4_cfg.hc_mult,
@@ -438,6 +452,9 @@ impl DeepSeekV4DecoderLayer {
             compressor,
             indexer,
             sliding_window: v4_cfg.sliding_window,
+            scratch_valid: AtomicBool::new(false),
+            scratch_len: std::sync::atomic::AtomicUsize::new(0),
+            scratch_page0: std::sync::atomic::AtomicU32::new(u32::MAX),
         })
     }
 
@@ -515,7 +532,700 @@ impl DeepSeekV4DecoderLayer {
         if let Some(state) = self.indexer_state.lock().as_mut() {
             state.reset()?;
         }
+        self.scratch_valid.store(false, Ordering::Relaxed);
+        self.scratch_len.store(0, Ordering::Relaxed);
+        self.scratch_page0.store(u32::MAX, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// Fresh single-shot prefill (Phase 0 golden path). Used when `start_pos==0`.
+    fn prefill_fresh(
+        &mut self,
+        attn_normed: &Tensor,
+        qr: &Tensor,
+        seq_len: usize,
+    ) -> Result<Tensor> {
+        let kv = self.self_attn.wkv_forward(attn_normed)?.contiguous()?;
+        self.rope.apply_inplace(&kv, 0, false)?;
+        attention_rs::deepseek_v4::fp8_act_quant_nope_bf16_inplace(
+            &kv,
+            1,
+            self.self_attn.get_head_dim(),
+            self.qk_rope_head_dim,
+            64,
+        )?;
+
+        let window_topk = self.sliding_window.min(seq_len);
+        let mut topk_idxs = attention_rs::deepseek_v4::window_topk_indices(
+            seq_len,
+            self.sliding_window,
+            window_topk,
+            attn_normed.device(),
+        )?;
+        let mut total_topk = window_topk;
+        let mut compressed_kv = None;
+        let mut kv_combined = kv.clone();
+
+        if let Some(compressor) = &self.compressor {
+            if seq_len >= compressor.ratio {
+                let compressed =
+                    compressor.prefill(attn_normed, seq_len, Some(&self.rope), 0, false)?;
+                let compressed_len = compressed.dim(0)?;
+                let offset = seq_len;
+                let compress_idxs = if let Some(indexer) = &self.indexer {
+                    let scores = indexer.scores_prefill(
+                        attn_normed,
+                        qr,
+                        seq_len,
+                        compressed_len,
+                        &self.rope,
+                    )?;
+                    indexer.topk_prefill(&scores, seq_len, compressed_len, offset)?
+                } else {
+                    attention_rs::deepseek_v4::compress_topk_indices(
+                        seq_len,
+                        compressed_len,
+                        compressor.ratio,
+                        offset,
+                        attn_normed.device(),
+                    )?
+                };
+                let compress_topk = compress_idxs.dim(1)?;
+                topk_idxs = attention_rs::deepseek_v4::concat_topk_indices(
+                    &topk_idxs,
+                    &compress_idxs,
+                    seq_len,
+                    window_topk,
+                    compress_topk,
+                )?;
+                total_topk += compress_topk;
+                // Single allocation instead of Tensor::cat (avoids temporary peak).
+                let head_dim = self.self_attn.get_head_dim();
+                let total = seq_len + compressed_len;
+                let combined = Tensor::zeros((total, head_dim), DType::BF16, attn_normed.device())?;
+                attention_rs::deepseek_v4::copy_contiguous_into(&combined, &kv, 0)?;
+                attention_rs::deepseek_v4::copy_contiguous_into(
+                    &combined,
+                    &compressed,
+                    seq_len * head_dim,
+                )?;
+                kv_combined = combined;
+                compressed_kv = Some(compressed);
+            }
+        }
+
+        let output = self.self_attn.sparse_attn(
+            attn_normed,
+            qr,
+            &self.rope,
+            0,
+            &kv_combined,
+            &topk_idxs,
+            kv_combined.dim(0)?,
+            total_topk,
+        )?;
+        self.ensure_decode_buffers(attn_normed.device())?;
+        {
+            let mut sparse = self.sparse_kv.lock();
+            let sparse = sparse.as_mut().expect("sparse cache ensured");
+            sparse.reset()?;
+            // Keep Phase-0 golden window layout for fresh prefills.
+            sparse.seed_window_from_prefill(&kv)?;
+            if let Some(compressed) = &compressed_kv {
+                sparse.seed_compressed_from_prefill(compressed)?;
+            }
+        }
+
+        if let Some(compressor) = &self.compressor {
+            let mut compressor_state = self.compressor_state.lock();
+            let state = compressor_state.as_mut().expect("compressor state ensured");
+            seed_compressor_decode_state(
+                compressor,
+                attn_normed,
+                state,
+                &self.rope,
+                seq_len,
+                false,
+            )?;
+        }
+
+        if let Some(indexer) = &self.indexer {
+            let mut indexer_state = self.indexer_state.lock();
+            let state = indexer_state.as_mut().expect("indexer state ensured");
+            state.reset()?;
+            if seq_len >= indexer.compressor.ratio {
+                let indexer_kv =
+                    indexer
+                        .compressor
+                        .prefill(attn_normed, seq_len, Some(&self.rope), 0, false)?;
+                let indexer_kv = indexer_kv.contiguous()?;
+                attention_rs::deepseek_v4::hadamard_fp4_quant_bf16_inplace(
+                    &indexer_kv,
+                    1,
+                    indexer.index_head_dim,
+                )?;
+                state.seed_from_prefill(&indexer_kv)?;
+            }
+            seed_compressor_decode_state(
+                &indexer.compressor,
+                attn_normed,
+                &mut state.compressor_state,
+                &self.rope,
+                seq_len,
+                true,
+            )?;
+        }
+        Ok(output)
+    }
+
+    /// One-token sparse decode step (write KV/compressor then attend).
+    /// Used by decode and by chunked/prefix continue (causal: write→attend per token).
+    fn decode_one_token(
+        &mut self,
+        attn_normed: &Tensor,
+        qr: &Tensor,
+        positions: &Tensor,
+        abs_pos: usize,
+    ) -> Result<Tensor> {
+        self.ensure_decode_buffers(attn_normed.device())?;
+        let bufs = self.decode_buffers.lock();
+        let bufs = bufs.as_ref().expect("decode buffers ensured");
+
+        let kv = self.self_attn.wkv_forward(attn_normed)?.contiguous()?;
+        self.rope.apply_from_positions(&kv, positions, 0, false)?;
+        attention_rs::deepseek_v4::fp8_act_quant_nope_bf16_inplace(
+            &kv,
+            1,
+            self.self_attn.get_head_dim(),
+            self.qk_rope_head_dim,
+            64,
+        )?;
+        self.sparse_kv
+            .lock()
+            .as_mut()
+            .expect("sparse cache ensured")
+            .write_window_token_from_pos(&kv, positions)?;
+
+        if let Some(compressor) = &self.compressor {
+            let weighted = bufs
+                .compressor_weighted
+                .as_ref()
+                .expect("compressor weighted buffer");
+            let out = bufs.compressor_out.as_ref().expect("compressor out buffer");
+            let emitted = {
+                let state = self.compressor_state.lock();
+                let state = state.as_ref().expect("compressor state ensured");
+                compressor.decode_graph(
+                    attn_normed,
+                    state,
+                    positions,
+                    weighted,
+                    out,
+                    Some(&self.rope),
+                    false,
+                )?
+            };
+            {
+                let mut sparse = self.sparse_kv.lock();
+                let sparse = sparse.as_mut().expect("sparse cache ensured");
+                sparse.write_compressed_row_from_pos(&emitted, positions)?;
+                let ratio = sparse.compress_ratio.max(1);
+                if (abs_pos + 1) % ratio == 0 {
+                    let row = abs_pos / ratio;
+                    sparse.compressed_len = sparse.compressed_len.max(row + 1);
+                }
+            }
+        }
+
+        if let Some(indexer) = &self.indexer {
+            let weighted = bufs
+                .indexer_compressor_weighted
+                .as_ref()
+                .expect("indexer compressor weighted buffer");
+            let out = bufs
+                .indexer_compressor_out
+                .as_ref()
+                .expect("indexer compressor out buffer");
+            let emitted = {
+                let state = self.indexer_state.lock();
+                let state = state.as_ref().expect("indexer state ensured");
+                indexer.compressor.decode_graph(
+                    attn_normed,
+                    &state.compressor_state,
+                    positions,
+                    weighted,
+                    out,
+                    Some(&self.rope),
+                    true,
+                )?
+            };
+            {
+                let mut istate = self.indexer_state.lock();
+                let istate = istate.as_mut().expect("indexer state ensured");
+                istate.write_compressed_from_pos(&emitted, positions, indexer.compressor.ratio)?;
+                let ratio = indexer.compressor.ratio.max(1);
+                if (abs_pos + 1) % ratio == 0 {
+                    let row = abs_pos / ratio;
+                    istate.compressed_len = istate.compressed_len.max(row + 1);
+                }
+            }
+        }
+
+        let win = self.sliding_window;
+        attention_rs::deepseek_v4::window_topk_indices_decode_from_pos_into(
+            positions,
+            win,
+            &bufs.window_topk,
+        )?;
+
+        let compress_topk = if self.indexer.is_some() {
+            self.indexer.as_ref().unwrap().index_topk
+        } else if self.compressor.is_some() {
+            self.sparse_kv
+                .lock()
+                .as_ref()
+                .expect("sparse cache ensured")
+                .compressed_slots
+        } else {
+            0
+        };
+
+        if self.compressor.is_some() {
+            if let Some(indexer) = &self.indexer {
+                let state = self.indexer_state.lock();
+                let state = state.as_ref().expect("indexer state ensured");
+                let score_len = state.compressed_len.max(1).min(state.max_compressed_len);
+                let scores = bufs.indexer_scores.as_ref().expect("indexer scores buffer");
+                indexer.scores_decode_from_positions_into(
+                    attn_normed,
+                    qr,
+                    &state.kv_cache,
+                    score_len,
+                    &self.rope,
+                    positions,
+                    scores,
+                )?;
+                attention_rs::deepseek_v4::indexer_mask_scores_by_position(
+                    scores,
+                    positions,
+                    self.compression.ratio().max(1),
+                )?;
+                let topk_row = bufs.compress_topk.narrow(0, 0, 1)?.squeeze(0)?;
+                indexer.topk_decode_into(scores, score_len, win, &topk_row)?;
+            } else {
+                attention_rs::deepseek_v4::compress_topk_indices_decode_from_pos_into(
+                    positions,
+                    compress_topk,
+                    win,
+                    self.compression.ratio().max(1),
+                    &bufs.compress_topk,
+                )?;
+            }
+        }
+
+        attention_rs::deepseek_v4::concat_topk_indices_into(
+            &bufs.window_topk,
+            &bufs.compress_topk,
+            1,
+            win,
+            compress_topk,
+            &bufs.concat_topk,
+        )?;
+        let total_topk = win + compress_topk;
+
+        let (attention_kv, kv_len) = {
+            let sparse_cache = self.sparse_kv.lock();
+            let sparse_cache = sparse_cache.as_ref().expect("sparse cache ensured");
+            (sparse_cache.kv.clone(), sparse_cache.total_slots().max(1))
+        };
+        self.self_attn.sparse_attn_from_positions(
+            attn_normed,
+            qr,
+            &self.rope,
+            positions,
+            &attention_kv,
+            &bufs.concat_topk,
+            &bufs.attn_out,
+            kv_len,
+            total_topk,
+        )
+    }
+
+    /// Chunked / prefix continue: causal per-token decode (not bulk write-then-attend).
+    fn prefill_continue_via_decode(
+        &mut self,
+        attn_normed: &Tensor,
+        qr: &Tensor,
+        positions: &Tensor,
+        start_pos: usize,
+        seq_len: usize,
+        block_table: &[u32],
+    ) -> Result<Tensor> {
+        let mut outs: Vec<Tensor> = Vec::with_capacity(seq_len);
+        let mut sync_from = start_pos;
+        for t in 0..seq_len {
+            let xs = attn_normed.narrow(0, t, 1)?.contiguous()?;
+            let qr_t = qr.narrow(0, t, 1)?.contiguous()?;
+            let pos = positions.narrow(0, t, 1)?.contiguous()?;
+            outs.push(self.decode_one_token(&xs, &qr_t, &pos, start_pos + t)?);
+            let abs_end = start_pos + t + 1;
+            if abs_end % V4_NATIVE_BLOCK_SIZE == 0 || t + 1 == seq_len {
+                let n = abs_end - sync_from;
+                if n > 0 {
+                    self.sync_to_pages(sync_from, n, block_table)?;
+                }
+                sync_from = abs_end;
+            }
+        }
+        if outs.len() == 1 {
+            Ok(outs.pop().unwrap())
+        } else {
+            let refs: Vec<&Tensor> = outs.iter().collect();
+            Tensor::cat(&refs, 0)
+        }
+    }
+
+    /// Hydrate sparse + compressor residual from hybrid pages when scratch was
+    /// cleared or belongs to a different sequence (prefix-cache hit).
+    /// Same-request chunked continue keeps live scratch via identity match.
+    fn hydrate_from_pages_if_needed(&self, start_pos: usize, block_table: &[u32]) -> Result<()> {
+        if start_pos == 0 || block_table.is_empty() {
+            return Ok(());
+        }
+        let page0 = block_table[0];
+        if self.scratch_valid.load(Ordering::Relaxed)
+            && self.scratch_len.load(Ordering::Relaxed) == start_pos
+            && self.scratch_page0.load(Ordering::Relaxed) == page0
+        {
+            return Ok(());
+        }
+        // Prefix hits must land on a native-block boundary where residual was frozen.
+        if start_pos % V4_NATIVE_BLOCK_SIZE != 0 {
+            candle_core::bail!(
+                "DeepSeek V4 prefix hit at {} is not native-block aligned ({})",
+                start_pos,
+                V4_NATIVE_BLOCK_SIZE
+            );
+        }
+        let device = {
+            let sparse = self.sparse_kv.lock();
+            if let Some(sparse) = sparse.as_ref() {
+                sparse.kv.device().clone()
+            } else {
+                let pool_guard = self.hybrid_pool.lock();
+                let Some(pool) = pool_guard.as_ref() else {
+                    return Ok(());
+                };
+                let Some(layer) = pool.layers.first() else {
+                    return Ok(());
+                };
+                layer.swa.device().clone()
+            }
+        };
+        self.ensure_decode_buffers(&device)?;
+        let pool_guard = self.hybrid_pool.lock();
+        let Some(pool) = pool_guard.as_ref() else {
+            return Ok(());
+        };
+        if !pool.residual_frozen_at(start_pos, block_table) {
+            candle_core::bail!(
+                "DeepSeek V4 prefix hit at {}: residual was never frozen at this boundary — refusing unsafe continue",
+                start_pos
+            );
+        }
+        let ratio = self.compression.ratio();
+        let compressed_len = if ratio == 0 { 0 } else { start_pos / ratio };
+        {
+            let mut sparse = self.sparse_kv.lock();
+            let sparse = sparse.as_mut().expect("sparse cache ensured");
+            sparse.reset()?;
+            pool.gather_sparse_into(
+                self.layer_idx,
+                &sparse.kv,
+                sparse.sliding_window,
+                compressed_len,
+                start_pos,
+                block_table,
+            )?;
+            sparse.compressed_len = compressed_len.min(sparse.compressed_slots);
+        }
+        if let Some(state) = self.compressor_state.lock().as_mut() {
+            pool.load_residual_into_state(
+                self.layer_idx,
+                &state.kv_state,
+                &state.score_state,
+                start_pos,
+                block_table,
+                false,
+            )?;
+        }
+        if let Some(state) = self.indexer_state.lock().as_mut() {
+            pool.load_residual_into_state(
+                self.layer_idx,
+                &state.compressor_state.kv_state,
+                &state.compressor_state.score_state,
+                start_pos,
+                block_table,
+                true,
+            )?;
+            let compressed_len = start_pos / 4;
+            if compressed_len > 0 {
+                if let Some(layer) = pool.layer(self.layer_idx) {
+                    if let Some(ic) = &layer.indexer_compressed {
+                        let n = compressed_len.min(state.max_compressed_len);
+                        let rows_per_page = V4_NATIVE_BLOCK_SIZE / 4;
+                        for abs_row in 0..n {
+                            let page_idx = abs_row / rows_per_page;
+                            let row = abs_row % rows_per_page;
+                            let Some(&page) = block_table.get(page_idx) else {
+                                continue;
+                            };
+                            let page = page as usize;
+                            if page >= pool.num_pages {
+                                continue;
+                            }
+                            let src = ic
+                                .narrow(0, page, 1)?
+                                .squeeze(0)?
+                                .narrow(0, row, 1)?
+                                .contiguous()?;
+                            attention_rs::deepseek_v4::copy_contiguous_into(
+                                &state.kv_cache,
+                                &src,
+                                abs_row * state.kv_cache.dim(1)?,
+                            )?;
+                        }
+                        state.compressed_len = n;
+                    }
+                }
+            }
+        }
+        self.scratch_valid.store(true, Ordering::Relaxed);
+        self.scratch_len.store(start_pos, Ordering::Relaxed);
+        self.scratch_page0.store(block_table[0], Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn mark_scratch_identity(&self, native_len: usize, block_table: &[u32]) {
+        self.scratch_valid.store(true, Ordering::Relaxed);
+        self.scratch_len.store(native_len, Ordering::Relaxed);
+        if let Some(&page0) = block_table.first() {
+            self.scratch_page0.store(page0, Ordering::Relaxed);
+        }
+    }
+
+    fn sync_to_pages(&self, start_pos: usize, seq_len: usize, block_table: &[u32]) -> Result<()> {
+        if block_table.is_empty() || seq_len == 0 {
+            return Ok(());
+        }
+        let pool_guard = self.hybrid_pool.lock();
+        let Some(pool) = pool_guard.as_ref() else {
+            return Ok(());
+        };
+        let native_len = start_pos + seq_len;
+
+        if let Some(state) = self.compressor_state.lock().as_ref() {
+            pool.save_residual_from_state(
+                self.layer_idx,
+                &state.kv_state,
+                &state.score_state,
+                native_len,
+                block_table,
+                false,
+            )?;
+        }
+        if let Some(state) = self.indexer_state.lock().as_ref() {
+            pool.save_residual_from_state(
+                self.layer_idx,
+                &state.compressor_state.kv_state,
+                &state.compressor_state.score_state,
+                native_len,
+                block_table,
+                true,
+            )?;
+            // Mirror indexer compressed rows into indexer pages.
+            if state.compressed_len > 0 {
+                if let Some(layer) = pool.layer(self.layer_idx) {
+                    if let Some(ic) = &layer.indexer_compressed {
+                        let rows_per_page = 256 / 4;
+                        let n = state.compressed_len;
+                        for abs_row in 0..n {
+                            let page_idx = abs_row / rows_per_page;
+                            let row = abs_row % rows_per_page;
+                            let Some(&page) = block_table.get(page_idx) else {
+                                continue;
+                            };
+                            let page = page as usize;
+                            if page >= pool.num_pages {
+                                continue;
+                            }
+                            let src = state.kv_cache.narrow(0, abs_row, 1)?.contiguous()?;
+                            let dst = ic.narrow(0, page, 1)?.squeeze(0)?;
+                            let hd = dst.dim(1)?;
+                            attention_rs::deepseek_v4::copy_contiguous_into(&dst, &src, row * hd)?;
+                        }
+                    }
+                }
+            }
+        }
+
+        let sparse_guard = self.sparse_kv.lock();
+        let Some(sparse) = sparse_guard.as_ref() else {
+            return Ok(());
+        };
+        let win = sparse.sliding_window;
+        let ratio = self.compression.ratio();
+
+        if ratio > 0 && sparse.compressed_slots > 0 {
+            if start_pos == 0 {
+                if sparse.compressed_len > 0 {
+                    let rows = sparse
+                        .kv
+                        .narrow(0, win, sparse.compressed_len)?
+                        .contiguous()?;
+                    pool.write_compressed_rows(self.layer_idx, &rows, 0, block_table)?;
+                }
+            } else {
+                let first = start_pos / ratio;
+                let end = if sparse.compressed_len > first {
+                    sparse.compressed_len
+                } else {
+                    // Decode may not bump compressed_len; still mirror the boundary row.
+                    (first + 1).min(sparse.compressed_slots)
+                };
+                if end > first {
+                    let rows = sparse
+                        .kv
+                        .narrow(0, win + first, end - first)?
+                        .contiguous()?;
+                    pool.write_compressed_rows(self.layer_idx, &rows, first, block_table)?;
+                }
+            }
+        }
+
+        let abs_positions: Vec<i64> = (start_pos..start_pos + seq_len).map(|p| p as i64).collect();
+        let idxs: Vec<u32> = (start_pos..start_pos + seq_len)
+            .map(|p| (p % win) as u32)
+            .collect();
+        let idx_t = Tensor::from_vec(idxs, (seq_len,), sparse.kv.device())?;
+        let token_kv = sparse.kv.narrow(0, 0, win)?.index_select(&idx_t, 0)?;
+        pool.write_swa_rows(self.layer_idx, &token_kv, &abs_positions, block_table)?;
+        pool.update_residual_freeze(native_len, block_table);
+        drop(pool_guard);
+        self.mark_scratch_identity(native_len, block_table);
+        Ok(())
+    }
+
+    /// Snapshot compressor/indexer residual into hybrid pages at every native
+    /// block boundary so later prefix hits can hydrate. Live decode state is
+    /// restored to `seq_len` afterward. Does not change attention output.
+    fn freeze_residuals_at_boundaries(
+        &self,
+        attn_normed: &Tensor,
+        seq_len: usize,
+        block_table: &[u32],
+    ) -> Result<()> {
+        if seq_len < V4_NATIVE_BLOCK_SIZE || block_table.is_empty() {
+            return Ok(());
+        }
+        let pool_guard = self.hybrid_pool.lock();
+        let Some(pool) = pool_guard.as_ref() else {
+            return Ok(());
+        };
+        let mut boundary = V4_NATIVE_BLOCK_SIZE;
+        while boundary <= seq_len {
+            let xs = attn_normed.narrow(0, 0, boundary)?.contiguous()?;
+            if let Some(compressor) = &self.compressor {
+                let mut state = self.compressor_state.lock();
+                let state = state.as_mut().expect("compressor state ensured");
+                compressor.seed_decode_state_after_prefill(&xs, state, boundary)?;
+                pool.save_residual_from_state(
+                    self.layer_idx,
+                    &state.kv_state,
+                    &state.score_state,
+                    boundary,
+                    block_table,
+                    false,
+                )?;
+            }
+            if let Some(indexer) = &self.indexer {
+                let mut istate = self.indexer_state.lock();
+                let istate = istate.as_mut().expect("indexer state ensured");
+                indexer.compressor.seed_decode_state_after_prefill(
+                    &xs,
+                    &mut istate.compressor_state,
+                    boundary,
+                )?;
+                pool.save_residual_from_state(
+                    self.layer_idx,
+                    &istate.compressor_state.kv_state,
+                    &istate.compressor_state.score_state,
+                    boundary,
+                    block_table,
+                    true,
+                )?;
+            }
+            pool.update_residual_freeze(boundary, block_table);
+            boundary += V4_NATIVE_BLOCK_SIZE;
+        }
+        // Restore live residual to full-sequence handoff (matches prefill_fresh seed).
+        if let Some(compressor) = &self.compressor {
+            let mut state = self.compressor_state.lock();
+            let state = state.as_mut().expect("compressor state ensured");
+            compressor.seed_decode_state_after_prefill(attn_normed, state, seq_len)?;
+        }
+        if let Some(indexer) = &self.indexer {
+            let mut istate = self.indexer_state.lock();
+            let istate = istate.as_mut().expect("indexer state ensured");
+            indexer.compressor.seed_decode_state_after_prefill(
+                attn_normed,
+                &mut istate.compressor_state,
+                seq_len,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Unified prefill for fresh / chunked / prefix-hit.
+    ///
+    /// - `start_pos == 0`: golden `prefill_fresh` (any length) + page sync;
+    ///   residual frozen at each 256 boundary for prefix reuse
+    /// - `start_pos > 0`: decode-loop continue (bulk `prefill_continue` removed)
+    fn prefill_unified(
+        &mut self,
+        attn_normed: &Tensor,
+        qr: &Tensor,
+        positions: &Tensor,
+        start_pos: usize,
+        seq_len: usize,
+        block_table: &[u32],
+    ) -> Result<Tensor> {
+        if start_pos > 0 {
+            self.hydrate_from_pages_if_needed(start_pos, block_table)?;
+        }
+
+        let output = if start_pos == 0 {
+            let out = self.prefill_fresh(attn_normed, qr, seq_len)?;
+            self.sync_to_pages(0, seq_len, block_table)?;
+            if seq_len >= V4_NATIVE_BLOCK_SIZE {
+                self.freeze_residuals_at_boundaries(attn_normed, seq_len, block_table)?;
+                // Re-sync final residual/SWA after boundary freeze restored live state.
+                self.sync_to_pages(0, seq_len, block_table)?;
+            }
+            out
+        } else {
+            // Causal per-token continue (same path as decode).
+            self.prefill_continue_via_decode(
+                attn_normed,
+                qr,
+                positions,
+                start_pos,
+                seq_len,
+                block_table,
+            )?
+        };
+
+        Ok(output)
     }
 
     pub fn forward(
@@ -526,6 +1236,7 @@ impl DeepSeekV4DecoderLayer {
         _cache: Option<(&Tensor, &Tensor)>,
         input_metadata: &InputMetadata,
         input_ids: Option<&Tensor>,
+        block_table: &[u32],
     ) -> Result<HcHiddenStates> {
         // Attention branch: fused hc_pre + attn_norm -> attn -> hc_post
         let attn_norm_w = self.attn_norm.v4_weight_f32().ok_or_else(|| {
@@ -543,146 +1254,22 @@ impl DeepSeekV4DecoderLayer {
         )?;
         let qr = self.self_attn.compute_qr(&attn_normed)?;
         let seq_len = attn_normed.dims()[0];
+        // Unified metadata: start_pos = num_cached_tokens (context − chunk).
         let start_pos = if input_metadata.is_prefill {
-            // Prefill currently only supports a fresh start (start_pos=0).
-            0usize
+            input_metadata.max_context_len.saturating_sub(seq_len)
         } else {
-            // Do not D2H `positions` (I64 GPU→host reads were returning garbage in
-            // the runner process). `max_context_len` is authoritative for decode.
+            // Do not D2H `positions` (I64 GPU→host reads were returning garbage).
             input_metadata.max_context_len.saturating_sub(1)
         };
         let attn_output = if input_metadata.is_prefill {
-            if start_pos != 0 {
-                candle_core::bail!("DeepSeek V4 sparse prefill currently requires start_pos=0");
-            }
-
-            let kv = self.self_attn.wkv_forward(&attn_normed)?.contiguous()?;
-            self.rope.apply_inplace(&kv, 0, false)?;
-            // Official AttentionMLA: FP8-simulate non-rope KV dims to match QAT
-            attention_rs::deepseek_v4::fp8_act_quant_nope_bf16_inplace(
-                &kv,
-                1,
-                self.self_attn.get_head_dim(),
-                self.qk_rope_head_dim,
-                64,
-            )?;
-
-            let window_topk = self.sliding_window.min(seq_len);
-            let mut topk_idxs = attention_rs::deepseek_v4::window_topk_indices(
-                seq_len,
-                self.sliding_window,
-                window_topk,
-                attn_normed.device(),
-            )?;
-            let mut total_topk = window_topk;
-            let mut compressed_kv = None;
-            let mut kv_combined = kv.clone();
-
-            if let Some(compressor) = &self.compressor {
-                if seq_len >= compressor.ratio {
-                    let compressed =
-                        compressor.prefill(&attn_normed, seq_len, Some(&self.rope), 0, false)?;
-                    let compressed_len = compressed.dim(0)?;
-                    let offset = seq_len;
-                    let compress_idxs = if let Some(indexer) = &self.indexer {
-                        let scores = indexer.scores_prefill(
-                            &attn_normed,
-                            &qr,
-                            seq_len,
-                            compressed_len,
-                            &self.rope,
-                        )?;
-                        indexer.topk_prefill(&scores, seq_len, compressed_len, offset)?
-                    } else {
-                        attention_rs::deepseek_v4::compress_topk_indices(
-                            seq_len,
-                            compressed_len,
-                            compressor.ratio,
-                            offset,
-                            attn_normed.device(),
-                        )?
-                    };
-                    let compress_topk = compress_idxs.dim(1)?;
-                    topk_idxs = attention_rs::deepseek_v4::concat_topk_indices(
-                        &topk_idxs,
-                        &compress_idxs,
-                        seq_len,
-                        window_topk,
-                        compress_topk,
-                    )?;
-                    total_topk += compress_topk;
-                    kv_combined = Tensor::cat(&[&kv, &compressed], 0)?;
-                    compressed_kv = Some(compressed);
-                }
-            }
-
-            let output = self.self_attn.sparse_attn(
+            self.prefill_unified(
                 &attn_normed,
                 &qr,
-                &self.rope,
-                0,
-                &kv_combined,
-                &topk_idxs,
-                kv_combined.dim(0)?,
-                total_topk,
-            )?;
-            self.ensure_decode_buffers(attn_normed.device())?;
-            {
-                let mut sparse = self.sparse_kv.lock();
-                let sparse = sparse.as_mut().expect("sparse cache ensured");
-                sparse.reset()?;
-                sparse.seed_window_from_prefill(&kv)?;
-                if let Some(compressed) = &compressed_kv {
-                    sparse.seed_compressed_from_prefill(compressed)?;
-                }
-            }
-
-            if let Some(compressor) = &self.compressor {
-                let mut compressor_state = self.compressor_state.lock();
-                let state = compressor_state.as_mut().expect("compressor state ensured");
-                seed_compressor_decode_state(
-                    compressor,
-                    &attn_normed,
-                    state,
-                    &self.rope,
-                    seq_len,
-                    false,
-                )?;
-            }
-
-            if let Some(indexer) = &self.indexer {
-                let mut indexer_state = self.indexer_state.lock();
-                let state = indexer_state.as_mut().expect("indexer state ensured");
-                state.reset()?;
-                if seq_len >= indexer.compressor.ratio {
-                    // Prefill compressor leaves BF16 compressed KV; apply the same
-                    // Hadamard+FP4 transform used on decode emits so scores_decode
-                    // sees a consistent cache (Q is always Hadamard'd).
-                    let indexer_kv = indexer.compressor.prefill(
-                        &attn_normed,
-                        seq_len,
-                        Some(&self.rope),
-                        0,
-                        false,
-                    )?;
-                    let indexer_kv = indexer_kv.contiguous()?;
-                    attention_rs::deepseek_v4::hadamard_fp4_quant_bf16_inplace(
-                        &indexer_kv,
-                        1,
-                        indexer.index_head_dim,
-                    )?;
-                    state.seed_from_prefill(&indexer_kv)?;
-                }
-                seed_compressor_decode_state(
-                    &indexer.compressor,
-                    &attn_normed,
-                    &mut state.compressor_state,
-                    &self.rope,
-                    seq_len,
-                    true,
-                )?;
-            }
-            output
+                positions,
+                start_pos,
+                seq_len,
+                block_table,
+            )?
         } else {
             if seq_len != 1 {
                 candle_core::bail!(
@@ -695,165 +1282,11 @@ impl DeepSeekV4DecoderLayer {
                     self.max_seq_len
                 );
             }
-
-            self.ensure_decode_buffers(attn_normed.device())?;
-            let bufs = self.decode_buffers.lock();
-            let bufs = bufs.as_ref().expect("decode buffers ensured");
-
-            let kv = self.self_attn.wkv_forward(&attn_normed)?.contiguous()?;
-            self.rope.apply_from_positions(&kv, positions, 0, false)?;
-            attention_rs::deepseek_v4::fp8_act_quant_nope_bf16_inplace(
-                &kv,
-                1,
-                self.self_attn.get_head_dim(),
-                self.qk_rope_head_dim,
-                64,
-            )?;
-            self.sparse_kv
-                .lock()
-                .as_mut()
-                .expect("sparse cache ensured")
-                .write_window_token_from_pos(&kv, positions)?;
-
-            if let Some(compressor) = &self.compressor {
-                let weighted = bufs
-                    .compressor_weighted
-                    .as_ref()
-                    .expect("compressor weighted buffer");
-                let out = bufs.compressor_out.as_ref().expect("compressor out buffer");
-                let emitted = {
-                    let state = self.compressor_state.lock();
-                    let state = state.as_ref().expect("compressor state ensured");
-                    compressor.decode_graph(
-                        &attn_normed,
-                        state,
-                        positions,
-                        weighted,
-                        out,
-                        Some(&self.rope),
-                        false,
-                    )?
-                };
-                self.sparse_kv
-                    .lock()
-                    .as_mut()
-                    .expect("sparse cache ensured")
-                    .write_compressed_row_from_pos(&emitted, positions)?;
-            }
-
-            if let Some(indexer) = &self.indexer {
-                let weighted = bufs
-                    .indexer_compressor_weighted
-                    .as_ref()
-                    .expect("indexer compressor weighted buffer");
-                let out = bufs
-                    .indexer_compressor_out
-                    .as_ref()
-                    .expect("indexer compressor out buffer");
-                let emitted = {
-                    let state = self.indexer_state.lock();
-                    let state = state.as_ref().expect("indexer state ensured");
-                    indexer.compressor.decode_graph(
-                        &attn_normed,
-                        &state.compressor_state,
-                        positions,
-                        weighted,
-                        out,
-                        Some(&self.rope),
-                        true,
-                    )?
-                };
-                self.indexer_state
-                    .lock()
-                    .as_mut()
-                    .expect("indexer state ensured")
-                    .write_compressed_from_pos(&emitted, positions, indexer.compressor.ratio)?;
-            }
-
-            let win = self.sliding_window;
-            attention_rs::deepseek_v4::window_topk_indices_decode_from_pos_into(
-                positions,
-                win,
-                &bufs.window_topk,
-            )?;
-
-            // compress_topk is a per-layer constant (index_topk or compressed slot
-            // capacity). Never branch on it for kernel topology — always fill
-            // compress_topk (when this layer has a compressor) and always concat
-            // into concat_topk so sparse_attn sees a fixed tensor address.
-            let compress_topk = if self.indexer.is_some() {
-                self.indexer.as_ref().unwrap().index_topk
-            } else if self.compressor.is_some() {
-                self.sparse_kv
-                    .lock()
-                    .as_ref()
-                    .expect("sparse cache ensured")
-                    .compressed_slots
-            } else {
-                0
-            };
-
-            if self.compressor.is_some() {
-                if let Some(indexer) = &self.indexer {
-                    let state = self.indexer_state.lock();
-                    let state = state.as_ref().expect("indexer state ensured");
-                    // Score/topk over the live compressed length, not the config
-                    // capacity. Capacity can be max_position_embeddings (1M+) and
-                    // must not be passed into shared-memory topk kernels.
-                    let score_len = state.compressed_len.max(1).min(state.max_compressed_len);
-                    let scores = bufs.indexer_scores.as_ref().expect("indexer scores buffer");
-                    indexer.scores_decode_from_positions_into(
-                        &attn_normed,
-                        &qr,
-                        &state.kv_cache,
-                        score_len,
-                        &self.rope,
-                        positions,
-                        scores,
-                    )?;
-                    attention_rs::deepseek_v4::indexer_mask_scores_by_position(
-                        scores,
-                        positions,
-                        self.compression.ratio().max(1),
-                    )?;
-                    let topk_row = bufs.compress_topk.narrow(0, 0, 1)?.squeeze(0)?;
-                    indexer.topk_decode_into(scores, score_len, win, &topk_row)?;
-                } else {
-                    attention_rs::deepseek_v4::compress_topk_indices_decode_from_pos_into(
-                        positions,
-                        compress_topk,
-                        win,
-                        self.compression.ratio().max(1),
-                        &bufs.compress_topk,
-                    )?;
-                }
-            }
-
-            attention_rs::deepseek_v4::concat_topk_indices_into(
-                &bufs.window_topk,
-                &bufs.compress_topk,
-                1,
-                win,
-                compress_topk,
-                &bufs.concat_topk,
-            )?;
-            let total_topk = win + compress_topk;
-
-            let sparse_cache = self.sparse_kv.lock();
-            let sparse_cache = sparse_cache.as_ref().expect("sparse cache ensured");
-            let kv_len = sparse_cache.total_slots().max(1);
-            let attention_kv = sparse_cache.kv.clone();
-            self.self_attn.sparse_attn_from_positions(
-                &attn_normed,
-                &qr,
-                &self.rope,
-                positions,
-                &attention_kv,
-                &bufs.concat_topk,
-                &bufs.attn_out,
-                kv_len,
-                total_topk,
-            )?
+            // Prefix-hit may land on decode when the new prompt is fully cached.
+            self.hydrate_from_pages_if_needed(start_pos, block_table)?;
+            let attn_out = self.decode_one_token(&attn_normed, &qr, positions, start_pos)?;
+            self.sync_to_pages(start_pos, seq_len, block_table)?;
+            attn_out
         };
 
         let attn_branch = attn_output.to_dtype(DType::F32)?.contiguous()?;
@@ -904,6 +1337,7 @@ pub struct DeepSeekV4ForCausalLM {
     dtype: DType,
     vocab_size: usize,
     is_qvar_builder: bool,
+    hybrid_pool: Arc<Mutex<Option<V4HybridPagePool>>>,
 }
 
 impl DeepSeekV4ForCausalLM {
@@ -947,10 +1381,23 @@ impl DeepSeekV4ForCausalLM {
             }
         };
 
-        // Sparse RoPE / indexer / compressor capacity comes from the model
-        // config (`max_position_embeddings`), not engine `max_model_len`.
-        // Scheduling length is planned later by the KV allocator like other models.
-        let sparse_max_seq_len = config.max_position_embeddings.max(1);
+        // Private sparse / indexer / compressor caches must NOT be sized to the
+        // full `max_position_embeddings` (often 1M). That pre-allocates multi-GB
+        // per GPU and makes prefix snapshots OOM after the first chunk.
+        // Prefer engine `max_model_len` when set; otherwise cap to 128k (still
+        // above default prefill chunk × several steps). RoPE tables share this.
+        let sparse_max_seq_len = config
+            .max_model_len
+            .unwrap_or(131_072)
+            .min(config.max_position_embeddings.max(1))
+            .max(16_384);
+        if sparse_max_seq_len < config.max_position_embeddings {
+            crate::log_warn!(
+                "DeepSeek V4 sparse KV capacity capped at {} tokens (model max_position_embeddings={}); set --max-model-len to raise.",
+                sparse_max_seq_len,
+                config.max_position_embeddings
+            );
+        }
         let rope_scaling = config.rope_scaling.as_ref();
         let yarn_factor = rope_scaling
             .and_then(|m| m.get("factor"))
@@ -998,6 +1445,7 @@ impl DeepSeekV4ForCausalLM {
         )?);
 
         let reporter = progress_reporter.clone();
+        let hybrid_pool = Arc::new(Mutex::new(None));
         let mut layers = Vec::new();
         for i in 0..config.num_hidden_layers {
             let layer_vb = if is_qvar_builder {
@@ -1020,6 +1468,7 @@ impl DeepSeekV4ForCausalLM {
                 &v4_cfg,
                 dtype,
                 i,
+                hybrid_pool.clone(),
             )?;
             layers.push(Mutex::new(layer));
             reporter.write().set_progress(i + 1);
@@ -1096,7 +1545,48 @@ impl DeepSeekV4ForCausalLM {
             dtype,
             vocab_size,
             is_qvar_builder,
+            hybrid_pool,
         })
+    }
+
+    pub fn init_hybrid_page_pool(&self, num_pages: usize) -> Result<()> {
+        let head_dim = self
+            .layers
+            .first()
+            .map(|l| l.lock().self_attn.get_head_dim())
+            .unwrap_or(512);
+        let specs = build_v4_cache_specs(
+            &self.v4_cfg.compress_ratios,
+            self.v4_cfg.sliding_window,
+            head_dim,
+            self.v4_cfg.index_head_dim,
+        );
+        let pool = V4HybridPagePool::new(&specs, num_pages, &self.device)?;
+        *self.hybrid_pool.lock() = Some(pool);
+        Ok(())
+    }
+
+    pub fn clear_seq_state(&self, _seq_id: usize) {
+        for layer in &self.layers {
+            let _ = layer.lock().reset_decode_state();
+        }
+    }
+
+    /// Sync hybrid pages from live scratch after CUDA-graph decode replay
+    /// (graph path skips `forward`, so `sync_to_pages` would otherwise not run).
+    pub fn sync_hybrid_pages_after_decode(
+        &self,
+        block_table: &[u32],
+        native_len: usize,
+    ) -> Result<()> {
+        if block_table.is_empty() || native_len == 0 {
+            return Ok(());
+        }
+        let start_pos = native_len.saturating_sub(1);
+        for layer in &self.layers {
+            layer.lock().sync_to_pages(start_pos, 1, block_table)?;
+        }
+        Ok(())
     }
 
     pub fn embed_forward(&self, xs: &Tensor) -> Result<Tensor> {
@@ -1143,6 +1633,16 @@ impl DeepSeekV4ForCausalLM {
             self.embed_forward(input_ids)?
         };
 
+        // Host block table prepared in runner `prepare_prefill` / `prepare_decode`
+        // (CPU Vec — no D2H, CUDA-graph compatible).
+        let empty_bt: Vec<u32> = Vec::new();
+        let block_table: &[u32] = input_metadata
+            .block_tables_host
+            .as_ref()
+            .and_then(|bts| bts.first())
+            .map(|v| v.as_slice())
+            .unwrap_or(&empty_bt);
+
         // Expand to HC hidden states
         let mut hc_hidden = hc_expand(&xs, self.v4_cfg.hc_mult)?;
 
@@ -1163,6 +1663,7 @@ impl DeepSeekV4ForCausalLM {
                     Some((k_cache, v_cache)),
                     input_metadata,
                     layer_input_ids,
+                    block_table,
                 )?;
             }
         }

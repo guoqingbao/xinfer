@@ -2268,6 +2268,27 @@ pub fn prepare_engine_config(
     econfig.prefill_chunk_size =
         crate::utils::config::normalize_prefill_chunk_size(econfig.prefill_chunk_size);
 
+    // DeepSeek V4 hybrid pages use a 256-token native unit (vLLM). Force before
+    // BlockManager / runner slot_mapping so page indices match engine blocks.
+    if let Some(arches) = &config.architectures {
+        if arches.iter().any(|a| {
+            matches!(
+                a.as_str(),
+                "DeepseekV4ForCausalLM" | "deepseek_v4" | "deepseek4"
+            )
+        }) {
+            let native = crate::models::layers::ds_v4::V4_NATIVE_BLOCK_SIZE;
+            if econfig.block_size != native {
+                crate::log_warn!(
+                    "DeepSeek V4: forcing engine block_size {} → {} (native hybrid page unit)",
+                    econfig.block_size,
+                    native
+                );
+                econfig.block_size = native;
+            }
+        }
+    }
+
     let config_model_len = resolve_config_model_len(config, config_tokenizer);
 
     econfig.config_model_len = Some(config_model_len);

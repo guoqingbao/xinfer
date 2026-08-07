@@ -351,4 +351,83 @@ impl LayerSparseKvCache {
         )?;
         Ok(())
     }
+
+    /// Seed the decode ring from the chronological last tokens of a sequence
+    /// whose absolute length is `total_len`.
+    ///
+    /// `token_kv` may be the full sequence or just the last `min(win, total_len)`
+    /// rows (e.g. contiguous window portion from continued prefill).
+    pub fn seed_window_from_last(&mut self, token_kv: &Tensor, total_len: usize) -> Result<()> {
+        let n = token_kv.dim(0)?;
+        if total_len == 0 || n == 0 {
+            return Ok(());
+        }
+        let win = self.sliding_window;
+        let need = total_len.min(win);
+        if n < need {
+            candle_core::bail!(
+                "seed_window_from_last: need {need} rows for total_len={total_len}, got {n}"
+            );
+        }
+        let last = if n == need {
+            token_kv.clone()
+        } else {
+            token_kv.narrow(0, n - need, need)?
+        };
+        self.seed_window_from_prefill(&last)
+    }
+
+    /// Gather `n` chronological window tokens ending at `end_exclusive`
+    /// (absolute positions `[end_exclusive-n, end_exclusive)`).
+    pub fn gather_chrono_window(&self, end_exclusive: usize, n: usize) -> Result<Tensor> {
+        if n == 0 {
+            return Tensor::zeros((0, self.head_dim), DType::BF16, self.kv.device());
+        }
+        if end_exclusive < n {
+            candle_core::bail!("gather_chrono_window: end_exclusive={end_exclusive} < n={n}");
+        }
+        let win = self.sliding_window;
+        let start = end_exclusive - n;
+        let idxs: Vec<u32> = (start..end_exclusive).map(|p| (p % win) as u32).collect();
+        let idx_t = Tensor::from_vec(idxs, (n,), self.kv.device())?.to_dtype(DType::U32)?;
+        self.kv.narrow(0, 0, win)?.index_select(&idx_t, 0)
+    }
+
+    /// Batched ring write: row `i` lands at `positions[i] % sliding_window`.
+    pub fn write_window_rows_from_pos(
+        &mut self,
+        token_kv: &Tensor,
+        positions: &Tensor,
+    ) -> Result<()> {
+        attention_rs::deepseek_v4::write_window_rows_from_pos(
+            &self.kv,
+            token_kv,
+            positions,
+            self.sliding_window,
+            self.head_dim,
+        )
+    }
+
+    /// Write compressed rows at `[win + start_row, ...)`.
+    pub fn write_compressed_rows_at(&mut self, rows: &Tensor, start_row: usize) -> Result<()> {
+        let n = rows.dim(0)?;
+        if start_row + n > self.compressed_slots {
+            candle_core::bail!(
+                "compressed rows [{start_row}, {}) exceed capacity {}",
+                start_row + n,
+                self.compressed_slots
+            );
+        }
+        if n > 0 {
+            let win = self.sliding_window;
+            let rows = rows.contiguous()?;
+            attention_rs::deepseek_v4::copy_contiguous_into(
+                &self.kv,
+                &rows,
+                (win + start_row) * self.head_dim,
+            )?;
+        }
+        self.compressed_len = self.compressed_len.max(start_row + n);
+        Ok(())
+    }
 }
