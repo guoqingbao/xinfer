@@ -536,6 +536,7 @@ xinfer --m Qwen/Qwen3.6-27B-FP8 --ui-server --enable-tool-grammar
 | Variable | Description |
 |---|---|
 | `XINFER_NVFP4_FORCE_LUT=1` | Force software NVFP4 decode to use the LUT-based dequantization path (higher precision) instead of hardware FP4 intrinsics on Blackwell (SM100+). Useful when decode precision matters more than peak throughput. |
+| `XINFER_DISABLE_FLASHMLA=1` | Disable FlashMLA (SM90) and FlashInfer SM120 sparse MLA for DeepSeek V4; fall back to the custom BF16 sparse attention kernel. Default is off — accelerated sparse is used when the GPU arch and shapes allow it. |
 | `XINFER_SSE_BUFFER_SIZE=256` | Size of the bounded SSE streaming buffer per client connection (default: 256). Increase for slow network proxies or high-throughput models. |
 | `SM90_LOWER_PRECISION_GDN_PREFILL=1` | Enable the FlashInfer SM90 persistent kernel for GatedDeltaNet (GDN) prefill on Hopper GPUs (SM90). Delivers faster prefill speedup for Qwen3.5/3.6, with a slight precision trade-off. |
 

@@ -12,8 +12,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 pub struct V4LayerPages {
     /// `[num_pages, 256, head_dim]` BF16 token KV (SWA ring is a view over these).
     pub swa: Tensor,
+    /// Optional FlashMLA-ABI FP8 FOOTER pages: `[num_pages, 256 * 584]` U8.
+    /// Auto-allocated when sparse FlashMLA/FlashInfer path is active.
+    pub swa_fp8: Option<Tensor>,
     /// `[num_pages, 256/ratio, head_dim]` BF16 compressed KV (None for SWA-only).
     pub compressed: Option<Tensor>,
+    /// Optional FP8 FOOTER for compressed pages: `[num_pages, rows * 584]` U8.
+    pub compressed_fp8: Option<Tensor>,
     /// `[num_pages, residual_window, 2*state_width]` F32 packed `[kv|score]`.
     pub residual: Option<Tensor>,
     /// `[num_pages, 256/4, index_head_dim]` BF16 (C4 only).
@@ -24,6 +29,7 @@ pub struct V4LayerPages {
     pub head_dim: usize,
     pub residual_window: usize,
     pub index_head_dim: Option<usize>,
+    pub fp8_kv_enabled: bool,
 }
 
 impl V4LayerPages {
@@ -33,6 +39,18 @@ impl V4LayerPages {
             DType::BF16,
             device,
         )?;
+        // Auto-enable FP8 FOOTER pages for DSV4 head_dim=512 (FlashMLA / FlashInfer ABI).
+        let fp8_kv_enabled = spec.head_dim == 512;
+        let bpt = attention_rs::deepseek_v4::fp8_kv_bytes_per_token();
+        let swa_fp8 = if fp8_kv_enabled {
+            Some(Tensor::zeros(
+                (num_pages, V4_NATIVE_BLOCK_SIZE * bpt),
+                DType::U8,
+                device,
+            )?)
+        } else {
+            None
+        };
         let compressed = if spec.compress_ratio > 0 {
             let rows = spec.compressed_entries_per_native_block();
             Some(Tensor::zeros(
@@ -40,6 +58,12 @@ impl V4LayerPages {
                 DType::BF16,
                 device,
             )?)
+        } else {
+            None
+        };
+        let compressed_fp8 = if fp8_kv_enabled && spec.compress_ratio > 0 {
+            let rows = spec.compressed_entries_per_native_block();
+            Some(Tensor::zeros((num_pages, rows * bpt), DType::U8, device)?)
         } else {
             None
         };
@@ -74,7 +98,9 @@ impl V4LayerPages {
         };
         Ok(Self {
             swa,
+            swa_fp8,
             compressed,
+            compressed_fp8,
             residual,
             indexer_compressed,
             indexer_residual,
@@ -82,6 +108,7 @@ impl V4LayerPages {
             head_dim: spec.head_dim,
             residual_window: spec.residual_window,
             index_head_dim: spec.index_head_dim,
+            fp8_kv_enabled,
         })
     }
 
@@ -91,8 +118,19 @@ impl V4LayerPages {
             return Ok(());
         }
         self.swa.narrow(0, page, 1)?.zero_()?;
+        if let Some(fp8) = &self.swa_fp8 {
+            // Candle Tensor::zero_ does not support U8.
+            let page_view = fp8.narrow(0, page, 1)?.contiguous()?;
+            let z = Tensor::zeros(page_view.dims(), DType::U8, fp8.device())?;
+            attention_rs::deepseek_v4::copy_contiguous_into(&page_view, &z, 0)?;
+        }
         if let Some(c) = &self.compressed {
             c.narrow(0, page, 1)?.zero_()?;
+        }
+        if let Some(fp8) = &self.compressed_fp8 {
+            let page_view = fp8.narrow(0, page, 1)?.contiguous()?;
+            let z = Tensor::zeros(page_view.dims(), DType::U8, fp8.device())?;
+            attention_rs::deepseek_v4::copy_contiguous_into(&page_view, &z, 0)?;
         }
         if let Some(r) = &self.residual {
             r.narrow(0, page, 1)?.zero_()?;
@@ -251,6 +289,20 @@ impl V4HybridPagePool {
             let src = token_kv.narrow(0, i, take)?.contiguous()?;
             let dst = layer.swa.narrow(0, page, 1)?.squeeze(0)?;
             attention_rs::deepseek_v4::copy_contiguous_into(&dst, &src, row * hd)?;
+            if let Some(fp8) = &layer.swa_fp8 {
+                // Pack the written BF16 rows into the matching FOOTER page slice.
+                let page_fp8 = fp8.narrow(0, page, 1)?.squeeze(0)?;
+                // Pack into a temporary aligned page buffer starting at `row`.
+                // For simplicity pack the contiguous run into an offset view via
+                // full-page pack of the BF16 page (amortized; correctness first).
+                let bf16_page = layer.swa.narrow(0, page, 1)?.squeeze(0)?.contiguous()?;
+                attention_rs::deepseek_v4::pack_fp8_kv_footer(
+                    &bf16_page.reshape((V4_NATIVE_BLOCK_SIZE, hd))?,
+                    &page_fp8,
+                    V4_NATIVE_BLOCK_SIZE,
+                    V4_NATIVE_BLOCK_SIZE,
+                )?;
+            }
             i += take;
         }
         Ok(())
@@ -294,6 +346,17 @@ impl V4HybridPagePool {
             let src = compressed.narrow(0, i, take)?.contiguous()?;
             let dst = cache.narrow(0, page, 1)?.squeeze(0)?;
             attention_rs::deepseek_v4::copy_contiguous_into(&dst, &src, row * hd)?;
+            if let (Some(fp8), Some(bf16_cache)) = (&layer.compressed_fp8, &layer.compressed) {
+                let page_fp8 = fp8.narrow(0, page, 1)?.squeeze(0)?;
+                let bf16_page = bf16_cache.narrow(0, page, 1)?.squeeze(0)?.contiguous()?;
+                let rows = bf16_page.dim(0)?;
+                attention_rs::deepseek_v4::pack_fp8_kv_footer(
+                    &bf16_page.reshape((rows, hd))?,
+                    &page_fp8,
+                    rows,
+                    rows,
+                )?;
+            }
             i += take;
         }
         Ok(())
