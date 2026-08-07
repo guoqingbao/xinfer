@@ -216,23 +216,42 @@ impl V4HybridPagePool {
             );
         }
         let bs = self.native_block_size;
-        for (i, &pos) in abs_positions.iter().enumerate() {
+        let hd = layer.head_dim;
+        // Contiguous page runs — typically ~ceil(n/256) copies instead of n.
+        let mut i = 0;
+        while i < n {
+            let pos = abs_positions[i];
             if pos < 0 {
+                i += 1;
                 continue;
             }
             let pos = pos as usize;
             let page_idx = pos / bs;
             let row = pos % bs;
+            let mut take = 1;
+            while i + take < n {
+                let p2 = abs_positions[i + take];
+                if p2 < 0 || p2 as usize != pos + take {
+                    break;
+                }
+                if (pos + take) / bs != page_idx {
+                    break;
+                }
+                take += 1;
+            }
             let Some(&page) = block_table.get(page_idx) else {
+                i += take;
                 continue;
             };
             let page = page as usize;
             if page >= self.num_pages {
+                i += take;
                 continue;
             }
-            let src = token_kv.narrow(0, i, 1)?.contiguous()?;
-            let dst = layer.swa.narrow(0, page, 1)?.squeeze(0)?; // [256, hd]
-            attention_rs::deepseek_v4::copy_contiguous_into(&dst, &src, row * layer.head_dim)?;
+            let src = token_kv.narrow(0, i, take)?.contiguous()?;
+            let dst = layer.swa.narrow(0, page, 1)?.squeeze(0)?;
+            attention_rs::deepseek_v4::copy_contiguous_into(&dst, &src, row * hd)?;
+            i += take;
         }
         Ok(())
     }
@@ -255,20 +274,27 @@ impl V4HybridPagePool {
         let ratio = layer.compress_ratio.max(1);
         let rows_per_page = V4_NATIVE_BLOCK_SIZE / ratio;
         let n = compressed.dim(0)?;
-        for i in 0..n {
+        let hd = layer.head_dim;
+        let mut i = 0;
+        while i < n {
             let abs_row = first_row + i;
             let page_idx = abs_row / rows_per_page;
             let row = abs_row % rows_per_page;
+            let room = rows_per_page - row;
+            let take = room.min(n - i);
             let Some(&page) = block_table.get(page_idx) else {
+                i += take;
                 continue;
             };
             let page = page as usize;
             if page >= self.num_pages {
+                i += take;
                 continue;
             }
-            let src = compressed.narrow(0, i, 1)?.contiguous()?;
+            let src = compressed.narrow(0, i, take)?.contiguous()?;
             let dst = cache.narrow(0, page, 1)?.squeeze(0)?;
-            attention_rs::deepseek_v4::copy_contiguous_into(&dst, &src, row * layer.head_dim)?;
+            attention_rs::deepseek_v4::copy_contiguous_into(&dst, &src, row * hd)?;
+            i += take;
         }
         Ok(())
     }
@@ -426,51 +452,70 @@ impl V4HybridPagePool {
         }
         let hd = layer.head_dim;
         let bs = self.native_block_size;
-        // Rebuild window ring from the last `sliding_window` tokens.
+        // Rebuild window ring from the last `sliding_window` tokens in page runs.
         let win_start = native_len.saturating_sub(sliding_window);
-        for pos in win_start..native_len {
+        let mut pos = win_start;
+        while pos < native_len {
             let page_idx = pos / bs;
             let row = pos % bs;
+            let room = bs - row;
+            let take = room.min(native_len - pos);
             let Some(&page) = block_table.get(page_idx) else {
+                pos += take;
                 continue;
             };
             let page = page as usize;
             if page >= self.num_pages {
+                pos += take;
                 continue;
             }
-            let src = layer
-                .swa
-                .narrow(0, page, 1)?
-                .squeeze(0)?
-                .narrow(0, row, 1)?
-                .contiguous()?;
-            let slot = pos % sliding_window;
-            attention_rs::deepseek_v4::copy_contiguous_into(sparse_kv, &src, slot * hd)?;
+            // Copy page rows into ring slots. Slots wrap; split at window boundary.
+            let mut copied = 0;
+            while copied < take {
+                let abs = pos + copied;
+                let slot = abs % sliding_window;
+                let run = (sliding_window - slot).min(take - copied);
+                let src = layer
+                    .swa
+                    .narrow(0, page, 1)?
+                    .squeeze(0)?
+                    .narrow(0, row + copied, run)?
+                    .contiguous()?;
+                attention_rs::deepseek_v4::copy_contiguous_into(sparse_kv, &src, slot * hd)?;
+                copied += run;
+            }
+            pos += take;
         }
-        // Copy compressed rows [0, compressed_len).
+        // Copy compressed rows [0, compressed_len) in page runs.
         if let Some(cache) = &layer.compressed {
             let ratio = layer.compress_ratio.max(1);
             let rows_per_page = bs / ratio;
-            for abs_row in 0..compressed_len {
+            let mut abs_row = 0;
+            while abs_row < compressed_len {
                 let page_idx = abs_row / rows_per_page;
                 let row = abs_row % rows_per_page;
+                let room = rows_per_page - row;
+                let take = room.min(compressed_len - abs_row);
                 let Some(&page) = block_table.get(page_idx) else {
+                    abs_row += take;
                     continue;
                 };
                 let page = page as usize;
                 if page >= self.num_pages {
+                    abs_row += take;
                     continue;
                 }
                 let src = cache
                     .narrow(0, page, 1)?
                     .squeeze(0)?
-                    .narrow(0, row, 1)?
+                    .narrow(0, row, take)?
                     .contiguous()?;
                 attention_rs::deepseek_v4::copy_contiguous_into(
                     sparse_kv,
                     &src,
                     (sliding_window + abs_row) * hd,
                 )?;
+                abs_row += take;
             }
         }
         Ok(())

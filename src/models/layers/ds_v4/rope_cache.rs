@@ -386,11 +386,14 @@ impl LayerSparseKvCache {
         if end_exclusive < n {
             candle_core::bail!("gather_chrono_window: end_exclusive={end_exclusive} < n={n}");
         }
-        let win = self.sliding_window;
         let start = end_exclusive - n;
-        let idxs: Vec<u32> = (start..end_exclusive).map(|p| (p % win) as u32).collect();
-        let idx_t = Tensor::from_vec(idxs, (n,), self.kv.device())?.to_dtype(DType::U32)?;
-        self.kv.narrow(0, 0, win)?.index_select(&idx_t, 0)
+        attention_rs::deepseek_v4::gather_ring_chrono(
+            &self.kv,
+            start,
+            n,
+            self.sliding_window,
+            self.head_dim,
+        )
     }
 
     /// Batched ring write: row `i` lands at `positions[i] % sliding_window`.

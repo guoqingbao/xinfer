@@ -1018,26 +1018,33 @@ impl DeepSeekV4DecoderLayer {
                     if let Some(ic) = &layer.indexer_compressed {
                         let n = compressed_len.min(state.max_compressed_len);
                         let rows_per_page = V4_NATIVE_BLOCK_SIZE / 4;
-                        for abs_row in 0..n {
+                        let hd = state.kv_cache.dim(1)?;
+                        let mut abs_row = 0;
+                        while abs_row < n {
                             let page_idx = abs_row / rows_per_page;
                             let row = abs_row % rows_per_page;
+                            let room = rows_per_page - row;
+                            let take = room.min(n - abs_row);
                             let Some(&page) = block_table.get(page_idx) else {
+                                abs_row += take;
                                 continue;
                             };
                             let page = page as usize;
                             if page >= pool.num_pages {
+                                abs_row += take;
                                 continue;
                             }
                             let src = ic
                                 .narrow(0, page, 1)?
                                 .squeeze(0)?
-                                .narrow(0, row, 1)?
+                                .narrow(0, row, take)?
                                 .contiguous()?;
                             attention_rs::deepseek_v4::copy_contiguous_into(
                                 &state.kv_cache,
                                 &src,
-                                abs_row * state.kv_cache.dim(1)?,
+                                abs_row * hd,
                             )?;
+                            abs_row += take;
                         }
                         state.compressed_len = n;
                     }
@@ -1089,20 +1096,26 @@ impl DeepSeekV4DecoderLayer {
                     if let Some(ic) = &layer.indexer_compressed {
                         let rows_per_page = 256 / 4;
                         let n = state.compressed_len;
-                        for abs_row in 0..n {
+                        let mut abs_row = 0;
+                        while abs_row < n {
                             let page_idx = abs_row / rows_per_page;
                             let row = abs_row % rows_per_page;
+                            let room = rows_per_page - row;
+                            let take = room.min(n - abs_row);
                             let Some(&page) = block_table.get(page_idx) else {
+                                abs_row += take;
                                 continue;
                             };
                             let page = page as usize;
                             if page >= pool.num_pages {
+                                abs_row += take;
                                 continue;
                             }
-                            let src = state.kv_cache.narrow(0, abs_row, 1)?.contiguous()?;
+                            let src = state.kv_cache.narrow(0, abs_row, take)?.contiguous()?;
                             let dst = ic.narrow(0, page, 1)?.squeeze(0)?;
                             let hd = dst.dim(1)?;
                             attention_rs::deepseek_v4::copy_contiguous_into(&dst, &src, row * hd)?;
+                            abs_row += take;
                         }
                     }
                 }
@@ -1270,11 +1283,253 @@ impl DeepSeekV4DecoderLayer {
         Ok(())
     }
 
+    /// Fused continued prefill (vLLM chrono-gather path).
+    ///
+    /// Layout matches cold attend: `[chrono SWA gather | compressed]`.
+    /// `gather_len = query_len + min(prefix_len, window-1)` — no ring overwrite
+    /// before attend, no per-token decode loop, one `sparse_attn`.
+    fn prefill_continue_fused(
+        &mut self,
+        attn_normed: &Tensor,
+        qr: &Tensor,
+        positions: &Tensor,
+        start_pos: usize,
+        query_len: usize,
+        block_table: &[u32],
+    ) -> Result<Tensor> {
+        let device = attn_normed.device();
+        let win = self.sliding_window;
+        let head_dim = self.self_attn.get_head_dim();
+        let prefix_win = start_pos.min(win.saturating_sub(1));
+        let gather_start = start_pos - prefix_win;
+        let gather_len = prefix_win + query_len;
+
+        // 1) Chrono SWA prefix from the live ring (before writing new rows).
+        let prev = if prefix_win > 0 {
+            let sparse = self.sparse_kv.lock();
+            let sparse = sparse.as_ref().expect("sparse cache ensured");
+            sparse.gather_chrono_window(start_pos, prefix_win)?
+        } else {
+            Tensor::zeros((0, head_dim), DType::BF16, device)?
+        };
+
+        // 2) Batched token KV for the uncached chunk.
+        let kv = self.self_attn.wkv_forward(attn_normed)?.contiguous()?;
+        self.rope.apply_from_positions(&kv, positions, 0, false)?;
+        attention_rs::deepseek_v4::fp8_act_quant_nope_bf16_inplace(
+            &kv,
+            1,
+            head_dim,
+            self.qk_rope_head_dim,
+            64,
+        )?;
+
+        let window_portion = if prefix_win > 0 {
+            Tensor::cat(&[&prev, &kv], 0)?.contiguous()?
+        } else {
+            kv.contiguous()?
+        };
+
+        // 3) Continue-compress (overlap Phase-A is tiny; bulk is fused CUDA).
+        let bufs_guard = self.decode_buffers.lock();
+        let bufs = bufs_guard.as_ref().expect("decode buffers ensured");
+        if let Some(compressor) = &self.compressor {
+            let weighted = bufs
+                .compressor_weighted
+                .as_ref()
+                .expect("compressor weighted buffer");
+            let cout = bufs.compressor_out.as_ref().expect("compressor out buffer");
+            let (phase_a, bulk, bulk_start) = {
+                let mut state = self.compressor_state.lock();
+                let state = state.as_mut().expect("compressor state ensured");
+                compressor.prefill_continue(
+                    attn_normed,
+                    state,
+                    positions,
+                    weighted,
+                    cout,
+                    Some(&self.rope),
+                    false,
+                    start_pos,
+                )?
+            };
+            self.write_continue_compressed(
+                &phase_a,
+                bulk.as_ref(),
+                bulk_start,
+                start_pos,
+                compressor.ratio,
+                false,
+            )?;
+        }
+        if let Some(indexer) = &self.indexer {
+            let weighted = bufs
+                .indexer_compressor_weighted
+                .as_ref()
+                .expect("indexer compressor weighted");
+            let cout = bufs
+                .indexer_compressor_out
+                .as_ref()
+                .expect("indexer compressor out");
+            let (phase_a, bulk, bulk_start) = {
+                let mut istate = self.indexer_state.lock();
+                let istate = istate.as_mut().expect("indexer state ensured");
+                indexer.compressor.prefill_continue(
+                    attn_normed,
+                    &mut istate.compressor_state,
+                    positions,
+                    weighted,
+                    cout,
+                    Some(&self.rope),
+                    true,
+                    start_pos,
+                )?
+            };
+            self.write_continue_compressed(
+                &phase_a,
+                bulk.as_ref(),
+                bulk_start,
+                start_pos,
+                indexer.compressor.ratio,
+                true,
+            )?;
+        }
+        drop(bufs_guard);
+
+        // Default: vLLM chrono-gather batch attend (fast + correct after
+        // gather_ring_chrono + RoPE-from-pos fixes).
+        // XINFER_V4_CONTINUE=hybrid — fused compress + sequential attend
+        // XINFER_V4_CONTINUE=loop — golden per-token decode_one_token
+        let use_chrono = match std::env::var("XINFER_V4_CONTINUE") {
+            Ok(v) => {
+                let v = v.to_ascii_lowercase();
+                !(v == "hybrid" || v == "loop" || v == "0" || v == "false")
+            }
+            Err(_) => true,
+        };
+        if !use_chrono {
+            let mut outs: Vec<Tensor> = Vec::with_capacity(query_len);
+            for t in 0..query_len {
+                let kv_t = kv.narrow(0, t, 1)?.contiguous()?;
+                let xs = attn_normed.narrow(0, t, 1)?.contiguous()?;
+                let qr_t = qr.narrow(0, t, 1)?.contiguous()?;
+                let pos = positions.narrow(0, t, 1)?.contiguous()?;
+                {
+                    let mut sparse = self.sparse_kv.lock();
+                    let sparse = sparse.as_mut().expect("sparse cache ensured");
+                    sparse.write_window_token_from_pos(&kv_t, &pos)?;
+                }
+                outs.push(self.decode_attend_only(&xs, &qr_t, &pos)?);
+            }
+            self.commit_pages(start_pos, query_len, block_table, Some(&kv))?;
+            let refs: Vec<&Tensor> = outs.iter().collect();
+            return Ok(Tensor::cat(&refs, 0)?);
+        }
+
+        // 4) Chrono batch attend workspace `[SWA gather | compressed]` (cold layout).
+        let (compressed_len, compress_ratio) = {
+            let sparse = self.sparse_kv.lock();
+            let sparse = sparse.as_ref().expect("sparse cache ensured");
+            (sparse.compressed_len, sparse.compress_ratio.max(1))
+        };
+        let (kv_combined, kv_len) = if compressed_len > 0 {
+            let compressed = {
+                let sparse = self.sparse_kv.lock();
+                let sparse = sparse.as_ref().expect("sparse cache ensured");
+                sparse.kv.narrow(0, win, compressed_len)?.contiguous()?
+            };
+            let total = gather_len + compressed_len;
+            let combined = Tensor::zeros((total, head_dim), DType::BF16, device)?;
+            attention_rs::deepseek_v4::copy_contiguous_into(&combined, &window_portion, 0)?;
+            attention_rs::deepseek_v4::copy_contiguous_into(
+                &combined,
+                &compressed,
+                gather_len * head_dim,
+            )?;
+            (combined, total)
+        } else {
+            (window_portion, gather_len.max(1))
+        };
+
+        // 5) Position-aware topk into the gather workspace.
+        let window_topk = attention_rs::deepseek_v4::window_topk_indices_chrono_from_pos(
+            positions,
+            win,
+            query_len,
+            gather_start,
+            gather_len,
+        )?;
+        let mut total_topk = win;
+        let mut topk_idxs = window_topk;
+
+        if compressed_len > 0 && self.compressor.is_some() {
+            let compress_idxs = if let Some(indexer) = &self.indexer {
+                let state = self.indexer_state.lock();
+                let state = state.as_ref().expect("indexer state ensured");
+                let score_len = state.compressed_len.max(1).min(state.max_compressed_len);
+                let scores = indexer.scores_prefill_against_cache(
+                    attn_normed,
+                    qr,
+                    &state.kv_cache,
+                    score_len,
+                    &self.rope,
+                    positions,
+                )?;
+                attention_rs::deepseek_v4::indexer_mask_scores_prefill_by_pos(
+                    &scores,
+                    positions,
+                    indexer.compressor.ratio,
+                )?;
+                indexer.topk_prefill_from_pos(&scores, positions, score_len, gather_len)?
+            } else {
+                attention_rs::deepseek_v4::compress_topk_indices_prefill_from_pos(
+                    positions,
+                    compressed_len,
+                    gather_len,
+                    compress_ratio,
+                    query_len,
+                )?
+            };
+            let compress_topk = compress_idxs.dim(1)?;
+            topk_idxs = attention_rs::deepseek_v4::concat_topk_indices(
+                &topk_idxs,
+                &compress_idxs,
+                query_len,
+                win,
+                compress_topk,
+            )?;
+            total_topk += compress_topk;
+        }
+
+        // 6) One batched sparse attend over the whole uncached chunk.
+        let num_heads = self.self_attn.get_num_heads();
+        let attn_out = Tensor::zeros((query_len, num_heads, head_dim), DType::BF16, device)?;
+        let out = self.self_attn.sparse_attn_from_positions(
+            attn_normed,
+            qr,
+            &self.rope,
+            positions,
+            &kv_combined,
+            &topk_idxs,
+            &attn_out,
+            kv_len,
+            total_topk,
+        )?;
+
+        // 7) Commit ring + pages once (pages remain source of truth).
+        {
+            let mut sparse = self.sparse_kv.lock();
+            let sparse = sparse.as_mut().expect("sparse cache ensured");
+            sparse.write_window_rows_from_pos(&kv, positions)?;
+        }
+        self.commit_pages(start_pos, query_len, block_table, Some(&kv))?;
+        Ok(out)
+    }
+
     /// Unified prefill (vLLM-matched continue):
     /// - cold: batched `prefill_fresh` + full-KV page commit
-    /// - continue: fused `prefill_continue` + gather workspace matching cold
-    ///   layout `[SWA | compressed]` + chrono window topk + one `sparse_attn`
-    ///   (vLLM gather_len / gather_start; no per-token decode loop)
+    /// - continue: fused chrono-gather + `prefill_continue` + one `sparse_attn`
+    ///   (no per-token decode loop; no cached-prefix recompute)
     fn prefill_unified(
         &mut self,
         attn_normed: &Tensor,
@@ -1311,17 +1566,33 @@ impl DeepSeekV4DecoderLayer {
             self.load_residual_from_pages(start_pos, block_table)?;
         }
 
-        // Interleaved write→compress→attend per token is required for correctness.
-        // Batched compressor-then-attend and chrono-gather attend both diverge.
-        let mut outs: Vec<Tensor> = Vec::with_capacity(query_len);
-        for t in 0..query_len {
-            let xs = attn_normed.narrow(0, t, 1)?.contiguous()?;
-            let qr_t = qr.narrow(0, t, 1)?.contiguous()?;
-            let pos = positions.narrow(0, t, 1)?.contiguous()?;
-            outs.push(self.decode_one_token(&xs, &qr_t, &pos, start_pos + t, block_table)?);
+        // `XINFER_V4_CONTINUE`:
+        //   unset/chrono — fused compress + chrono-gather batch attend (default)
+        //   hybrid — fused compress + sequential attend
+        //   loop — golden per-token decode_one_token
+        let mode = std::env::var("XINFER_V4_CONTINUE")
+            .unwrap_or_else(|_| "chrono".into())
+            .to_ascii_lowercase();
+        if mode == "loop" {
+            let mut outs: Vec<Tensor> = Vec::with_capacity(query_len);
+            for t in 0..query_len {
+                let xs = attn_normed.narrow(0, t, 1)?.contiguous()?;
+                let qr_t = qr.narrow(0, t, 1)?.contiguous()?;
+                let pos = positions.narrow(0, t, 1)?.contiguous()?;
+                outs.push(self.decode_one_token(&xs, &qr_t, &pos, start_pos + t, block_table)?);
+            }
+            let refs: Vec<&Tensor> = outs.iter().collect();
+            return Ok(Tensor::cat(&refs, 0)?);
         }
-        let refs: Vec<&Tensor> = outs.iter().collect();
-        Ok(Tensor::cat(&refs, 0)?)
+
+        self.prefill_continue_fused(
+            attn_normed,
+            qr,
+            positions,
+            start_pos,
+            query_len,
+            block_table,
+        )
     }
 
     pub fn forward(
