@@ -2191,7 +2191,6 @@ impl DeepSeekV4ForCausalLM {
                 .lock()
                 .remove(&seq_id)
                 .filter(|state| state.covers(start_pos, block_table));
-            let mut adopted = false;
             if parked_state.is_none() && start_pos > 0 {
                 let mut retired = self.retired_state.lock();
                 if retired
@@ -2199,7 +2198,6 @@ impl DeepSeekV4ForCausalLM {
                     .map_or(false, |state| state.covers(start_pos, block_table))
                 {
                     parked_state = retired.take();
-                    adopted = true;
                 }
             }
             let mut parked =
