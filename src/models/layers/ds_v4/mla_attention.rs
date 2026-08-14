@@ -599,6 +599,7 @@ impl MlaV4Attention {
         attn_out: &Tensor,
         kv_len: usize,
         topk: usize,
+        layout: Option<attention_rs::deepseek_v4::FlashInferSm120Layout>,
     ) -> Result<Tensor> {
         let (seq_len, _) = xs.dims2()?;
 
@@ -619,7 +620,7 @@ impl MlaV4Attention {
             .as_ref()
             .ok_or_else(|| candle_core::Error::msg("V4 sparse attention requires attn_sink"))?;
 
-        attention_rs::deepseek_v4::sparse_attention_into(
+        attention_rs::deepseek_v4::sparse_attention_into_with_sm120_layout(
             &q_full.contiguous()?,
             &kv_combined.contiguous()?,
             attn_sink,
@@ -631,6 +632,7 @@ impl MlaV4Attention {
             kv_len,
             topk,
             self.sm_scale,
+            layout,
         )?;
 
         let out = attn_out;

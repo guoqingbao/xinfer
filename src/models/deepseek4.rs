@@ -950,6 +950,10 @@ impl DeepSeekV4DecoderLayer {
                 &bufs.attn_out,
                 kv_len,
                 total_topk,
+                Some(attention_rs::deepseek_v4::FlashInferSm120Layout {
+                    window_len: win,
+                    compressed_offset: Some(win),
+                }),
             )?
         };
         // Write-through into engine pages (pages = source of truth).
@@ -1044,6 +1048,10 @@ impl DeepSeekV4DecoderLayer {
             &bufs.attn_out,
             kv_len,
             total_topk,
+            Some(attention_rs::deepseek_v4::FlashInferSm120Layout {
+                window_len: win,
+                compressed_offset: Some(win),
+            }),
         )
     }
 
@@ -1623,6 +1631,7 @@ impl DeepSeekV4DecoderLayer {
             &attn_out,
             kv_len,
             total_topk,
+            None,
         )?;
 
         // 7) Commit ring + pages once (pages remain source of truth).

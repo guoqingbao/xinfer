@@ -2654,13 +2654,67 @@ impl FusedMoeMxfp4 {
     }
 }
 
+struct Nvfp4Projection {
+    blocks: Tensor,
+    scales: Tensor,
+    global_scales: Tensor,
+    input_scales: Tensor,
+    scales_swizzled: Option<Tensor>,
+}
+
+enum Nvfp4GateUpWeights {
+    Fused(Nvfp4Projection),
+    Separate {
+        gate: Nvfp4Projection,
+        up: Nvfp4Projection,
+    },
+}
+
+fn maybe_swizzle_nvfp4_scales(scales: &Tensor) -> Result<Option<Tensor>> {
+    #[cfg(feature = "cuda")]
+    {
+        let sm = attention_rs::cuda_utils::sm_version(scales.device().as_cuda_device()?)
+            .unwrap_or(0) as usize;
+        if sm >= 100 {
+            return Ok(Some(
+                attention_rs::nvfp4_linear::swizzle_nvfp4_weight_scales(scales)?,
+            ));
+        }
+    }
+    Ok(None)
+}
+
+impl Nvfp4Projection {
+    fn new(
+        blocks: Tensor,
+        scales: Tensor,
+        global_scales: Vec<f32>,
+        input_scales: Vec<f32>,
+    ) -> Result<Self> {
+        let dev = blocks.device().clone();
+        let num_experts = blocks.dim(0)?;
+        if global_scales.len() != num_experts || input_scales.len() != num_experts {
+            candle_core::bail!(
+                "NVFP4 MoE projection scale count mismatch: experts={}, global={}, input={}",
+                num_experts,
+                global_scales.len(),
+                input_scales.len()
+            );
+        }
+        let scales_swizzled = maybe_swizzle_nvfp4_scales(&scales)?;
+        Ok(Self {
+            blocks,
+            scales,
+            global_scales: Tensor::from_vec(global_scales, (num_experts,), &dev)?,
+            input_scales: Tensor::from_vec(input_scales, (num_experts,), &dev)?,
+            scales_swizzled,
+        })
+    }
+}
+
 pub struct FusedMoeNvfp4 {
     gate: Linear,
-    gate_up_blocks: Tensor,
-    gate_up_scales: Tensor,
-    gate_up_global_scales: Tensor,
-    gate_up_input_scales: Tensor,
-    gate_up_scales_swizzled: Option<Tensor>,
+    gate_up: Nvfp4GateUpWeights,
     down_blocks: Tensor,
     down_scales: Tensor,
     down_global_scales: Tensor,
@@ -2852,6 +2906,7 @@ impl FusedMoeNvfp4 {
         let mut down_scales_vec = Vec::new();
         let mut down_gscales_vec: Vec<f32> = Vec::new();
         let mut down_iscales_vec: Vec<f32> = Vec::new();
+        let mut gate_up: Option<Nvfp4GateUpWeights> = None;
 
         match &experts_vb.0 {
             Either::Left(vb) => {
@@ -2983,18 +3038,26 @@ impl FusedMoeNvfp4 {
                         1.0
                     };
 
+                    let mut fused_blocks = Vec::with_capacity(num_experts);
+                    let mut fused_scales = Vec::with_capacity(num_experts);
                     for i in 0..num_experts {
-                        // Each shard already holds local_inter along dim 2;
-                        // transpose to [local_inter, K/2] / [local_inter, K/16].
-                        gate_blocks_vec.push(gu_gate.get(i)?.t()?.contiguous()?);
-                        up_blocks_vec.push(gu_up.get(i)?.t()?.contiguous()?);
-                        gate_scales_vec.push(gu_sc_gate.get(i)?.t()?.contiguous()?);
-                        up_scales_vec.push(gu_sc_up.get(i)?.t()?.contiguous()?);
-                        gate_gscales_vec.push(gate_up_gscale);
-                        up_gscales_vec.push(gate_up_gscale);
-                        gate_iscales_vec.push(gate_up_iscale);
-                        up_iscales_vec.push(gate_up_iscale);
+                        // The checkpoint is already gate_up_proj. Rebuild the
+                        // local fused tensor after sharding; do not create
+                        // separate gate/up runtime projections.
+                        let gate_blocks = gu_gate.get(i)?.t()?.contiguous()?;
+                        let up_blocks = gu_up.get(i)?.t()?.contiguous()?;
+                        fused_blocks.push(Tensor::cat(&[&gate_blocks, &up_blocks], 0)?);
+
+                        let gate_scales = gu_sc_gate.get(i)?.t()?.contiguous()?;
+                        let up_scales = gu_sc_up.get(i)?.t()?.contiguous()?;
+                        fused_scales.push(Tensor::cat(&[&gate_scales, &up_scales], 0)?);
                     }
+                    gate_up = Some(Nvfp4GateUpWeights::Fused(Nvfp4Projection::new(
+                        Tensor::stack(&fused_blocks, 0)?,
+                        Tensor::stack(&fused_scales, 0)?,
+                        vec![gate_up_gscale; num_experts],
+                        vec![gate_up_iscale; num_experts],
+                    )?));
 
                     let d_raw = vb.get_with_hints_dtype(
                         (num_experts, inter / 2, hidden),
@@ -3169,77 +3232,46 @@ impl FusedMoeNvfp4 {
             _ => candle_core::bail!("FusedMoeNvfp4: GGUF loading not supported for NVFP4"),
         }
 
-        let gate_blocks = Tensor::stack(&gate_blocks_vec, 0)?;
-        let gate_scales = Tensor::stack(&gate_scales_vec, 0)?;
-        let up_blocks = Tensor::stack(&up_blocks_vec, 0)?;
-        let up_scales = Tensor::stack(&up_scales_vec, 0)?;
+        let (gate_up, w_size_n) = if let Some(gate_up) = gate_up {
+            let w_size_n = match &gate_up {
+                Nvfp4GateUpWeights::Fused(projection) => projection.blocks.dim(1)? / 2,
+                Nvfp4GateUpWeights::Separate { .. } => unreachable!(),
+            };
+            (gate_up, w_size_n)
+        } else {
+            let gate_blocks = Tensor::stack(&gate_blocks_vec, 0)?;
+            let gate_scales = Tensor::stack(&gate_scales_vec, 0)?;
+            let up_blocks = Tensor::stack(&up_blocks_vec, 0)?;
+            let up_scales = Tensor::stack(&up_scales_vec, 0)?;
+            let gate =
+                Nvfp4Projection::new(gate_blocks, gate_scales, gate_gscales_vec, gate_iscales_vec)?;
+            let up = Nvfp4Projection::new(up_blocks, up_scales, up_gscales_vec, up_iscales_vec)?;
+            let w_size_n = gate.blocks.dim(1)?;
+            if up.blocks.dim(1)? != w_size_n {
+                candle_core::bail!(
+                    "NVFP4 MoE gate/up output dimensions differ: gate={}, up={}",
+                    w_size_n,
+                    up.blocks.dim(1)?
+                );
+            }
+            (Nvfp4GateUpWeights::Separate { gate, up }, w_size_n)
+        };
 
-        let gate_up_blocks = Tensor::cat(&[&gate_blocks, &up_blocks], 1)?;
-        let gate_up_scales = Tensor::cat(&[&gate_scales, &up_scales], 1)?;
-        let w_size_n = gate_up_blocks.dim(1)? / 2;
-
-        let dev = gate_up_blocks.device();
-        let gate_up_gscales: Vec<f32> = gate_gscales_vec
-            .iter()
-            .zip(up_gscales_vec.iter())
-            .map(|(g, u)| {
-                if (g - u).abs() > f32::EPSILON {
-                    crate::log_warn!(
-                        "NVFP4 MoE: gate/up global scales differ ({g} vs {u}), using gate scale"
-                    );
-                }
-                *g
-            })
-            .collect();
-        let gate_up_global_scales = Tensor::from_vec(gate_up_gscales, (num_experts,), dev)?;
-
-        let gate_up_iscales: Vec<f32> = gate_iscales_vec
-            .iter()
-            .zip(up_iscales_vec.iter())
-            .map(|(g, u)| {
-                if (g - u).abs() > f32::EPSILON {
-                    crate::log_warn!(
-                        "NVFP4 MoE: gate/up input scales differ ({g} vs {u}), using gate scale"
-                    );
-                }
-                *g
-            })
-            .collect();
-        let gate_up_input_scales = Tensor::from_vec(gate_up_iscales, (num_experts,), dev)?;
+        let dev = match &gate_up {
+            Nvfp4GateUpWeights::Fused(projection) => projection.blocks.device().clone(),
+            Nvfp4GateUpWeights::Separate { gate, .. } => gate.blocks.device().clone(),
+        };
 
         let down_blocks = Tensor::stack(&down_blocks_vec, 0)?;
         let down_scales = Tensor::stack(&down_scales_vec, 0)?;
-        let down_global_scales = Tensor::from_vec(down_gscales_vec, (num_experts,), dev)?;
-        let down_input_scales = Tensor::from_vec(down_iscales_vec, (num_experts,), dev)?;
+        let down_global_scales = Tensor::from_vec(down_gscales_vec, (num_experts,), &dev)?;
+        let down_input_scales = Tensor::from_vec(down_iscales_vec, (num_experts,), &dev)?;
 
-        let (gate_up_scales_swizzled, down_scales_swizzled) = {
-            #[cfg(feature = "cuda")]
-            {
-                let sm = attention_rs::cuda_utils::sm_version(dev.as_cuda_device()?).unwrap_or(0)
-                    as usize;
-                if sm >= 100 {
-                    let gu_sw =
-                        attention_rs::nvfp4_linear::swizzle_nvfp4_weight_scales(&gate_up_scales)?;
-                    let d_sw =
-                        attention_rs::nvfp4_linear::swizzle_nvfp4_weight_scales(&down_scales)?;
-                    (Some(gu_sw), Some(d_sw))
-                } else {
-                    (None, None)
-                }
-            }
-            #[cfg(not(feature = "cuda"))]
-            {
-                (None, None)
-            }
-        };
+        let down_scales_swizzled = maybe_swizzle_nvfp4_scales(&down_scales)?;
 
         Ok(Self {
             gate,
-            gate_up_blocks,
-            gate_up_scales,
-            gate_up_global_scales,
-            gate_up_input_scales,
-            gate_up_scales_swizzled,
+            gate_up,
             down_blocks,
             down_scales,
             down_global_scales,
@@ -3302,19 +3334,50 @@ impl FusedMoeNvfp4 {
 
         let pre_sorted_refs = pre_sorted.as_ref().map(|(a, b)| (a, b));
 
-        let gate_up = moe::moe_gemm_nvfp4(
-            &xs,
-            &self.gate_up_blocks,
-            &self.gate_up_scales,
-            &self.gate_up_global_scales,
-            Some(&self.gate_up_input_scales),
-            None,
-            &topk_ids,
-            pre_sorted_refs,
-            is_prefill,
-            None,
-            self.gate_up_scales_swizzled.as_ref(),
-        )?;
+        let gate_up = match &self.gate_up {
+            Nvfp4GateUpWeights::Fused(projection) => moe::moe_gemm_nvfp4(
+                &xs,
+                &projection.blocks,
+                &projection.scales,
+                &projection.global_scales,
+                Some(&projection.input_scales),
+                None,
+                &topk_ids,
+                pre_sorted_refs,
+                is_prefill,
+                None,
+                projection.scales_swizzled.as_ref(),
+            )?,
+            Nvfp4GateUpWeights::Separate { gate, up } => {
+                let gate_output = moe::moe_gemm_nvfp4(
+                    &xs,
+                    &gate.blocks,
+                    &gate.scales,
+                    &gate.global_scales,
+                    Some(&gate.input_scales),
+                    None,
+                    &topk_ids,
+                    pre_sorted_refs,
+                    is_prefill,
+                    None,
+                    gate.scales_swizzled.as_ref(),
+                )?;
+                let up_output = moe::moe_gemm_nvfp4(
+                    &xs,
+                    &up.blocks,
+                    &up.scales,
+                    &up.global_scales,
+                    Some(&up.input_scales),
+                    None,
+                    &topk_ids,
+                    pre_sorted_refs,
+                    is_prefill,
+                    None,
+                    up.scales_swizzled.as_ref(),
+                )?;
+                Tensor::cat(&[&gate_output, &up_output], 2)?
+            }
+        };
 
         let down_inputs = gated_activation(&gate_up, self.w_size_n, &self.act)?;
 
