@@ -17,6 +17,7 @@ pub enum KvCacheDtype {
     Turbo8,
     Turbo4,
     Turbo3,
+    Nvfp4,
 }
 
 impl KvCacheDtype {
@@ -28,6 +29,10 @@ impl KvCacheDtype {
         matches!(self, Self::Fp8 | Self::Turbo8)
     }
 
+    pub fn is_nvfp4(&self) -> bool {
+        matches!(self, Self::Nvfp4)
+    }
+
     pub fn from_str_opt(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
             "auto" | "bf16" | "bfloat16" => Some(Self::Auto),
@@ -35,6 +40,7 @@ impl KvCacheDtype {
             "turbo8" | "k8v4" => Some(Self::Turbo8),
             "turbo4" | "4bit" => Some(Self::Turbo4),
             "turbo3" | "k3v4" => Some(Self::Turbo3),
+            "nvfp4" | "ds_nvfp4" | "fp4" => Some(Self::Nvfp4),
             _ => None,
         }
     }
@@ -54,6 +60,7 @@ impl std::fmt::Display for KvCacheDtype {
             Self::Turbo8 => write!(f, "turbo8"),
             Self::Turbo4 => write!(f, "turbo4"),
             Self::Turbo3 => write!(f, "turbo3"),
+            Self::Nvfp4 => write!(f, "nvfp4"),
         }
     }
 }
@@ -312,6 +319,8 @@ pub struct Config {
     pub mtp_use_dedicated_embeddings: Option<bool>,
     #[serde(skip)]
     pub mtp_enabled: bool,
+    #[serde(default)]
+    pub expert_dtype: Option<String>,
 }
 
 impl fmt::Debug for Config {
@@ -359,6 +368,10 @@ impl Config {
     }
 
     pub fn higher_precision_required(&self) -> bool {
+        let is_fp4_expert = self
+            .expert_dtype
+            .as_deref()
+            .is_some_and(|dtype| matches!(dtype.to_ascii_lowercase().as_str(), "fp4" | "mxfp4"));
         self.is_f16_mode
             || self.quant.is_some()
             || self.quantization_config.as_ref().is_some_and(|cfg| {
@@ -379,6 +392,7 @@ impl Config {
                             | "nvfp4"
                     )
             })
+            || is_fp4_expert
     }
 }
 
@@ -754,6 +768,7 @@ pub struct TokenizerConfig {
     pub bos_token: Option<String>,
     #[serde(default, deserialize_with = "deserialize_token_field")]
     pub eos_token: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_token_field")]
     pub pad_token: Option<String>,
 }
 
@@ -944,6 +959,7 @@ pub enum ModelType {
     Yi,
     StableLM,
     DeepSeek,
+    DeepSeekV4,
     GLM5,
     Mistral3VL,
     Qwen3VL,
@@ -1039,6 +1055,8 @@ pub struct QuantConfig {
     pub desc_act: Option<bool>,
     pub checkpoint_format: Option<String>,
     pub fmt: Option<String>,
+    #[serde(default)]
+    pub scale_fmt: Option<String>,
     #[serde(default)]
     pub format: Option<String>,
     pub weight_block_size: Option<Vec<usize>>,
@@ -1350,6 +1368,7 @@ impl fmt::Debug for QuantConfig {
             .field("desc_act", &self.desc_act)
             .field("checkpoint_format", &self.checkpoint_format)
             .field("fmt", &self.fmt)
+            .field("scale_fmt", &self.scale_fmt)
             .field("format", &self.format)
             .field("weight_block_size", &self.weight_block_size)
             .field("is_mlx_nvfp4", &self.is_mlx_nvfp4)
@@ -1500,6 +1519,7 @@ mod tests {
             desc_act: None,
             checkpoint_format: None,
             fmt: None,
+            scale_fmt: None,
             format: Some("mxfp4-pack-quantized".to_string()),
             weight_block_size: None,
             modules_to_not_convert: vec![
@@ -1675,7 +1695,7 @@ mod tests {
             "quantization_status": "compressed",
             "sparsity_config": {},
             "transform_config": {},
-            "version": "0.14.2.dev54+g704d57b"
+            "version": "0.14.3.dev54+g704d57b"
         }"#;
         let mut cfg: QuantConfig = serde_json::from_str(json).unwrap();
         cfg.normalize_compressed_tensors();
@@ -1783,7 +1803,7 @@ mod tests {
             "quantization_status": "compressed",
             "sparsity_config": {},
             "transform_config": {},
-            "version": "0.14.2.a20260310"
+            "version": "0.14.3.a20260310"
         }"#;
         let mut cfg: QuantConfig = serde_json::from_str(json).unwrap();
         cfg.normalize_compressed_tensors();

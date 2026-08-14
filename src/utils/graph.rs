@@ -33,10 +33,7 @@ impl CudaGraph {
         }
     }
 
-    pub fn end_capture(
-        stream: sys::CUstream,
-        flags: sys::CUgraphInstantiate_flags,
-    ) -> Result<CudaGraph> {
+    pub fn end_capture(stream: sys::CUstream, flags: u64) -> Result<CudaGraph> {
         let mut graph = MaybeUninit::uninit();
         let cu_graph = unsafe {
             lib()
@@ -51,7 +48,7 @@ impl CudaGraph {
         let mut graph_exec = MaybeUninit::uninit();
         let cu_graph_exec = unsafe {
             lib()
-                .cuGraphInstantiateWithFlags(graph_exec.as_mut_ptr(), cu_graph, flags as u32 as u64)
+                .cuGraphInstantiateWithFlags(graph_exec.as_mut_ptr(), cu_graph, flags)
                 .result()
                 .map_err(|e| {
                     candle_core::Error::Msg(format!("cuGraphInstantiateWithFlags failed: {e:?}"))
@@ -281,9 +278,13 @@ where
         self.capturing = false;
         let bs = self.current_bs.take().unwrap();
 
+        // AUTO_FREE_ON_LAUNCH: graph pool allocs are freed after each launch and
+        // re-created on the next. Required for V4's large capture pool to launch
+        // successfully. Logits must be D2D-copied into a non-pool buffer during
+        // capture so replay reads a stable address (see capture()).
         let graph = CudaGraph::end_capture(
             self.device.cu_stream().clone(),
-            CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH,
+            CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH as u32 as u64,
         )?;
         self.captured_graphs
             .insert(bs, CudaGraphHandle::new(Arc::new(graph)));
@@ -617,6 +618,8 @@ impl<M: CudaGraphModule> GraphCapturer<M> {
                     mamba_slot_mapping: Some(mamba_slot_mapping.narrow(0, 0, bs)?),
                     slot_mapping: slot_mapping.narrow(0, 0, bs)?,
                     block_tables: Some(block_tables.narrow(0, 0, bs)?),
+                    block_tables_host: None,
+                    context_lens_host: None,
                     context_lens: Some(context_lens.narrow(0, 0, bs)?),
                     cu_seqlens_q: None,
                     cu_seqlens_k: None,
@@ -944,6 +947,8 @@ impl<M: CudaGraphModule> GraphCapturer<M> {
             mamba_slot_mapping: Some(mamba_slot_mapping.clone()),
             slot_mapping: slot_mapping.clone(),
             block_tables: Some(block_tables.clone()),
+            block_tables_host: None,
+            context_lens_host: None,
             context_lens: Some(context_lens.clone()),
             cu_seqlens_q: Some(cu_seqlens_q.clone()),
             cu_seqlens_k: Some(cu_seqlens_k.clone()),

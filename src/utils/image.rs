@@ -682,6 +682,7 @@ mod tests {
             is_f16_mode: false,
             mtp_num_hidden_layers: None,
             mtp_use_dedicated_embeddings: None,
+            expert_dtype: None,
         }
     }
 

@@ -6,10 +6,18 @@ use either::Either;
 
 pub struct NormX {
     norm: Either<RmsNorm, LayerNorm>,
+    /// When set, forward uses DeepSeek-V4 ATen-order RMSNorm CUDA kernel
+    /// (`rms_norm_v4`) instead of Candle's generic reduction. V4's 86 HC
+    /// updates amplify last-bit F32 differences from the mean reduction.
+    v4_weight: Option<Tensor>,
+    v4_eps: f32,
     dtype: DType,
 }
 impl NormX {
     pub fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        if let Some(weight) = &self.v4_weight {
+            return self.forward_v4(xs, weight);
+        }
         let in_dtype = xs.dtype();
         if xs.dtype() != self.dtype {
             let converted = xs.to_dtype(self.dtype)?;
@@ -26,6 +34,76 @@ impl NormX {
             Ok(out)
         }
     }
+
+    /// F32 weight tensor for DeepSeek-V4 ATen-order RMSNorm (used by fused HC pre+norm).
+    pub fn v4_weight_f32(&self) -> Option<&Tensor> {
+        self.v4_weight.as_ref()
+    }
+
+    pub fn v4_eps(&self) -> f32 {
+        self.v4_eps
+    }
+
+    /// Single ATen-order CUDA RMSNorm launch. Hot path (contiguous BF16 2D +
+    /// F32 weight) does no dtype/reshape/weight clones around the kernel.
+    fn forward_v4(&self, xs: &Tensor, weight: &Tensor) -> Result<Tensor> {
+        let in_dtype = xs.dtype();
+        let dims = xs.dims();
+        let dim = *dims
+            .last()
+            .ok_or_else(|| candle_core::Error::Msg("NormX V4: expected non-empty dims".into()))?;
+        let rows: usize = if dims.len() <= 1 {
+            1
+        } else {
+            dims[..dims.len() - 1].iter().product::<usize>().max(1)
+        };
+
+        // Fast path: already BF16 [rows, dim] — one kernel, no host-side glue.
+        if in_dtype == DType::BF16 && dims.len() == 2 && dims[0] == rows && dims[1] == dim {
+            let x = if xs.is_contiguous() {
+                xs.clone()
+            } else {
+                xs.contiguous()?
+            };
+            return attention_rs::deepseek_v4::rms_norm_v4(&x, weight, dim, self.v4_eps);
+        }
+
+        // Slow path: materialize BF16 2D, normalize in-place, restore shape/dtype.
+        let x = if in_dtype == DType::BF16 {
+            xs.clone()
+        } else {
+            xs.to_dtype(DType::BF16)?
+        };
+        let x = x.reshape((rows, dim))?;
+        let x = if x.is_contiguous() {
+            x
+        } else {
+            x.contiguous()?
+        };
+        attention_rs::deepseek_v4::rms_norm_v4_inplace(&x, weight, dim, self.v4_eps)?;
+        let out = if dims.len() == 2 && dims[0] == rows && dims[1] == dim {
+            x
+        } else {
+            x.reshape(dims.to_vec())?
+        };
+        if in_dtype == DType::BF16 {
+            Ok(out)
+        } else {
+            out.to_dtype(in_dtype)
+        }
+    }
+
+    /// In-place V4 RMSNorm on an owned contiguous BF16 `[rows, dim]` buffer.
+    pub fn forward_v4_inplace(&self, xs: &Tensor) -> Result<()> {
+        let weight = self.v4_weight.as_ref().ok_or_else(|| {
+            candle_core::Error::Msg("forward_v4_inplace requires V4 norm weight".into())
+        })?;
+        let dim = *xs
+            .dims()
+            .last()
+            .ok_or_else(|| candle_core::Error::Msg("forward_v4_inplace: empty dims".into()))?;
+        attention_rs::deepseek_v4::rms_norm_v4_inplace(xs, weight, dim, self.v4_eps)
+    }
 }
 
 pub fn rms_norm(
@@ -36,6 +114,39 @@ pub fn rms_norm(
     is_gemma: bool,
 ) -> Result<NormX> {
     rms_norm_sharded(size, eps, vb, dtype, is_gemma, Shard::default())
+}
+
+/// DeepSeek-V4 RMSNorm with ATen (128,4) mean-reduction order.
+pub fn rms_norm_v4(size: usize, eps: f64, vb: VarBuilderX, dtype: DType) -> Result<NormX> {
+    rms_norm_v4_sharded(size, eps, vb, dtype, Shard::default())
+}
+
+pub fn rms_norm_v4_sharded(
+    size: usize,
+    eps: f64,
+    vb: VarBuilderX,
+    dtype: DType,
+    shard: Shard,
+) -> Result<NormX> {
+    let (weight, dtype) = match &vb.0 {
+        Either::Left(vb) => {
+            let ws = vb.get_with_hints(size, "weight", shard)?;
+            if ws.dtype() != dtype {
+                (ws.to_dtype(dtype)?, dtype)
+            } else {
+                (ws, dtype)
+            }
+        }
+        Either::Right(vb) => (vb.get(size, "weight")?.dequantize(vb.device())?, DType::F32),
+    };
+    let weight_f32 = weight.to_dtype(DType::F32)?;
+    Ok(NormX {
+        // Keep a candle RmsNorm as unused fallback placeholder so Either stays populated.
+        norm: Either::Left(RmsNorm::new(weight_f32.clone(), eps)),
+        v4_weight: Some(weight_f32),
+        v4_eps: eps as f32,
+        dtype,
+    })
 }
 
 pub fn rms_norm_sharded(
@@ -61,6 +172,8 @@ pub fn rms_norm_sharded(
     let weight = if is_gemma { (weight + 1.0)? } else { weight };
     Ok(NormX {
         norm: Either::Left(RmsNorm::new(weight, eps)),
+        v4_weight: None,
+        v4_eps: eps as f32,
         dtype,
     })
 }
@@ -87,11 +200,15 @@ pub fn layer_norm(
         };
         Ok(NormX {
             norm: Either::Right(LayerNorm::new(weight, bias, eps)),
+            v4_weight: None,
+            v4_eps: eps as f32,
             dtype,
         })
     } else {
         Ok(NormX {
             norm: Either::Right(LayerNorm::new_no_bias(weight, eps)),
+            v4_weight: None,
+            v4_eps: eps as f32,
             dtype,
         })
     }

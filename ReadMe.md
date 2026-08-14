@@ -141,12 +141,15 @@ Add `--kvcache-dtype` to compress KV cache and extend context length:
 * ✅ GLM4.7 Flash
 * ✅ GLM 5.2 (DeepSeek V3.2 DSA architecture)
 * ✅ DeepSeek V3/R1/V3.2
+* ✅ **DeepSeek V4** (support 2-bit ISQ via `--isq w2`)
 * ✅ Phi3 / Phi4 (Phi-3, Phi-4, Phi-4-mini, etc.)
 * ✅ Gemma3/**Gemma4** (Multimodal model)
 * ✅ Qwen3-VL (Dense, Multimodal model)
 * ✅ MiroThinker-v1.5 (30B, 235B)
 
-**Formats:** Safetensors (BF16, `FP8-blockwise`, GPTQ, AWQ, MXFP4, `NVFP4`) | GGUF (all quant types) | `ISQ` (on-the-fly quantization)
+**Formats:** Safetensors (BF16, `FP8-blockwise`, GPTQ, AWQ, MXFP4, `NVFP4`) | GGUF (all quant types) | `ISQ` (on-the-fly quantization, including **2-bit W2** for DeepSeek V4 MoE)
+
+> **DeepSeek V4 Flash + 2-bit ISQ:** `--isq w2` re-packs MXFP4 routed experts to 2-bit on load. With 2× GPU tensor parallel (`--d 0,1`), model weights use about **46 GB per GPU** (**46 × 2 GB** total).
 
 ---
 
@@ -209,6 +212,9 @@ xinfer --d 0,1 --m Qwen/Qwen3-30B-A3B-Instruct-2507 --kvcache-dtype fp8
 # ISQ on-the-fly quantization
 xinfer --m Qwen/Qwen3.6-35B-A3B --isq q4k
 
+# DeepSeek V4 Flash (2-bit ISQ MoE, ~46 GB weights/GPU on 2× TP)
+xinfer --d 0,1 --m /path/DeepSeek-V4-Flash --isq w2 --kv-fraction 0.7 --ui-server
+
 # NVFP4 model
 xinfer --m unsloth/Qwen3.6-27B-NVFP4
 
@@ -258,6 +264,9 @@ xinfer --m Qwen/Qwen3.6-35B-A3B --isq q4k --kvcache-dtype turbo4
 
 # Metal ISQ
 xinfer --m /path/Qwen3-4B --isq q6k
+
+# DeepSeek V4 Flash: 2-bit W2 ISQ for routed MoE experts (~46 GB weights/GPU, 2× TP)
+xinfer --d 0,1 --m /path/DeepSeek-V4-Flash --isq w2 --kv-fraction 0.7
 ```
 
 </details>
@@ -500,7 +509,7 @@ xinfer --m Qwen/Qwen3.6-27B-FP8 --ui-server --enable-tool-grammar
 | `--ui-server` | API server + built-in ChatGPT-style web UI |
 | `--server` | API server. Bare: `0.0.0.0:8000`; or `host[:port]`, `file:///path`, `socket:///path`, `unix:///path` |
 | `--i` | Interactive CLI chat |
-| `--isq` | On-the-fly quantization: `q2k`, `q3k`, `q4k`, `q5k`, `q6k`, `q8_0` |
+| `--isq` | On-the-fly quantization: `q2k`, `q3k`, `q4k`, `q5k`, `q6k`, `q8_0`, `w2` / `moe_w2` |
 | `--kvcache-dtype` | KV cache quantization: `fp8`, `turbo8`, `turbo4`, `turbo3` |
 | `--max-num-seqs` | Max concurrent requests (default: 32, macOS: 8) |
 | `--max-tokens` | Max tokens per response (default: 16384) |
@@ -527,6 +536,7 @@ xinfer --m Qwen/Qwen3.6-27B-FP8 --ui-server --enable-tool-grammar
 | Variable | Description |
 |---|---|
 | `XINFER_NVFP4_FORCE_LUT=1` | Force software NVFP4 decode to use the LUT-based dequantization path (higher precision) instead of hardware FP4 intrinsics on Blackwell (SM100+). Useful when decode precision matters more than peak throughput. |
+| `XINFER_ENABLE_FLASHMLA` | Enables DeepSeek V4 sparse MLA acceleration when set to `1` or `true`. It is disabled by default (unset), so the precision-preserving custom BF16 sparse-attention kernel is used. |
 | `XINFER_SSE_BUFFER_SIZE=256` | Size of the bounded SSE streaming buffer per client connection (default: 256). Increase for slow network proxies or high-throughput models. |
 | `SM90_LOWER_PRECISION_GDN_PREFILL=1` | Enable the FlashInfer SM90 persistent kernel for GatedDeltaNet (GDN) prefill on Hopper GPUs (SM90). Delivers faster prefill speedup for Qwen3.5/3.6, with a slight precision trade-off. |
 
@@ -564,6 +574,7 @@ SM90_LOWER_PRECISION_GDN_PREFILL=1 xinfer --m Qwen/Qwen3.5-35B-A3B-FP8 --ui-serv
 * [x] TurboQuant KV Cache (2-4 bit compression with WHT rotation)
 * [x] FP8 Models (CUDA: MoE, Dense; Metal: Dense)
 * [x] GLM 5.2 (DeepSeek V3.2 + DSA)
+* [x] DeepSeek V4 (Flash) + 2-bit W2 ISQ MoE (~46 GB weights/GPU × 2)
 * [ ] Additional model support (Kimi K2, etc.)
 * [x] CPU KV Cache Offloading
 * [x] Prefill-decode Disaggregation (CUDA)

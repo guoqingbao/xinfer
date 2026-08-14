@@ -140,12 +140,15 @@ xinfer --w /home/Qwen3.6-35B-A3B --d 0,1 --ui-server --mtp 2
 * ✅ GLM4.7 Flash
 * ✅ GLM 5.2（DeepSeek V3.2 DSA 架构）
 * ✅ DeepSeek V3/R1/V3.2
+* ✅ **DeepSeek V4**（支持 通过 `--isq w2` 实现 2-bit权重加载）
 * ✅ Phi3 / Phi4（Phi-3、Phi-4、Phi-4-mini 等）
 * ✅ Gemma3/**Gemma4**（多模态）
 * ✅ Qwen3-VL（Dense、多模态）
 * ✅ MiroThinker-v1.5（30B、235B）
 
-**格式：** Safetensors（BF16、`FP8-blockwise`、GPTQ、AWQ、MXFP4、`NVFP4`）| GGUF（所有量化类型）| `ISQ`（即时量化）
+**格式：** Safetensors（BF16、`FP8-blockwise`、GPTQ、AWQ、MXFP4、`NVFP4`）| GGUF（所有量化类型）| `ISQ`（即时量化，含 DeepSeek V4 MoE 的 **2-bit W2**）
+
+> **DeepSeek V4 Flash + 2-bit ISQ：** `--isq w2` 在加载时将 MXFP4 路由专家重打包为 2-bit。双卡张量并行（`--d 0,1`）下，模型权重约占用 **每卡 46 GB**（合计 **46 × 2 GB**）。
 
 ---
 
@@ -208,6 +211,9 @@ xinfer --d 0,1 --m Qwen/Qwen3-30B-A3B-Instruct-2507 --kvcache-dtype fp8
 # ISQ 即时量化
 xinfer --m Qwen/Qwen3.6-35B-A3B --isq q4k
 
+# DeepSeek V4 Flash（2-bit ISQ MoE，双卡约每卡 46 GB 权重）
+xinfer --d 0,1 --m /path/DeepSeek-V4-Flash --isq w2 --kv-fraction 0.7 --ui-server
+
 # NVFP4 模型
 xinfer --m unsloth/Qwen3.6-27B-NVFP4
 
@@ -257,6 +263,9 @@ xinfer --m Qwen/Qwen3.6-35B-A3B --isq q4k --kvcache-dtype turbo4
 
 # Metal ISQ
 xinfer --m /path/Qwen3-4B --isq q6k
+
+# DeepSeek V4 Flash：路由 MoE 专家 2-bit W2 ISQ（双卡 TP，约每卡 46 GB 权重）
+xinfer --d 0,1 --m /path/DeepSeek-V4-Flash --isq w2 --kv-fraction 0.7
 ```
 
 </details>
@@ -494,7 +503,7 @@ xinfer --m Qwen/Qwen3.6-27B-FP8 --ui-server --enable-tool-grammar
 | `--ui-server` | API 服务 + ChatGPT 风格内置 Web UI |
 | `--server` | API 服务器。无参数：`0.0.0.0:8000`；或 `host[:port]`、`file:///path`、`socket:///path`、`unix:///path` |
 | `--i` | 交互式 CLI 对话 |
-| `--isq` | 即时量化：`q2k`、`q3k`、`q4k`、`q5k`、`q6k`、`q8_0` |
+| `--isq` | 即时量化：`q2k`、`q3k`、`q4k`、`q5k`、`q6k`、`q8_0`、`w2` / `moe_w2` |
 | `--kvcache-dtype` | KV 缓存量化：`fp8`、`turbo8`、`turbo4`、`turbo3` |
 | `--max-num-seqs` | 最大并发请求数（默认 32，macOS 为 8） |
 | `--max-tokens` | 单次最大输出 token 数（默认 16384） |
@@ -525,6 +534,7 @@ xinfer --m Qwen/Qwen3.6-27B-FP8 --ui-server --enable-tool-grammar
 | 变量 | 描述 |
 |---|---|
 | `XINFER_NVFP4_FORCE_LUT=1` | 强制 NVFP4 软件解码使用 LUT（查找表）路径替代 Blackwell (SM100+) 硬件 FP4 指令。精度更高，适用于对解码精度有要求的场景。 |
+| `XINFER_ENABLE_FLASHMLA` | 设置为 `1` 或 `true` 时启用 DeepSeek V4 稀疏 MLA 加速。默认未设置，因此默认使用保精度的自定义 BF16 稀疏注意力内核。 |
 | `XINFER_SSE_BUFFER_SIZE=256` | 每个客户端连接的 SSE 流式缓冲区大小（默认：256）。对于慢速网络代理或高吞吐模型，可适当增大。 |
 | `SM90_LOWER_PRECISION_GDN_PREFILL=1` | 在 Hopper (SM90) GPU 上启用 FlashInfer SM90 持久化内核加速 GatedDeltaNet (GDN) 预填充。可为 Qwen3.5/3.6 等混合架构模型带来预填充加速，但精度略有损失。|
 
@@ -562,6 +572,7 @@ SM90_LOWER_PRECISION_GDN_PREFILL=1 xinfer --m Qwen/Qwen3.5-35B-A3B-FP8 --ui-serv
 * [x] TurboQuant KV Cache（2-4 位压缩，WHT 旋转量化）
 * [x] FP8 模型（CUDA: MoE, Dense; Metal: Dense）
 * [x] **GLM 5.2（DeepSeek V3.2 + DSA）**
+* [x] DeepSeek V4（Flash）+ 2-bit W2 ISQ MoE（约每卡 46 GB 权重 × 2）
 * [ ] 支持更多模型类型（Kimi K2 等）
 * [x] CPU KV Cache 卸载
 * [x] PD（Prefill/Decode）分离（CUDA）

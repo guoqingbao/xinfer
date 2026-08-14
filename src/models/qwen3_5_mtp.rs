@@ -118,6 +118,7 @@ fn mtp_quant_config(
         desc_act: None,
         checkpoint_format: None,
         fmt: None,
+        scale_fmt: None,
         format: None,
         weight_block_size: None,
         modules_to_not_convert: Vec::new(),

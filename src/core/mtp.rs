@@ -297,6 +297,8 @@ impl ModelRunner {
                 (1, seq_info.block_table.len()),
                 self.device(),
             )?),
+            block_tables_host: Some(vec![seq_info.block_table.clone()]),
+            context_lens_host: Some(vec![total_kv_len]),
             seqlens: None,
             cu_seqlens_q: Some(Tensor::from_vec(
                 vec![0u32, q_len as u32],
@@ -437,25 +439,26 @@ impl ModelRunner {
         }
 
         let kv_cache = self.get_kv_cache();
+        let kv_pairs = kv_cache.as_pairs();
         let (logits, hidden_states) = match self.model() {
             Model::Qwen3_5(model) => model.forward_with_hidden(
                 &input_ids,
                 &positions,
-                Some(&kv_cache),
+                kv_pairs,
                 &input_metadata,
                 false,
             )?,
             Model::Qwen3_5MoE(model) => model.forward_with_hidden(
                 &input_ids,
                 &positions,
-                Some(&kv_cache),
+                kv_pairs,
                 &input_metadata,
                 false,
             )?,
             Model::Qwen3VL(model) => model.forward_with_hidden(
                 &input_ids,
                 &positions,
-                Some(&kv_cache),
+                kv_pairs,
                 &input_metadata,
                 false,
             )?,
@@ -615,25 +618,26 @@ impl ModelRunner {
             }
         } else {
             let kv_cache = self.get_kv_cache();
+            let kv_pairs = kv_cache.as_pairs();
             let res = match self.model() {
                 Model::Qwen3_5(model) => model.forward(
                     &verify_input_ids,
                     &verify_positions_tensor,
-                    Some(&kv_cache),
+                    kv_pairs,
                     &verify_metadata,
                     false,
                 ),
                 Model::Qwen3_5MoE(model) => model.forward(
                     &verify_input_ids,
                     &verify_positions_tensor,
-                    Some(&kv_cache),
+                    kv_pairs,
                     &verify_metadata,
                     false,
                 ),
                 Model::Qwen3VL(model) => model.forward(
                     &verify_input_ids,
                     &verify_positions_tensor,
-                    Some(&kv_cache),
+                    kv_pairs,
                     &verify_metadata,
                     None,
                 ),

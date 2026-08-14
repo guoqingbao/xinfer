@@ -13,7 +13,9 @@ pub mod guidance_grammar;
 pub mod guided_decoding;
 pub mod heartbeat;
 pub mod image;
+pub mod kv_backend;
 pub mod kvcache_allocator;
+pub use kv_backend::{CpuKvCache, GpuKvCache, KvCacheBackend};
 pub mod logits_processor;
 pub mod multi_node;
 pub mod progress;
@@ -755,6 +757,7 @@ pub fn config_from_gguf<R: std::io::Seek + std::io::Read>(
         },
         mtp_use_dedicated_embeddings: None,
         mtp_enabled: false,
+        expert_dtype: None,
     };
 
     if arch == "gemma4" || arch == "gemma3" {
@@ -1090,6 +1093,15 @@ fn is_qwen_chat_template_arch_name(arch: &str) -> bool {
             | "Qwen3NextForConditionalGeneration"
     )
 }
+
+pub fn is_deepseek_v4_arch_name(arch: &str) -> bool {
+    matches!(arch, "DeepseekV4ForCausalLM" | "deepseek_v4" | "deepseek4")
+}
+
+/// DeepSeek-V4 chat template (encoding_dsv4.py / openinfer e2e).
+/// Special tokens use FULLWIDTH vertical bars (U+FF5C ｜), not ASCII |.
+/// Chat mode appends `</think>` after `<｜Assistant｜>`; thinking mode appends `<think>`.
+const DEEPSEEK_V4_CHAT_TEMPLATE: &str = r#"{%- if bos_token -%}{{ bos_token }}{%- endif -%}{%- for message in messages -%}{%- if message['role'] == 'system' -%}{{ message['content'] }}{%- elif message['role'] == 'user' -%}{{ '<｜User｜>' + message['content'] }}{%- elif message['role'] == 'assistant' -%}{{ '<｜Assistant｜></think>' + message['content'] + (eos_token if eos_token else '') }}{%- endif -%}{%- endfor -%}{%- if add_generation_prompt -%}{{ '<｜Assistant｜>' }}{%- if enable_thinking -%}{{ '<think>' }}{%- else -%}{{ '</think>' }}{%- endif -%}{%- endif -%}"#;
 
 const QWEN_THINKING_CHAT_TEMPLATE: &str = r#"
 {%- for message in messages %}
@@ -1528,6 +1540,21 @@ pub fn init_config_tokenizer(
             }
         }
         let arch_name = config.architectures.as_ref().unwrap()[0].clone();
+
+        // DeepSeek V4: head_dim=512 in config is the MLA attention dim, not RoPE dim.
+        // Clear it so ScalingRotaryEmbedding computes RoPE dim from hidden_size/num_attention_heads.
+        // MlaV4Attention reads head_dim from extra_config_json independently.
+        if arch_name == "DeepseekV4ForCausalLM" {
+            config.head_dim = None;
+            if let Some(ref extra) = config.extra_config_json {
+                if let Ok(root) = serde_json::from_str::<serde_json::Value>(extra) {
+                    if let Some(ed) = root.get("expert_dtype").and_then(|v| v.as_str()) {
+                        config.expert_dtype = Some(ed.to_string());
+                    }
+                }
+            }
+        }
+
         if config.moe_cfg.is_none()
             && matches!(
                 arch_name.as_str(),
@@ -1538,6 +1565,7 @@ pub fn init_config_tokenizer(
                     | "DeepseekV3ForCausalLM"
                     | "DeepseekV32ForCausalLM"
                     | "DeepseekForCausalLM"
+                    | "DeepseekV4ForCausalLM"
                     | "GlmMoeDsaForCausalLM"
                     | "Qwen3_5MoeForCausalLM"
                     | "Qwen3_5MoeForConditionalGeneration"
@@ -1660,6 +1688,11 @@ pub fn init_config_tokenizer(
                         "No chat_template.jinja found; using built-in Qwen chat template"
                     );
                     config_tokenizer.chat_template = Some(QWEN_THINKING_CHAT_TEMPLATE.to_string());
+                } else if is_deepseek_v4_arch_name(arch_name.as_str()) {
+                    crate::log_warn!(
+                        "No chat_template.jinja found; using built-in DeepSeek-V4 chat template"
+                    );
+                    config_tokenizer.chat_template = Some(DEEPSEEK_V4_CHAT_TEMPLATE.to_string());
                 }
             } else if let Some(f) = model_pathes.get_chat_template_filename() {
                 crate::log_warn!("Try loading chat template from chat_template.json");
@@ -1979,7 +2012,13 @@ pub fn spawn_runner(
 
 pub fn is_no_cuda_graph_supprt(architectures: String) -> bool {
     #[allow(unused_mut)]
-    let mut black_list = vec!["Phi3ForCausalLM", "Phi4ForCausalLM", "phi3", "phi4"];
+    let mut black_list = vec![
+        "Phi3ForCausalLM",
+        "Phi4ForCausalLM",
+        "phi3",
+        "phi4",
+        "DeepseekV4ForCausalLM",
+    ];
 
     #[cfg(not(feature = "flashinfer"))]
     {
@@ -2008,6 +2047,7 @@ pub fn get_arch_rope(
         ("DeepseekV3ForCausalLM", false),
         ("DeepseekV32ForCausalLM", false),
         ("DeepseekForCausalLM", false),
+        ("DeepseekV4ForCausalLM", false),
         ("GlmMoeDsaForCausalLM", true),
         ("Phi3ForCausalLM", false),
         ("Phi4ForCausalLM", false),
@@ -2135,6 +2175,11 @@ pub fn get_arch_rope(
         | "deepseek3"
         | "deepseek2"
         | "deepseek" => (ModelType::DeepSeek, "<|User|>{}<|Assistant|>".to_string()),
+        "DeepseekV4ForCausalLM" | "deepseek_v4" | "deepseek4" => (
+            ModelType::DeepSeekV4,
+            // Fullwidth ｜ (U+FF5C). ASCII <|User|> tokenizes as garbage pieces.
+            "<｜begin▁of▁sentence｜><｜User｜>{}<｜Assistant｜></think>".to_string(),
+        ),
         "Phi3ForCausalLM" | "Phi4ForCausalLM" | "phi3" | "phi4" => {
             (ModelType::Phi4, "<|user|>\n{}<|assistant|>".to_string())
         }
@@ -2225,6 +2270,27 @@ pub fn prepare_engine_config(
     econfig.prefill_chunk_size =
         crate::utils::config::normalize_prefill_chunk_size(econfig.prefill_chunk_size);
 
+    // DeepSeek V4 hybrid pages use a 256-token native unit (vLLM). Force before
+    // BlockManager / runner slot_mapping so page indices match engine blocks.
+    if let Some(arches) = &config.architectures {
+        if arches.iter().any(|a| {
+            matches!(
+                a.as_str(),
+                "DeepseekV4ForCausalLM" | "deepseek_v4" | "deepseek4"
+            )
+        }) {
+            let native = crate::models::layers::ds_v4::V4_NATIVE_BLOCK_SIZE;
+            if econfig.block_size != native {
+                crate::log_warn!(
+                    "DeepSeek V4: forcing engine block_size {} → {} (native hybrid page unit)",
+                    econfig.block_size,
+                    native
+                );
+                econfig.block_size = native;
+            }
+        }
+    }
+
     let config_model_len = resolve_config_model_len(config, config_tokenizer);
 
     econfig.config_model_len = Some(config_model_len);
@@ -2255,7 +2321,11 @@ pub fn prepare_engine_config(
             }
             if egen_cfg.temperature.is_none() {
                 egen_cfg.temperature = gen_cfg.temperature;
+            }
+            if egen_cfg.top_p.is_none() {
                 egen_cfg.top_p = gen_cfg.top_p;
+            }
+            if egen_cfg.top_k.is_none() {
                 egen_cfg.top_k = gen_cfg.top_k;
             }
         }
@@ -2592,6 +2662,7 @@ mod tests {
             mtp_num_hidden_layers: None,
             mtp_use_dedicated_embeddings: None,
             mtp_enabled: false,
+            expert_dtype: None,
         }
     }
 

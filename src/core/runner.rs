@@ -18,9 +18,11 @@ use crate::utils::logits_processor::{LogitsProcessor, Sampling};
 use crate::utils::progress::ProgressLike;
 #[cfg(feature = "flashinfer")]
 use crate::utils::FlashInferKvParams;
+use crate::utils::{CpuKvCache, GpuKvCache};
 use crate::{
     core::sequence::{DecodeSequence, Sequence, ToDecodeInput},
     models::deepseek3::DeepSeekForCausalLM,
+    models::deepseek4::DeepSeekV4ForCausalLM,
     models::glm4::GLM4ForCausalLM,
     models::glm4_moe::GLM4MoEForCausalLM,
     models::glm4_moe_lite::GLM4MoeLiteForCausalLM,
@@ -99,6 +101,7 @@ pub enum Model {
     GLM4MoE(Arc<GLM4MoEForCausalLM>),
     GLM4MoeLite(Arc<GLM4MoeLiteForCausalLM>),
     DeepSeek(Arc<DeepSeekForCausalLM>),
+    DeepSeekV4(Arc<DeepSeekV4ForCausalLM>),
     GLM5(Arc<DeepSeekForCausalLM>),
     Mistral3VL(Arc<Mistral3ForConditionalGeneration>),
     Gemma3(Arc<Gemma3ForConditionalGeneration>),
@@ -126,8 +129,8 @@ pub struct CpuTqLayerCache {
 
 pub struct ModelRunner {
     pub(crate) model: Model,
-    gpu_kv_cache: Arc<Mutex<Vec<(Tensor, Tensor)>>>,
-    cpu_kv_cache: Arc<Mutex<Vec<(Tensor, Tensor)>>>,
+    gpu_kv_cache: Arc<Mutex<GpuKvCache>>,
+    cpu_kv_cache: Arc<Mutex<CpuKvCache>>,
     cpu_tq_cache: Option<Vec<CpuTqLayerCache>>,
     pub(crate) device: Device,
     config: EngineConfig,
@@ -155,10 +158,23 @@ impl ModelRunner {
     // Mamba slots track concurrent sequence states (not KV token blocks).
 
     pub(crate) fn is_mla_model(&self) -> bool {
+        // Classical MLA only (FlashInfer MLA plans). DeepSeek V4 is a separate
+        // KvCacheBackend::DeepSeekV4 — never treat it as MLA.
         matches!(
             self.model_type,
             ModelType::GLM4MoeLite | ModelType::DeepSeek | ModelType::GLM5
         )
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn kv_backend(&self) -> crate::utils::KvCacheBackend {
+        match self.model_type {
+            ModelType::DeepSeekV4 => crate::utils::KvCacheBackend::DeepSeekV4,
+            ModelType::GLM4MoeLite | ModelType::DeepSeek | ModelType::GLM5 => {
+                crate::utils::KvCacheBackend::Mla
+            }
+            _ => crate::utils::KvCacheBackend::Flash,
+        }
     }
 
     pub(crate) fn model(&self) -> &Model {
@@ -297,6 +313,7 @@ impl ModelRunner {
                 GLM4MoE => GLM4MoEForCausalLM,
                 GLM4MoeLite => GLM4MoeLiteForCausalLM,
                 DeepSeek => DeepSeekForCausalLM,
+                DeepSeekV4 => DeepSeekV4ForCausalLM,
                 GLM5 => DeepSeekForCausalLM,
                 Mistral3VL => Mistral3ForConditionalGeneration,
                 Gemma3 => Gemma3ForConditionalGeneration,
@@ -322,6 +339,7 @@ impl ModelRunner {
                 GLM4MoE => EmbedInputs,
                 GLM4MoeLite => EmbedInputs,
                 DeepSeek => EmbedInputs,
+                DeepSeekV4 => EmbedInputs,
                 GLM5 => EmbedInputs,
                 Mistral3VL => NoneArg,
                 Gemma3 => NoneArg,
@@ -348,6 +366,7 @@ impl ModelRunner {
                     GLM4MoE => EmbedInputs,
                     GLM4MoeLite => EmbedInputs,
                     DeepSeek => EmbedInputs,
+                    DeepSeekV4 => EmbedInputs,
                     GLM5 => EmbedInputs,
                     Mistral3VL => NoneArg,
                     Gemma3 => NoneArg,
@@ -517,8 +536,16 @@ impl ModelRunner {
             );
         }
 
-        let (gpu_kv_cache, cpu_kv_cache) =
+        let (mut gpu_kv_cache, cpu_kv_cache) =
             allocator.init_kv_cache(&allocation, dtype, &device, econfig.pd_config.as_ref())?;
+
+        if let Model::DeepSeekV4(v4) = &model {
+            // Share one Arc between engine GpuKvCache and model layers.
+            if let GpuKvCache::DeepSeekV4(pool_arc) = &gpu_kv_cache {
+                v4.attach_hybrid_page_pool(pool_arc.clone());
+            }
+            gpu_kv_cache = GpuKvCache::DeepSeekV4(v4.hybrid_pool_arc());
+        }
 
         let num_cpu_blocks =
             (econfig.cpu_mem_fold.unwrap_or(0.5f32) * econfig.num_blocks as f32) as usize;
@@ -547,13 +574,16 @@ impl ModelRunner {
         #[cfg(feature = "flashinfer")]
         let skip_flashinfer_init = config.kvcache_dtype.is_turboquant()
             || (config.kvcache_dtype.is_fp8_keys() && !attention_rs::has_flashinfer_fp8_e4m3())
-            || has_heterogeneous_head_dim;
+            || has_heterogeneous_head_dim
+            // V4 never consumes FlashInfer attention; skip its MLA workspace.
+            || matches!(model_type, ModelType::DeepSeekV4);
         #[cfg(feature = "flashinfer")]
         let flashinfer_kv_params = if skip_flashinfer_init {
             None
         } else {
             let mut params = None;
-            for (k_cache, _) in &gpu_kv_cache {
+            let empty: Vec<(Tensor, Tensor)> = Vec::new();
+            for (k_cache, _) in gpu_kv_cache.as_pairs().unwrap_or(&empty) {
                 if k_cache.rank() != 4 {
                     continue;
                 }
@@ -743,7 +773,7 @@ impl ModelRunner {
         self.mtp_head.is_some() && self.mtp_num_speculative > 0
     }
 
-    pub fn get_kv_cache(&self) -> MutexGuard<'_, Vec<(Tensor, Tensor)>> {
+    pub fn get_kv_cache(&self) -> MutexGuard<'_, GpuKvCache> {
         loop {
             if let Ok(v) = self.gpu_kv_cache.try_lock() {
                 return v;
@@ -751,7 +781,7 @@ impl ModelRunner {
         }
     }
 
-    pub fn get_cpu_kv_cache(&self) -> MutexGuard<'_, Vec<(Tensor, Tensor)>> {
+    pub fn get_cpu_kv_cache(&self) -> MutexGuard<'_, CpuKvCache> {
         loop {
             if let Ok(v) = self.cpu_kv_cache.try_lock() {
                 return v;
@@ -961,10 +991,12 @@ impl ModelRunner {
         let images = images.as_ref();
 
         let _prefill_guard = set_linear_is_prefill(is_prefill);
+        let kv_guard = self.get_kv_cache();
+        let kv_pairs = kv_guard.as_pairs();
         let logits = crate::model_call!(
             &self.model,
             forward,
-            (&input_ids, &positions, Some(&self.get_kv_cache()), &input_metadata),
+            (&input_ids, &positions, kv_pairs, &input_metadata),
             {
                 Qwen3 => false,
                 Qwen3MoE => false,
@@ -977,6 +1009,7 @@ impl ModelRunner {
                 GLM4MoE => false,
                 GLM4MoeLite => false,
                 DeepSeek => false,
+                DeepSeekV4 => false,
                 GLM5 => false,
                 Mistral3VL => images,
                 Gemma3 => images,
@@ -985,6 +1018,7 @@ impl ModelRunner {
                 MiniMax => false,
             }
         )?;
+        drop(kv_guard);
         let output_ids = self.sample(&logits, seqs, is_prefill)?;
         #[cfg(feature = "nvtx")]
         nvtx::range_pop!();
@@ -995,10 +1029,12 @@ impl ModelRunner {
         let (input_ids, positions, input_metadata) = self.prepare_prefill(seqs)?;
 
         let _prefill_guard = set_linear_is_prefill(true);
+        let kv_guard = self.get_kv_cache();
+        let kv_pairs = kv_guard.as_pairs();
         let hidden = crate::model_call!(
             &self.model,
             forward_embedding,
-            (&input_ids, &positions, Some(&self.get_kv_cache()), &input_metadata),
+            (&input_ids, &positions, kv_pairs, &input_metadata),
             {
                 Qwen3 => false,
                 Qwen3MoE => false,
@@ -1014,6 +1050,7 @@ impl ModelRunner {
             },
             candle_core::bail!("Embedding is not supported for this model type")
         )?;
+        drop(kv_guard);
 
         crate::log_info!(
             "Embedding forward finished with hidden shape {:?}",
@@ -1166,7 +1203,7 @@ impl ModelRunner {
             .zip(prefill_tokens.iter())
             .map(|(seq, &num_tokens)| (seq.num_cached_tokens + num_tokens) as u32)
             .collect();
-        let context_lens_t = Tensor::from_vec(context_lens_vec, seqs.len(), &self.device)?;
+        let context_lens_t = Tensor::from_vec(context_lens_vec.clone(), seqs.len(), &self.device)?;
         let block_tables = Some(block_tables_t);
         let context_lens = Some(context_lens_t);
         let cu_seqlens_q_vec = cu_seqlens_q.clone();
@@ -1303,6 +1340,12 @@ impl ModelRunner {
         let sequence_ids_vec = seqs.iter().map(|s| s.id()).collect::<Vec<_>>();
         let mamba_slot_mapping = self.prepare_mamba_slot_mapping(&sequence_ids_vec, true)?;
         let sequence_ids = Some(sequence_ids_vec);
+        // Host block tables for V4 hybrid pages (CPU, prepared here — no D2H in forward).
+        let block_tables_host = Some(
+            seqs.iter()
+                .map(|s| s.block_table().to_vec())
+                .collect::<Vec<_>>(),
+        );
 
         let input_metadata = InputMetadata {
             is_prefill: true,
@@ -1311,6 +1354,8 @@ impl ModelRunner {
             mamba_slot_mapping,
             slot_mapping,
             block_tables,
+            block_tables_host,
+            context_lens_host: Some(context_lens_vec),
             context_lens,
             cu_seqlens_q: Some(cu_seqlens_q),
             cu_seqlens_k: Some(cu_seqlens_k),
@@ -1378,6 +1423,7 @@ impl ModelRunner {
         let max_context_len = context_lens.clone().into_iter().max().unwrap() as usize;
 
         let slot_mapping = Tensor::from_vec(slot_mapping, (s_len,), &self.device)?;
+        let context_lens_host = context_lens.clone();
         let context_lens = Tensor::from_vec(context_lens, (c_len,), &self.device)?;
         let max_active_blocks = active_block_tables.iter().map(Vec::len).max().unwrap_or(0);
         let mut flat_block_tables = Vec::with_capacity(seq_refs.len() * max_active_blocks);
@@ -1495,6 +1541,8 @@ impl ModelRunner {
             mamba_slot_mapping,
             slot_mapping,
             block_tables: Some(block_tables),
+            block_tables_host: Some(active_block_tables.clone()),
+            context_lens_host: Some(context_lens_host),
             context_lens: Some(context_lens),
             cu_seqlens_q: None,
             cu_seqlens_k: None,
@@ -1736,6 +1784,7 @@ impl ModelRunner {
             Model::Qwen3_5(model) => model.release_sequence_state(id),
             Model::Qwen3_5MoE(model) => model.release_sequence_state(id),
             Model::Qwen3VL(model) => model.release_sequence_state(id),
+            Model::DeepSeekV4(model) => model.clear_seq_state(id),
             _ => {}
         }
     }
@@ -1753,6 +1802,7 @@ impl ModelRunner {
             Model::GLM4MoE(model) => model.get_vocab_size(),
             Model::GLM4MoeLite(model) => model.get_vocab_size(),
             Model::DeepSeek(model) => model.get_vocab_size(),
+            Model::DeepSeekV4(model) => model.get_vocab_size(),
             Model::GLM5(model) => model.get_vocab_size(),
             Model::Mistral3VL(model) => model.get_vocab_size(),
             Model::Gemma3(model) => model.get_vocab_size(),
@@ -1764,9 +1814,16 @@ impl ModelRunner {
 
     #[cfg(all(feature = "cuda", feature = "graph"))]
     pub fn warmup_capture(&mut self) -> Result<()> {
+        if matches!(self.model_type, ModelType::DeepSeekV4) {
+            // V4 keeps recurrent compressor/indexer state per request and swaps
+            // those GPU handles between requests, which a captured graph cannot
+            // follow. Decode always runs eagerly for this model.
+            crate::log_warn!("CUDA graph capture disabled for DeepSeek V4");
+            return Ok(());
+        }
         let kv_cache_lock = self.gpu_kv_cache.lock().unwrap();
-        self.decode_capturer
-            .capture(&self.device, Some(&kv_cache_lock))?;
+        let kv_pairs = kv_cache_lock.as_pairs();
+        self.decode_capturer.capture(&self.device, kv_pairs)?;
 
         if self.mtp_num_speculative > 0 {
             // self.decode_capturer.model.sync()?;
@@ -1775,11 +1832,7 @@ impl ModelRunner {
                     "Capturing MTP verify graphs for up to {} draft tokens...",
                     self.mtp_num_speculative
                 );
-                mtp_cap.capture_mtp(
-                    &self.device,
-                    Some(&kv_cache_lock),
-                    self.mtp_num_speculative,
-                )?;
+                mtp_cap.capture_mtp(&self.device, kv_pairs, self.mtp_num_speculative)?;
             }
         }
 
@@ -1803,23 +1856,28 @@ impl ModelRunner {
         if !tq_full {
             let gpu_cache = self.get_kv_cache();
             let cpu_cache = self.get_cpu_kv_cache();
+            let (Some(gpu_pairs), Some(cpu_pairs)) = (gpu_cache.as_pairs(), cpu_cache.as_pairs())
+            else {
+                // DeepSeek V4 hybrid pages: CPU swap deferred.
+                return Ok(true);
+            };
             assert!(
-                gpu_cache.len() > 0 && cpu_cache.len() > 0,
+                !gpu_pairs.is_empty() && !cpu_pairs.is_empty(),
                 "Invalid kvcache tensors!"
             );
-            let block_size_bytes = cpu_cache[0].0.elem_count() / cpu_cache[0].0.dim(0)?
-                * cpu_cache[0].0.dtype().size_in_bytes();
-            for i in 0..gpu_cache.len() {
+            let block_size_bytes = cpu_pairs[0].0.elem_count() / cpu_pairs[0].0.dim(0)?
+                * cpu_pairs[0].0.dtype().size_in_bytes();
+            for i in 0..gpu_pairs.len() {
                 if swap_in {
-                    cache::swap_blocks(&cpu_cache[i].0, &gpu_cache[i].0, &mappings)?;
-                    cache::swap_blocks(&cpu_cache[i].1, &gpu_cache[i].1, &mappings)?;
+                    cache::swap_blocks(&cpu_pairs[i].0, &gpu_pairs[i].0, &mappings)?;
+                    cache::swap_blocks(&cpu_pairs[i].1, &gpu_pairs[i].1, &mappings)?;
                 } else {
-                    cache::swap_blocks(&gpu_cache[i].0, &cpu_cache[i].0, &mappings)?;
-                    cache::swap_blocks(&gpu_cache[i].1, &cpu_cache[i].1, &mappings)?;
+                    cache::swap_blocks(&gpu_pairs[i].0, &cpu_pairs[i].0, &mappings)?;
+                    cache::swap_blocks(&gpu_pairs[i].1, &cpu_pairs[i].1, &mappings)?;
                 }
             }
             let total_mb =
-                (block_size_bytes * mappings.len() * gpu_cache.len() * 2) as f32 / 1024.0 / 1024.0;
+                (block_size_bytes * mappings.len() * gpu_pairs.len() * 2) as f32 / 1024.0 / 1024.0;
             if swap_in {
                 crate::log_info!("{:.2} MB CPU KV cached blocks swapped in GPU!", total_mb);
             } else {
@@ -1919,7 +1977,13 @@ impl ModelRunner {
                     "PD client does not support send_kvcache, call this in the PD server!"
                 )
             }
-            transfer.transfer_kv_cache(seq, &*self.get_kv_cache(), first_token)
+            let guard = self.get_kv_cache();
+            let pairs = guard.as_pairs().ok_or_else(|| {
+                candle_core::Error::Msg(
+                    "PD KV transfer is not supported for DeepSeek V4 hybrid cache".into(),
+                )
+            })?;
+            transfer.transfer_kv_cache(seq, pairs, first_token)
         } else {
             candle_core::bail!("KV Cache transfer engine is not initialized!")
         }
@@ -1932,7 +1996,13 @@ impl ModelRunner {
                     "PD server does not support receive_kvcache, call this in the PD client!"
                 )
             }
-            transfer.receive_kv_cache(seq, &*self.get_kv_cache())
+            let guard = self.get_kv_cache();
+            let pairs = guard.as_pairs().ok_or_else(|| {
+                candle_core::Error::Msg(
+                    "PD KV transfer is not supported for DeepSeek V4 hybrid cache".into(),
+                )
+            })?;
+            transfer.receive_kv_cache(seq, pairs)
         } else {
             candle_core::bail!("KV Cache transfer engine is not initialized!")
         }
@@ -1960,22 +2030,21 @@ impl ModelRunner {
         }
     }
 
-    pub fn clear_blocks(&self, _block_ids: Vec<u32>) -> Result<bool> {
+    pub fn clear_blocks(&self, block_ids: Vec<u32>) -> Result<bool> {
+        if block_ids.is_empty() {
+            return Ok(true);
+        }
+        let guard = self.get_kv_cache();
+        if let Some(pool_arc) = guard.as_v4_pool() {
+            let pool_guard = pool_arc.lock();
+            if let Some(ref pool) = *pool_guard {
+                for id in block_ids {
+                    pool.zero_page(id as usize)?;
+                    pool.clear_residual_frozen(id as usize);
+                }
+            }
+        }
         Ok(true)
-        // fn cache_clear(gpu_cache: &Vec<(Tensor, Tensor)>, block_ids: &Vec<u32>) -> Result<bool> {
-        //     if gpu_cache.is_empty() || block_ids.is_empty() {
-        //         return Ok(true);
-        //     }
-
-        //     for i in 0..gpu_cache.len() {
-        //         cache::clear_blocks(&gpu_cache[i].0, block_ids)?;
-        //         cache::clear_blocks(&gpu_cache[i].1, block_ids)?;
-        //     }
-
-        //     Ok(true)
-        // }
-
-        // cache_clear(&*self.get_kv_cache(), &block_ids)
     }
 }
 

@@ -114,8 +114,9 @@ async fn main() -> Result<()> {
         prompts
     };
 
-    let generation_cfg = if (args.temperature.is_some()
-        && (args.top_k.is_some() && args.top_p.is_some()))
+    let generation_cfg = if args.temperature.is_some()
+        || args.top_k.is_some()
+        || args.top_p.is_some()
         || args.frequency_penalty.is_some()
         || args.presence_penalty.is_some()
     {

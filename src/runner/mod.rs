@@ -130,18 +130,22 @@ pub enum SerializableDType {
     F16 = 4,
     F32 = 5,
     F64 = 6,
+    F8E8M0 = 7,
+    F8E4M3 = 8,
 }
 
 impl From<DType> for SerializableDType {
     fn from(dt: DType) -> Self {
         match dt {
-            DType::U8 | DType::F8E8M0 | DType::F8E4M3 => Self::U8,
+            DType::U8 => Self::U8,
             DType::U32 => Self::U32,
             DType::I64 => Self::I64,
             DType::BF16 => Self::BF16,
             DType::F16 => Self::F16,
             DType::F32 => Self::F32,
             DType::F64 => Self::F64,
+            DType::F8E8M0 => Self::F8E8M0,
+            DType::F8E4M3 => Self::F8E4M3,
         }
     }
 }
@@ -156,6 +160,8 @@ impl From<SerializableDType> for DType {
             SerializableDType::F16 => DType::F16,
             SerializableDType::F32 => DType::F32,
             SerializableDType::F64 => DType::F64,
+            SerializableDType::F8E8M0 => DType::F8E8M0,
+            SerializableDType::F8E4M3 => DType::F8E4M3,
         }
     }
 }

@@ -549,6 +549,20 @@ impl Module for LinearX {
 }
 
 impl LinearX {
+    pub fn fp8_weight_scale(&self) -> Option<(&Tensor, &Tensor)> {
+        match self {
+            Self::LnFp8(ln) => Some((&ln.weight, &ln.weight_scale)),
+            _ => None,
+        }
+    }
+
+    pub fn dense_weight(&self) -> Result<&Tensor> {
+        match self {
+            Self::Linear(ln) => Ok(ln.weight()),
+            _ => candle_core::bail!("dense weight requested from a quantized linear layer"),
+        }
+    }
+
     pub fn indexed_moe_forward(&self, x: &Tensor, ids: &Tensor) -> Result<Tensor> {
         match self {
             Self::Linear(_) => {
@@ -627,7 +641,9 @@ fn has_nvfp4_specific_tensors(vb: &VarBuilder, is_mlx_nvfp4: bool) -> bool {
 }
 
 fn has_fp8_tensors(vb: &VarBuilder) -> bool {
-    vb.contains_tensor("weight_scale") || vb.contains_tensor("weight_scale_inv")
+    vb.contains_tensor("weight_scale")
+        || vb.contains_tensor("weight_scale_inv")
+        || vb.contains_tensor("scale")
 }
 
 pub fn linear_x(
@@ -651,7 +667,8 @@ pub fn linear_x(
                     }
 
                     let has_fp8_scale = vb.contains_tensor("weight_scale")
-                        || vb.contains_tensor("weight_scale_inv");
+                        || vb.contains_tensor("weight_scale_inv")
+                        || vb.contains_tensor("scale");
                     if !has_fp8_scale {
                         let weight = vb.get_with_hints((out_dim, in_dim), "weight", shards)?;
                         if matches!(
@@ -795,7 +812,8 @@ pub fn linear_no_bias_x(
                     }
 
                     let has_fp8_scale = vb.contains_tensor("weight_scale")
-                        || vb.contains_tensor("weight_scale_inv");
+                        || vb.contains_tensor("weight_scale_inv")
+                        || vb.contains_tensor("scale");
                     if !has_fp8_scale {
                         let weight = vb.get_with_hints((out_dim, in_dim), "weight", shards)?;
                         if matches!(
@@ -1002,6 +1020,7 @@ pub struct LnFp8 {
     pub bias: Option<Tensor>,
     pub weight_block_size: Vec<usize>,
     pub sm_version: usize,
+    pub ue8m0: bool,
 }
 
 fn load_fp8_weight(vb: &VarBuilder, shape: (usize, usize), shard: Shard) -> Result<Tensor> {
@@ -1067,18 +1086,42 @@ impl LnFp8 {
         let scale_dim0 = (out_dim + by - 1) / by;
         let scale_dim1 = (in_dim + bx - 1) / bx;
 
-        let weight_scale = match vb.get_with_hints((scale_dim0, scale_dim1), "weight_scale", shard)
-        {
+        let scale_dtype = if quant_cfg.scale_fmt.as_deref() == Some("ue8m0") {
+            // Preserve the exponent byte. Asking Candle to load safetensors
+            // F8_E8M0 directly as F32 numerically corrupts these scales.
+            DType::F8E8M0
+        } else {
+            DType::F32
+        };
+        let weight_scale = match vb.get_with_hints_dtype(
+            (scale_dim0, scale_dim1),
+            "weight_scale",
+            shard,
+            scale_dtype,
+        ) {
             Ok(s) => s,
-            Err(_) => vb
-                .get_with_hints((scale_dim0, scale_dim1), "weight_scale_inv", shard)
-                .map_err(|_| {
-                    candle_core::Error::Msg(
-                        "LnFp8: Missing weight_scale or weight_scale_inv".into(),
-                    )
-                })?,
-        }
-        .to_dtype(DType::F32)?;
+            Err(_) => match vb.get_with_hints_dtype(
+                (scale_dim0, scale_dim1),
+                "weight_scale_inv",
+                shard,
+                scale_dtype,
+            ) {
+                Ok(s) => s,
+                Err(_) => vb
+                    .get_with_hints_dtype((scale_dim0, scale_dim1), "scale", shard, scale_dtype)
+                    .map_err(|_| {
+                        candle_core::Error::Msg(
+                            "LnFp8: Missing weight_scale, weight_scale_inv, or scale".into(),
+                        )
+                    })?,
+            },
+        };
+        // Keep UE8M0 scales as F8E8M0 bytes; converting to F32 via Candle corrupts them.
+        let weight_scale = if scale_dtype == DType::F8E8M0 {
+            weight_scale
+        } else {
+            weight_scale.to_dtype(DType::F32)?
+        };
         let input_scale = load_fp8_input_scale(&vb)?;
 
         #[cfg(feature = "cuda")]
@@ -1089,7 +1132,9 @@ impl LnFp8 {
         let sm_version = 0;
 
         #[cfg(feature = "cutlass")]
-        let weight_scale_cutlass = if sm_version >= 100 {
+        let weight_scale_cutlass = if scale_dtype == DType::F8E8M0 {
+            None
+        } else if sm_version >= 100 {
             Some(weight_scale.t()?)
         } else if sm_version >= 90 {
             Some(weight_scale.t()?.contiguous()?)
@@ -1125,6 +1170,7 @@ impl LnFp8 {
             bias,
             weight_block_size: block_size,
             sm_version,
+            ue8m0: quant_cfg.scale_fmt.as_deref() == Some("ue8m0"),
         })
     }
 }
@@ -1264,27 +1310,66 @@ fn load_ln_fp8_with_hints(
 
     let weight = load_fp8_weight(&vb, (out_dim, in_dim), shard)?;
     let weight = normalize_sharded_2d(weight, shard, out_dim, in_dim, "weight")?;
-    let weight_scale = if let Some(s) =
-        load_scale(&vb, "weight_scale", scale_dim0, scale_dim1, shard)?
-    {
-        s
-    } else if let Some(s) = load_scale(&vb, "weight_scale_inv", scale_dim0, scale_dim1, shard)? {
-        s
+    let scale_dtype = if quant_cfg.scale_fmt.as_deref() == Some("ue8m0") {
+        // DeepSeek-V4 stores exact power-of-two exponents in F8_E8M0.
+        // Preserve the byte representation and let the CUDA fallback decode
+        // it; an eager F8_E8M0 -> F32 VarBuilder conversion is not reliable.
+        DType::F8E8M0
     } else {
-        match vb.get_with_hints_dtype((scale_dim0, scale_dim1), "weight_scale", shard, DType::F32) {
-            Ok(s) => s,
-            Err(_) => vb
-                .get_with_hints_dtype(
+        DType::F32
+    };
+    let weight_scale = if scale_dtype == DType::F32 {
+        if let Some(s) = load_scale(&vb, "weight_scale", scale_dim0, scale_dim1, shard)? {
+            s
+        } else if let Some(s) = load_scale(&vb, "weight_scale_inv", scale_dim0, scale_dim1, shard)?
+        {
+            s
+        } else if let Some(s) = load_scale(&vb, "scale", scale_dim0, scale_dim1, shard)? {
+            s
+        } else {
+            match vb.get_with_hints_dtype(
+                (scale_dim0, scale_dim1),
+                "weight_scale",
+                shard,
+                scale_dtype,
+            ) {
+                Ok(s) => s,
+                Err(_) => match vb.get_with_hints_dtype(
                     (scale_dim0, scale_dim1),
                     "weight_scale_inv",
                     shard,
-                    DType::F32,
-                )
-                .map_err(|_| {
-                    candle_core::Error::Msg(
-                        "LnFp8: Missing weight_scale or weight_scale_inv".into(),
-                    )
-                })?,
+                    scale_dtype,
+                ) {
+                    Ok(s) => s,
+                    Err(_) => vb
+                        .get_with_hints_dtype((scale_dim0, scale_dim1), "scale", shard, scale_dtype)
+                        .map_err(|_| {
+                            candle_core::Error::Msg(
+                                "LnFp8: Missing weight_scale, weight_scale_inv, or scale".into(),
+                            )
+                        })?,
+                },
+            }
+        }
+    } else {
+        match vb.get_with_hints_dtype((scale_dim0, scale_dim1), "weight_scale", shard, scale_dtype)
+        {
+            Ok(s) => s,
+            Err(_) => match vb.get_with_hints_dtype(
+                (scale_dim0, scale_dim1),
+                "weight_scale_inv",
+                shard,
+                scale_dtype,
+            ) {
+                Ok(s) => s,
+                Err(_) => vb
+                    .get_with_hints_dtype((scale_dim0, scale_dim1), "scale", shard, scale_dtype)
+                    .map_err(|_| {
+                        candle_core::Error::Msg(
+                            "LnFp8: Missing weight_scale, weight_scale_inv, or scale".into(),
+                        )
+                    })?,
+            },
         }
     };
     let weight_scale = normalize_sharded_2d(
@@ -1304,7 +1389,9 @@ fn load_ln_fp8_with_hints(
     let sm_version = 0;
 
     #[cfg(feature = "cutlass")]
-    let weight_scale_cutlass = if sm_version >= 100 {
+    let weight_scale_cutlass = if scale_dtype == DType::F8E8M0 {
+        None
+    } else if sm_version >= 100 {
         // SM100+: Column-major scale layout
         Some(weight_scale.t()?)
     } else if sm_version >= 90 {
@@ -1336,6 +1423,7 @@ fn load_ln_fp8_with_hints(
         bias,
         weight_block_size: block_size,
         sm_version,
+        ue8m0: quant_cfg.scale_fmt.as_deref() == Some("ue8m0"),
     })
 }
 
@@ -1349,6 +1437,26 @@ impl Module for LnFp8 {
 
         let x_2d = x.reshape((b_sz * seq_len, in_dim))?;
 
+        #[cfg(feature = "cuda")]
+        let out = if self.ue8m0 {
+            attention_rs::fp8_linear::fp8_matmul_ue8m0(
+                &x_2d,
+                &self.weight,
+                &self.weight_scale,
+                &self.weight_block_size,
+            )?
+        } else {
+            attention_rs::fp8_linear::fp8_matmul_with_input_scale(
+                &x_2d,
+                &self.weight,
+                &self.weight_scale,
+                self.weight_scale_cutlass.as_ref(),
+                &self.weight_block_size,
+                self.input_scale,
+                linear_is_prefill(),
+            )?
+        };
+        #[cfg(not(feature = "cuda"))]
         let out = attention_rs::fp8_linear::fp8_matmul_with_input_scale(
             &x_2d,
             &self.weight,
