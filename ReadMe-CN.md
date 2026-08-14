@@ -534,7 +534,7 @@ xinfer --m Qwen/Qwen3.6-27B-FP8 --ui-server --enable-tool-grammar
 | 变量 | 描述 |
 |---|---|
 | `XINFER_NVFP4_FORCE_LUT=1` | 强制 NVFP4 软件解码使用 LUT（查找表）路径替代 Blackwell (SM100+) 硬件 FP4 指令。精度更高，适用于对解码精度有要求的场景。 |
-| `XINFER_DISABLE_FLASHMLA=1` | 禁用 DeepSeek V4 的 FlashMLA（SM90）与 FlashInfer SM120 稀疏 MLA，回退到自定义 BF16 稀疏注意力内核。默认关闭——在 GPU 架构与形状支持时自动使用加速路径。 |
+| `XINFER_ENABLE_FLASHMLA` | 设置为 `1` 或 `true` 时启用 DeepSeek V4 稀疏 MLA 加速。默认未设置，因此默认使用保精度的自定义 BF16 稀疏注意力内核。 |
 | `XINFER_SSE_BUFFER_SIZE=256` | 每个客户端连接的 SSE 流式缓冲区大小（默认：256）。对于慢速网络代理或高吞吐模型，可适当增大。 |
 | `SM90_LOWER_PRECISION_GDN_PREFILL=1` | 在 Hopper (SM90) GPU 上启用 FlashInfer SM90 持久化内核加速 GatedDeltaNet (GDN) 预填充。可为 Qwen3.5/3.6 等混合架构模型带来预填充加速，但精度略有损失。|
 
