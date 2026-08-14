@@ -410,14 +410,6 @@ pub struct GraphCapturer<M: CudaGraphModule> {
     pub flashinfer_kv_params: Option<FlashInferKvParams>,
     pub is_mla: bool,
     pub mtp_graph_vars: Option<MtpGraphCaptureVars>,
-    /// Decode position used during graph capture (defaults to max_model_len - 1).
-    pub capture_decode_pos: Option<usize>,
-    /// When set, allocate logits buffers outside the capture pool and D2D-copy
-    /// into them as the last captured node. Required when capture allocates so
-    /// much pool memory that `AUTO_FREE_ON_LAUNCH` recycles the forward() return
-    /// buffer (DeepSeek V4 ~80GB pool → all-zero logits on replay).
-    pub persistent_logit_vocab: Option<usize>,
-    pub persistent_logit_dtype: Option<DType>,
 }
 
 pub fn planned_graph_capture_batches(max_num_seqs: usize) -> Vec<usize> {
@@ -477,9 +469,6 @@ impl<M: CudaGraphModule> GraphCapturer<M> {
         hidden_size: usize,
         #[cfg(feature = "flashinfer")] flashinfer_kv_params: &Option<FlashInferKvParams>,
         is_mla: bool,
-        capture_decode_pos: Option<usize>,
-        persistent_logit_vocab: Option<usize>,
-        persistent_logit_dtype: Option<DType>,
     ) -> Self {
         let graph_bs = planned_graph_capture_batches(max_num_seqs);
         println!("The following batches for capture: {:?}", graph_bs);
@@ -497,9 +486,6 @@ impl<M: CudaGraphModule> GraphCapturer<M> {
             flashinfer_kv_params: flashinfer_kv_params.clone(),
             is_mla,
             mtp_graph_vars: None,
-            capture_decode_pos,
-            persistent_logit_vocab,
-            persistent_logit_dtype,
         }
     }
 
@@ -507,7 +493,6 @@ impl<M: CudaGraphModule> GraphCapturer<M> {
         &mut self,
         device: &Device,
         kv_caches: Option<&Vec<(Tensor, Tensor)>>,
-        pre_capture_reset: Option<&dyn Fn() -> Result<()>>,
     ) -> Result<()> {
         let _fp8_domain = attention_rs::fp8_linear::set_fp8_execution_domain(
             attention_rs::fp8_linear::Fp8ExecutionDomain::DecodeGraph,
@@ -518,18 +503,14 @@ impl<M: CudaGraphModule> GraphCapturer<M> {
         let max_num_blocks = (self.max_model_len + self.block_size - 1) / self.block_size;
 
         let input_ids = Tensor::zeros((max_bs,), DType::U32, device)?;
-        let capture_pos =
-            self.capture_decode_pos
-                .unwrap_or_else(|| self.max_model_len.saturating_sub(1)) as i64;
-        let positions = Tensor::from_vec(vec![capture_pos; max_bs], (max_bs,), device)?;
+        let positions = Tensor::zeros((max_bs,), DType::I64, device)?;
         let mamba_slot_mapping = Tensor::from_vec(
             (0..max_bs).map(|i| i as i64).collect::<Vec<_>>(),
             (max_bs,),
             device,
         )?;
         let slot_mapping = Tensor::zeros((max_bs,), DType::I64, device)?;
-        let capture_ctx = (capture_pos + 1) as u32;
-        let context_lens = Tensor::full(capture_ctx, max_bs, device)?;
+        let context_lens = Tensor::zeros((max_bs,), DType::U32, device)?;
         let block_tables = Tensor::zeros((max_bs, max_num_blocks), DType::U32, device)?;
         #[cfg(feature = "flashinfer")]
         let (flashinfer_indptr, flashinfer_indices, flashinfer_last_len, last_len_host) = {
@@ -563,19 +544,7 @@ impl<M: CudaGraphModule> GraphCapturer<M> {
 
         let mut outputs = BTreeMap::<usize, Tensor>::new();
         let _guard = candle_core::cuda_backend::cuda_param_cache_scope(true);
-        // V4 sparse decode accumulators must not be mutated by cache-prewarm /
-        // warmup forwards at the capture position before the capture forward.
-        let phases: &[CapturePhase] = if self.capture_decode_pos.is_some() {
-            &[CapturePhase::Capture]
-        } else {
-            &CapturePhase::ALL
-        };
-        for phase in phases {
-            if matches!(phase, CapturePhase::Capture) {
-                if let Some(reset) = pre_capture_reset {
-                    reset()?;
-                }
-            }
+        for phase in CapturePhase::ALL {
             let iter: Box<dyn Iterator<Item = usize>> = if phase.is_warmup() {
                 Box::new(0..self.graph_bs.len())
             } else {
@@ -650,12 +619,13 @@ impl<M: CudaGraphModule> GraphCapturer<M> {
                     slot_mapping: slot_mapping.narrow(0, 0, bs)?,
                     block_tables: Some(block_tables.narrow(0, 0, bs)?),
                     block_tables_host: None,
+                    context_lens_host: None,
                     context_lens: Some(context_lens.narrow(0, 0, bs)?),
                     cu_seqlens_q: None,
                     cu_seqlens_k: None,
                     max_seqlen_q: 0,
                     max_seqlen_k: 0,
-                    max_context_len: capture_pos as usize + 1,
+                    max_context_len: self.max_model_len,
                     seqlens: None,
                     flashinfer_metadata,
                     is_mtp_verify: false,
@@ -664,15 +634,6 @@ impl<M: CudaGraphModule> GraphCapturer<M> {
                 let should_capture =
                     !phase.is_cache_prewarm() && (!phase.is_warmup() || capture_in_warmup);
                 if should_capture {
-                    // Pre-allocate logits outside the capture pool so AUTO_FREE
-                    // cannot invalidate the Tensor we return from replay().
-                    if let (Some(vocab), Some(dt)) =
-                        (self.persistent_logit_vocab, self.persistent_logit_dtype)
-                    {
-                        if !outputs.contains_key(&bs) {
-                            outputs.insert(bs, Tensor::zeros((bs, vocab), dt, device)?);
-                        }
-                    }
                     self.model.start_capture(bs)?;
                 }
                 if phase.is_warmup() {
@@ -695,31 +656,7 @@ impl<M: CudaGraphModule> GraphCapturer<M> {
                         &input_metadata,
                         false,
                     )?;
-                    if let Some(persistent) = outputs.get(&bs) {
-                        if out.dtype() != persistent.dtype() {
-                            candle_core::bail!(
-                                "graph persistent logits dtype {:?} != forward output {:?}",
-                                persistent.dtype(),
-                                out.dtype()
-                            );
-                        }
-                        if out.elem_count() > persistent.elem_count() {
-                            candle_core::bail!(
-                                "graph persistent logits too small: {} < forward {}",
-                                persistent.elem_count(),
-                                out.elem_count()
-                            );
-                        }
-                        let src = if out.is_contiguous() {
-                            out
-                        } else {
-                            out.contiguous()?
-                        };
-                        // Graph-safe cudaMemcpyAsync into the pre-capture buffer.
-                        attention_rs::deepseek_v4::copy_contiguous_into(persistent, &src, 0)?;
-                    } else {
-                        outputs.insert(bs, out);
-                    }
+                    outputs.insert(bs, out);
                 }
                 if should_capture {
                     self.model.end_capture(!phase.is_warmup())?;
@@ -1011,6 +948,7 @@ impl<M: CudaGraphModule> GraphCapturer<M> {
             slot_mapping: slot_mapping.clone(),
             block_tables: Some(block_tables.clone()),
             block_tables_host: None,
+            context_lens_host: None,
             context_lens: Some(context_lens.clone()),
             cu_seqlens_q: Some(cu_seqlens_q.clone()),
             cu_seqlens_k: Some(cu_seqlens_k.clone()),

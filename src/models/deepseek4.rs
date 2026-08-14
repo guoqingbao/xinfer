@@ -5,7 +5,6 @@ use crate::models::layers::ds_v4::{
     IndexerWeights, LayerCompressionType, LayerDecodeBuffers, LayerSparseKvCache, MlaV4Attention,
     MlaV4Config, V4HybridPagePool, V4RopeTables, V4Router, V4_NATIVE_BLOCK_SIZE,
 };
-use crate::models::layers::mask::get_attention_causal_mask;
 use crate::models::layers::mlp::MLP;
 use crate::models::layers::moe::MoeW2ExpertWeights;
 use crate::models::layers::others::{embedding, rms_norm_v4, NormX};
@@ -16,7 +15,7 @@ use attention_rs::InputMetadata;
 use candle_core::{DType, Device, Result, Tensor};
 use candle_nn::{Activation, Module};
 use parking_lot::{Mutex, RwLock};
-use std::iter::zip;
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -231,6 +230,55 @@ pub struct DeepSeekV4DecoderLayer {
     compressor: Option<CompressorWeights>,
     indexer: Option<IndexerWeights>,
     sliding_window: usize,
+}
+
+/// Per-request recurrent state owned by the compressor, indexer and sparse ring.
+///
+/// These are GPU tensor handles, not device copies: switching requests moves the
+/// handles between the request table and the layer's active fields, so a request
+/// transition never reconstructs recurrent state from quantized page data.
+struct LayerStateSnapshot {
+    sparse: Option<LayerSparseKvCache>,
+    compressor: Option<CompressorDecodeState>,
+    indexer: Option<IndexerDecodeState>,
+}
+
+/// Parked recurrent state for one request, tagged with the absolute position it
+/// was parked at.
+///
+/// The tag is what makes reuse safe: a snapshot only describes the history up to
+/// `next_pos`, so a request that resumes anywhere else (prefix-cache hit,
+/// recompute after preemption) must rebuild from its pages instead of silently
+/// inheriting a history that does not belong to its current block table.
+struct RequestState {
+    next_pos: usize,
+    /// Physical pages backing `[0, next_pos)`, used to prove that another
+    /// request resuming at `next_pos` shares this exact history.
+    block_prefix: Vec<u32>,
+    layers: Vec<LayerStateSnapshot>,
+}
+
+impl RequestState {
+    /// True when a request resuming at `start_pos` over `block_table` has the
+    /// same token history as this state.
+    ///
+    /// A prefix-cache hit hands the new request the *same physical pages* for
+    /// the matched region, so identical pages at an identical position mean the
+    /// recurrent state is already correct — the compressor and indexer never
+    /// have to be rebuilt from the page residual.
+    fn covers(&self, start_pos: usize, block_table: &[u32]) -> bool {
+        // `>=` mirrors the single-sequence path this replaces: a state that has
+        // already run past `start_pos` still holds the history up to it, since
+        // the ring and the compressed rows are indexed by absolute position.
+        if self.next_pos < start_pos {
+            return false;
+        }
+        let pages = start_pos / V4_NATIVE_BLOCK_SIZE;
+        if pages > self.block_prefix.len() || pages > block_table.len() {
+            return false;
+        }
+        self.block_prefix[..pages] == block_table[..pages]
+    }
 }
 
 impl DeepSeekV4DecoderLayer {
@@ -520,6 +568,67 @@ impl DeepSeekV4DecoderLayer {
         if let Some(state) = self.indexer_state.lock().as_mut() {
             state.reset()?;
         }
+        Ok(())
+    }
+
+    /// Detach this layer's recurrent state so it can be parked in the request table.
+    fn take_state(&self) -> LayerStateSnapshot {
+        LayerStateSnapshot {
+            sparse: self.sparse_kv.lock().take(),
+            compressor: self.compressor_state.lock().take(),
+            indexer: self.indexer_state.lock().take(),
+        }
+    }
+
+    /// Install the recurrent state of the request that is about to run.
+    ///
+    /// A request without parked state is either starting from scratch or resuming
+    /// from a prefix-cache hit at a frozen native boundary, which is hydrated from
+    /// its pages.
+    fn restore_state(
+        &self,
+        snapshot: Option<LayerStateSnapshot>,
+        start_pos: usize,
+        block_table: &[u32],
+        device: &Device,
+    ) -> Result<()> {
+        let had_persistent_state = snapshot.is_some();
+        if let Some(snapshot) = snapshot {
+            if let Some(state) = snapshot.sparse {
+                *self.sparse_kv.lock() = Some(state);
+            }
+            if let Some(state) = snapshot.compressor {
+                *self.compressor_state.lock() = Some(state);
+            }
+            if let Some(state) = snapshot.indexer {
+                *self.indexer_state.lock() = Some(state);
+            }
+        }
+
+        // Install persistent handles before ensuring buffers: the reverse order
+        // would allocate a throw-away recurrent state on every request switch.
+        self.ensure_decode_buffers(device)?;
+
+        if had_persistent_state {
+            return Ok(());
+        }
+
+        // No parked state: these handles were just allocated, so put them in the
+        // same cleared state a finished request used to leave behind before
+        // hydrating. Hydration only rewrites the residual window and the rows
+        // covered by `start_pos`; anything outside that has to already be
+        // cleared, or the compressor scores over the untouched rows are read as
+        // real history.
+        self.reset_decode_state()?;
+        if start_pos == 0 {
+            return Ok(());
+        }
+        if start_pos % V4_NATIVE_BLOCK_SIZE != 0 {
+            candle_core::bail!(
+                "DeepSeek V4 request state missing for non-boundary position {start_pos}"
+            );
+        }
+        self.load_residual_from_pages(start_pos, block_table)?;
         Ok(())
     }
 
@@ -1604,6 +1713,7 @@ impl DeepSeekV4DecoderLayer {
         input_metadata: &InputMetadata,
         input_ids: Option<&Tensor>,
         block_table: &[u32],
+        start_pos: usize,
     ) -> Result<HcHiddenStates> {
         // Attention branch: fused hc_pre + attn_norm -> attn -> hc_post
         let attn_norm_w = self.attn_norm.v4_weight_f32().ok_or_else(|| {
@@ -1621,13 +1731,6 @@ impl DeepSeekV4DecoderLayer {
         )?;
         let qr = self.self_attn.compute_qr(&attn_normed)?;
         let seq_len = attn_normed.dims()[0];
-        // Unified metadata: start_pos = num_cached_tokens (context − chunk).
-        let start_pos = if input_metadata.is_prefill {
-            input_metadata.max_context_len.saturating_sub(seq_len)
-        } else {
-            // Do not D2H `positions` (I64 GPU→host reads were returning garbage).
-            input_metadata.max_context_len.saturating_sub(1)
-        };
         let attn_output = if input_metadata.is_prefill {
             self.prefill_unified(
                 &attn_normed,
@@ -1639,9 +1742,7 @@ impl DeepSeekV4DecoderLayer {
             )?
         } else {
             if seq_len != 1 {
-                candle_core::bail!(
-                    "DeepSeek V4 sparse decode currently supports one sequence at a time"
-                );
+                candle_core::bail!("DeepSeek V4 sparse decode expects one token per request");
             }
             if start_pos >= self.max_seq_len {
                 candle_core::bail!(
@@ -1649,7 +1750,11 @@ impl DeepSeekV4DecoderLayer {
                     self.max_seq_len
                 );
             }
-            // Prefix full-hit may land on decode at a native-block boundary.
+            // Realign the live ring with the pages at every native block. The
+            // incremental decode path advances `compressed_len` on its own, but
+            // `commit_pages` places compressed rows by that counter: letting it
+            // drift writes misaligned rows into the pages. A later prefix-cache
+            // hit reads those pages back, so the drift only surfaces on reuse.
             if start_pos > 0 && start_pos % V4_NATIVE_BLOCK_SIZE == 0 {
                 self.load_residual_from_pages(start_pos, block_table)?;
             }
@@ -1705,6 +1810,12 @@ pub struct DeepSeekV4ForCausalLM {
     vocab_size: usize,
     is_qvar_builder: bool,
     hybrid_pool: Arc<Mutex<Option<V4HybridPagePool>>>,
+    request_states: Mutex<HashMap<usize, RequestState>>,
+    /// State of the most recently finished request, kept so the next turn of a
+    /// conversation can adopt it on a prefix-cache hit instead of rebuilding
+    /// from page residual. One slot only: this is the same amount of recurrent
+    /// state a single-sequence run already keeps resident.
+    retired_state: Mutex<Option<RequestState>>,
 }
 
 impl DeepSeekV4ForCausalLM {
@@ -1913,6 +2024,8 @@ impl DeepSeekV4ForCausalLM {
             vocab_size,
             is_qvar_builder,
             hybrid_pool,
+            request_states: Mutex::new(HashMap::new()),
+            retired_state: Mutex::new(None),
         })
     }
 
@@ -1928,9 +2041,12 @@ impl DeepSeekV4ForCausalLM {
         *self.hybrid_pool.lock() = src.take();
     }
 
-    pub fn clear_seq_state(&self, _seq_id: usize) {
-        for layer in &self.layers {
-            let _ = layer.lock().reset_decode_state();
+    pub fn clear_seq_state(&self, seq_id: usize) {
+        // Retire rather than drop: the next turn of a conversation prefix-hits
+        // this sequence's pages, and its recurrent state is the exact state
+        // that turn resumes from.
+        if let Some(state) = self.request_states.lock().remove(&seq_id) {
+            *self.retired_state.lock() = Some(state);
         }
     }
 
@@ -1971,104 +2087,204 @@ impl DeepSeekV4ForCausalLM {
         input_metadata: &InputMetadata,
         embeded_inputs: bool,
     ) -> Result<Tensor> {
-        let seqlens = input_metadata.seqlens.clone().unwrap_or_default();
-        let attention_mask = get_attention_causal_mask(
-            &self.device,
-            self.dtype,
-            positions,
-            seqlens.clone(),
-            self.config.sliding_window,
-            input_metadata.is_prefill,
-        );
-
+        // The V4 kernels accept many query rows, but the compressor and indexer
+        // keep one recurrent state machine. Dispatch one request at a time and
+        // park that state by sequence id: the scheduler gets a batched API
+        // without ever mixing two histories in the same recurrent state.
         let xs = if embeded_inputs {
             input_ids.to_owned()
         } else {
             self.embed_forward(input_ids)?
         };
+        let _ = kv_caches;
 
-        // Host block table prepared in runner `prepare_prefill` / `prepare_decode`
-        // (CPU Vec — no D2H, CUDA-graph compatible).
-        let empty_bt: Vec<u32> = Vec::new();
-        let block_table: &[u32] = input_metadata
-            .block_tables_host
-            .as_ref()
-            .and_then(|bts| bts.first())
-            .map(|v| v.as_slice())
-            .unwrap_or(&empty_bt);
-
-        // Expand to HC hidden states
-        let mut hc_hidden = hc_expand(&xs, self.v4_cfg.hc_mult)?;
-
-        // Hybrid pages live on `self.hybrid_pool`; Flash/MLA-style `kv_caches`
-        // pairs are unused (engine passes None for DeepSeekV4).
-        if let Some(kv_caches) = kv_caches {
-            for (layer_idx, ((k_cache, v_cache), layer)) in
-                zip(kv_caches.iter(), self.layers.iter()).enumerate()
-            {
-                let mut layer = layer.lock();
-                let layer_input_ids = if layer_idx < self.v4_cfg.n_hash_layers {
-                    Some(input_ids)
-                } else {
-                    None
-                };
-                hc_hidden = layer.forward(
-                    &hc_hidden,
-                    attention_mask.as_ref(),
-                    positions,
-                    Some((k_cache, v_cache)),
-                    input_metadata,
-                    layer_input_ids,
-                    block_table,
-                )?;
-            }
+        let token_count = xs.dim(0)?;
+        let request_lens = if input_metadata.is_prefill {
+            input_metadata
+                .seqlens
+                .as_ref()
+                .filter(|lengths| !lengths.is_empty())
+                // Runner metadata stores the ends of each cumulative query range
+                // (`cu_seqlens_q[1..]`); this dispatcher needs per-request lengths.
+                .map(|ends| {
+                    let mut previous = 0usize;
+                    ends.iter()
+                        .map(|&end| {
+                            let end = end as usize;
+                            let len = end.saturating_sub(previous);
+                            previous = end;
+                            len
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_else(|| vec![token_count])
         } else {
+            vec![1; token_count]
+        };
+        if request_lens.iter().sum::<usize>() != token_count {
+            candle_core::bail!(
+                "DeepSeek V4 request lengths {:?} do not cover {} input rows",
+                request_lens,
+                token_count
+            );
+        }
+
+        let request_ids = input_metadata
+            .sequence_ids
+            .clone()
+            .unwrap_or_else(|| (0..request_lens.len()).collect());
+        if request_ids.len() != request_lens.len() {
+            candle_core::bail!(
+                "DeepSeek V4 received {} request ids for {} requests",
+                request_ids.len(),
+                request_lens.len()
+            );
+        }
+        let context_lens = input_metadata
+            .context_lens_host
+            .clone()
+            .unwrap_or_else(|| vec![input_metadata.max_context_len as u32; request_lens.len()]);
+        if context_lens.len() != request_lens.len() {
+            candle_core::bail!(
+                "DeepSeek V4 received {} context lengths for {} requests",
+                context_lens.len(),
+                request_lens.len()
+            );
+        }
+
+        // Host block tables are prepared in runner `prepare_prefill` /
+        // `prepare_decode` (CPU Vec — no D2H in the forward).
+        let empty_block_table: Vec<u32> = Vec::new();
+        let block_tables = input_metadata.block_tables_host.as_ref();
+
+        let mut outputs = Vec::with_capacity(request_lens.len());
+        let mut offset = 0usize;
+        for (request_idx, (&seq_len, &seq_id)) in
+            request_lens.iter().zip(request_ids.iter()).enumerate()
+        {
+            let input_slice = xs.narrow(0, offset, seq_len)?.contiguous()?;
+            let token_id_slice = if !embeded_inputs {
+                Some(input_ids.narrow(0, offset, seq_len)?.contiguous()?)
+            } else {
+                None
+            };
+            let position_slice = positions.narrow(0, offset, seq_len)?.contiguous()?;
+            let block_table: &[u32] = block_tables
+                .and_then(|bts| bts.get(request_idx))
+                .map(|v| v.as_slice())
+                .unwrap_or(&empty_block_table);
+            let context_len = context_lens[request_idx] as usize;
+            if context_len < seq_len {
+                candle_core::bail!(
+                    "DeepSeek V4 request {seq_id} context length {context_len} < query length {seq_len}"
+                );
+            }
+            // Unified metadata: start_pos = number of already-cached tokens.
+            let start_pos = context_len - seq_len;
+
+            // Only reuse parked state that ends exactly where this request
+            // resumes. A prefix-cache hit or a recompute after preemption moves
+            // the resume point without finishing the sequence, and that state
+            // describes a different history than the current block table.
+            let mut parked_state = self
+                .request_states
+                .lock()
+                .remove(&seq_id)
+                .filter(|state| state.covers(start_pos, block_table));
+            let mut adopted = false;
+            if parked_state.is_none() && start_pos > 0 {
+                let mut retired = self.retired_state.lock();
+                if retired
+                    .as_ref()
+                    .map_or(false, |state| state.covers(start_pos, block_table))
+                {
+                    parked_state = retired.take();
+                    adopted = true;
+                }
+            }
+            let mut parked =
+                parked_state.map(|state| state.layers.into_iter().map(Some).collect::<Vec<_>>());
+            for (layer_idx, layer) in self.layers.iter().enumerate() {
+                let snapshot = parked
+                    .as_mut()
+                    .and_then(|snapshots| snapshots.get_mut(layer_idx))
+                    .and_then(Option::take);
+                layer
+                    .lock()
+                    .restore_state(snapshot, start_pos, block_table, &self.device)?;
+            }
+
+            let mut hc_hidden = hc_expand(&input_slice, self.v4_cfg.hc_mult)?;
             for (layer_idx, layer) in self.layers.iter().enumerate() {
                 let mut layer = layer.lock();
                 let layer_input_ids = if layer_idx < self.v4_cfg.n_hash_layers {
-                    Some(input_ids)
+                    token_id_slice.as_ref()
                 } else {
                     None
                 };
                 hc_hidden = layer.forward(
                     &hc_hidden,
-                    attention_mask.as_ref(),
-                    positions,
+                    None,
+                    &position_slice,
                     None,
                     input_metadata,
                     layer_input_ids,
                     block_table,
+                    start_pos,
                 )?;
             }
+
+            // HC head collapse
+            let hidden = if let Some(hc_head_weights) = &self.hc_head {
+                hc_head(
+                    &hc_hidden,
+                    &hc_head_weights.hc_fn,
+                    &hc_head_weights.hc_scale,
+                    &hc_head_weights.hc_base,
+                )?
+            } else {
+                // Fallback: take first HC branch [seq, hc, dim] -> [seq, dim]
+                hc_hidden.data.narrow(1, 0, 1)?.squeeze(1)?
+            };
+            let last = if input_metadata.is_prefill {
+                hidden.narrow(0, seq_len.saturating_sub(1), 1)?
+            } else {
+                hidden
+            };
+            // Final RMSNorm: owned buffer, single in-place CUDA kernel.
+            let last = if last.dtype() == DType::BF16 && last.is_contiguous() {
+                last
+            } else {
+                last.to_dtype(DType::BF16)?.contiguous()?
+            };
+            self.norm.forward_v4_inplace(&last)?;
+            outputs.push(self.lm_head.forward(&last)?);
+
+            let snapshots = self
+                .layers
+                .iter()
+                .map(|layer| layer.lock().take_state())
+                .collect::<Vec<_>>();
+            let next_pos = start_pos + seq_len;
+            let pages = next_pos
+                .div_ceil(V4_NATIVE_BLOCK_SIZE)
+                .min(block_table.len());
+            self.request_states.lock().insert(
+                seq_id,
+                RequestState {
+                    next_pos,
+                    block_prefix: block_table[..pages].to_vec(),
+                    layers: snapshots,
+                },
+            );
+            offset += seq_len;
         }
 
-        // HC head collapse
-        let mut xs = if let Some(hc_head_weights) = &self.hc_head {
-            hc_head(
-                &hc_hidden,
-                &hc_head_weights.hc_fn,
-                &hc_head_weights.hc_scale,
-                &hc_head_weights.hc_base,
-            )?
-        } else {
-            // Fallback: take first HC branch [seq, hc, dim] -> [seq, dim]
-            hc_hidden.data.narrow(1, 0, 1)?.squeeze(1)?
-        };
-        if !seqlens.is_empty() {
-            let indices: Vec<_> = seqlens.iter().map(|x| x - 1 as u32).collect();
-            let batch = indices.len();
-            xs = xs
-                .contiguous()?
-                .index_select(&Tensor::from_vec(indices, (batch,), xs.device())?, 0)?;
+        if outputs.len() == 1 {
+            return Ok(outputs.remove(0));
         }
-        // Final RMSNorm: owned buffer, single in-place CUDA kernel.
-        let xs = if xs.dtype() == DType::BF16 && xs.is_contiguous() {
-            xs
-        } else {
-            xs.to_dtype(DType::BF16)?.contiguous()?
-        };
-        self.norm.forward_v4_inplace(&xs)?;
-        self.lm_head.forward(&xs)
+        let output_refs = outputs.iter().collect::<Vec<_>>();
+        Tensor::cat(&output_refs, 0)
     }
 
     pub fn forward_embedding(
@@ -2105,26 +2321,6 @@ impl DeepSeekV4ForCausalLM {
             input_metadata,
             embeded_inputs,
         )
-    }
-
-    /// Prewarm V4 HC/indexer/compressor scratch pools before CUDA graph capture.
-    pub fn prewarm_cuda_graph_scratch(&self) -> Result<()> {
-        for layer in &self.layers {
-            layer.lock().ensure_decode_buffers(&self.device)?;
-        }
-        let hc = self.v4_cfg.hc_mult;
-        let hidden = self.config.hidden_size;
-        let hc_elems = hc * hidden;
-        let fp4_elems = self.v4_cfg.index_n_heads * self.v4_cfg.index_head_dim.max(128);
-        attention_rs::deepseek_v4::prewarm_decode_scratch(&self.device, hc_elems, fp4_elems)
-    }
-
-    /// Clear per-layer decode accumulators before graph capture warmup.
-    pub fn reset_decode_state_for_graph(&self) -> Result<()> {
-        for layer in &self.layers {
-            layer.lock().reset_decode_state()?;
-        }
-        Ok(())
     }
 
     pub fn get_vocab_size(&self) -> usize {

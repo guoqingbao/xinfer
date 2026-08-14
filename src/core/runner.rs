@@ -444,9 +444,7 @@ impl ModelRunner {
         };
 
         #[cfg(all(feature = "cuda", feature = "graph"))]
-        let graph_capture_max_num_seqs = if matches!(model_type, ModelType::DeepSeekV4) {
-            1
-        } else if is_hybrid_mamba_model {
+        let graph_capture_max_num_seqs = if is_hybrid_mamba_model {
             mamba_cache_capacity.max(1)
         } else {
             econfig.max_num_parallel_reqs.max(1)
@@ -703,30 +701,6 @@ impl ModelRunner {
             (None, 0)
         };
 
-        #[cfg(all(feature = "cuda", feature = "graph"))]
-        let graph_capture_max_model_len = econfig.max_model_len.unwrap_or(32768);
-
-        #[cfg(all(feature = "cuda", feature = "graph"))]
-        let graph_capture_decode_pos = if matches!(model_type, ModelType::DeepSeekV4) {
-            // Capture at a mid-range decode position: exercises window + compress
-            // topk without the max-position edge cases of pos 8191.
-            Some(511)
-        } else {
-            None
-        };
-
-        #[cfg(all(feature = "cuda", feature = "graph"))]
-        let (graph_persistent_logit_vocab, graph_persistent_logit_dtype) =
-            if matches!(model_type, ModelType::DeepSeekV4) {
-                let vocab = match &model {
-                    Model::DeepSeekV4(m) => m.get_vocab_size(),
-                    _ => unreachable!(),
-                };
-                (Some(vocab), Some(dtype))
-            } else {
-                (None, None)
-            };
-
         Ok(Self {
             model,
             gpu_kv_cache: Arc::new(Mutex::new(gpu_kv_cache)),
@@ -738,7 +712,7 @@ impl ModelRunner {
             decode_capturer: GraphCapturer::new(
                 wrapper,
                 graph_capture_max_num_seqs,
-                graph_capture_max_model_len,
+                econfig.max_model_len.unwrap_or(32768),
                 econfig.block_size,
                 config.hidden_size,
                 #[cfg(feature = "flashinfer")]
@@ -747,16 +721,13 @@ impl ModelRunner {
                     model_type,
                     ModelType::GLM4MoeLite | ModelType::DeepSeek | ModelType::GLM5
                 ),
-                graph_capture_decode_pos,
-                graph_persistent_logit_vocab,
-                graph_persistent_logit_dtype,
             ),
             #[cfg(all(feature = "cuda", feature = "graph"))]
             mtp_capturer: mtp_wrapper.map(|w| {
                 GraphCapturer::new(
                     w,
                     graph_capture_max_num_seqs,
-                    graph_capture_max_model_len,
+                    econfig.max_model_len.unwrap_or(32768),
                     econfig.block_size,
                     config.hidden_size,
                     #[cfg(feature = "flashinfer")]
@@ -765,9 +736,6 @@ impl ModelRunner {
                         model_type,
                         ModelType::GLM4MoeLite | ModelType::DeepSeek | ModelType::GLM5
                     ),
-                    graph_capture_decode_pos,
-                    graph_persistent_logit_vocab,
-                    graph_persistent_logit_dtype,
                 )
             }),
             #[cfg(feature = "flashinfer")]
@@ -1253,7 +1221,7 @@ impl ModelRunner {
             .zip(prefill_tokens.iter())
             .map(|(seq, &num_tokens)| (seq.num_cached_tokens + num_tokens) as u32)
             .collect();
-        let context_lens_t = Tensor::from_vec(context_lens_vec, seqs.len(), &self.device)?;
+        let context_lens_t = Tensor::from_vec(context_lens_vec.clone(), seqs.len(), &self.device)?;
         let block_tables = Some(block_tables_t);
         let context_lens = Some(context_lens_t);
         let cu_seqlens_q_vec = cu_seqlens_q.clone();
@@ -1405,6 +1373,7 @@ impl ModelRunner {
             slot_mapping,
             block_tables,
             block_tables_host,
+            context_lens_host: Some(context_lens_vec),
             context_lens,
             cu_seqlens_q: Some(cu_seqlens_q),
             cu_seqlens_k: Some(cu_seqlens_k),
@@ -1472,6 +1441,7 @@ impl ModelRunner {
         let max_context_len = context_lens.clone().into_iter().max().unwrap() as usize;
 
         let slot_mapping = Tensor::from_vec(slot_mapping, (s_len,), &self.device)?;
+        let context_lens_host = context_lens.clone();
         let context_lens = Tensor::from_vec(context_lens, (c_len,), &self.device)?;
         let max_active_blocks = active_block_tables.iter().map(Vec::len).max().unwrap_or(0);
         let mut flat_block_tables = Vec::with_capacity(seq_refs.len() * max_active_blocks);
@@ -1590,6 +1560,7 @@ impl ModelRunner {
             slot_mapping,
             block_tables: Some(block_tables),
             block_tables_host: Some(active_block_tables.clone()),
+            context_lens_host: Some(context_lens_host),
             context_lens: Some(context_lens),
             cu_seqlens_q: None,
             cu_seqlens_k: None,
@@ -1831,6 +1802,7 @@ impl ModelRunner {
             Model::Qwen3_5(model) => model.release_sequence_state(id),
             Model::Qwen3_5MoE(model) => model.release_sequence_state(id),
             Model::Qwen3VL(model) => model.release_sequence_state(id),
+            Model::DeepSeekV4(model) => model.clear_seq_state(id),
             _ => {}
         }
     }
@@ -1860,19 +1832,16 @@ impl ModelRunner {
 
     #[cfg(all(feature = "cuda", feature = "graph"))]
     pub fn warmup_capture(&mut self) -> Result<()> {
+        if matches!(self.model_type, ModelType::DeepSeekV4) {
+            // V4 keeps recurrent compressor/indexer state per request and swaps
+            // those GPU handles between requests, which a captured graph cannot
+            // follow. Decode always runs eagerly for this model.
+            crate::log_warn!("CUDA graph capture disabled for DeepSeek V4");
+            return Ok(());
+        }
         let kv_cache_lock = self.gpu_kv_cache.lock().unwrap();
         let kv_pairs = kv_cache_lock.as_pairs();
-        if let Model::DeepSeekV4(model) = &self.model {
-            model.prewarm_cuda_graph_scratch()?;
-            model.reset_decode_state_for_graph()?;
-            self.decode_capturer.capture(
-                &self.device,
-                kv_pairs,
-                Some(&|| model.reset_decode_state_for_graph()),
-            )?;
-        } else {
-            self.decode_capturer.capture(&self.device, kv_pairs, None)?;
-        }
+        self.decode_capturer.capture(&self.device, kv_pairs)?;
 
         if self.mtp_num_speculative > 0 {
             // self.decode_capturer.model.sync()?;
@@ -1889,7 +1858,6 @@ impl ModelRunner {
             Model::Qwen3_5(model) => model.reset_mamba_cache()?,
             Model::Qwen3_5MoE(model) => model.reset_mamba_cache()?,
             Model::Qwen3VL(model) => model.reset_mamba_cache()?,
-            Model::DeepSeekV4(model) => model.reset_decode_state_for_graph()?,
             _ => {}
         }
         self.restored_prefix_sequences.write().clear();

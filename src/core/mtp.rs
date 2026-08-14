@@ -298,6 +298,7 @@ impl ModelRunner {
                 self.device(),
             )?),
             block_tables_host: Some(vec![seq_info.block_table.clone()]),
+            context_lens_host: Some(vec![total_kv_len]),
             seqlens: None,
             cu_seqlens_q: Some(Tensor::from_vec(
                 vec![0u32, q_len as u32],

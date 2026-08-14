@@ -1275,6 +1275,13 @@ impl KVCacheAllocator {
         }
 
         if total_tokens <= self.config_model_len {
+            // The physical pool is shared by all requests. If the caller asked
+            // for concurrency, reserve an equal context budget per request
+            // instead of silently picking a one-sequence full-context plan.
+            let requested = self.user_max_num_seqs.unwrap_or(1).max(1);
+            if requested > 1 {
+                return Ok((requested, (total_tokens / requested).max(1)));
+            }
             return Ok((1, total_tokens));
         }
 
