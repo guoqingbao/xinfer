@@ -147,8 +147,19 @@ impl MtpMlp {
             } => {
                 let shared_output = match (shared_gate, shared_expert) {
                     (Some(sg), Some(se)) => {
-                        let gate = candle_nn::ops::sigmoid(&sg.forward(xs)?)?;
+                        let gate_dtype = sg.weight_dtype();
+                        let gate_in = if xs.dtype() != gate_dtype {
+                            xs.to_dtype(gate_dtype)?
+                        } else {
+                            xs.clone()
+                        };
+                        let gate = candle_nn::ops::sigmoid(&sg.forward(&gate_in)?)?;
                         let shared_out = se.forward(xs)?;
+                        let gate = if gate.dtype() != shared_out.dtype() {
+                            gate.to_dtype(shared_out.dtype())?
+                        } else {
+                            gate
+                        };
                         Some(gate.broadcast_mul(&shared_out)?)
                     }
                     _ => None,
@@ -360,11 +371,13 @@ impl Qwen3_5MtpHead {
                             ws.dequantize(&vb.device())?.reshape((1, hidden_size))?
                         }
                     }
-                    .to_dtype(if is_qvar_builder {
-                        DType::F32
-                    } else {
-                        dtype
-                    })?;
+                    .to_dtype(
+                        if is_qvar_builder || mtp_config.higher_precision_required() {
+                            DType::F32
+                        } else {
+                            dtype
+                        },
+                    )?;
                     let shared_gate = Linear::new(ws, None, &None)?;
                     let shared_mlp = MLP::new(
                         if is_qvar_builder {

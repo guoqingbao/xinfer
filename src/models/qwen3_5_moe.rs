@@ -180,51 +180,52 @@ impl Qwen3_5MoEDecoderLayer {
         };
 
         // Shared experts (Qwen2 MoE style)
-        let (shared_gate, shared_expert) = if let Some(intermediate_size) =
-            moe_cfg.shared_expert_intermediate_size
-        {
-            if intermediate_size > 0 {
-                let ws = match &vb.0 {
-                    Either::Left(vb) => vb
-                        .pp("mlp.shared_expert_gate")
-                        .get((1, config.hidden_size), "weight")?,
-                    Either::Right(vb) => {
-                        let ws = vb
-                            .pp("ffn_gate_inp_shexp")
-                            .get((config.hidden_size,), "weight")?;
-                        ws.dequantize(&vb.device())?
-                            .reshape((1, config.hidden_size))?
+        let (shared_gate, shared_expert) =
+            if let Some(intermediate_size) = moe_cfg.shared_expert_intermediate_size {
+                if intermediate_size > 0 {
+                    let ws = match &vb.0 {
+                        Either::Left(vb) => vb
+                            .pp("mlp.shared_expert_gate")
+                            .get((1, config.hidden_size), "weight")?,
+                        Either::Right(vb) => {
+                            let ws = vb
+                                .pp("ffn_gate_inp_shexp")
+                                .get((config.hidden_size,), "weight")?;
+                            ws.dequantize(&vb.device())?
+                                .reshape((1, config.hidden_size))?
+                        }
                     }
-                }
-                .to_dtype(if is_qvar_builder || config.quant.is_some() {
-                    DType::F32
+                    .to_dtype(
+                        if is_qvar_builder || config.higher_precision_required() {
+                            DType::F32
+                        } else {
+                            dtype
+                        },
+                    )?;
+                    let shared_gate = Linear::new(ws, None, &None)?;
+                    let mlp = MLP::new(
+                        if is_qvar_builder {
+                            vb.clone()
+                        } else {
+                            vb.pp("mlp.shared_expert").clone()
+                        },
+                        comm.clone(),
+                        config.hidden_size,
+                        intermediate_size,
+                        &config.hidden_act,
+                        &config.quantization_config,
+                        &config.quant,
+                        false,
+                        dtype,
+                        if is_qvar_builder { "_shexp" } else { "" },
+                    )?;
+                    (Some(shared_gate), Some(mlp))
                 } else {
-                    dtype
-                })?;
-                let shared_gate = Linear::new(ws, None, &None)?;
-                let mlp = MLP::new(
-                    if is_qvar_builder {
-                        vb.clone()
-                    } else {
-                        vb.pp("mlp.shared_expert").clone()
-                    },
-                    comm.clone(),
-                    config.hidden_size,
-                    intermediate_size,
-                    &config.hidden_act,
-                    &config.quantization_config,
-                    &config.quant,
-                    false,
-                    dtype,
-                    if is_qvar_builder { "_shexp" } else { "" },
-                )?;
-                (Some(shared_gate), Some(mlp))
+                    (None, None)
+                }
             } else {
                 (None, None)
-            }
-        } else {
-            (None, None)
-        };
+            };
 
         let norm_dtype = if is_qvar_builder || config.higher_precision_required() {
             DType::F32
@@ -309,8 +310,21 @@ impl Qwen3_5MoEDecoderLayer {
         // Shared experts
         let shared_output = match (&self.shared_gate, &self.shared_expert) {
             (Some(shared_gate), Some(shared_expert)) => {
-                let gate = candle_nn::ops::sigmoid(&shared_gate.forward(&xs)?)?;
+                // Gate weights may be F32 under NVFP4/ISQ/GGUF while residual
+                // activations stay BF16 — cast like the MoE router path.
+                let gate_dtype = shared_gate.weight_dtype();
+                let gate_in = if xs.dtype() != gate_dtype {
+                    xs.to_dtype(gate_dtype)?
+                } else {
+                    xs.clone()
+                };
+                let gate = candle_nn::ops::sigmoid(&shared_gate.forward(&gate_in)?)?;
                 let shared_output = shared_expert.forward(&xs)?;
+                let gate = if gate.dtype() != shared_output.dtype() {
+                    gate.to_dtype(shared_output.dtype())?
+                } else {
+                    gate
+                };
                 Some(gate.broadcast_mul(&shared_output)?)
             }
             _ => None,
