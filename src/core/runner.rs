@@ -925,21 +925,6 @@ impl ModelRunner {
                         .replay(&input_ids, &positions, &input_metadata)?,
                 };
                 let output_ids = self.sample(&logits, seqs, is_prefill)?;
-                // sync_hybrid_pages_after_decode deferred (engine-owned pool phase)
-                if std::env::var_os("XINFER_DEBUG_TOKENS").is_some() && !is_prefill {
-                    if let Ok(flat) = logits.flatten_all()?.to_dtype(DType::F32)?.to_vec1::<f32>() {
-                        let argmax = flat
-                            .iter()
-                            .enumerate()
-                            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-                            .map(|(i, v)| (i, *v));
-                        eprintln!(
-                            "graph logits argmax={argmax:?} sum={:.4}",
-                            flat.iter().sum::<f32>()
-                        );
-                    }
-                    eprintln!("graph sample tokens: {:?}", output_ids);
-                }
                 return Ok(output_ids);
             }
         }
@@ -1035,9 +1020,6 @@ impl ModelRunner {
         )?;
         drop(kv_guard);
         let output_ids = self.sample(&logits, seqs, is_prefill)?;
-        if std::env::var_os("XINFER_DEBUG_TOKENS").is_some() && !is_prefill {
-            eprintln!("eager sample tokens: {:?}", output_ids);
-        }
         #[cfg(feature = "nvtx")]
         nvtx::range_pop!();
         Ok(output_ids)
