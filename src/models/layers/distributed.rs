@@ -1683,6 +1683,9 @@ impl VocabParallelLinear {
     }
 
     fn finish_logits(&self, logits: Tensor, input_dims: &[usize]) -> Result<Tensor> {
+        #[cfg(not(feature = "nccl"))]
+        let _ = input_dims;
+
         #[cfg(feature = "nccl")]
         if let Some(all_gather) = &self.all_gather {
             // logits shape: [batch, local_vocab]

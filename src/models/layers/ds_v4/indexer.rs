@@ -1,6 +1,8 @@
 use super::compressor::{CompressorDecodeState, CompressorWeights};
 use super::rope_cache::V4RopeTables;
-use crate::models::layers::distributed::{AllReduce, Comm};
+#[cfg(feature = "nccl")]
+use crate::models::layers::distributed::AllReduce;
+use crate::models::layers::distributed::Comm;
 use crate::models::layers::VarBuilderX;
 use candle_core::{DType, Device, Result, Tensor, D};
 
@@ -18,6 +20,7 @@ pub struct IndexerWeights {
     pub global_index_n_heads: usize,
     pub index_n_heads: usize,
     pub index_topk: usize,
+    #[cfg(feature = "nccl")]
     score_all_reduce: Option<AllReduce>,
 }
 
@@ -105,6 +108,7 @@ impl IndexerWeights {
             global_index_n_heads: index_n_heads,
             index_n_heads: index_n_heads / comm.world_size(),
             index_topk,
+            #[cfg(feature = "nccl")]
             score_all_reduce: (comm.world_size() > 1).then(|| AllReduce::new(comm.clone())),
         }))
     }
@@ -185,7 +189,7 @@ impl IndexerWeights {
 
         let weights = input.matmul(&self.weights_proj.t()?)?;
 
-        let mut scores = attention_rs::deepseek_v4::indexer_scores_prefill(
+        let scores = attention_rs::deepseek_v4::indexer_scores_prefill(
             &q,
             &compressed_kv,
             &weights,
@@ -196,9 +200,11 @@ impl IndexerWeights {
             score_scale,
         )?;
         #[cfg(feature = "nccl")]
-        if let Some(all_reduce) = &self.score_all_reduce {
-            scores = scores.apply_op1_no_bwd(all_reduce)?;
-        }
+        let scores = if let Some(all_reduce) = &self.score_all_reduce {
+            scores.apply_op1_no_bwd(all_reduce)?
+        } else {
+            scores
+        };
         Ok(scores)
     }
 
@@ -218,7 +224,7 @@ impl IndexerWeights {
         let q = q.reshape((1, self.index_n_heads * self.index_head_dim))?;
         let weights = input.matmul(&self.weights_proj.t()?)?;
 
-        let mut scores = attention_rs::deepseek_v4::indexer_scores_decode(
+        let scores = attention_rs::deepseek_v4::indexer_scores_decode(
             &q,
             indexer_kv_cache,
             &weights,
@@ -228,9 +234,11 @@ impl IndexerWeights {
             score_scale,
         )?;
         #[cfg(feature = "nccl")]
-        if let Some(all_reduce) = &self.score_all_reduce {
-            scores = scores.apply_op1_no_bwd(all_reduce)?;
-        }
+        let scores = if let Some(all_reduce) = &self.score_all_reduce {
+            scores.apply_op1_no_bwd(all_reduce)?
+        } else {
+            scores
+        };
         Ok(scores)
     }
 
@@ -293,7 +301,7 @@ impl IndexerWeights {
         let q = q.reshape((1, self.index_n_heads * self.index_head_dim))?;
         let weights = input.matmul(&self.weights_proj.t()?)?;
 
-        let mut scores = attention_rs::deepseek_v4::indexer_scores_decode(
+        let scores = attention_rs::deepseek_v4::indexer_scores_decode(
             &q,
             indexer_kv_cache,
             &weights,
@@ -303,9 +311,11 @@ impl IndexerWeights {
             score_scale,
         )?;
         #[cfg(feature = "nccl")]
-        if let Some(all_reduce) = &self.score_all_reduce {
-            scores = scores.apply_op1_no_bwd(all_reduce)?;
-        }
+        let scores = if let Some(all_reduce) = &self.score_all_reduce {
+            scores.apply_op1_no_bwd(all_reduce)?
+        } else {
+            scores
+        };
         Ok(scores)
     }
 
@@ -334,7 +344,7 @@ impl IndexerWeights {
             .narrow(0, 0, compressed_len.max(1))?
             .contiguous()?;
 
-        let mut scores = attention_rs::deepseek_v4::indexer_scores_prefill(
+        let scores = attention_rs::deepseek_v4::indexer_scores_prefill(
             &q,
             &kv,
             &weights,
@@ -345,9 +355,11 @@ impl IndexerWeights {
             score_scale,
         )?;
         #[cfg(feature = "nccl")]
-        if let Some(all_reduce) = &self.score_all_reduce {
-            scores = scores.apply_op1_no_bwd(all_reduce)?;
-        }
+        let scores = if let Some(all_reduce) = &self.score_all_reduce {
+            scores.apply_op1_no_bwd(all_reduce)?
+        } else {
+            scores
+        };
         Ok(scores)
     }
 
