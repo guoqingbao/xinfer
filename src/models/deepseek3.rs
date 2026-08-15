@@ -348,7 +348,7 @@ impl DeepSeekForCausalLM {
                 vb.pp("lm_head")
             },
             comm.clone(),
-            &None,
+            &config.quantization_config,
             &None,
             dtype,
         )?;

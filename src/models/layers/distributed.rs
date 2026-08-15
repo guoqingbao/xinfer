@@ -755,7 +755,7 @@ impl MergedParallelColumnLinear {
                         )
                     })?;
 
-                    let block_size = quant_cfg
+                    let mut block_size = quant_cfg
                         .weight_block_size
                         .clone()
                         .unwrap_or(vec![128, 128]);
@@ -783,36 +783,54 @@ impl MergedParallelColumnLinear {
                                 DType::U8,
                             )
                         })?;
-                    let scale_dim0 = (out_dim + by - 1) / by;
-                    let scale_dim1 = (in_dim + bx - 1) / bx;
                     let no_shard = Shard::default();
-                    let weight_scale = match v
-                        .get_with_hints_dtype((), "weight_scale", no_shard, DType::F32)
-                        .or_else(|_| {
-                            v.get_with_hints_dtype((1,), "weight_scale", no_shard, DType::F32)
-                        }) {
-                        Ok(s) => s.broadcast_as((scale_dim0, scale_dim1))?.contiguous()?,
-                        Err(_) => match v.get_with_hints_dtype(
-                            (scale_dim0, scale_dim1),
-                            "weight_scale",
-                            no_shard,
-                            DType::F32,
-                        ) {
-                            Ok(s) => s,
-                            Err(_) => v
-                                .get_with_hints_dtype(
-                                    (scale_dim0, scale_dim1),
-                                    "weight_scale_inv",
-                                    no_shard,
-                                    DType::F32,
-                                )
-                                .map_err(|_| {
-                                    candle_core::Error::Msg(
-                                        "LnFp8: Missing weight_scale or weight_scale_inv".into(),
+                    // compressed-tensors channel-wise FP8 uses one scale per
+                    // output row, [out_dim, 1], rather than block scales.
+                    let channel_scale = ["weight_scale", "weight_scale_inv", "scale"]
+                        .into_iter()
+                        .find_map(|name| {
+                            v.get_with_hints_dtype((out_dim, 1), name, no_shard, DType::F32)
+                                .ok()
+                        });
+                    let (weight_scale, by) = if let Some(scale) = channel_scale {
+                        block_size = vec![1, in_dim];
+                        (scale, 1)
+                    } else {
+                        let by = block_size[0];
+                        let bx = block_size[1];
+                        let scale_dim0 = (out_dim + by - 1) / by;
+                        let scale_dim1 = (in_dim + bx - 1) / bx;
+                        let weight_scale = match v
+                            .get_with_hints_dtype((), "weight_scale", no_shard, DType::F32)
+                            .or_else(|_| {
+                                v.get_with_hints_dtype((1,), "weight_scale", no_shard, DType::F32)
+                            }) {
+                            Ok(s) => s.broadcast_as((scale_dim0, scale_dim1))?.contiguous()?,
+                            Err(_) => match v.get_with_hints_dtype(
+                                (scale_dim0, scale_dim1),
+                                "weight_scale",
+                                no_shard,
+                                DType::F32,
+                            ) {
+                                Ok(s) => s,
+                                Err(_) => v
+                                    .get_with_hints_dtype(
+                                        (scale_dim0, scale_dim1),
+                                        "weight_scale_inv",
+                                        no_shard,
+                                        DType::F32,
                                     )
-                                })?,
-                        },
+                                    .map_err(|_| {
+                                        candle_core::Error::Msg(
+                                            "LnFp8: Missing weight_scale or weight_scale_inv"
+                                                .into(),
+                                        )
+                                    })?,
+                            },
+                        };
+                        (weight_scale, by)
                     };
+                    let scale_dim0 = (out_dim + by - 1) / by;
                     let input_scale = crate::models::layers::linear::load_fp8_input_scale(v)?;
 
                     #[cfg(feature = "cuda")]
@@ -1365,6 +1383,35 @@ pub struct VocabParallelLinear {
     dtype: DType,
 }
 
+/// Return quantization metadata only when the vocabulary weight is natively
+/// quantized in the checkpoint.  In particular, do not forward ISQ's `quant`
+/// setting here: an lm_head that is stored as BF16/F16 must remain dense.
+fn native_vocab_quant_config(
+    vb: &VarBuilderX,
+    quant_cfg: &Option<QuantConfig>,
+) -> Option<QuantConfig> {
+    let quant_cfg = quant_cfg.as_ref()?;
+    if vb.is_qvar_builder() {
+        return None;
+    }
+
+    let has_native_quantized_weight = [
+        "weight_scale",
+        "weight_scale_inv",
+        "scale",
+        "scales",
+        "weight_packed",
+        "weight_global_scale",
+        "weight_scale_2",
+        "blocks",
+        "qweight",
+    ]
+    .into_iter()
+    .any(|name| vb.has_key(name));
+
+    has_native_quantized_weight.then(|| quant_cfg.clone())
+}
+
 #[allow(dead_code)]
 pub struct AllGather {
     comm: Rc<Comm>,
@@ -1503,6 +1550,13 @@ impl VocabParallelLinear {
         quant: &Option<String>,
         dtype: DType,
     ) -> Result<Self> {
+        // Vocabulary heads are special: ISQ must never quantize them, while
+        // checkpoint-native lm_head quantization must still be honored.  The
+        // Callers provide the model-wide config, but this common loader owns
+        // the decision whether the lm_head may actually use it.
+        let native_quant_cfg = native_vocab_quant_config(&vb, quant_cfg);
+        let quant_cfg = &native_quant_cfg;
+        let quant = &None;
         let world_size = comm.world_size();
         if world_size <= 1 {
             let linear = linear(in_dim, out_dim, vb, shard(0, 0, 1), quant_cfg, quant, dtype)?;

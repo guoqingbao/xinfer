@@ -372,7 +372,7 @@ impl GLM4MoEForCausalLM {
                 }
             },
             comm.clone(),
-            &None,
+            &config.quantization_config,
             &None,
             dtype,
         )?;
