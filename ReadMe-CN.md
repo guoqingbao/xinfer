@@ -99,7 +99,7 @@ xinfer --w /home/Qwen3.6-35B-A3B --d 0,1 --ui-server --mtp 2
 | **Qwen3-30B-A3B** | NVFP4 | **30B (MoE)** | **72.86** tokens/s (**V100, Software FP4**) |
 | **Qwen3-Next-80B** | AWQ | **80B (MoE)** | **90** tokens/s (**Hopper**) |
 | **Qwen3.5-27B** (**多模态**) | Q4_K_M | **27B (Dense)** | **49.33** tokens/s |
-| **Qwen3.5-27B/Qwen3.6-27B** | FP8 | **27B (Dense)** | **45** tokens/s (**Hopper**) |
+| **Qwen3.5/3.6/3.8 27B** | FP8 | **27B (Dense)** | **45** tokens/s (**Hopper**) |
 | **Qwen3.6-35B-A3B** (**多模态**) | FP8 | **35B (MoE)** | **120** tokens/s (**Hopper**) |
 | **GLM4.7 Flash** | NVFP4 | **30B (MoE)** | **79** tokens/s (**Hopper, Software FP4**) |
 | **Gemma4-31B** | ISQ (BF16→Q4K) | **31B (Dense)** | **47** tokens/s (**Hopper**) |
@@ -132,7 +132,7 @@ xinfer --w /home/Qwen3.6-35B-A3B --d 0,1 --ui-server --mtp 2
 * ✅ Qwen 系列（Qwen2、Qwen3）
 * ✅ Qwen2/Qwen3 MoE 系列
 * ✅ Qwen3-Next 系列
-* ✅ Qwen3.5/3.6 Dense/MoE 系列（27B、35B、122B、397B、多模态）
+* ✅ Qwen3.5/3.6/3.8 Dense/MoE 系列（27B、35B、122B、397B、多模态）
 * ✅ Mistral v1、v2
 * ✅ Mistral-3-VL Reasoning（3B、8B、14B、多模态）
 * ✅ GLM4（0414 版本）

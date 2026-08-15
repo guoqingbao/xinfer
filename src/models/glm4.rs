@@ -282,7 +282,7 @@ impl GLM4ForCausalLM {
                 }
             },
             comm.clone(),
-            &None,
+            &config.quantization_config,
             &None,
             dtype,
         )?;

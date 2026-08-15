@@ -683,7 +683,7 @@ impl Gemma3ForConditionalGeneration {
                 vb.pp("lm_head")
             },
             comm.clone(),
-            &None,
+            &text_cfg.quantization_config,
             &None,
             dtype,
         )?;

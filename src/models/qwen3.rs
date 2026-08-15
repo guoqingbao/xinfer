@@ -279,7 +279,7 @@ impl Qwen3ForCausalLM {
                 }
             },
             comm.clone(),
-            &None,
+            &config.quantization_config,
             &None,
             dtype,
         )?;

@@ -474,7 +474,7 @@ impl LLama4ForConditionalGeneration {
                 vb.pp("language_model.lm_head")
             },
             comm.clone(),
-            &None,
+            &config.quantization_config,
             &None,
             dtype,
         )?;

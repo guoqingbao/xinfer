@@ -562,27 +562,41 @@ impl Qwen3_5MoEForCausalLM {
                     .is_some_and(|q| q.is_mlx_nvfp4),
         )?;
 
-        let lm_head = VocabParallelLinear::load_no_bias(
-            config.hidden_size,
-            vocab_size,
-            if tie_word_embeddings.is_some_and(|x| x) {
+        let is_mlx_nvfp4_tied = tie_word_embeddings.is_some_and(|x| x)
+            && config
+                .quantization_config
+                .as_ref()
+                .is_some_and(|q| q.is_mlx_nvfp4);
+        let lm_head = if is_mlx_nvfp4_tied {
+            VocabParallelLinear::from_weight_bias(
+                embed_tokens.embeddings().clone(),
+                None,
+                comm.clone(),
+                vocab_size,
+                dtype,
+            )?
+        } else {
+            let lm_head_vb = if tie_word_embeddings.is_some_and(|x| x) {
                 if is_qvar_builder {
                     vb.pp(&format!("{}{}", gguf_prefix, key_map["embed_tokens"]))
                 } else {
                     vb.pp(&format!("{}embed_tokens", prefix))
                 }
+            } else if is_qvar_builder {
+                vb.pp(key_map["lm_head"])
             } else {
-                if is_qvar_builder {
-                    vb.pp(key_map["lm_head"])
-                } else {
-                    vb.pp("lm_head")
-                }
-            },
-            comm.clone(),
-            &None,
-            &None,
-            dtype,
-        )?;
+                vb.pp("lm_head")
+            };
+            VocabParallelLinear::load_no_bias(
+                config.hidden_size,
+                vocab_size,
+                lm_head_vb,
+                comm.clone(),
+                &config.quantization_config,
+                &None,
+                dtype,
+            )?
+        };
 
         // Initialize MambaCache
         let world_size = comm.world_size();

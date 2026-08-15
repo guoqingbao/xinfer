@@ -1295,7 +1295,7 @@ fn load_ln_fp8_with_hints(
         )
     }
 
-    let block_size = quant_cfg
+    let mut block_size = quant_cfg
         .weight_block_size
         .clone()
         .unwrap_or(vec![128, 128]);
@@ -1318,14 +1318,71 @@ fn load_ln_fp8_with_hints(
     } else {
         DType::F32
     };
-    let weight_scale = if scale_dtype == DType::F32 {
-        if let Some(s) = load_scale(&vb, "weight_scale", scale_dim0, scale_dim1, shard)? {
-            s
-        } else if let Some(s) = load_scale(&vb, "weight_scale_inv", scale_dim0, scale_dim1, shard)?
-        {
-            s
-        } else if let Some(s) = load_scale(&vb, "scale", scale_dim0, scale_dim1, shard)? {
-            s
+    // compressed-tensors `float-quantized` checkpoints can store one scale
+    // per output channel as [out_dim, 1].  A row-parallel weight must load
+    // this replicated tensor without a dim-1 shard because that dimension has
+    // size one.
+    let channel_shard = if shard.dim == 0 {
+        shard
+    } else {
+        Shard::default()
+    };
+    let channel_scale = if scale_dtype == DType::F32 {
+        ["weight_scale", "weight_scale_inv", "scale"]
+            .into_iter()
+            .find_map(|name| {
+                vb.get_with_hints_dtype((out_dim, 1), name, channel_shard, scale_dtype)
+                    .ok()
+            })
+    } else {
+        None
+    };
+    let (weight_scale, scale_shard, scale_global_dim) = if let Some(scale) = channel_scale {
+        // The local weight's second dimension is the block width seen by the
+        // matmul kernel (it can be TP-sharded for row-parallel projections).
+        block_size = vec![1, weight.dim(1)?];
+        (scale, channel_shard, (out_dim, 1))
+    } else {
+        let weight_scale = if scale_dtype == DType::F32 {
+            if let Some(s) = load_scale(&vb, "weight_scale", scale_dim0, scale_dim1, shard)? {
+                s
+            } else if let Some(s) =
+                load_scale(&vb, "weight_scale_inv", scale_dim0, scale_dim1, shard)?
+            {
+                s
+            } else if let Some(s) = load_scale(&vb, "scale", scale_dim0, scale_dim1, shard)? {
+                s
+            } else {
+                match vb.get_with_hints_dtype(
+                    (scale_dim0, scale_dim1),
+                    "weight_scale",
+                    shard,
+                    scale_dtype,
+                ) {
+                    Ok(s) => s,
+                    Err(_) => match vb.get_with_hints_dtype(
+                        (scale_dim0, scale_dim1),
+                        "weight_scale_inv",
+                        shard,
+                        scale_dtype,
+                    ) {
+                        Ok(s) => s,
+                        Err(_) => vb
+                            .get_with_hints_dtype(
+                                (scale_dim0, scale_dim1),
+                                "scale",
+                                shard,
+                                scale_dtype,
+                            )
+                            .map_err(|_| {
+                                candle_core::Error::Msg(
+                                    "LnFp8: Missing weight_scale, weight_scale_inv, or scale"
+                                        .into(),
+                                )
+                            })?,
+                    },
+                }
+            }
         } else {
             match vb.get_with_hints_dtype(
                 (scale_dim0, scale_dim1),
@@ -1350,33 +1407,14 @@ fn load_ln_fp8_with_hints(
                         })?,
                 },
             }
-        }
-    } else {
-        match vb.get_with_hints_dtype((scale_dim0, scale_dim1), "weight_scale", shard, scale_dtype)
-        {
-            Ok(s) => s,
-            Err(_) => match vb.get_with_hints_dtype(
-                (scale_dim0, scale_dim1),
-                "weight_scale_inv",
-                shard,
-                scale_dtype,
-            ) {
-                Ok(s) => s,
-                Err(_) => vb
-                    .get_with_hints_dtype((scale_dim0, scale_dim1), "scale", shard, scale_dtype)
-                    .map_err(|_| {
-                        candle_core::Error::Msg(
-                            "LnFp8: Missing weight_scale, weight_scale_inv, or scale".into(),
-                        )
-                    })?,
-            },
-        }
+        };
+        (weight_scale, shard, (scale_dim0, scale_dim1))
     };
     let weight_scale = normalize_sharded_2d(
         weight_scale,
-        shard,
-        scale_dim0,
-        scale_dim1,
+        scale_shard,
+        scale_global_dim.0,
+        scale_global_dim.1,
         "weight_scale(_inv)",
     )?;
     let input_scale = load_fp8_input_scale(&vb)?;

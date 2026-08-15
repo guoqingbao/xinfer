@@ -329,7 +329,7 @@ impl MiniMaxForCausalLM {
                 }
             },
             comm.clone(),
-            &None,
+            &config.quantization_config,
             &None,
             dtype,
         )?;

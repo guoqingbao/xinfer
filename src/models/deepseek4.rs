@@ -1998,7 +1998,7 @@ impl DeepSeekV4ForCausalLM {
                 vb.pp("head")
             },
             comm.clone(),
-            &None,
+            &config.quantization_config,
             &None,
             dtype,
         )?;
