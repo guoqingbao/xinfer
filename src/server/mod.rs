@@ -106,7 +106,7 @@ pub struct ChatCompletionRequest {
     #[serde(default)]
     pub constraint_type: Option<String>,
     /// Reasoning effort level for OpenAI-compatible reasoning API
-    /// Values: "none", "low", "medium", "high"
+    /// Values: "none", "low", "medium", "high", or "xhigh".
     #[serde(default, alias = "reasoning")]
     pub reasoning_effort: Option<String>,
 }
@@ -285,12 +285,14 @@ pub struct ExtraBody {
 }
 
 pub fn normalize_reasoning_controls(params: &mut SamplingParams, guidance_tokens: &GuidanceTokens) {
-    let reasoning_enabled = params
-        .reasoning_effort
-        .as_ref()
-        .map(|effort| effort.is_enabled())
-        .unwrap_or(false);
-    if !reasoning_enabled {
+    let Some(effort) = params.reasoning_effort.as_ref() else {
+        return;
+    };
+    if !effort.is_enabled() {
+        // An explicit `reasoning_effort: "none"` must override the engine's
+        // reasoning-enabled default, including for clients that do not send
+        // the legacy `thinking` field.
+        params.thinking = Some(false);
         return;
     }
 
@@ -301,6 +303,7 @@ pub fn normalize_reasoning_controls(params: &mut SamplingParams, guidance_tokens
             "reasoning_effort requested but current model/tokenizer does not expose reasoning tokens; disabling reasoning_effort"
         );
         params.reasoning_effort = None;
+        params.thinking = Some(false);
         return;
     }
 
@@ -1942,6 +1945,16 @@ mod tests {
     }
 
     #[test]
+    fn test_chat_completion_reasoning_effort_xhigh_parsing() {
+        let json = r#"{
+            "messages":[{"role":"user","content":"hi"}],
+            "reasoning_effort":"xhigh"
+        }"#;
+        let request: ChatCompletionRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(request.reasoning_effort.as_deref(), Some("xhigh"));
+    }
+
+    #[test]
     #[cfg(not(feature = "python"))]
     fn test_normalize_reasoning_controls_enables_thinking() {
         let mut params = SamplingParams::new_with_max_tokens(32);
@@ -1983,6 +1996,27 @@ mod tests {
 
         assert_eq!(params.thinking, Some(false));
         assert_eq!(params.reasoning_effort, None);
+    }
+
+    #[test]
+    #[cfg(not(feature = "python"))]
+    fn test_normalize_reasoning_controls_disables_explicit_none() {
+        let mut params = SamplingParams::new_with_max_tokens(32);
+        params.reasoning_effort = Some(ReasoningEffort::None);
+        let guidance_tokens = GuidanceTokens {
+            bos_token_ids: Vec::new(),
+            eos_token_ids: vec![2],
+            reasoning_start_ids: vec![101],
+            reasoning_end_ids: vec![102],
+            tool_call_start_ids: Vec::new(),
+            tool_call_end_ids: Vec::new(),
+            add_bos_token: false,
+        };
+
+        normalize_reasoning_controls(&mut params, &guidance_tokens);
+
+        assert_eq!(params.thinking, Some(false));
+        assert_eq!(params.reasoning_effort, Some(ReasoningEffort::None));
     }
 
     #[test]

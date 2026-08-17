@@ -1413,7 +1413,8 @@ impl ReasoningEffort {
             "low" => Self::Low,
             "normal" | "medium" => Self::Medium,
             "high" => Self::High,
-            "very_high" | "chain_of_thought" | "cot" | "cove" => Self::ChainOfThought,
+            "xhigh" | "x_high" | "very_high" | "maximum" | "max" => Self::High,
+            "chain_of_thought" | "cot" | "cove" => Self::ChainOfThought,
             #[cfg(all(not(feature = "python"), not(feature = "pyo3")))]
             s if s.starts_with("custom:") => Self::Custom(s[7..].to_string()),
             _ => Self::None,
@@ -2052,6 +2053,10 @@ mod tests {
         );
         assert_eq!(
             ReasoningEffort::from_str("high".to_string()),
+            ReasoningEffort::High
+        );
+        assert_eq!(
+            ReasoningEffort::from_str("xhigh".to_string()),
             ReasoningEffort::High
         );
         assert_eq!(

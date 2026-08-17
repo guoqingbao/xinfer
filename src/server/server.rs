@@ -400,16 +400,16 @@ pub async fn chat_completion(
     params.session_id = request.session_id.clone();
     params.thinking = request.thinking.clone();
     params.stop_sequences = request.stop.clone();
+    // `reasoning_effort` is the control sent by the built-in UI and by
+    // OpenAI-compatible clients.  Preserve an explicit `none`: dropping it
+    // would make the engine fall back to its reasoning-enabled default.
+    if let Some(effort) = request
+        .reasoning_effort
+        .as_ref()
+        .map(|value| ReasoningEffort::from_str(value.clone()))
     {
-        let effort_str = request
-            .reasoning_effort
-            .clone()
-            .unwrap_or_else(|| "none".to_string());
-        params.reasoning_effort = if effort_str != "none" {
-            Some(ReasoningEffort::from_str(effort_str))
-        } else {
-            None
-        };
+        params.thinking = Some(effort.is_enabled());
+        params.reasoning_effort = Some(effort);
     }
     let (
         img_cfg,

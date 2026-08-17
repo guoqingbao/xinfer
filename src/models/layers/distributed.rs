@@ -61,7 +61,7 @@ impl TensorParallelColumnLinear {
         Self { linear }
     }
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        self.linear.forward(x)
+        self.linear.forward_dense_dtype_compatible(x)
     }
 
     pub fn fp8_weight_scale(&self) -> Option<(&Tensor, &Tensor)> {
@@ -93,6 +93,34 @@ pub fn tensor_parallel_chunk(
     x.narrow(dim, rank * chunk_size, chunk_size)?.contiguous()
 }
 
+fn is_dense_gguf_dtype(dtype: GgmlDType) -> bool {
+    matches!(dtype, GgmlDType::F32 | GgmlDType::F16 | GgmlDType::BF16)
+}
+
+// Restoring Qwen3.5/3.8 GDN heads permutes rows before tensor-parallel
+// sharding.  IQ formats are supported natively for direct GGUF matmuls, but
+// Candle intentionally does not implement IQ re-quantization.  Keep these
+// restored tensors in dequantized form instead of silently converting them to
+// another quantization format.
+fn is_iq_gguf_dtype(dtype: GgmlDType) -> bool {
+    matches!(
+        dtype,
+        GgmlDType::IQ2_XXS
+            | GgmlDType::IQ2_XS
+            | GgmlDType::IQ3_XXS
+            | GgmlDType::IQ1_S
+            | GgmlDType::IQ4_NL
+            | GgmlDType::IQ3_S
+            | GgmlDType::IQ2_S
+            | GgmlDType::IQ4_XS
+            | GgmlDType::IQ1_M
+    )
+}
+
+fn keep_restored_gguf_dense(dtype: GgmlDType) -> bool {
+    is_dense_gguf_dtype(dtype) || is_iq_gguf_dtype(dtype)
+}
+
 pub fn load_restored_gguf_column_linear(
     vb: &VarBuilderX,
     in_dim: usize,
@@ -107,12 +135,21 @@ pub fn load_restored_gguf_column_linear(
         _ => candle_core::bail!("expected GGUF varbuilder for {}", name),
     };
     let ws = qvb.get((out_dim, in_dim), "weight")?;
-    let mut wdtype = ws.dtype();
-    let weight = restore_weight(ws.dequantize_f16(qvb.device())?)?;
+    let wdtype = ws.dtype();
+    let weight = if is_dense_gguf_dtype(wdtype) {
+        restore_weight(ws.dequantize(qvb.device())?)?
+    } else {
+        restore_weight(ws.dequantize_f16(qvb.device())?)?
+    };
     qvb.clear_cache();
     drop(ws);
     let local_weight = tensor_parallel_chunk(&weight, 0, comm.rank(), comm.world_size(), name)?;
     drop(weight);
+    if keep_restored_gguf_dense(wdtype) {
+        let linear = Linear::new(local_weight, None, &None)?;
+        return Ok(TensorParallelColumnLinear::new(linear));
+    }
+    let mut wdtype = wdtype;
     let last_dim = local_weight.dim(candle_core::D::Minus1)?;
     if last_dim % wdtype.block_size() != 0 {
         wdtype = GgmlDType::Q8_0;
@@ -267,8 +304,14 @@ pub fn load_restored_gguf_merged_qkv_linear(
     let out_dim = key_dim_global * 2 + value_dim_global;
     let ws = qvb.get((out_dim, hidden_size), "weight")?;
     let mut wdtype = ws.dtype();
+    let dense_weight = is_dense_gguf_dtype(wdtype);
+    let keep_dense_weight = keep_restored_gguf_dense(wdtype);
     let weight = restore_qwen35_qkv_weight(
-        &ws.dequantize_f16(qvb.device())?,
+        &(if dense_weight {
+            ws.dequantize(qvb.device())?
+        } else {
+            ws.dequantize_f16(qvb.device())?
+        }),
         key_dim_global,
         num_k_heads_global,
         num_v_heads_global,
@@ -303,6 +346,14 @@ pub fn load_restored_gguf_merged_qkv_linear(
     let local_weight = Tensor::cat(&local_chunk_refs, 0)?;
     drop(local_chunks);
     drop(weight);
+    if keep_dense_weight {
+        return MergedParallelColumnLinear::from_packed_local(
+            local_weight,
+            None,
+            output_splits,
+            &None,
+        );
+    }
     let qtensor = QTensor::quantize_owned(local_weight, wdtype)?;
     let qlinear = QLinear::from_qparts_x(qtensor, None, dtype)?;
     MergedParallelColumnLinear::from_packed_local_qlinear(
@@ -504,7 +555,7 @@ impl TensorParallelRowLinear {
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let mut xs = self.linear.forward(x)?;
+        let mut xs = self.linear.forward_dense_dtype_compatible(x)?;
         #[cfg(feature = "nccl")]
         if let Some(all_reduce) = &self.all_reduce {
             // AllReduce supports F32/BF16/F16. Perform in native dtype to avoid
@@ -537,12 +588,21 @@ pub fn load_restored_gguf_row_linear(
         _ => candle_core::bail!("expected GGUF varbuilder for {}", name),
     };
     let ws = qvb.get((out_dim, in_dim), "weight")?;
-    let mut wdtype = ws.dtype();
-    let weight = restore_weight(ws.dequantize_f16(qvb.device())?)?;
+    let wdtype = ws.dtype();
+    let weight = if is_dense_gguf_dtype(wdtype) {
+        restore_weight(ws.dequantize(qvb.device())?)?
+    } else {
+        restore_weight(ws.dequantize_f16(qvb.device())?)?
+    };
     qvb.clear_cache();
     drop(ws);
     let local_weight = tensor_parallel_chunk(&weight, 1, comm.rank(), comm.world_size(), name)?;
     drop(weight);
+    if keep_restored_gguf_dense(wdtype) {
+        let linear = Linear::new(local_weight, None, &None)?;
+        return Ok(TensorParallelRowLinear::new(linear, comm, dtype));
+    }
+    let mut wdtype = wdtype;
     if local_weight.dim(1)? % wdtype.block_size() != 0 {
         wdtype = GgmlDType::Q8_0;
     }
