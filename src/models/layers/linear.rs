@@ -17,9 +17,10 @@ use candle_core::quantized::GgmlDType;
 use candle_core::CudaStorage;
 use candle_core::{
     quantized::{QMatMul, QTensor},
-    DType, Device, Result, Tensor,
+    DType, Device, Module, Result, Tensor,
 };
-use candle_core::{CpuStorage, Layout, Module, Shape};
+#[cfg(feature = "cuda")]
+use candle_core::{CpuStorage, Layout, Shape};
 use candle_nn::var_builder::Shard;
 use candle_nn::var_builder::ShardedVarBuilder as VarBuilder;
 use either::Either;
