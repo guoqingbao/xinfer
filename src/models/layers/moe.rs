@@ -990,8 +990,8 @@ fn can_quantize_to(dtype: GgmlDType) -> bool {
     )
 }
 
-/// Dtypes supported natively by the `moe_gemm_gguf` kernel (no requant needed).
-/// Both CUDA and Metal support K-quants, Q8_0, and IQ formats.
+/// Dtypes supported natively by the CUDA `moe_gemm_gguf` kernel (no requant
+/// needed). The IQ formats are decoded directly from their GGUF block layout.
 fn moe_gemm_gguf_supports(dtype: GgmlDType) -> bool {
     matches!(
         dtype,
@@ -1004,7 +1004,12 @@ fn moe_gemm_gguf_supports(dtype: GgmlDType) -> bool {
             | GgmlDType::IQ2_XXS
             | GgmlDType::IQ2_XS
             | GgmlDType::IQ3_XXS
+            | GgmlDType::IQ1_S
+            | GgmlDType::IQ4_NL
+            | GgmlDType::IQ3_S
+            | GgmlDType::IQ2_S
             | GgmlDType::IQ4_XS
+            | GgmlDType::IQ1_M
     )
 }
 

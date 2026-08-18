@@ -99,7 +99,7 @@ Add `--kvcache-dtype` to compress KV cache and extend context length:
 | **Qwen3-30B-A3B** | NVFP4 | **30B (MoE)** | **197.29** tokens/s (**RTX 5090**) |
 | **Qwen3-30B-A3B** | NVFP4 | **30B (MoE)** | **72.86** tokens/s (**V100, Software FP4**) |
 | **Qwen3-Next-80B** | AWQ | **80B (MoE)** | **90** tokens/s (**Hopper**) |
-| **Qwen3.5-27B** (**Multimodal**) | Q4_K_M | **27B (Dense)** | **49.33** tokens/s |
+| **Qwen3.5/3.6/3.8 27B** (**Multimodal**) | Q4_K_M/IQ4 | **27B (Dense)** | **58** tokens/s |
 | **Qwen3.5/3.6/3.8 27B** | FP8 | **27B (Dense)** | **45** tokens/s (**Hopper**) |
 | **Qwen3.6-35B-A3B** (**Multimodal**) | FP8 | **35B (MoE)** | **120** tokens/s (**Hopper**) |
 | **GLM4.7 Flash** | NVFP4 | **30B (MoE)** | **79** tokens/s (**Hopper, Software FP4**) |
