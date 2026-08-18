@@ -617,7 +617,7 @@ pub struct FusedMoeWNA16 {
     down_packed: Tensor,
     down_scales: Tensor,
     w_size_n: usize,
-    act: Activation,
+    act: GatedActivation,
     routing: MoeRouting,
     all_reduce: AllReduce,
     world_size: usize,
@@ -884,7 +884,10 @@ impl FusedMoeWNA16 {
             down_packed,
             down_scales,
             w_size_n,
-            act: cfg.hidden_act,
+            act: GatedActivation::from_model_config(
+                cfg.hidden_act.clone(),
+                cfg.extra_config_json.as_deref(),
+            ),
             routing: MoeRouting::from_moe_cfg(
                 moe_cfg,
                 try_load_e_score_correction_bias(bias_vb, num_experts),
@@ -3493,7 +3496,7 @@ impl MoeW2ExpertWeights {
         xs: &Tensor,
         topk_weights: &Tensor,
         topk_ids: &Tensor,
-        act: &Activation,
+        act: &GatedActivation,
         swiglu_limit: f32,
         dtype: DType,
         is_prefill: bool,
@@ -3527,7 +3530,9 @@ impl MoeW2ExpertWeights {
             is_prefill,
         )?;
 
-        let down_inputs = if matches!(act, Activation::Silu) && swiglu_limit > 0.0 {
+        let down_inputs = if matches!(act, GatedActivation::Standard(candle_nn::Activation::Silu))
+            && swiglu_limit > 0.0
+        {
             attention_rs::moe_w2::moe_w2_swiglu_clamp_bf16(
                 &gate_up,
                 self.gate_up_n / 2,
@@ -3567,7 +3572,7 @@ impl MoeW2ExpertWeights {
 pub struct FusedMoeW2 {
     gate: Linear,
     experts: MoeW2ExpertWeights,
-    act: Activation,
+    act: GatedActivation,
     routing: MoeRouting,
     all_reduce: AllReduce,
     world_size: usize,

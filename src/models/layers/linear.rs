@@ -1609,6 +1609,30 @@ fn load_ln_fp8_with_hints(
                     },
                 }
             }
+        } else {
+            match vb.get_with_hints_dtype(
+                (scale_dim0, scale_dim1),
+                "weight_scale",
+                shard,
+                scale_dtype,
+            ) {
+                Ok(s) => s,
+                Err(_) => match vb.get_with_hints_dtype(
+                    (scale_dim0, scale_dim1),
+                    "weight_scale_inv",
+                    shard,
+                    scale_dtype,
+                ) {
+                    Ok(s) => s,
+                    Err(_) => vb
+                        .get_with_hints_dtype((scale_dim0, scale_dim1), "scale", shard, scale_dtype)
+                        .map_err(|_| {
+                            candle_core::Error::Msg(
+                                "LnFp8: Missing weight_scale, weight_scale_inv, or scale".into(),
+                            )
+                        })?,
+                },
+            }
         };
         (weight_scale, shard, (scale_dim0, scale_dim1))
     };

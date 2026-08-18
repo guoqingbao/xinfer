@@ -1,3 +1,4 @@
+use crate::models::layers::activation::GatedActivation;
 use crate::models::layers::distributed::{AllReduce, Comm, VocabParallelLinear};
 use crate::models::layers::ds_v4::{
     hc_expand, hc_head, hc_post, hc_pre_norm, CompressorDecodeState, CompressorWeights,
@@ -13,7 +14,7 @@ use crate::utils::config::Config;
 use crate::utils::progress::ProgressLike;
 use attention_rs::InputMetadata;
 use candle_core::{DType, Device, Result, Tensor};
-use candle_nn::{Activation, Module};
+use candle_nn::Module;
 use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -102,7 +103,7 @@ impl DeepSeekV4Config {
 struct V4MoeW2 {
     router: V4Router,
     experts: MoeW2ExpertWeights,
-    act: Activation,
+    act: GatedActivation,
     all_reduce: AllReduce,
     world_size: usize,
     dtype: DType,
