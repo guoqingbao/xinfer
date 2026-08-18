@@ -1,5 +1,5 @@
 use crate::tools::Tool;
-use minijinja::{context, Environment};
+use minijinja::{context, Environment, Value};
 #[cfg(feature = "python")]
 use pyo3::pyclass;
 use regex::Regex;
@@ -150,6 +150,10 @@ pub struct ChatTemplate {
     preserve_tokens: Vec<String>,
     add_generation_prompt: bool,
     enable_thinking: bool,
+    /// Optional per-request reasoning effort exposed to Jinja templates.
+    /// Keep this undefined when no request override is present so templates
+    /// can apply their own model-specific default (Qwen3.8 uses `xhigh`).
+    reasoning_effort: Option<String>,
 }
 
 const REASONING_BLOCK_PAIRS: [(&str, &str); 5] = [
@@ -297,6 +301,7 @@ impl ChatTemplate {
             preserve_tokens: Vec::new(),
             add_generation_prompt,
             enable_thinking,
+            reasoning_effort: None,
         };
         if system_message.is_some() {
             template.append_message(
@@ -333,6 +338,10 @@ impl ChatTemplate {
 
     pub fn enable_thinking(&self) -> bool {
         self.enable_thinking
+    }
+
+    pub fn set_reasoning_effort(&mut self, effort: Option<String>) {
+        self.reasoning_effort = effort;
     }
 
     pub fn set_escape_tokens(&mut self, mut tokens: Vec<String>) {
@@ -454,6 +463,11 @@ impl ChatTemplate {
               bos_token => self.bos_token,
               eos_token => self.eos_token,
               enable_thinking => self.enable_thinking,
+              reasoning_effort => self
+                  .reasoning_effort
+                  .as_deref()
+                  .map(Value::from)
+                  .unwrap_or(Value::UNDEFINED),
               tools => tools,
             })
             .map_err(ApplyChatTemplateError::RenderTemplateError)
@@ -518,6 +532,10 @@ mod tests {
 {%- if add_generation_prompt %}
     {{- '<|im_start|>assistant\n' }}
 {%- endif %}
+"#;
+
+    const REASONING_EFFORT_TEMPLATE: &str = r#"
+{%- if enable_thinking %}{{ reasoning_effort|default('xhigh') }}{%- endif %}
 "#;
 
     const ALT_ASSISTANT_HEADER_TEMPLATE: &str = r#"
@@ -674,6 +692,25 @@ You are MiniMax.
             .generation_prompt_replay_suffix(&Vec::new(), &rendered)
             .unwrap();
         assert_eq!(replay, "<think>\n");
+    }
+
+    #[test]
+    fn reasoning_effort_is_undefined_by_default_for_template_defaults() {
+        let template = build_template(REASONING_EFFORT_TEMPLATE, true);
+        assert_eq!(
+            template.apply_chat_template(&Vec::new(), false).unwrap(),
+            "xhigh"
+        );
+    }
+
+    #[test]
+    fn reasoning_effort_override_is_passed_to_template() {
+        let mut template = build_template(REASONING_EFFORT_TEMPLATE, true);
+        template.set_reasoning_effort(Some("low".to_string()));
+        assert_eq!(
+            template.apply_chat_template(&Vec::new(), false).unwrap(),
+            "low"
+        );
     }
 
     #[test]
