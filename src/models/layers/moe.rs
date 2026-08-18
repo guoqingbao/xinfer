@@ -2675,14 +2675,14 @@ enum Nvfp4GateUpWeights {
     },
 }
 
-fn maybe_swizzle_nvfp4_scales(scales: &Tensor) -> Result<Option<Tensor>> {
+fn maybe_swizzle_nvfp4_scales(_scales: &Tensor) -> Result<Option<Tensor>> {
     #[cfg(feature = "cuda")]
     {
-        let sm = attention_rs::cuda_utils::sm_version(scales.device().as_cuda_device()?)
+        let sm = attention_rs::cuda_utils::sm_version(_scales.device().as_cuda_device()?)
             .unwrap_or(0) as usize;
         if sm >= 100 {
             return Ok(Some(
-                attention_rs::nvfp4_linear::swizzle_nvfp4_weight_scales(scales)?,
+                attention_rs::nvfp4_linear::swizzle_nvfp4_weight_scales(_scales)?,
             ));
         }
     }

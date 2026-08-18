@@ -8,18 +8,19 @@ use crate::utils::should_skip_quant_for_module;
 use attention_rs::kernels::ffi::gguf_gemm;
 #[cfg(feature = "cuda")]
 use candle_core::backend::BackendStorage;
-use candle_core::quantized::GgmlDType;
-use candle_core::{
-    quantized::{QMatMul, QTensor},
-    DType, Device, Result, Tensor,
-};
-use candle_core::{CpuStorage, Layout, Module, Shape};
 #[cfg(feature = "cuda")]
 use candle_core::cuda_backend::cudarc::driver::DevicePtr;
 #[cfg(feature = "cuda")]
 use candle_core::cuda_backend::WrapErr;
+use candle_core::quantized::GgmlDType;
 #[cfg(feature = "cuda")]
 use candle_core::CudaStorage;
+use candle_core::{
+    quantized::{QMatMul, QTensor},
+    DType, Device, Module, Result, Tensor,
+};
+#[cfg(feature = "cuda")]
+use candle_core::{CpuStorage, Layout, Shape};
 use candle_nn::var_builder::Shard;
 use candle_nn::var_builder::ShardedVarBuilder as VarBuilder;
 use either::Either;
@@ -795,6 +796,22 @@ fn has_fp8_tensors(vb: &VarBuilder) -> bool {
         || vb.contains_tensor("scale")
 }
 
+/// Check the shape returned by a sharded scale load before treating it as a
+/// channel-wise scale. `ShardedSafeTensors` derives the returned shape from
+/// the checkpoint tensor, not from the requested shape, so a block scale such
+/// as `[48, 40]` can be returned by a probe for `[6144, 1]` on two ranks.
+pub(crate) fn is_channel_scale_shape(shape: &[usize], out_dim: usize, shard: Shard) -> bool {
+    if shape.len() != 2 || shape[1] != 1 {
+        return false;
+    }
+    let local_out = if shard.world_size > 1 && shard.dim == 0 {
+        out_dim.checked_div(shard.world_size).unwrap_or(0)
+    } else {
+        out_dim
+    };
+    shape[0] == local_out || shape[0] == out_dim
+}
+
 pub fn linear_x(
     in_dim: usize,
     out_dim: usize,
@@ -1480,8 +1497,10 @@ fn load_ln_fp8_with_hints(
         ["weight_scale", "weight_scale_inv", "scale"]
             .into_iter()
             .find_map(|name| {
-                vb.get_with_hints_dtype((out_dim, 1), name, channel_shard, scale_dtype)
-                    .ok()
+                let scale = vb
+                    .get_with_hints_dtype((out_dim, 1), name, channel_shard, scale_dtype)
+                    .ok()?;
+                is_channel_scale_shape(scale.dims(), out_dim, channel_shard).then_some(scale)
             })
     } else {
         None

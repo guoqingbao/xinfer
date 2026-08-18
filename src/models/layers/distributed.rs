@@ -1,6 +1,6 @@
 use crate::models::layers::linear::{
-    linear_b_x as linear_b, linear_no_bias_x as linear, LinearX as Linear, LnFp8, LnMxfp4, LnNvfp4,
-    QLinear,
+    is_channel_scale_shape, linear_b_x as linear_b, linear_no_bias_x as linear, LinearX as Linear,
+    LnFp8, LnMxfp4, LnNvfp4, QLinear,
 };
 use crate::models::layers::{isq_high_precision_quant, VarBuilderX};
 use crate::utils::config::QuantConfig;
@@ -849,8 +849,10 @@ impl MergedParallelColumnLinear {
                     let channel_scale = ["weight_scale", "weight_scale_inv", "scale"]
                         .into_iter()
                         .find_map(|name| {
-                            v.get_with_hints_dtype((out_dim, 1), name, no_shard, DType::F32)
-                                .ok()
+                            let scale = v
+                                .get_with_hints_dtype((out_dim, 1), name, no_shard, DType::F32)
+                                .ok()?;
+                            is_channel_scale_shape(scale.dims(), out_dim, no_shard).then_some(scale)
                         });
                     let (weight_scale, by) = if let Some(scale) = channel_scale {
                         block_size = vec![1, in_dim];
