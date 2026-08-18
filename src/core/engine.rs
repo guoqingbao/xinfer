@@ -1675,6 +1675,12 @@ impl LLMEngine {
         } else {
             prompt_template.set_enable_thinking(params.thinking.unwrap_or(default_enable_thinking));
         };
+        prompt_template.set_reasoning_effort(
+            params
+                .reasoning_effort
+                .as_ref()
+                .and_then(|effort| effort.chat_template_value()),
+        );
         prompt_template.set_messages(messages);
         let image_idx: i32 = 0;
         let prompt_processed = prompt_template

@@ -10,7 +10,7 @@ use crate::tools::helpers::{
     retain_tool_calls_forced_name, strict_tool_call_validation_enabled,
 };
 use crate::tools::{Tool, ToolCall, ToolChoice};
-use crate::utils::config::SamplingParams;
+use crate::utils::config::{ReasoningEffort, SamplingParams};
 use crate::utils::guidance_grammar::build_guided_decoding_grammar;
 use axum::{
     extract::{Json, State},
@@ -185,6 +185,11 @@ pub struct ClaudeMessageRequest {
     pub tool_choice: Option<ClaudeToolChoice>,
     #[serde(default)]
     pub thinking: Option<ClaudeThinking>,
+    /// Optional xInfer extension matching the OpenAI-compatible API. The
+    /// standard Anthropic control is `thinking`; this field is useful when a
+    /// client needs Qwen3.8's `low`/`medium`/`xhigh` template instruction.
+    #[serde(default, alias = "reasoning")]
+    pub reasoning_effort: Option<String>,
     #[serde(default, flatten)]
     pub extra: HashMap<String, Value>,
 }
@@ -2039,6 +2044,14 @@ pub async fn messages(
     params.top_k = request.top_k.map(|v| v as isize);
     params.top_p = request.top_p;
     params.thinking = anthropic_thinking;
+    if let Some(effort) = request
+        .reasoning_effort
+        .as_ref()
+        .map(|value| ReasoningEffort::from_str(value.clone()))
+    {
+        params.thinking = Some(effort.is_enabled());
+        params.reasoning_effort = Some(effort);
+    }
     if let Some(stop_sequences) = &request.stop_sequences {
         if !stop_sequences.is_empty() {
             params.stop_sequences = Some(stop_sequences.clone());
@@ -2162,7 +2175,7 @@ pub async fn messages(
             tool_choice_required,
             forced_tool_name.clone(),
             max_tokens,
-            None,
+            params.reasoning_effort.clone(),
             engine_config.enable_tool_grammar,
             &engine.tokenizer,
             &model_type,
@@ -3398,6 +3411,7 @@ pub async fn count_tokens(
         tools: request.tools.clone(),
         tool_choice: None,
         thinking: None,
+        reasoning_effort: None,
         extra: request.extra.clone(),
     };
     let normalized = normalize_claude_request_for_prefix_cache(&mut message_request);
@@ -3509,6 +3523,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             thinking: None,
+            reasoning_effort: None,
             extra: HashMap::new(),
         };
 
@@ -3555,6 +3570,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             thinking: None,
+            reasoning_effort: None,
             extra: HashMap::new(),
         };
 
@@ -3593,6 +3609,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             thinking: None,
+            reasoning_effort: None,
             extra: HashMap::new(),
         };
 
@@ -3628,6 +3645,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             thinking: None,
+            reasoning_effort: None,
             extra: HashMap::new(),
         };
 
@@ -3703,6 +3721,7 @@ mod tests {
                 mode: "enabled".to_string(),
                 budget_tokens: Some(128),
             })),
+            reasoning_effort: None,
             extra: HashMap::new(),
         };
 
@@ -3717,6 +3736,22 @@ mod tests {
             budget_tokens: None,
         }));
         assert_eq!(thinking_to_bool(&thinking), Some(true));
+    }
+
+    #[test]
+    fn accepts_reasoning_effort_extension() {
+        let request: ClaudeMessageRequest = serde_json::from_value(json!({
+            "model": "default",
+            "messages": [{"role": "user", "content": "hello"}],
+            "thinking": {"type": "enabled"},
+            "reasoning_effort": "xhigh"
+        }))
+        .unwrap();
+        assert_eq!(request.reasoning_effort.as_deref(), Some("xhigh"));
+        assert_eq!(
+            ReasoningEffort::from_str(request.reasoning_effort.unwrap()),
+            ReasoningEffort::High
+        );
     }
 
     #[test]
@@ -3871,6 +3906,7 @@ mod tests {
             }]),
             tool_choice: None,
             thinking: None,
+            reasoning_effort: None,
             extra: HashMap::new(),
         };
 

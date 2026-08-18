@@ -1425,6 +1425,22 @@ impl ReasoningEffort {
     pub fn is_enabled(&self) -> bool {
         *self != ReasoningEffort::None
     }
+
+    /// Convert the normalized effort to the value expected by a model's chat
+    /// template. OpenAI-compatible `high` and `xhigh` both map to Qwen3.8's
+    /// supported `xhigh` spelling; the enum intentionally keeps them unified
+    /// for the rest of the inference stack.
+    pub fn chat_template_value(&self) -> Option<String> {
+        match self {
+            ReasoningEffort::None | ReasoningEffort::ModelDefault => None,
+            ReasoningEffort::Low => Some("low".to_string()),
+            ReasoningEffort::Medium => Some("medium".to_string()),
+            ReasoningEffort::High => Some("xhigh".to_string()),
+            ReasoningEffort::ChainOfThought => Some("xhigh".to_string()),
+            #[cfg(all(not(feature = "python"), not(feature = "pyo3")))]
+            ReasoningEffort::Custom(value) => Some(value.clone()),
+        }
+    }
 }
 
 /// Conversion to string for serialization
@@ -1537,6 +1553,7 @@ mod tests {
             mode: None,
             quantized_layers: None,
             is_mlx_nvfp4: false,
+            is_compressed_tensors: false,
         };
         assert!(cfg.should_skip_module("model.layers.0.self_attn.q_proj"));
         assert!(cfg.should_skip_module("model.layers.5.linear_attn.out_proj"));
@@ -1696,7 +1713,7 @@ mod tests {
             "quantization_status": "compressed",
             "sparsity_config": {},
             "transform_config": {},
-            "version": "0.14.3.dev54+g704d57b"
+            "version": "0.14.4.dev54+g704d57b"
         }"#;
         let mut cfg: QuantConfig = serde_json::from_str(json).unwrap();
         cfg.normalize_compressed_tensors();
@@ -1804,7 +1821,7 @@ mod tests {
             "quantization_status": "compressed",
             "sparsity_config": {},
             "transform_config": {},
-            "version": "0.14.3.a20260310"
+            "version": "0.14.4.a20260310"
         }"#;
         let mut cfg: QuantConfig = serde_json::from_str(json).unwrap();
         cfg.normalize_compressed_tensors();
@@ -2072,5 +2089,18 @@ mod tests {
         assert!(ReasoningEffort::Medium.is_enabled());
         assert!(ReasoningEffort::High.is_enabled());
         assert!(ReasoningEffort::ChainOfThought.is_enabled());
+    }
+
+    #[test]
+    fn test_reasoning_effort_chat_template_value() {
+        assert_eq!(
+            ReasoningEffort::from_str("xhigh".to_string()).chat_template_value(),
+            Some("xhigh".to_string())
+        );
+        assert_eq!(
+            ReasoningEffort::High.chat_template_value(),
+            Some("xhigh".to_string())
+        );
+        assert_eq!(ReasoningEffort::ModelDefault.chat_template_value(), None);
     }
 }
