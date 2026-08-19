@@ -604,19 +604,6 @@ impl LinearX {
             Self::LnNvfp4(_) => panic!("LnNvfp4 does not support indexed_moe_forward yet"),
         }
     }
-
-    /// Dtype of the weight used for matmul (for casting activations before forward).
-    pub fn weight_dtype(&self) -> DType {
-        match self {
-            Self::Linear(ln) => ln.weight().dtype(),
-            Self::QLinear(ln) => ln.dtype,
-            Self::LnFp8(_) | Self::LnMxfp4(_) | Self::LnNvfp4(_) => {
-                // Quantized linears accept BF16/F16 activations and handle
-                // dtype internally; callers should not promote to F32.
-                DType::BF16
-            }
-        }
-    }
 }
 
 impl LinearX {

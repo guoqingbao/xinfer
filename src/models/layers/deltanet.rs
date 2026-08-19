@@ -540,12 +540,11 @@ impl GatedDeltaNet {
         }
 
         let is_quantized = config.quantization_config.is_some();
-        let gdn_dtype =
-            if vb.is_qvar_builder() || config.is_f16_mode || config.higher_precision_required() {
-                DType::F32
-            } else {
-                dtype
-            };
+        let gdn_dtype = if vb.is_qvar_builder() || config.is_f16_mode {
+            DType::F32
+        } else {
+            dtype
+        };
 
         let num_v_heads = num_v_heads_global / world_size;
         let num_k_heads = num_k_heads_global / world_size;
