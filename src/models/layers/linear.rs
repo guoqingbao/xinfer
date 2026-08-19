@@ -5,22 +5,13 @@ use crate::utils::config::QuantConfig;
 use crate::utils::should_skip_fp8_for_module;
 use crate::utils::should_skip_quant_for_module;
 #[cfg(feature = "cuda")]
-use attention_rs::kernels::ffi::gguf_gemm;
-#[cfg(feature = "cuda")]
-use candle_core::backend::BackendStorage;
-#[cfg(feature = "cuda")]
-use candle_core::cuda_backend::cudarc::driver::DevicePtr;
-#[cfg(feature = "cuda")]
-use candle_core::cuda_backend::WrapErr;
+use attention_rs::gguf_linear::gguf_iq_matmul;
+use attention_rs::gguf_linear::is_iq_gguf_dtype;
 use candle_core::quantized::GgmlDType;
-#[cfg(feature = "cuda")]
-use candle_core::CudaStorage;
 use candle_core::{
     quantized::{QMatMul, QTensor},
     DType, Device, Module, Result, Tensor,
 };
-#[cfg(feature = "cuda")]
-use candle_core::{CpuStorage, Layout, Shape};
 use candle_nn::var_builder::Shard;
 use candle_nn::var_builder::ShardedVarBuilder as VarBuilder;
 use either::Either;
@@ -52,117 +43,6 @@ pub fn set_linear_is_prefill(is_prefill: bool) -> LinearPrefillGuard {
 
 pub fn linear_is_prefill() -> bool {
     LINEAR_IS_PREFILL.with(|flag| flag.get())
-}
-
-fn is_iq_gguf_dtype(dtype: GgmlDType) -> bool {
-    matches!(
-        dtype,
-        GgmlDType::IQ2_XXS
-            | GgmlDType::IQ2_XS
-            | GgmlDType::IQ3_XXS
-            | GgmlDType::IQ1_S
-            | GgmlDType::IQ4_NL
-            | GgmlDType::IQ3_S
-            | GgmlDType::IQ2_S
-            | GgmlDType::IQ4_XS
-            | GgmlDType::IQ1_M
-    )
-}
-
-#[cfg(feature = "cuda")]
-fn iq_gguf_dtype_code(dtype: GgmlDType) -> Result<i32> {
-    Ok(match dtype {
-        GgmlDType::IQ2_XXS => 6,
-        GgmlDType::IQ2_XS => 7,
-        GgmlDType::IQ3_XXS => 8,
-        GgmlDType::IQ4_XS => 9,
-        GgmlDType::IQ1_S => 10,
-        GgmlDType::IQ4_NL => 11,
-        GgmlDType::IQ3_S => 12,
-        GgmlDType::IQ2_S => 13,
-        GgmlDType::IQ1_M => 14,
-        dtype => candle_core::bail!("unsupported native IQ GGUF dtype {dtype:?}"),
-    })
-}
-
-#[cfg(feature = "cuda")]
-struct GgufIqMatMul {
-    weight: Arc<QTensor>,
-}
-
-#[cfg(feature = "cuda")]
-impl GgufIqMatMul {
-    fn cuda_fwd(&self, x: &CudaStorage, x_l: &Layout) -> Result<(CudaStorage, Shape)> {
-        if x.dtype() != DType::F32 {
-            candle_core::bail!(
-                "native IQ GGUF GEMM requires F32 activations, got {:?}",
-                x.dtype()
-            );
-        }
-        if !x_l.is_contiguous() {
-            candle_core::bail!("native IQ GGUF GEMM requires contiguous activations: {x_l:?}");
-        }
-        let x_dims = x_l.shape().dims();
-        let Some(&size_k) = x_dims.last() else {
-            candle_core::bail!("native IQ GGUF GEMM requires a rank-2-or-higher input");
-        };
-        let (size_n, weight_k) = self.weight.shape().dims2()?;
-        if size_k != weight_k {
-            candle_core::bail!(
-                "native IQ GGUF GEMM input/weight mismatch: input K={}, weight shape={:?}",
-                size_k,
-                self.weight.shape()
-            );
-        }
-        let size_m = x_l.shape().elem_count() / size_k;
-        let mut output_dims = x_dims.to_vec();
-        *output_dims.last_mut().unwrap() = size_n;
-        let output_shape = Shape::from(output_dims);
-
-        let input = x.as_cuda_slice::<f32>()?;
-        let input = input.slice(x_l.start_offset()..x_l.start_offset() + x_l.shape().elem_count());
-        let dev = x.device().clone();
-        let output = unsafe { dev.alloc::<f32>(output_shape.elem_count()) }.w()?;
-        let stream = *dev.cu_stream() as i64;
-        let input_ptr = *input.device_ptr() as *const f32;
-        let weight_ptr = self.weight.device_ptr()? as *const std::ffi::c_void;
-        let output_ptr = *output.device_ptr() as *mut f32;
-        let dtype = iq_gguf_dtype_code(self.weight.dtype())?;
-
-        unsafe {
-            gguf_gemm(
-                input_ptr,
-                weight_ptr,
-                output_ptr,
-                size_m as i32,
-                size_n as i32,
-                size_k as i32,
-                dtype,
-                stream,
-            );
-        }
-        Ok((CudaStorage::wrap_cuda_slice(output, dev), output_shape))
-    }
-}
-
-#[cfg(feature = "cuda")]
-impl candle_core::CustomOp1 for GgufIqMatMul {
-    fn name(&self) -> &'static str {
-        "native_iq_gguf_gemm"
-    }
-
-    fn cpu_fwd(&self, _: &CpuStorage, _: &Layout) -> Result<(CpuStorage, Shape)> {
-        candle_core::bail!("native IQ GGUF GEMM is only implemented on CUDA")
-    }
-
-    fn cuda_fwd(&self, x: &CudaStorage, x_l: &Layout) -> Result<(CudaStorage, Shape)> {
-        self.cuda_fwd(x, x_l)
-    }
-}
-
-#[cfg(feature = "cuda")]
-fn native_iq_gguf_matmul(x: &Tensor, weight: Arc<QTensor>) -> Result<Tensor> {
-    x.apply_op1_no_bwd(&GgufIqMatMul { weight })
 }
 
 pub fn shard(dim: usize, rank: usize, world_size: usize) -> candle_nn::var_builder::Shard {
@@ -625,7 +505,7 @@ impl Module for QLinear {
                 QMatMul::QTensor(weight) if is_iq_gguf_dtype(weight.dtype()) => {
                     #[cfg(feature = "cuda")]
                     {
-                        native_iq_gguf_matmul(&xs, weight.clone())?
+                        gguf_iq_matmul(&xs, weight)?
                     }
                     #[cfg(not(feature = "cuda"))]
                     {
