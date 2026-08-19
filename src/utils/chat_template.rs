@@ -151,8 +151,8 @@ pub struct ChatTemplate {
     add_generation_prompt: bool,
     enable_thinking: bool,
     /// Optional per-request reasoning effort exposed to Jinja templates.
-    /// Keep this undefined when no request override is present so templates
-    /// can apply their own model-specific default (Qwen3.8 uses `xhigh`).
+    /// When unset, rendering passes `"medium"` so Qwen3.8's shipped
+    /// `reasoning_effort|default('xhigh')` does not take effect.
     reasoning_effort: Option<String>,
 }
 
@@ -467,7 +467,7 @@ impl ChatTemplate {
                   .reasoning_effort
                   .as_deref()
                   .map(Value::from)
-                  .unwrap_or(Value::UNDEFINED),
+                  .unwrap_or(Value::from("medium")),
               tools => tools,
             })
             .map_err(ApplyChatTemplateError::RenderTemplateError)
@@ -695,11 +695,11 @@ You are MiniMax.
     }
 
     #[test]
-    fn reasoning_effort_is_undefined_by_default_for_template_defaults() {
+    fn reasoning_effort_defaults_to_medium_when_unset() {
         let template = build_template(REASONING_EFFORT_TEMPLATE, true);
         assert_eq!(
             template.apply_chat_template(&Vec::new(), false).unwrap(),
-            "xhigh"
+            "medium"
         );
     }
 

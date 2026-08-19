@@ -1510,7 +1510,6 @@ impl LLMEngine {
                 .iter()
                 .map(|(_, _, t, _)| *t)
                 .fold(0.0f32, f32::max);
-            let has_cache = prefill_batch.iter().any(|(_, _, _, c)| *c);
             if max_time > 0.0 {
                 crate::log_info!(
                     "Prefilling {} seq(s) {:?}: {} total tokens in {:.2}s ({:.2} tokens/s)",
