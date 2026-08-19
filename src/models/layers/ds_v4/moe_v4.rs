@@ -4,6 +4,7 @@
 //! clean general MoE path. Hash routing matches openinfer's
 //! `deepseek_hash_gate_cuda` (partial gate dots + sqrt-softplus + normalize).
 
+use crate::models::layers::activation::GatedActivation;
 use crate::models::layers::distributed::{shard, AllReduce, Comm};
 use crate::models::layers::linear::LinearX as Linear;
 use crate::models::layers::moe::{
@@ -159,7 +160,7 @@ pub struct FusedMoeMxfp4 {
     pub(crate) down_blocks: Tensor,
     pub(crate) down_scales: Tensor,
     pub(crate) w_size_n: usize,
-    pub(crate) act: Activation,
+    pub(crate) act: GatedActivation,
     pub(crate) all_reduce: AllReduce,
     pub(crate) world_size: usize,
     pub(crate) dtype: DType,
@@ -457,7 +458,10 @@ impl FusedMoeMxfp4 {
             down_blocks,
             down_scales,
             w_size_n,
-            act: cfg.hidden_act,
+            act: GatedActivation::from_model_config(
+                cfg.hidden_act.clone(),
+                cfg.extra_config_json.as_deref(),
+            ),
             all_reduce: AllReduce::new(comm.clone()),
             world_size: comm.world_size(),
             dtype,
@@ -526,7 +530,9 @@ impl FusedMoeMxfp4 {
             None,
         )?;
 
-        let down_inputs = if matches!(self.act, Activation::Silu) && self.swiglu_limit > 0.0 {
+        let down_inputs = if matches!(self.act, GatedActivation::Standard(Activation::Silu))
+            && self.swiglu_limit > 0.0
+        {
             let gate_up_f32 = gate_up.to_dtype(DType::F32)?;
             let flat_gate_up = gate_up_f32.reshape((num_tokens * topk, self.w_size_n * 2))?;
             let gate = flat_gate_up

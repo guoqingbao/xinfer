@@ -1,3 +1,4 @@
+pub mod activation;
 pub mod attention;
 pub mod deepstack;
 pub mod deltanet;
@@ -6,6 +7,7 @@ pub mod ds_v4;
 pub mod indexer;
 pub mod linear;
 pub mod mask;
+pub mod minimax3_attention;
 pub mod mla_attention;
 pub mod mlp;
 pub mod moe;

@@ -98,6 +98,24 @@ fn parse_fallback_moe_cfg(arch_name: &str, raw_cfg: &[u8]) -> Option<MoEConfig> 
         }
 
         serde_json::from_value(raw_cfg_json).ok()
+    } else if arch_name == "MiniMaxM3SparseForConditionalGeneration"
+        || arch_name == "MiniMaxM3SparseForCausalLM"
+    {
+        let root: serde_json::Value = serde_json::from_slice(raw_cfg).ok()?;
+        let cfg = root.get("text_config").unwrap_or(&root);
+        let mut moe_cfg = cfg.clone();
+        let obj = moe_cfg.as_object_mut()?;
+        if !obj.contains_key("moe_intermediate_size") {
+            obj.insert(
+                "moe_intermediate_size".to_string(),
+                obj.get("intermediate_size")?.clone(),
+            );
+        }
+        obj.entry("norm_topk_prob")
+            .or_insert_with(|| serde_json::json!(true));
+        obj.entry("first_k_dense_replace")
+            .or_insert_with(|| serde_json::json!(3));
+        serde_json::from_value(moe_cfg).ok()
     } else {
         serde_json::from_slice(raw_cfg).ok()
     }
@@ -1449,6 +1467,63 @@ pub fn init_config_tokenizer(
                         config.moe_cfg = Some(moe_cfg);
                         config
                     }
+                    "MiniMaxM3SparseForConditionalGeneration" | "MiniMaxM3SparseForCausalLM" => {
+                        // M3 uses a custom `swigluoai` activation name which
+                        // candle's serde enum does not know. Keep the M3
+                        // parameters in Config and use SiLU as the loader
+                        // placeholder; the M3 model applies the exact OAI
+                        // SwiGLU formula itself.
+                        let mut cv = config_value.clone();
+                        if let Some(obj) = cv.as_object_mut() {
+                            obj.insert("hidden_act".to_string(), serde_json::json!("silu"));
+                        }
+                        let mut config: Config =
+                            serde_json::from_value(cv).map_err(candle_core::Error::wrap)?;
+                        let raw = raw_config_json
+                            .get("text_config")
+                            .unwrap_or(&raw_config_json);
+                        let num_experts = raw
+                            .get("num_local_experts")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0) as usize;
+                        let top_k = raw
+                            .get("num_experts_per_tok")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(1) as usize;
+                        let shared_size = raw
+                            .get("shared_intermediate_size")
+                            .and_then(|v| v.as_u64())
+                            .map(|v| v as usize);
+                        config.moe_cfg = Some(MoEConfig {
+                            moe_intermediate_size: raw
+                                .get("intermediate_size")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(config.intermediate_size as u64)
+                                as usize,
+                            shared_expert_intermediate_size: shared_size,
+                            num_experts: Some(num_experts),
+                            mlp_only_layers: Some(vec![0, 1, 2]),
+                            decoder_sparse_step: Some(1),
+                            norm_topk_prob: true,
+                            num_experts_per_tok: top_k,
+                            routed_scaling_factor: raw
+                                .get("routed_scaling_factor")
+                                .and_then(|v| v.as_f64()),
+                            first_k_dense_replace: Some(3),
+                            n_shared_experts: raw
+                                .get("n_shared_experts")
+                                .and_then(|v| v.as_u64())
+                                .map(|v| v as usize),
+                            n_group: None,
+                            topk_group: None,
+                            scoring_func: raw
+                                .get("scoring_func")
+                                .and_then(|v| v.as_str())
+                                .map(str::to_owned),
+                            topk_method: None,
+                        });
+                        config
+                    }
                     _ => serde_json::from_value(config_value).map_err(candle_core::Error::wrap)?,
                 };
 
@@ -1478,8 +1553,21 @@ pub fn init_config_tokenizer(
                 .map_err(candle_core::Error::wrap)?
             }
         } else {
-            serde_json::from_slice(&std::fs::read(&config_path).map_err(candle_core::Error::wrap)?)
-                .map_err(candle_core::Error::wrap)?
+            let raw = std::fs::read(&config_path).map_err(candle_core::Error::wrap)?;
+            let mut value: serde_json::Value =
+                serde_json::from_slice(&raw).map_err(candle_core::Error::wrap)?;
+            let is_minimax_m3 = value
+                .get("architectures")
+                .and_then(|v| v.as_array())
+                .and_then(|v| v.first())
+                .and_then(|v| v.as_str())
+                .is_some_and(|v| v.starts_with("MiniMaxM3"));
+            if is_minimax_m3 {
+                if let Some(obj) = value.as_object_mut() {
+                    obj.insert("hidden_act".to_string(), serde_json::json!("silu"));
+                }
+            }
+            serde_json::from_value(value).map_err(candle_core::Error::wrap)?
         };
 
         apply_runtime_rope_overrides(&mut config, econfig.yarn_scaling_factor);
@@ -1504,6 +1592,15 @@ pub fn init_config_tokenizer(
         }
 
         if let Some(qcfg) = &mut config.quantization_config {
+            let is_minimax_m3 = config
+                .architectures
+                .as_ref()
+                .and_then(|a| a.first())
+                .is_some_and(|a| a.starts_with("MiniMaxM3"));
+            if is_minimax_m3 && qcfg.quant_method.eq_ignore_ascii_case("mxfp8") {
+                qcfg.quant_method = "fp8".to_string();
+                qcfg.weight_block_size = Some(vec![1, 32]);
+            }
             qcfg.normalize_compressed_tensors();
             if let Some(mode) = &qcfg.mode {
                 if mode.eq_ignore_ascii_case("mxfp4") && qcfg.quant_method.is_empty() {
@@ -1555,6 +1652,19 @@ pub fn init_config_tokenizer(
             }
         }
 
+        if let Some(qcfg) = &mut config.quantization_config {
+            if matches!(
+                arch_name.as_str(),
+                "MiniMaxM3SparseForConditionalGeneration" | "MiniMaxM3SparseForCausalLM"
+            ) && qcfg.quant_method == "nvfp4"
+                && qcfg.weight_block_size.is_none()
+            {
+                // M3's non-expert projections are ModelOpt MXFP8: one E4M3
+                // scale per output row and each group of 32 input values.
+                // Routed experts remain NVFP4 and do not use this field.
+                qcfg.weight_block_size = Some(vec![1, 32]);
+            }
+        }
         if config.moe_cfg.is_none()
             && matches!(
                 arch_name.as_str(),
@@ -1572,6 +1682,8 @@ pub fn init_config_tokenizer(
                     | "Qwen3NextForCausalLM"
                     | "Qwen3NextForConditionalGeneration"
                     | "MiniMaxM2ForCausalLM"
+                    | "MiniMaxM3SparseForConditionalGeneration"
+                    | "MiniMaxM3SparseForCausalLM"
             )
         {
             if let Ok(raw_cfg) = std::fs::read(&config_path) {
@@ -2085,6 +2197,8 @@ pub fn get_arch_rope(
         ("gemma4", false),
         ("MiniMaxM2ForCausalLM", false),
         ("minimax_m2", false),
+        ("MiniMaxM3SparseForConditionalGeneration", false),
+        ("MiniMaxM3SparseForCausalLM", false),
     ]
     .iter()
     .cloned()
@@ -2197,6 +2311,10 @@ pub fn get_arch_rope(
         ),
         "MiniMaxM2ForCausalLM" | "minimax_m2" => (
             ModelType::MiniMax,
+            "<|im_start|>user\n {} <|im_end|>".to_string(),
+        ),
+        "MiniMaxM3SparseForConditionalGeneration" | "MiniMaxM3SparseForCausalLM" => (
+            ModelType::MiniMax3,
             "<|im_start|>user\n {} <|im_end|>".to_string(),
         ),
         _ => candle_core::bail!("Unsupported architecture: {}", architectures),

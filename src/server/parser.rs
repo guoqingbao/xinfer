@@ -400,7 +400,7 @@ impl ToolConfig {
                 start_is_special: false,
                 end_is_special: false,
             },
-            ModelType::MiniMax => ToolConfig {
+            ModelType::MiniMax | ModelType::MiniMax3 => ToolConfig {
                 // MiniMax tokenizer ships dedicated tool envelope tokens:
                 //   200052 => <minimax:tool_call>
                 //   200053 => </minimax:tool_call>
@@ -1696,6 +1696,7 @@ impl StreamToolParser {
             ModelType::Yi | ModelType::StableLM => "qwen",
             ModelType::DeepSeek | ModelType::DeepSeekV4 => "deepseek",
             ModelType::MiniMax => "minimax_m2",
+            ModelType::MiniMax3 => "minimax_m2",
         }
     }
 

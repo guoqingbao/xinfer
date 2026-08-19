@@ -29,6 +29,7 @@ use crate::{
     models::llama::LLaMaForCausalLM,
     models::llama4::LLama4ForConditionalGeneration,
     models::minimax::MiniMaxForCausalLM,
+    models::minimax3::MiniMax3ForCausalLM,
     models::mistral3_vl::Mistral3ForConditionalGeneration,
     models::phi4::Phi4ForCausalLM,
     models::qwen3::Qwen3ForCausalLM,
@@ -108,6 +109,7 @@ pub enum Model {
     Gemma4(Arc<Gemma4ForCausalLM>),
     Qwen3VL(Arc<Qwen3VLForConditionalGeneration>),
     MiniMax(Arc<MiniMaxForCausalLM>),
+    MiniMax3(Arc<MiniMax3ForCausalLM>),
 }
 
 pub enum RunnerType {
@@ -320,6 +322,7 @@ impl ModelRunner {
                 Gemma4 => Gemma4ForCausalLM,
                 Qwen3VL => Qwen3VLForConditionalGeneration,
                 MiniMax => MiniMaxForCausalLM,
+                MiniMax3 => MiniMax3ForCausalLM,
             }
         )?;
 
@@ -346,6 +349,7 @@ impl ModelRunner {
                 Gemma4 => EmbedInputs,
                 Qwen3VL => NoneArg,
                 MiniMax => EmbedInputs,
+                MiniMax3 => EmbedInputs,
             }
         );
 
@@ -371,8 +375,9 @@ impl ModelRunner {
                     Mistral3VL => NoneArg,
                     Gemma3 => NoneArg,
                     Gemma4 => EmbedInputs,
-                    Qwen3VL => NoneArg,
-                    MiniMax => EmbedInputs,
+                Qwen3VL => NoneArg,
+                MiniMax => EmbedInputs,
+                MiniMax3 => EmbedInputs,
                 }
             ))
         } else {
@@ -1016,6 +1021,7 @@ impl ModelRunner {
                 Gemma4 => false,
                 Qwen3VL => images,
                 MiniMax => false,
+                MiniMax3 => false,
             }
         )?;
         drop(kv_guard);
@@ -1047,6 +1053,7 @@ impl ModelRunner {
                 Gemma3 => None,
                 Gemma4 => false,
                 MiniMax => false,
+                MiniMax3 => false,
             },
             candle_core::bail!("Embedding is not supported for this model type")
         )?;
@@ -1207,6 +1214,7 @@ impl ModelRunner {
         let block_tables = Some(block_tables_t);
         let context_lens = Some(context_lens_t);
         let cu_seqlens_q_vec = cu_seqlens_q.clone();
+        let cu_seqlens_k_vec = cu_seqlens_k.clone();
         let cu_seqlens_q = Tensor::from_vec(cu_seqlens_q, (q_len,), &self.device)?;
         let cu_seqlens_k = Tensor::from_vec(cu_seqlens_k, (k_len,), &self.device)?;
 
@@ -1363,6 +1371,7 @@ impl ModelRunner {
             max_seqlen_k,
             max_context_len,
             seqlens: Some(cu_seqlens_q_vec[1..].to_vec()),
+            kv_seqlens: Some(cu_seqlens_k_vec[1..].to_vec()),
             flashinfer_metadata,
             is_mtp_verify: false,
         };
@@ -1550,6 +1559,7 @@ impl ModelRunner {
             max_seqlen_k: 0,
             max_context_len,
             seqlens: None,
+            kv_seqlens: None,
             flashinfer_metadata,
             is_mtp_verify: false,
         };
@@ -1809,6 +1819,7 @@ impl ModelRunner {
             Model::Gemma4(model) => model.get_vocab_size(),
             Model::Qwen3VL(model) => model.get_vocab_size(),
             Model::MiniMax(model) => model.get_vocab_size(),
+            Model::MiniMax3(model) => model.get_vocab_size(),
         }
     }
 

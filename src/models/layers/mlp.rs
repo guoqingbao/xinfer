@@ -1,3 +1,4 @@
+use crate::models::layers::activation::GatedActivation;
 use crate::models::layers::distributed::{
     shard, Comm, MergedParallelColumnLinear, ReplicatedLinear, TensorParallelColumnLinear,
     TensorParallelRowLinear,
@@ -20,7 +21,7 @@ enum GateUpProjection {
 pub struct MLP {
     gate_up_proj: GateUpProjection,
     down_proj: TensorParallelRowLinear,
-    activation: Activation,
+    activation: GatedActivation,
     swiglu_limit: f32,
 }
 
@@ -463,7 +464,7 @@ impl MLP {
         Ok(Self {
             gate_up_proj,
             down_proj,
-            activation: activation.clone(),
+            activation: GatedActivation::standard(activation.clone()),
             swiglu_limit: 0.0,
         })
     }
@@ -471,6 +472,32 @@ impl MLP {
     pub fn with_swiglu_limit(mut self, limit: f32) -> Self {
         self.swiglu_limit = limit;
         self
+    }
+
+    pub fn new_with_gated_activation(
+        vb: VarBuilderX,
+        comm: Rc<Comm>,
+        hidden_size: usize,
+        intermediate_size: usize,
+        quant_cfg: &Option<QuantConfig>,
+        quant: &Option<String>,
+        dtype: DType,
+        activation: GatedActivation,
+    ) -> Result<Self> {
+        let mut mlp = Self::new(
+            vb,
+            comm,
+            hidden_size,
+            intermediate_size,
+            &Activation::Silu,
+            quant_cfg,
+            quant,
+            false,
+            dtype,
+            "",
+        )?;
+        mlp.activation = activation;
+        Ok(mlp)
     }
 
     pub fn forward(&self, xs: &Tensor) -> Result<Tensor> {
@@ -489,7 +516,11 @@ impl MLP {
                 (gate_up[0].clone(), gate_up[1].clone())
             }
         };
-        let activated = if self.swiglu_limit > 0.0 && matches!(self.activation, Activation::Silu) {
+        let activated = if self.swiglu_limit > 0.0
+            && matches!(
+                &self.activation,
+                GatedActivation::Standard(Activation::Silu)
+            ) {
             // DeepSeek V4's reference Expert promotes both projections to
             // FP32, clamps asymmetrically (gate <= limit, up in [-limit,
             // limit]), and only casts back immediately before w2.  Doing the
@@ -502,7 +533,7 @@ impl MLP {
             let activated = (candle_nn::ops::silu(&gate)? * up)?;
             activated.to_dtype(xs.dtype())?
         } else {
-            (self.activation.forward(&gate)? * up)?
+            self.activation.forward_separate(&gate, &up)?
         };
         self.down_proj.forward(&activated)
     }
