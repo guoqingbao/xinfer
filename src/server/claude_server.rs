@@ -866,33 +866,86 @@ fn tool_result_content_to_text(content: &ClaudeToolResultContent) -> Result<Stri
     }
 }
 
-fn flush_content_message(
+fn flush_chat_message(
     out: &mut Vec<ChatMessage>,
     role: &str,
     items: &mut Vec<MessageContent>,
+    calls: &mut Vec<ToolCall>,
     reasoning_content: Option<String>,
 ) {
     let content = build_message_content_type(std::mem::take(items));
-    if content.is_some() || reasoning_content.is_some() {
+    let tool_calls = if calls.is_empty() {
+        None
+    } else {
+        Some(std::mem::take(calls))
+    };
+    if content.is_some() || tool_calls.is_some() || reasoning_content.is_some() {
         out.push(ChatMessage {
             role: role.to_string(),
             content,
-            tool_calls: None,
+            tool_calls,
             tool_call_id: None,
             reasoning_content,
         });
     }
 }
 
-fn flush_tool_call_message(out: &mut Vec<ChatMessage>, calls: &mut Vec<ToolCall>) {
-    if !calls.is_empty() {
-        out.push(ChatMessage {
-            role: "assistant".to_string(),
-            content: None,
-            tool_calls: Some(std::mem::take(calls)),
-            tool_call_id: None,
-            reasoning_content: None,
-        });
+fn chat_message_plain_text(message: &ChatMessage) -> String {
+    match &message.content {
+        Some(MessageContentType::PureText(text)) => text.clone(),
+        Some(MessageContentType::Single(MessageContent::Text { text })) => text.clone(),
+        Some(MessageContentType::Multi(items)) => items
+            .iter()
+            .filter_map(|item| match item {
+                MessageContent::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
+fn append_plain_text(dst: &mut ChatMessage, extra: &str) {
+    let extra = extra.trim();
+    if extra.is_empty() {
+        return;
+    }
+    let mut combined = chat_message_plain_text(dst);
+    if !combined.is_empty() {
+        combined.push_str("\n\n");
+    }
+    combined.push_str(extra);
+    dst.content = Some(MessageContentType::PureText(combined));
+}
+
+fn push_converted_claude_messages(
+    out: &mut Vec<ChatMessage>,
+    source_role: &str,
+    converted: Vec<ChatMessage>,
+) {
+    if source_role != "system" {
+        out.extend(converted);
+        return;
+    }
+
+    // Qwen3.8 (and similar) templates allow at most one system message, and
+    // only as messages[0]. Claude Code still injects extra system turns
+    // (skills, reminders) later in the transcript. Keep a single leading
+    // system message; render the rest as user turns so history is not dropped.
+    if out.is_empty() {
+        out.extend(converted);
+        return;
+    }
+    if out.len() == 1 && out[0].role == "system" {
+        for message in converted {
+            append_plain_text(&mut out[0], &chat_message_plain_text(&message));
+        }
+        return;
+    }
+    for mut message in converted {
+        message.role = "user".to_string();
+        out.push(message);
     }
 }
 
@@ -902,6 +955,13 @@ fn validate_claude_tool_result_protocol(messages: &[ClaudeMessage]) -> Result<()
 
     for (idx, message) in messages.iter().enumerate() {
         let role = message.role.as_str();
+        // Claude Code and some Anthropic clients insert extra `system` turns
+        // (reminders, skills) into `messages`. Official Messages API only
+        // documents user/assistant there; accept system and ignore it for
+        // tool_use/tool_result adjacency.
+        if role == "system" {
+            continue;
+        }
         if role != "user" && role != "assistant" {
             return Err(format!(
                 "unsupported role at messages[{idx}]: {}",
@@ -1053,7 +1113,7 @@ fn validate_claude_tool_result_protocol(messages: &[ClaudeMessage]) -> Result<()
 
 fn convert_claude_message(message: &ClaudeMessage) -> Result<Vec<ChatMessage>, String> {
     let role = message.role.as_str();
-    if role != "user" && role != "assistant" {
+    if role != "user" && role != "assistant" && role != "system" {
         return Err(format!("unsupported role: {}", message.role));
     }
 
@@ -1074,7 +1134,13 @@ fn convert_claude_message(message: &ClaudeMessage) -> Result<Vec<ChatMessage>, S
                 match block {
                     ClaudeContentBlock::Text { text } => {
                         if !tool_calls.is_empty() {
-                            flush_tool_call_message(&mut out, &mut tool_calls);
+                            flush_chat_message(
+                                &mut out,
+                                role,
+                                &mut content_items,
+                                &mut tool_calls,
+                                thinking_content.take(),
+                            );
                         }
                         if !text.is_empty() {
                             push_text_content(&mut content_items, text.clone());
@@ -1088,7 +1154,13 @@ fn convert_claude_message(message: &ClaudeMessage) -> Result<Vec<ChatMessage>, S
                             return Err("thinking blocks must be in assistant messages".to_string());
                         }
                         if !tool_calls.is_empty() {
-                            flush_tool_call_message(&mut out, &mut tool_calls);
+                            flush_chat_message(
+                                &mut out,
+                                role,
+                                &mut content_items,
+                                &mut tool_calls,
+                                thinking_content.take(),
+                            );
                         }
                         let cleaned = strip_nested_reasoning_markers(thinking);
                         if !cleaned.trim().is_empty() {
@@ -1109,12 +1181,24 @@ fn convert_claude_message(message: &ClaudeMessage) -> Result<Vec<ChatMessage>, S
                                 .to_string());
                         }
                         if !tool_calls.is_empty() {
-                            flush_tool_call_message(&mut out, &mut tool_calls);
+                            flush_chat_message(
+                                &mut out,
+                                role,
+                                &mut content_items,
+                                &mut tool_calls,
+                                thinking_content.take(),
+                            );
                         }
                     }
                     ClaudeContentBlock::Image { source } => {
                         if !tool_calls.is_empty() {
-                            flush_tool_call_message(&mut out, &mut tool_calls);
+                            flush_chat_message(
+                                &mut out,
+                                role,
+                                &mut content_items,
+                                &mut tool_calls,
+                                thinking_content.take(),
+                            );
                         }
                         match source {
                             ClaudeImageSource::Base64 { media_type, data } => {
@@ -1134,12 +1218,6 @@ fn convert_claude_message(message: &ClaudeMessage) -> Result<Vec<ChatMessage>, S
                         if role != "assistant" {
                             return Err("tool_use blocks must be in assistant messages".to_string());
                         }
-                        flush_content_message(
-                            &mut out,
-                            role,
-                            &mut content_items,
-                            thinking_content.take(),
-                        );
                         let args = serde_json::to_string(input).map_err(|err| err.to_string())?;
                         tool_calls.push(crate::tools::new_tool_call(
                             id.clone(),
@@ -1155,8 +1233,13 @@ fn convert_claude_message(message: &ClaudeMessage) -> Result<Vec<ChatMessage>, S
                         if role != "user" {
                             return Err("tool_result blocks must be in user messages".to_string());
                         }
-                        flush_content_message(&mut out, role, &mut content_items, None);
-                        flush_tool_call_message(&mut out, &mut tool_calls);
+                        flush_chat_message(
+                            &mut out,
+                            role,
+                            &mut content_items,
+                            &mut tool_calls,
+                            None,
+                        );
                         let raw_text = tool_result_content_to_text(content)?;
                         let is_error = is_error.unwrap_or(false);
                         let text = if raw_text.trim().is_empty() {
@@ -1183,8 +1266,13 @@ fn convert_claude_message(message: &ClaudeMessage) -> Result<Vec<ChatMessage>, S
                 }
             }
 
-            flush_content_message(&mut out, role, &mut content_items, thinking_content.take());
-            flush_tool_call_message(&mut out, &mut tool_calls);
+            flush_chat_message(
+                &mut out,
+                role,
+                &mut content_items,
+                &mut tool_calls,
+                thinking_content.take(),
+            );
             Ok(out)
         }
     }
@@ -1198,7 +1286,11 @@ fn build_chat_messages(request: &ClaudeMessageRequest) -> Result<Vec<ChatMessage
         messages.push(system_to_chat_message(system)?);
     }
     for message in &request.messages {
-        messages.extend(convert_claude_message(message)?);
+        push_converted_claude_messages(
+            &mut messages,
+            message.role.as_str(),
+            convert_claude_message(message)?,
+        );
     }
     if messages.is_empty() {
         return Err("messages cannot be empty".to_string());
@@ -3534,6 +3626,105 @@ mod tests {
     }
 
     #[test]
+    fn accepts_system_role_inside_messages_array() {
+        let request = ClaudeMessageRequest {
+            model: "default".to_string(),
+            messages: vec![
+                ClaudeMessage {
+                    role: "user".to_string(),
+                    content: ClaudeContent::Text("hello".to_string()),
+                },
+                ClaudeMessage {
+                    role: "system".to_string(),
+                    content: ClaudeContent::Text("reminder".to_string()),
+                },
+                ClaudeMessage {
+                    role: "assistant".to_string(),
+                    content: ClaudeContent::Text("ok".to_string()),
+                },
+            ],
+            system: Some(ClaudeSystem::Text("base system".to_string())),
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stream: None,
+            stop_sequences: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            reasoning_effort: None,
+            extra: HashMap::new(),
+        };
+
+        let messages = build_chat_messages(&request).unwrap();
+        assert_eq!(
+            messages.iter().map(|m| m.role.as_str()).collect::<Vec<_>>(),
+            vec!["system", "user", "user", "assistant"]
+        );
+        assert!(chat_message_plain_text(&messages[2]).contains("reminder"));
+    }
+
+    #[test]
+    fn mid_conversation_system_does_not_drop_tool_history() {
+        let request = ClaudeMessageRequest {
+            model: "default".to_string(),
+            messages: vec![
+                ClaudeMessage {
+                    role: "user".to_string(),
+                    content: ClaudeContent::Text("proofread last commit".to_string()),
+                },
+                ClaudeMessage {
+                    role: "system".to_string(),
+                    content: ClaudeContent::Text("Available agent types".to_string()),
+                },
+                ClaudeMessage {
+                    role: "assistant".to_string(),
+                    content: ClaudeContent::Blocks(vec![
+                        ClaudeContentBlock::Text {
+                            text: "I'll look at git log.".to_string(),
+                        },
+                        ClaudeContentBlock::ToolUse {
+                            id: "call_1".to_string(),
+                            name: "Bash".to_string(),
+                            input: json!({"command": "git log -1"}),
+                        },
+                    ]),
+                },
+                ClaudeMessage {
+                    role: "user".to_string(),
+                    content: ClaudeContent::Blocks(vec![ClaudeContentBlock::ToolResult {
+                        tool_use_id: "call_1".to_string(),
+                        content: ClaudeToolResultContent::Text("abc123 fix".to_string()),
+                        is_error: Some(false),
+                    }]),
+                },
+            ],
+            system: None,
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stream: None,
+            stop_sequences: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            reasoning_effort: None,
+            extra: HashMap::new(),
+        };
+
+        let messages = build_chat_messages(&request).unwrap();
+        assert_eq!(
+            messages.iter().map(|m| m.role.as_str()).collect::<Vec<_>>(),
+            vec!["user", "user", "assistant", "tool"]
+        );
+        assert!(messages[2].tool_calls.is_some());
+        assert_eq!(messages[3].tool_call_id.as_deref(), Some("call_1"));
+        assert!(chat_message_plain_text(&messages[3]).contains("abc123"));
+    }
+
+    #[test]
     fn converts_tool_use_and_result_blocks() {
         let request = ClaudeMessageRequest {
             model: "default".to_string(),
@@ -3575,11 +3766,10 @@ mod tests {
         };
 
         let converted = build_chat_messages(&request).unwrap();
-        assert_eq!(converted.len(), 3);
+        assert_eq!(converted.len(), 2);
         assert_eq!(converted[0].role, "assistant");
-        assert_eq!(converted[1].role, "assistant");
-        assert_eq!(converted[2].role, "tool");
-        let tool_calls = converted[1]
+        assert_eq!(converted[1].role, "tool");
+        let tool_calls = converted[0]
             .tool_calls
             .clone()
             .expect("assistant tool_calls expected");
@@ -3945,12 +4135,14 @@ mod tests {
             ]),
         })
         .unwrap();
-        assert_eq!(messages.len(), 2);
+        assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].role, "assistant");
         assert!(messages[0].content.is_some());
-        assert_eq!(messages[1].role, "assistant");
-        assert!(messages[1].tool_calls.is_some());
-        let calls = messages[1].tool_calls.as_ref().unwrap();
+        assert_eq!(
+            messages[0].reasoning_content.as_deref(),
+            Some("I should use the tool")
+        );
+        let calls = messages[0].tool_calls.as_ref().unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].function.name, "Read");
     }
@@ -3971,12 +4163,13 @@ mod tests {
             ]),
         })
         .unwrap();
-        assert_eq!(messages.len(), 2);
+        assert_eq!(messages.len(), 1);
         let text = crate::server::extract_text_content(messages[0].content.as_ref().unwrap());
         assert!(
             text.contains("<think>"),
             "text block should preserve <think> markers for chat template processing"
         );
+        assert!(messages[0].tool_calls.is_some());
     }
 
     #[test]
