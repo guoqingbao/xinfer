@@ -67,6 +67,10 @@ impl TensorParallelColumnLinear {
     pub fn fp8_weight_scale(&self) -> Option<(&Tensor, &Tensor)> {
         self.linear.fp8_weight_scale()
     }
+
+    pub fn as_nvfp4(&self) -> Option<&crate::models::layers::linear::LnNvfp4> {
+        self.linear.as_nvfp4()
+    }
 }
 
 pub fn tensor_parallel_chunk(
