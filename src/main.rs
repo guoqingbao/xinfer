@@ -249,6 +249,9 @@ async fn main() -> Result<()> {
         args.master_port,
         args.enable_tool_grammar,
         None,
+        args.draft_model_id.clone(),
+        args.draft_model_path.clone(),
+        args.num_speculative_tokens,
     )
     .with_mtp(args.mtp);
 

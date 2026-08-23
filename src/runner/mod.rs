@@ -196,6 +196,12 @@ pub enum MessageType {
     /// Sent by runner in response to `RunDecodeMTP` with multiple tokens per sequence.
     RunResponseMTP(Vec<Vec<u32>>),
 
+    /// Sent by main process to request DFlash speculative decode on sequences.
+    RunDecodeDFlash(Vec<DecodeSequence>),
+
+    /// Sent by runner in response to `RunDecodeDFlash` with multiple tokens per sequence.
+    RunResponseDFlash(Vec<Vec<u32>>),
+
     /// Sent by main process to request embedding on sequences.
     RunEmbed((Vec<Sequence>, EmbeddingStrategy)),
 

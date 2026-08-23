@@ -430,6 +430,146 @@ impl Downloader {
         Ok((paths, gguf))
     }
 
+    /// Load a *separate* DFlash draft model (its own repo / dir). Draft checkpoints ship only
+    /// `config.json` + weights (no tokenizer), and may be safetensors **or** gguf. Returns
+    /// `(ModelPaths, is_gguf)` so the caller can build a matching `VarBuilderX`.
+    pub fn prepare_draft_model_weights(
+        &self,
+        hf_token: Option<String>,
+        hf_token_path: Option<String>,
+    ) -> Result<(ModelPaths, bool)> {
+        match (&self.model_id, &self.weight_path) {
+            // Local directory (or file) of draft weights.
+            (None, Some(path)) => {
+                let p = Path::new(path.as_str());
+                if p.is_dir() {
+                    if let Some(main_gguf) = Self::find_main_gguf_in_dir(p) {
+                        crate::log_info!(
+                            "DFlash draft: auto-detected GGUF {}",
+                            main_gguf.display()
+                        );
+                        Ok((Self::local_gguf_model(&main_gguf)?, true))
+                    } else {
+                        Ok((Self::local_safetensors_model(path)?, false))
+                    }
+                } else if p.is_file() {
+                    Ok((Self::local_gguf_model(p)?, true))
+                } else {
+                    candle_core::bail!("DFlash draft path not found: {}", path);
+                }
+            }
+            // HuggingFace repo id.
+            (Some(_), None) => {
+                let paths = self.download_draft_model(None, hf_token, hf_token_path)?;
+                Ok((paths, false))
+            }
+            _ => {
+                candle_core::bail!(
+                    "DFlash draft model requires either --draft-model-path or --draft-model-id"
+                );
+            }
+        }
+    }
+
+    /// Download a DFlash draft model from HuggingFace. Fetches `config.json` plus all weight
+    /// files (safetensors preferred; falls back to gguf). Skips tokenizer/generation files.
+    fn download_draft_model(
+        &self,
+        revision: Option<String>,
+        hf_token: Option<String>,
+        hf_token_path: Option<String>,
+    ) -> Result<ModelPaths> {
+        assert!(self.model_id.is_some(), "No DFlash draft model id provided!");
+
+        // Reuse the shared cache if it already has the weights.
+        if let Some(cache_path) = self.check_cache() {
+            let config_filename = cache_path.join("config.json");
+            if config_filename.exists() {
+                let gguf_files: Vec<PathBuf> = std::fs::read_dir(&cache_path)?
+                    .filter_map(|e| e.ok())
+                    .map(|e| e.path())
+                    .filter(|p| p.extension().is_some_and(|x| x == "gguf"))
+                    .collect();
+                let st_files: Vec<PathBuf> = std::fs::read_dir(&cache_path)?
+                    .filter_map(|e| e.ok())
+                    .map(|p| p.path())
+                    .filter(|p| p.extension().is_some_and(|x| x == "safetensors"))
+                    .collect();
+                if !gguf_files.is_empty() {
+                    return Ok(Self::local_gguf_model(&gguf_files[0])?);
+                }
+                if !st_files.is_empty() {
+                    return Ok(ModelPaths {
+                        tokenizer_filename: PathBuf::new(),
+                        tokenizer_config_filename: PathBuf::new(),
+                        config_filename,
+                        generation_config_filename: PathBuf::new(),
+                        filenames: st_files,
+                        auxiliary_filenames: Vec::new(),
+                        chat_template_filename: None,
+                    });
+                }
+            }
+        }
+
+        let api = ApiBuilder::new()
+            .with_progress(true)
+            .with_token(Some(get_token(hf_token.clone(), hf_token_path.clone())?))
+            .build()
+            .map_err(candle_core::Error::wrap)?;
+        let revision = revision.unwrap_or("main".to_string());
+        let api = api.repo(Repo::with_revision(
+            self.model_id.clone().unwrap(),
+            RepoType::Model,
+            revision,
+        ));
+
+        let config_filename = api.get("config.json").map_err(candle_core::Error::wrap)?;
+
+        let siblings = api.info().map_err(candle_core::Error::wrap)?.siblings;
+        let mut st_files: Vec<String> = Vec::new();
+        let mut gguf_files: Vec<String> = Vec::new();
+        for s in siblings.iter().map(|x| x.rfilename.clone()) {
+            if s.ends_with(".safetensors") {
+                st_files.push(s);
+            } else if s.ends_with(".gguf") {
+                gguf_files.push(s);
+            }
+        }
+
+        // Prefer safetensors; fall back to gguf.
+        let (filenames, is_gguf): (Vec<PathBuf>, bool) = if !st_files.is_empty() {
+            let mut out = Vec::new();
+            for rf in &st_files {
+                out.push(self.hf_get_with_retry(&api, rf, 5, std::time::Duration::from_secs(5))?);
+            }
+            (out, false)
+        } else if !gguf_files.is_empty() {
+            let mut out = Vec::new();
+            for rf in &gguf_files {
+                out.push(self.hf_get_with_retry(&api, rf, 5, std::time::Duration::from_secs(5))?);
+            }
+            (out, true)
+        } else {
+            candle_core::bail!("DFlash draft repo has no .safetensors or .gguf weights");
+        };
+
+        if is_gguf {
+            crate::log_info!("DFlash draft: downloaded {} GGUF shard(s)", filenames.len());
+        } else {
+            crate::log_info!("DFlash draft: downloaded {} safetensors shard(s)", filenames.len());
+        }
+        Ok(ModelPaths {
+            tokenizer_filename: PathBuf::new(),
+            tokenizer_config_filename: PathBuf::new(),
+            config_filename,
+            generation_config_filename: PathBuf::new(),
+            filenames,
+            auxiliary_filenames: Vec::new(),
+            chat_template_filename: None,
+        })
+    }
+
     pub fn check_cache(&self) -> Option<PathBuf> {
         use crate::utils::{contains_gguf, has_complete_safetensors};
         let sanitized_id = std::path::Path::new(self.model_id.as_ref().unwrap())

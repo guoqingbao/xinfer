@@ -318,7 +318,7 @@ impl ModelRunner {
         })
     }
 
-    fn mtp_rollback_mamba(&self, seq_id: usize, keep_tokens: usize) -> Result<bool> {
+    pub(crate) fn mtp_rollback_mamba(&self, seq_id: usize, keep_tokens: usize) -> Result<bool> {
         match self.model() {
             Model::Qwen3_5(m) => m.mtp_rollback_mamba(seq_id, keep_tokens),
             Model::Qwen3_5MoE(m) => m.mtp_rollback_mamba(seq_id, keep_tokens),

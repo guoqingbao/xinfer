@@ -891,6 +891,18 @@ pub struct Args {
     #[arg(long, default_value = None)]
     pub mtp: Option<usize>,
 
+    /// DFlash draft model HuggingFace id (a *separate* repo, e.g. z-lab/Qwen3.5-35B-A3B-DFlash).
+    #[arg(long, default_value = None)]
+    pub draft_model_id: Option<String>,
+
+    /// Local path (dir or file) to DFlash draft model weights (safetensors or gguf).
+    #[arg(long, default_value = None)]
+    pub draft_model_path: Option<String>,
+
+    /// Number of DFlash speculative tokens per step (defaults to the draft block_size - 1).
+    #[arg(long, default_value = None)]
+    pub num_speculative_tokens: Option<usize>,
+
     /// Enable grammar-based generation: tool grammar, structured outputs, and client constraints
     #[arg(long, default_value = "false")]
     pub enable_tool_grammar: bool,

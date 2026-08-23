@@ -478,6 +478,15 @@ pub struct EngineConfig {
     #[serde(default)]
     pub mtp_num_speculative_tokens: Option<usize>,
     pub enable_tool_grammar: bool,
+    /// DFlash draft model HuggingFace id (separate repo, e.g. z-lab/Qwen3.5-35B-A3B-DFlash).
+    #[serde(default)]
+    pub draft_model_id: Option<String>,
+    /// Local path (dir or file) to DFlash draft model weights (safetensors or gguf).
+    #[serde(default)]
+    pub draft_model_path: Option<String>,
+    /// Number of DFlash speculative tokens per step (defaults to draft block_size - 1).
+    #[serde(default)]
+    pub num_speculative_tokens: Option<usize>,
 }
 
 fn default_num_nodes() -> usize {
@@ -593,6 +602,15 @@ pub struct EngineConfig {
     pub mtp_num_speculative_tokens: Option<usize>,
     #[pyo3(get, set)]
     pub enable_tool_grammar: bool,
+    #[pyo3(get, set)]
+    #[serde(default)]
+    pub draft_model_id: Option<String>,
+    #[pyo3(get, set)]
+    #[serde(default)]
+    pub draft_model_path: Option<String>,
+    #[pyo3(get, set)]
+    #[serde(default)]
+    pub num_speculative_tokens: Option<usize>,
 }
 
 impl EngineConfig {
@@ -609,6 +627,21 @@ impl EngineConfig {
 
     pub fn with_mtp(mut self, mtp_tokens: Option<usize>) -> Self {
         self.mtp_num_speculative_tokens = mtp_tokens;
+        self
+    }
+
+    pub fn with_draft_model_id(mut self, id: Option<String>) -> Self {
+        self.draft_model_id = id;
+        self
+    }
+
+    pub fn with_draft_model_path(mut self, path: Option<String>) -> Self {
+        self.draft_model_path = path;
+        self
+    }
+
+    pub fn with_num_speculative_tokens(mut self, n: Option<usize>) -> Self {
+        self.num_speculative_tokens = n;
         self
     }
 }
@@ -655,6 +688,9 @@ impl EngineConfig {
         master_port: u16,
         enable_tool_grammar: bool,
         mtp_num_speculative_tokens: Option<usize>,
+        draft_model_id: Option<String>,
+        draft_model_path: Option<String>,
+        num_speculative_tokens: Option<usize>,
     ) -> Self {
         let mut device_ids = device_ids.unwrap_or_default();
         if device_ids.is_empty() {
@@ -716,6 +752,9 @@ impl EngineConfig {
             master_port,
             mtp_num_speculative_tokens,
             enable_tool_grammar,
+            draft_model_id,
+            draft_model_path,
+            num_speculative_tokens,
         }
     }
 }

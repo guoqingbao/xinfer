@@ -1280,6 +1280,94 @@ impl LLMEngine {
         }
     }
 
+    /// DFlash analogue of `run_mtp_on_local_streams`: send the DFlash request to every local
+    /// rank first (tensor-parallel verify must enter the same NCCL collectives), then collect.
+    fn run_dflash_on_local_streams(
+        runner_streams: &mut Vec<LocalStream>,
+        request: &MessageType,
+    ) -> Result<Vec<Vec<u32>>> {
+        let cloned_streams: Vec<LocalStream> = runner_streams
+            .iter_mut()
+            .map(|s| s.try_clone().expect("clone failed"))
+            .collect();
+
+        let all_outputs: Result<Vec<Vec<Vec<u32>>>> = cloned_streams
+            .into_par_iter()
+            .map(|mut stream| {
+                send_local(&mut vec![stream.try_clone()?], request, false)?;
+                match receive_local(&mut stream, false)? {
+                    MessageType::RunResponseDFlash(multi_tokens) if !multi_tokens.is_empty() => {
+                        Ok(multi_tokens)
+                    }
+                    MessageType::RunResponseDFlash(_) => {
+                        candle_core::bail!("DFlash runner returned empty response")
+                    }
+                    other => {
+                        candle_core::bail!("Unexpected DFlash response type: {:?}", other)
+                    }
+                }
+            })
+            .collect();
+
+        let all_outputs = all_outputs.map_err(candle_core::Error::wrap)?;
+        all_outputs
+            .into_iter()
+            .next()
+            .ok_or_else(|| candle_core::Error::Msg("No response from local DFlash runners".into()))
+    }
+
+    /// Run DFlash speculative decode. Returns `Vec<Vec<u32>>` (per-sequence accepted tokens),
+    /// consumed by `finish_step` exactly like MTP.
+    fn run_forward_dflash(
+        runners: &Arc<RwLock<RunnerType>>,
+        owned_seqs: &[Sequence],
+    ) -> Result<Vec<Vec<u32>>> {
+        match &mut *runners.write() {
+            RunnerType::Thread(model_runner) => {
+                let seq_refs: Vec<&Sequence> = owned_seqs.iter().collect();
+                model_runner.run_dflash_decode(Seqs::SeqRefs(&seq_refs))
+            }
+            RunnerType::Process(ref mut runner_streams) => {
+                use crate::runner::MessageType;
+
+                let sequences = owned_seqs
+                    .iter()
+                    .map(|s| DecodeSequence::new(s))
+                    .collect::<Vec<_>>();
+                let request = MessageType::RunDecodeDFlash(sequences);
+                Self::run_dflash_on_local_streams(runner_streams, &request)
+            }
+            RunnerType::MultiNodeMaster {
+                ref mut local_streams,
+                ref mut remote_streams,
+            } => {
+                use crate::runner::MessageType;
+
+                let sequences = owned_seqs
+                    .iter()
+                    .map(|s| DecodeSequence::new(s))
+                    .collect::<Vec<_>>();
+                let request = MessageType::RunDecodeDFlash(sequences);
+                let serialized =
+                    bincode::serialize(&request).expect("Bincode serialization failed");
+
+                for tcp_stream in remote_streams.iter_mut() {
+                    if let Err(e) = crate::utils::multi_node::send_tcp(tcp_stream, &serialized) {
+                        candle_core::bail!("Failed to send DFlash forward to remote worker: {}", e);
+                    }
+                }
+
+                let result = Self::run_dflash_on_local_streams(local_streams, &request);
+
+                for tcp_stream in remote_streams.iter_mut() {
+                    let _ = crate::utils::multi_node::recv_tcp(tcp_stream);
+                }
+
+                result
+            }
+        }
+    }
+
     /// Phase 3: Postprocess forward pass results, deliver tokens, and do maintenance.
     /// Handles both single-token (normal decode/prefill) and multi-token (MTP) outputs.
     pub fn finish_step(
@@ -2257,13 +2345,16 @@ impl LLMEngine {
     pub fn start_engine(engine: Arc<RwLock<Self>>) {
         GLOBAL_RT.spawn(async move {
             let engine = engine.clone();
-            let (is_pd_server, runners, mtp_enabled) = {
+            let (is_pd_server, runners, mtp_enabled, dflash_enabled) = {
                 let guard = engine.read();
                 let has_mtp = guard.econfig.mtp_num_speculative_tokens.is_some();
+                let has_dflash = guard.econfig.draft_model_id.is_some()
+                    || guard.econfig.draft_model_path.is_some();
                 (
                     guard.is_pd_mode() && guard.is_pd_server(),
                     guard.runners.clone(),
                     has_mtp,
+                    has_dflash,
                 )
             };
             loop {
@@ -2296,9 +2387,12 @@ impl LLMEngine {
                 // Engine lock released -- server can accept new requests during forward pass
 
                 if let Some((scheduled_ids, is_prefill, owned_seqs)) = prep {
-                    let use_mtp = mtp_enabled && !is_prefill && owned_seqs.len() == 1;
+                    let use_dflash = dflash_enabled && !is_prefill && owned_seqs.len() == 1;
+                    let use_mtp = !use_dflash && mtp_enabled && !is_prefill && owned_seqs.len() == 1;
 
-                    let forward_result: Result<Vec<Vec<u32>>> = if use_mtp {
+                    let forward_result: Result<Vec<Vec<u32>>> = if use_dflash {
+                        Self::run_forward_dflash(&runners, &owned_seqs)
+                    } else if use_mtp {
                         Self::run_forward_mtp(&runners, &owned_seqs)
                     } else {
                         Self::run_forward(&runners, &owned_seqs, is_prefill)

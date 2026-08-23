@@ -761,18 +761,65 @@ impl Qwen3VLForConditionalGeneration {
                 input_metadata,
                 embeded_inputs,
             ),
-            _ => {
-                candle_core::bail!("forward_with_hidden only supported for Qwen3.5 text models")
-            }
+_ => {
+                 candle_core::bail!("forward_with_hidden only supported for Qwen3.5 text models")
+             }
+         }
+     }
+
+    /// Forward that also returns the target-layer hidden states needed by the DFlash drafter.
+    pub fn forward_with_hidden_states(
+        &self,
+        input_ids: &Tensor,
+        positions: &Tensor,
+        kv_caches: Option<&Vec<(Tensor, Tensor)>>,
+        input_metadata: &InputMetadata,
+        embeded_inputs: bool,
+        target_layer_ids: &[usize],
+    ) -> Result<(Tensor, Vec<Tensor>)> {
+        match &self.text_model {
+            Qwen3TextModel::Dense(m) => m.forward_with_hidden_states(
+                input_ids,
+                positions,
+                kv_caches,
+                input_metadata,
+                embeded_inputs,
+                target_layer_ids,
+            ),
+            Qwen3TextModel::MoE(m) => m.forward_with_hidden_states(
+                input_ids,
+                positions,
+                kv_caches,
+                input_metadata,
+                embeded_inputs,
+                target_layer_ids,
+            ),
+            Qwen3TextModel::Dense35(m) => m.forward_with_hidden_states(
+                input_ids,
+                positions,
+                kv_caches,
+                input_metadata,
+                embeded_inputs,
+                target_layer_ids,
+            ),
+            Qwen3TextModel::MoE35(m) => m.forward_with_hidden_states(
+                input_ids,
+                positions,
+                kv_caches,
+                input_metadata,
+                embeded_inputs,
+                target_layer_ids,
+            ),
         }
     }
 
-    /// Apply lm_head to hidden states (for MTP drafting).
+    /// Apply lm_head to hidden states (for MTP / DFlash drafting).
     pub fn forward_lm_head(&self, hidden: &Tensor) -> Result<Tensor> {
         match &self.text_model {
+            Qwen3TextModel::Dense(m) => m.forward_lm_head(hidden),
+            Qwen3TextModel::MoE(m) => m.forward_lm_head(hidden),
             Qwen3TextModel::Dense35(m) => m.forward_lm_head(hidden),
             Qwen3TextModel::MoE35(m) => m.forward_lm_head(hidden),
-            _ => candle_core::bail!("forward_lm_head only supported for Qwen3.5 text models"),
         }
     }
 

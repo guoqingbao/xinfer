@@ -696,6 +696,70 @@ impl Qwen3_5MoEForCausalLM {
         Ok((logits, hidden))
     }
 
+    /// Forward that also returns the target-layer hidden states needed by the DFlash drafter.
+    pub fn forward_with_hidden_states(
+        &self,
+        input_ids: &Tensor,
+        positions: &Tensor,
+        kv_caches: Option<&Vec<(Tensor, Tensor)>>,
+        input_metadata: &InputMetadata,
+        embeded_inputs: bool,
+        target_layer_ids: &[usize],
+    ) -> Result<(Tensor, Vec<Tensor>)> {
+        let seqlens = input_metadata.seqlens.clone().unwrap_or_default();
+        let attention_mask = get_attention_causal_mask(
+            &self.device,
+            self.dtype,
+            positions,
+            seqlens.clone(),
+            self.config.sliding_window,
+            input_metadata.is_prefill,
+        );
+        let mut xs = if embeded_inputs {
+            input_ids.to_owned()
+        } else {
+            self.embed_forward(input_ids)?
+        };
+        let mut collector: Vec<Tensor> = Vec::new();
+        collector.push(xs.clone());
+        let mut kv_cache_idx = 0usize;
+        let seq_slots = self.resolve_seq_slots(input_metadata, xs.dim(0)?)?;
+        let mut mamba_cache = self.mamba_cache.write();
+        for (i, layer) in self.layers.iter().enumerate() {
+            let cache = if layer.is_full_attention() {
+                if let Some(kv_caches) = kv_caches {
+                    let c = &kv_caches[kv_cache_idx];
+                    kv_cache_idx += 1;
+                    Some((&c.0, &c.1))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            xs = layer.forward(
+                &xs,
+                attention_mask.as_ref(),
+                positions,
+                cache,
+                input_metadata,
+                &mut mamba_cache,
+                &seq_slots,
+            )?;
+            if target_layer_ids.contains(&i) {
+                collector.push(xs.clone());
+            }
+        }
+        if !seqlens.is_empty() {
+            let indices: Vec<_> = seqlens.iter().map(|x| x - 1).collect();
+            let batch = indices.len();
+            xs = xs.index_select(&Tensor::from_vec(indices, (batch,), xs.device())?, 0)?;
+        }
+        let xs = self.norm.forward(&xs)?;
+        let logits = self.forward_lm_head(&xs)?;
+        Ok((logits, collector))
+    }
+
     pub fn forward_lm_head(&self, hidden: &Tensor) -> Result<Tensor> {
         if self.is_qvar_builder {
             self.lm_head.forward(hidden)

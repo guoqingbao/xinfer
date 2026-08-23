@@ -152,6 +152,8 @@ pub struct ModelRunner {
     pub(crate) mtp_head: Option<Arc<Qwen3_5MtpHead>>,
     /// Number of speculative tokens to draft per step
     pub(crate) mtp_num_speculative: usize,
+    /// DFlash drafter (separate replicated draft model) for speculative decoding.
+    pub(crate) dflash_drafter: Option<Arc<crate::core::dflash_drafter::DFlashDrafter>>,
 }
 
 impl ModelRunner {
@@ -701,6 +703,8 @@ impl ModelRunner {
             (None, 0)
         };
 
+        let dflash_drafter = Self::init_dflash_drafter(econfig, &device)?;
+
         Ok(Self {
             model,
             gpu_kv_cache: Arc::new(Mutex::new(gpu_kv_cache)),
@@ -750,7 +754,52 @@ impl ModelRunner {
             model_type,
             mtp_head,
             mtp_num_speculative,
+            dflash_drafter,
         })
+    }
+
+    /// Initialize the DFlash drafter (a separate, replicated draft model) when a draft model is
+    /// configured. Runs inside each runner process, so every tensor-parallel rank loads its own
+    /// full copy of the (small) dense draft model.
+    fn init_dflash_drafter(
+        econfig: &EngineConfig,
+        device: &Device,
+    ) -> Result<Option<Arc<crate::core::dflash_drafter::DFlashDrafter>>> {
+        let has_draft = econfig.draft_model_id.is_some() || econfig.draft_model_path.is_some();
+        if !has_draft {
+            return Ok(None);
+        }
+
+        crate::log_info!("Loading DFlash draft model...");
+
+        let loader = crate::utils::downloader::Downloader::new(
+            econfig.draft_model_id.clone(),
+            econfig.draft_model_path.clone(),
+            None,
+        );
+        let (draft_paths, is_gguf) = loader
+            .prepare_draft_model_weights(econfig.hf_token.clone(), econfig.hf_token_path.clone())?;
+
+        let config_path = draft_paths.get_config_filename();
+        let config_data = std::fs::read(&config_path)
+            .map_err(|e| candle_core::Error::Msg(format!("Failed to read DFlash config: {}", e)))?;
+        let draft_config: crate::models::dflash::DFlashModelConfig =
+            serde_json::from_slice(&config_data)
+                .map_err(|e| candle_core::Error::Msg(format!("Failed to parse DFlash config: {}", e)))?;
+
+        let draft_vb =
+            crate::models::layers::VarBuilderX::new(&draft_paths, is_gguf, DType::BF16, device)?;
+
+        let drafter = crate::core::dflash_drafter::DFlashDrafter::new(
+            &draft_config,
+            &draft_vb,
+            DType::BF16,
+            device,
+            econfig.num_speculative_tokens,
+        )?;
+
+        crate::log_info!("DFlash draft model loaded successfully!");
+        Ok(Some(Arc::new(drafter)))
     }
 
     /// Initialize MTP head for speculative decoding.
