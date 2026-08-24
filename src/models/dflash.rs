@@ -12,6 +12,8 @@ use candle_core::{DType, Device, Result, Tensor, D};
 pub struct DFlashConfig {
     pub mask_token_id: Option<u32>,
     pub target_layer_ids: Option<Vec<usize>>,
+    #[serde(default)]
+    pub block_size: Option<usize>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -27,7 +29,8 @@ pub struct DFlashModelConfig {
     pub max_position_embeddings: usize,
     pub rope_theta: Option<f64>,
     pub attention_bias: Option<bool>,
-    pub block_size: usize,
+    #[serde(default)]
+    pub block_size: Option<usize>,
     pub num_target_layers: usize,
     #[serde(default)]
     pub dflash_config: Option<DFlashConfig>,
@@ -35,6 +38,16 @@ pub struct DFlashModelConfig {
     pub hidden_act: Option<String>,
     #[serde(default)]
     pub layer_types: Option<Vec<String>>,
+    #[serde(default)]
+    pub rope_parameters: Option<RopeParameters>,
+}
+
+/// Newer checkpoints (e.g. DFlash2) nest the RoPE base under `rope_parameters`
+/// instead of a top-level `rope_theta`.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct RopeParameters {
+    pub rope_theta: Option<f64>,
+    pub rope_type: Option<String>,
 }
 
 impl DFlashModelConfig {
@@ -54,6 +67,20 @@ impl DFlashModelConfig {
 
     pub fn mask_token_id(&self) -> Option<u32> {
         self.dflash_config.as_ref().and_then(|c| c.mask_token_id)
+    }
+
+    /// Resolve the verification block width from either the top-level field or the nested
+    /// `dflash_config` (DFlash2 checkpoints store it under `dflash_config`).
+    pub fn effective_block_size(&self) -> Option<usize> {
+        self.block_size
+            .or_else(|| self.dflash_config.as_ref().and_then(|c| c.block_size))
+    }
+
+    /// Resolve the RoPE base from either the top-level field or `rope_parameters`
+    /// (newer checkpoints nest `rope_theta` under `rope_parameters`).
+    pub fn effective_rope_theta(&self) -> Option<f64> {
+        self.rope_theta
+            .or_else(|| self.rope_parameters.as_ref().and_then(|rp| rp.rope_theta))
     }
 }
 
@@ -363,9 +390,44 @@ pub struct DFlashRotaryEmbedding {
 }
 
 impl DFlashRotaryEmbedding {
-    pub fn new(config: &DFlashModelConfig, dtype: DType, device: &Device) -> Result<Self> {
+    pub fn new(
+        config: &DFlashModelConfig,
+        dtype: DType,
+        device: &Device,
+        yarn_factor: Option<f64>,
+    ) -> Result<Self> {
         let head_dim = config.head_dim();
-        let rope_theta = config.rope_theta.unwrap_or(10000.0);
+        let rope_theta = config.effective_rope_theta().unwrap_or(10000.0);
+        let max_pos = config.max_position_embeddings;
+
+        // When the backbone uses dynamic YARN scaling, the draft model's RoPE must be scaled by the
+        // same factor (applied to the draft model's own rope_theta / max_position_embeddings) so its
+        // positional encoding stays consistent with the target model at extended context lengths.
+        // Reuse the exact YarnRotaryEmbedding math so the draft head scales identically to the model.
+        if let Some(factor) = yarn_factor.filter(|f| *f > 1.0) {
+            let (beta_fast, beta_slow, extrapolation_factor, attn_factor) =
+                crate::utils::derive_yarn_parameters(factor);
+            let yarn = crate::models::layers::rotary_emb::YarnRotaryEmbedding::new_yarn(
+                dtype,
+                device,
+                rope_theta as f32,
+                head_dim,
+                max_pos,
+                max_pos,
+                beta_fast as f32,
+                beta_slow as f32,
+                attn_factor as f32,
+                extrapolation_factor as f32,
+                factor as f32,
+            )?;
+            // new_yarn returns half-width (table_len, head_dim/2) tables; DFlash uses the doubled
+            // (interleaved) layout (table_len, head_dim).
+            return Ok(Self {
+                cos: Tensor::cat(&[&yarn.cos, &yarn.cos], D::Minus1)?,
+                sin: Tensor::cat(&[&yarn.sin, &yarn.sin], D::Minus1)?,
+            });
+        }
+
         let inv_freq: Vec<f32> = (0..head_dim)
             .step_by(2)
             .map(|i| 1f32 / rope_theta.powf(i as f64 / head_dim as f64) as f32)
@@ -373,9 +435,9 @@ impl DFlashRotaryEmbedding {
         let inv_freq_len = inv_freq.len();
         let inv_freq =
             Tensor::from_vec(inv_freq, (1, inv_freq_len), device)?.to_dtype(DType::F32)?;
-        let t = Tensor::arange(0u32, config.max_position_embeddings as u32, device)?
+        let t = Tensor::arange(0u32, max_pos as u32, device)?
             .to_dtype(DType::F32)?
-            .reshape((config.max_position_embeddings, 1))?;
+            .reshape((max_pos, 1))?;
         let freqs = t.matmul(&inv_freq)?;
         let cos_half = freqs.cos()?.to_dtype(dtype)?;
         let sin_half = freqs.sin()?.to_dtype(dtype)?;
@@ -414,6 +476,7 @@ impl DFlashDraftModel {
         config: &DFlashModelConfig,
         dtype: DType,
         device: &Device,
+        yarn_factor: Option<f64>,
     ) -> Result<Self> {
         let target_layer_ids = config.target_layer_ids();
         let fc_in_dim = target_layer_ids.len() * config.hidden_size;
@@ -449,7 +512,7 @@ impl DFlashDraftModel {
             false,
         )?;
 
-        let rotary_emb = DFlashRotaryEmbedding::new(config, dtype, device)?;
+        let rotary_emb = DFlashRotaryEmbedding::new(config, dtype, device, yarn_factor)?;
 
         Ok(Self {
             fc,
@@ -458,7 +521,7 @@ impl DFlashDraftModel {
             norm,
             rotary_emb,
             target_layer_ids,
-            block_size: config.block_size,
+            block_size: config.effective_block_size().unwrap_or(0),
             mask_token_id: config.mask_token_id(),
             config: config.clone(),
             device: device.clone(),
@@ -526,11 +589,12 @@ mod tests {
             max_position_embeddings: 2048,
             rope_theta: None,
             attention_bias: None,
-            block_size: num_draft + 1,
+            block_size: Some(num_draft + 1),
             num_target_layers: num_target,
             dflash_config: None,
             hidden_act: None,
             layer_types: None,
+            rope_parameters: None,
         }
     }
 
@@ -559,6 +623,7 @@ mod tests {
         c.dflash_config = Some(DFlashConfig {
             mask_token_id: Some(7),
             target_layer_ids: Some(vec![3, 7, 11]),
+            block_size: None,
         });
         assert_eq!(c.target_layer_ids(), vec![3, 7, 11]);
         assert_eq!(c.mask_token_id(), Some(7));
@@ -569,5 +634,63 @@ mod tests {
         let c = cfg(12, 3);
         assert_eq!(c.target_layer_ids(), vec![1, 5, 9]);
         assert_eq!(c.mask_token_id(), None);
+    }
+
+    #[test]
+    fn dflash_rope_yarn_scales_table_and_matches_backbone() {
+        let c = cfg(12, 1); // head_dim = 64/4 = 16, max_position_embeddings = 2048
+        let dev = Device::Cpu;
+
+        let plain = DFlashRotaryEmbedding::new(&c, DType::F32, &dev, None).unwrap();
+        let yarn = DFlashRotaryEmbedding::new(&c, DType::F32, &dev, Some(4.0)).unwrap();
+
+        // Plain RoPE table is max_position_embeddings long; YARN extends it by the factor.
+        assert_eq!(plain.cos.dim(0).unwrap(), c.max_position_embeddings);
+        assert_eq!(yarn.cos.dim(0).unwrap(), c.max_position_embeddings * 4);
+
+        // At position 0, sin is zero for both; cos is 1.0 (plain) vs mscale (yarn).
+        let zero = Tensor::from_vec(vec![0i64], (1,), &dev).unwrap();
+        let (pc, ps) = plain.get_cos_sin(&zero).unwrap();
+        let (yc, ys) = yarn.get_cos_sin(&zero).unwrap();
+        let ps: Vec<f32> = ps.flatten_all().unwrap().to_vec1().unwrap();
+        let ys: Vec<f32> = ys.flatten_all().unwrap().to_vec1().unwrap();
+        assert!(ps.iter().all(|v| v.abs() < 1e-6));
+        assert!(ys.iter().all(|v| v.abs() < 1e-6));
+
+        let pc: Vec<f32> = pc.flatten_all().unwrap().to_vec1().unwrap();
+        let yc: Vec<f32> = yc.flatten_all().unwrap().to_vec1().unwrap();
+        assert!(pc.iter().all(|v| (*v - 1.0).abs() < 1e-5));
+// YARN mscale = (0.1 * ln(factor) + 1) * attn_factor, with attn_factor = 1.0.
+        let mscale = 0.1f32 * 4.0f32.ln() + 1.0;
+        assert!(yc.iter().all(|v| (*v - mscale).abs() < 1e-4));
+    }
+
+    #[test]
+    fn dflash2_config_schema_parses_nested_block_size_and_rope() {
+        // Mirrors the z-lab DFlash2 checkpoint schema: block_size lives under dflash_config and
+        // rope_theta under rope_parameters; neither is present at the top level.
+        let json = r#"{
+            "hidden_size": 5120,
+            "num_hidden_layers": 5,
+            "num_attention_heads": 32,
+            "num_key_value_heads": 8,
+            "intermediate_size": 17408,
+            "rms_norm_eps": 1e-6,
+            "vocab_size": 248320,
+            "max_position_embeddings": 262144,
+            "num_target_layers": 64,
+            "dflash_config": { "block_size": 8, "mask_token_id": 248070, "target_layer_ids": [5, 19, 33, 47, 61] },
+            "rope_parameters": { "rope_theta": 10000000, "rope_type": "default" }
+        }"#;
+        let c: DFlashModelConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(c.effective_block_size(), Some(8));
+        assert_eq!(c.effective_rope_theta(), Some(10000000.0));
+        assert_eq!(c.target_layer_ids(), vec![5, 19, 33, 47, 61]);
+    }
+
+    #[test]
+    fn top_level_block_size_still_resolves() {
+        let c = cfg(12, 3); // block_size: Some(4)
+        assert_eq!(c.effective_block_size(), Some(4));
     }
 }

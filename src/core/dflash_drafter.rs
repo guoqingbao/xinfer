@@ -28,14 +28,16 @@ impl DFlashDrafter {
         dtype: DType,
         device: &Device,
         num_speculative_tokens: Option<usize>,
+        yarn_factor: Option<f64>,
     ) -> Result<Self> {
-        let draft_model = DFlashDraftModel::new(draft_vb, draft_config, dtype, device)?;
+        let draft_model = DFlashDraftModel::new(draft_vb, draft_config, dtype, device, yarn_factor)?;
 
         let target_layer_ids = draft_config.target_layer_ids();
         // DFlash config.block_size is the verification block width:
         // [known first token] + N draft tokens. The user-facing count is N.
-        let block_size =
-            num_speculative_tokens.unwrap_or_else(|| draft_config.block_size.saturating_sub(1));
+        let block_size = num_speculative_tokens
+            .or_else(|| draft_config.effective_block_size().map(|w| w.saturating_sub(1)))
+            .unwrap_or(0);
         let mask_token_id = draft_config.mask_token_id().unwrap_or(0);
         let context_window = std::cmp::min(
             DEFAULT_CONTEXT_WINDOW,
@@ -43,12 +45,13 @@ impl DFlashDrafter {
         );
 
         crate::log_info!(
-            "DFlash drafter initialized: {} layers, num_speculative_tokens={}, target_layer_ids={:?}, mask_token_id={}, context_window={}",
+            "DFlash drafter initialized: {} layers, num_speculative_tokens={}, target_layer_ids={:?}, mask_token_id={}, context_window={}, yarn_scaling_factor={:?}",
             draft_config.num_hidden_layers,
             block_size,
             target_layer_ids,
             mask_token_id,
             context_window,
+            yarn_factor,
         );
 
         Ok(Self {

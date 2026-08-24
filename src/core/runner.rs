@@ -796,6 +796,7 @@ impl ModelRunner {
             DType::BF16,
             device,
             econfig.num_speculative_tokens,
+            econfig.yarn_scaling_factor,
         )?;
 
         crate::log_info!("DFlash draft model loaded successfully!");
