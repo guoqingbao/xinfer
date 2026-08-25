@@ -8,12 +8,24 @@ use std::rc::Rc;
 
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct DFlashConfig {
+    #[serde(default)]
+    pub block_size: Option<usize>,
     pub mask_token_id: Option<u32>,
     pub target_layer_ids: Option<Vec<usize>>,
+    #[serde(default)]
+    pub conv_group_size: Option<usize>,
+    #[serde(default)]
+    pub conv_kernel_size: Option<usize>,
+    #[serde(default)]
+    pub selector_rank: Option<usize>,
+    #[serde(default)]
+    pub selector_top_k: Option<usize>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct DFlashModelConfig {
+    #[serde(default)]
+    pub architectures: Option<Vec<String>>,
     pub hidden_size: usize,
     pub num_hidden_layers: usize,
     pub num_attention_heads: usize,
@@ -25,18 +37,51 @@ pub struct DFlashModelConfig {
     pub max_position_embeddings: usize,
     pub rope_theta: Option<f64>,
     pub attention_bias: Option<bool>,
-    pub block_size: usize,
+    #[serde(default)]
+    pub block_size: Option<usize>,
     pub num_target_layers: usize,
     #[serde(default)]
     pub dflash_config: Option<DFlashConfig>,
     pub hidden_act: Option<String>,
     pub layer_types: Option<Vec<String>>,
+    #[serde(default)]
+    pub sliding_window: Option<usize>,
+    #[serde(default)]
+    pub rope_parameters: Option<serde_json::Value>,
 }
 
 impl DFlashModelConfig {
+    pub fn is_dflash2(&self) -> bool {
+        self.architectures
+            .as_ref()
+            .and_then(|architectures| architectures.first())
+            .is_some_and(|architecture| architecture.contains("DFlash2"))
+            || self
+                .dflash_config
+                .as_ref()
+                .is_some_and(|config| config.selector_top_k.is_some())
+    }
+
     pub fn head_dim(&self) -> usize {
         self.head_dim
             .unwrap_or(self.hidden_size / self.num_attention_heads)
+    }
+
+    pub fn block_size(&self) -> usize {
+        self.block_size
+            .or_else(|| self.dflash_config.as_ref().and_then(|c| c.block_size))
+            .unwrap_or(1)
+    }
+
+    pub fn rope_theta(&self) -> f64 {
+        self.rope_theta
+            .or_else(|| {
+                self.rope_parameters
+                    .as_ref()
+                    .and_then(|parameters| parameters.get("rope_theta"))
+                    .and_then(serde_json::Value::as_f64)
+            })
+            .unwrap_or(10000.0)
     }
 
     pub fn target_layer_ids(&self) -> Vec<usize> {
@@ -82,10 +127,15 @@ impl DFlashModelConfig {
             rope_scaling: None,
             quant: None,
             moe_cfg: None,
-            fp8_kvcache: None,
+            kvcache_dtype: crate::utils::config::KvCacheDtype::Auto,
             quantization_config: None,
             is_multi_model: None,
             extra_config_json: None,
+            is_f16_mode: false,
+            mtp_num_hidden_layers: None,
+            mtp_use_dedicated_embeddings: None,
+            mtp_enabled: false,
+            expert_dtype: None,
         }
     }
 }
@@ -137,6 +187,135 @@ fn apply_rotary_pos_emb(
     let k_embed = (k.broadcast_mul(&cos)? + rotate_half(k)?.broadcast_mul(&sin)?)?;
 
     Ok((q_embed, k_embed))
+}
+
+pub struct DFlashGroupedConv {
+    base_kernel: Tensor,
+    kernel_projection: ReplicatedLinear,
+    block_size: usize,
+    taps: usize,
+    num_groups: usize,
+}
+
+impl DFlashGroupedConv {
+    pub fn new(
+        vb: VarBuilderX,
+        hidden_size: usize,
+        group_size: usize,
+        taps: usize,
+        block_size: usize,
+        dtype: DType,
+    ) -> Result<Self> {
+        if group_size == 0 || hidden_size % group_size != 0 {
+            candle_core::bail!(
+                "DFlash2 convolution group size {} must divide hidden size {}",
+                group_size,
+                hidden_size
+            );
+        }
+        let base_kernel = vb.get((2, taps, hidden_size), "base_kernel")?;
+        let num_groups = hidden_size / group_size;
+        let kernel_projection = ReplicatedLinear::load_no_bias(
+            hidden_size,
+            2 * taps * num_groups,
+            vb.pp("kernel_projection"),
+            &None,
+            &None,
+            dtype,
+        )?;
+        Ok(Self {
+            base_kernel,
+            kernel_projection,
+            block_size,
+            taps,
+            num_groups,
+        })
+    }
+
+    fn convolve(&self, hidden_states: &Tensor, delta: &Tensor, side: usize) -> Result<Tensor> {
+        attention_rs::topk::dflash_grouped_conv(
+            hidden_states,
+            delta,
+            &self.base_kernel,
+            self.block_size,
+            side,
+        )
+    }
+
+    pub fn prepare(&self, hidden_states: &Tensor) -> Result<(Tensor, Tensor)> {
+        let coefficients = self.kernel_projection.forward(hidden_states)?.reshape((
+            hidden_states.dim(0)?,
+            2,
+            self.taps,
+            self.num_groups,
+        ))?;
+        Ok((
+            self.convolve(hidden_states, &coefficients.narrow(1, 0, 1)?.squeeze(1)?, 0)?,
+            coefficients.narrow(1, 1, 1)?.squeeze(1)?,
+        ))
+    }
+
+    pub fn finish(&self, hidden_states: &Tensor, coefficients: &Tensor) -> Result<Tensor> {
+        self.convolve(hidden_states, coefficients, 1)
+    }
+}
+
+pub struct DFlashCandidateSelector {
+    predecessor_codebook: Tensor,
+    successor_codebook: Tensor,
+    hidden_projection: ReplicatedLinear,
+    top_k: usize,
+}
+
+impl DFlashCandidateSelector {
+    pub fn new(
+        vb: VarBuilderX,
+        hidden_size: usize,
+        vocab_size: usize,
+        rank: usize,
+        top_k: usize,
+        dtype: DType,
+    ) -> Result<Self> {
+        let predecessor_codebook = vb.get((vocab_size, rank), "predecessor_codebook")?;
+        let successor_codebook = vb.get((vocab_size, rank), "successor_codebook")?;
+        let hidden_projection = ReplicatedLinear::load_no_bias(
+            hidden_size,
+            rank,
+            vb.pp("hidden_projection"),
+            &None,
+            &None,
+            dtype,
+        )?;
+        Ok(Self {
+            predecessor_codebook,
+            successor_codebook,
+            hidden_projection,
+            top_k,
+        })
+    }
+
+    pub fn select(
+        &self,
+        hidden_states: &Tensor,
+        logits: &Tensor,
+        anchor_token: u32,
+    ) -> Result<Vec<u32>> {
+        let logits = logits.contiguous()?.to_dtype(DType::F32)?;
+        let (unary_logits, candidate_ids) = attention_rs::topk::topk_select(&logits, self.top_k)?;
+        let hidden = self
+            .hidden_projection
+            .forward(hidden_states)?
+            .to_dtype(DType::F32)?;
+        let selected = attention_rs::topk::dflash_select_candidates(
+            &hidden,
+            &unary_logits,
+            &candidate_ids,
+            &self.predecessor_codebook,
+            &self.successor_codebook,
+            &Tensor::from_vec(vec![anchor_token], (1,), hidden_states.device())?,
+        )?;
+        selected.to_vec1::<u32>()
+    }
 }
 
 pub struct DFlashAttention {
@@ -283,6 +462,8 @@ pub struct DFlashDecoderLayer {
     mlp: MLP,
     input_layernorm: NormX,
     post_attention_layernorm: NormX,
+    attention_conv: Option<DFlashGroupedConv>,
+    mlp_conv: Option<DFlashGroupedConv>,
 }
 
 impl DFlashDecoderLayer {
@@ -319,12 +500,46 @@ impl DFlashDecoderLayer {
             DType::F32,
             false,
         )?;
+        let (attention_conv, mlp_conv) = if config.is_dflash2() {
+            let dflash_config = config.dflash_config.as_ref().ok_or_else(|| {
+                candle_core::Error::Msg("DFlash2 config is missing dflash_config".into())
+            })?;
+            let group_size = dflash_config.conv_group_size.ok_or_else(|| {
+                candle_core::Error::Msg("DFlash2 config is missing conv_group_size".into())
+            })?;
+            let taps = dflash_config.conv_kernel_size.ok_or_else(|| {
+                candle_core::Error::Msg("DFlash2 config is missing conv_kernel_size".into())
+            })?;
+            let block_size = config.block_size();
+            (
+                Some(DFlashGroupedConv::new(
+                    vb.pp("attention_conv"),
+                    config.hidden_size,
+                    group_size,
+                    taps,
+                    block_size,
+                    dtype,
+                )?),
+                Some(DFlashGroupedConv::new(
+                    vb.pp("mlp_conv"),
+                    config.hidden_size,
+                    group_size,
+                    taps,
+                    block_size,
+                    dtype,
+                )?),
+            )
+        } else {
+            (None, None)
+        };
 
         Ok(Self {
             self_attn,
             mlp,
             input_layernorm,
             post_attention_layernorm,
+            attention_conv,
+            mlp_conv,
         })
     }
 
@@ -337,13 +552,38 @@ impl DFlashDecoderLayer {
     ) -> Result<Tensor> {
         let residual = hidden_states;
         let hidden_states = self.input_layernorm.forward(hidden_states)?;
+        let (hidden_states, attention_coefficients) = if let Some(conv) = &self.attention_conv {
+            let (hidden_states, coefficients) = conv.prepare(&hidden_states)?;
+            (hidden_states, Some(coefficients))
+        } else {
+            (hidden_states, None)
+        };
         let attn_output = self
             .self_attn
             .forward(&hidden_states, target_hidden, cos, sin)?;
+        let attn_output = if let (Some(conv), Some(coefficients)) =
+            (&self.attention_conv, &attention_coefficients)
+        {
+            conv.finish(&attn_output, coefficients)?
+        } else {
+            attn_output
+        };
         let hidden_states = (attn_output + residual)?;
         let residual = &hidden_states;
         let hidden_states = self.post_attention_layernorm.forward(&hidden_states)?;
+        let (hidden_states, mlp_coefficients) = if let Some(conv) = &self.mlp_conv {
+            let (hidden_states, coefficients) = conv.prepare(&hidden_states)?;
+            (hidden_states, Some(coefficients))
+        } else {
+            (hidden_states, None)
+        };
         let mlp_output = self.mlp.forward(&hidden_states)?;
+        let mlp_output =
+            if let (Some(conv), Some(coefficients)) = (&self.mlp_conv, &mlp_coefficients) {
+                conv.finish(&mlp_output, coefficients)?
+            } else {
+                mlp_output
+            };
         residual + mlp_output
     }
 }
@@ -356,7 +596,7 @@ pub struct DFlashRotaryEmbedding {
 impl DFlashRotaryEmbedding {
     pub fn new(config: &DFlashModelConfig, dtype: DType, device: &Device) -> Result<Self> {
         let head_dim = config.head_dim();
-        let rope_theta = config.rope_theta.unwrap_or(10000.0);
+        let rope_theta = config.rope_theta();
         let inv_freq: Vec<f32> = (0..head_dim)
             .step_by(2)
             .map(|i| 1f32 / rope_theta.powf(i as f64 / head_dim as f64) as f32)
@@ -395,6 +635,7 @@ pub struct DFlashDraftModel {
     pub mask_token_id: Option<u32>,
     device: Device,
     dtype: DType,
+    candidate_selector: Option<DFlashCandidateSelector>,
 }
 
 impl DFlashDraftModel {
@@ -445,6 +686,25 @@ impl DFlashDraftModel {
         )?;
 
         let rotary_emb = DFlashRotaryEmbedding::new(config, dtype, device)?;
+        let candidate_selector = if config.is_dflash2() {
+            let dflash_config = config.dflash_config.as_ref().ok_or_else(|| {
+                candle_core::Error::Msg("DFlash2 config is missing dflash_config".into())
+            })?;
+            Some(DFlashCandidateSelector::new(
+                vb.pp("candidate_selector"),
+                config.hidden_size,
+                config.vocab_size,
+                dflash_config.selector_rank.ok_or_else(|| {
+                    candle_core::Error::Msg("DFlash2 config is missing selector_rank".into())
+                })?,
+                dflash_config.selector_top_k.ok_or_else(|| {
+                    candle_core::Error::Msg("DFlash2 config is missing selector_top_k".into())
+                })?,
+                dtype,
+            )?)
+        } else {
+            None
+        };
 
         Ok(Self {
             fc,
@@ -453,11 +713,12 @@ impl DFlashDraftModel {
             norm,
             rotary_emb,
             target_layer_ids,
-            block_size: config.block_size,
+            block_size: config.block_size(),
             mask_token_id: config.mask_token_id(),
             config: config.clone(),
             device: device.clone(),
             dtype,
+            candidate_selector,
         })
     }
 
@@ -490,6 +751,24 @@ impl DFlashDraftModel {
 
     pub fn device(&self) -> &Device {
         &self.device
+    }
+
+    pub fn is_dflash2(&self) -> bool {
+        self.candidate_selector.is_some()
+    }
+
+    pub fn select_candidates(
+        &self,
+        hidden_states: &Tensor,
+        logits: &Tensor,
+        anchor_token: u32,
+    ) -> Result<Vec<u32>> {
+        self.candidate_selector
+            .as_ref()
+            .ok_or_else(|| {
+                candle_core::Error::Msg("DFlash2 candidate selector is unavailable".into())
+            })?
+            .select(hidden_states, logits, anchor_token)
     }
 
     pub fn dtype(&self) -> DType {

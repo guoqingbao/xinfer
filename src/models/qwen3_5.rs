@@ -672,6 +672,82 @@ impl Qwen3_5ForCausalLM {
         Ok((logits, hidden))
     }
 
+    /// Forward pass returning the hidden states needed by an external draft model.
+    ///
+    /// The returned list contains the embedding output followed by the outputs of
+    /// the requested transformer layers, in the same order as `target_layer_ids`.
+    pub fn forward_with_hidden_states(
+        &self,
+        input_ids: &Tensor,
+        positions: &Tensor,
+        kv_caches: Option<&Vec<(Tensor, Tensor)>>,
+        input_metadata: &InputMetadata,
+        embeded_inputs: bool,
+        target_layer_ids: &[usize],
+    ) -> Result<(Tensor, Vec<Tensor>)> {
+        let seqlens = input_metadata.seqlens.clone().unwrap_or_default();
+        let attention_mask = get_attention_causal_mask(
+            &self.device,
+            self.dtype,
+            positions,
+            seqlens.clone(),
+            self.config.sliding_window,
+            input_metadata.is_prefill,
+        );
+        let mut xs = if embeded_inputs {
+            input_ids.clone()
+        } else {
+            self.embed_forward(input_ids)?
+        };
+        let mut hidden_states = vec![xs.clone()];
+        let mut kv_cache_idx = 0usize;
+        let seq_slots = self.resolve_seq_slots(input_metadata, xs.dim(0)?)?;
+        let mut mamba_cache = self.mamba_cache.write();
+
+        for (i, layer) in self.layers.iter().enumerate() {
+            let cache = if layer.is_full_attention() {
+                if let Some(kv_caches) = kv_caches {
+                    let current = &kv_caches[kv_cache_idx];
+                    kv_cache_idx += 1;
+                    Some((&current.0, &current.1))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            xs = layer.forward(
+                &xs,
+                attention_mask.as_ref(),
+                positions,
+                cache,
+                input_metadata,
+                &mut mamba_cache,
+                &seq_slots,
+            )?;
+            if target_layer_ids.contains(&i) {
+                hidden_states.push(xs.clone());
+            }
+        }
+
+        let logits_xs = if !seqlens.is_empty() {
+            let indices: Vec<_> = seqlens.iter().map(|x| x - 1).collect();
+            let batch = indices.len();
+            xs.index_select(&Tensor::from_vec(indices, (batch,), xs.device())?, 0)?
+        } else {
+            xs.clone()
+        };
+        let logits_xs = self.norm.forward(&logits_xs)?;
+        let logits = if self.is_qvar_builder {
+            self.lm_head.forward(&logits_xs)?
+        } else {
+            self.lm_head
+                .forward(&logits_xs.to_dtype(self.dtype)?)?
+                .to_dtype(DType::F32)?
+        };
+        Ok((logits, hidden_states))
+    }
+
     pub fn forward_with_deepstack(
         &self,
         input_ids: &Tensor,

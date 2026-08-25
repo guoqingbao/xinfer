@@ -304,6 +304,26 @@ pub fn run_runner() -> anyhow::Result<()> {
                     }
                 }
             }
+            Ok(MessageType::RunDecodeDFlash(sequences)) => {
+                let outputs = runner.run_dflash_decode(Seqs::DecodeVec(&sequences));
+                match outputs {
+                    Ok(multi_tokens) => {
+                        send_local(
+                            &mut vec![stream.try_clone()?],
+                            &MessageType::RunResponseDFlash(multi_tokens),
+                            false,
+                        )?;
+                    }
+                    Err(e) => {
+                        xinfer::log_error!("Runner DFlash decode error: {:?}", e);
+                        send_local(
+                            &mut vec![stream.try_clone()?],
+                            &MessageType::RunResponseDFlash(vec![]),
+                            false,
+                        )?;
+                    }
+                }
+            }
             Ok(MessageType::RunEmbed((sequences, strategy))) => {
                 use xinfer::core::sequence::Sequence;
                 let refs: Vec<&Sequence> = sequences.iter().collect();

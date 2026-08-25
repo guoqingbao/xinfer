@@ -891,6 +891,18 @@ pub struct Args {
     #[arg(long, default_value = None)]
     pub mtp: Option<usize>,
 
+    /// DFlash/DFlash2 draft model HuggingFace ID.
+    #[arg(long, default_value = None)]
+    pub draft_model_id: Option<String>,
+
+    /// Local path to DFlash/DFlash2 draft model weights.
+    #[arg(long, default_value = None)]
+    pub draft_model_path: Option<String>,
+
+    /// Number of tokens proposed by the external draft model per step.
+    #[arg(long, default_value = None)]
+    pub num_speculative_tokens: Option<usize>,
+
     /// Enable grammar-based generation: tool grammar, structured outputs, and client constraints
     #[arg(long, default_value = "false")]
     pub enable_tool_grammar: bool,

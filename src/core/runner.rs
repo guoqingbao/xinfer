@@ -152,6 +152,8 @@ pub struct ModelRunner {
     pub(crate) mtp_head: Option<Arc<Qwen3_5MtpHead>>,
     /// Number of speculative tokens to draft per step
     pub(crate) mtp_num_speculative: usize,
+    /// Optional external DFlash/DFlash2 drafter.
+    pub(crate) dflash_drafter: Option<crate::core::dflash_drafter::DFlashDrafter>,
 }
 
 impl ModelRunner {
@@ -291,6 +293,12 @@ impl ModelRunner {
             && is_mtp_model_type
             && (has_mtp_config || has_mtp_weights)
             && has_mtp_weights;
+        let external_speculative_enabled =
+            econfig.draft_model_id.is_some() || econfig.draft_model_path.is_some();
+        if external_speculative_enabled && econfig.num_speculative_tokens.unwrap_or(0) > 0 {
+            // DFlash verification uses the same per-token GDN snapshots as MTP.
+            config.mtp_enabled = true;
+        }
 
         let model = crate::build_model!(
             model_type,
@@ -700,6 +708,7 @@ impl ModelRunner {
         } else {
             (None, 0)
         };
+        let dflash_drafter = Self::init_dflash_drafter(econfig, comm.clone(), &device)?;
 
         Ok(Self {
             model,
@@ -750,7 +759,58 @@ impl ModelRunner {
             model_type,
             mtp_head,
             mtp_num_speculative,
+            dflash_drafter,
         })
+    }
+
+    fn init_dflash_drafter(
+        econfig: &EngineConfig,
+        comm: Rc<Comm>,
+        device: &Device,
+    ) -> Result<Option<crate::core::dflash_drafter::DFlashDrafter>> {
+        if econfig.draft_model_id.is_none() && econfig.draft_model_path.is_none() {
+            return Ok(None);
+        }
+
+        if !matches!(
+            econfig.num_speculative_tokens,
+            Some(tokens) if tokens > 0
+        ) {
+            candle_core::bail!("DFlash requires --num-speculative-tokens to be greater than zero");
+        }
+
+        crate::log_info!("Loading external DFlash draft model...");
+        let loader = crate::utils::downloader::Downloader::new(
+            econfig.draft_model_id.clone(),
+            econfig.draft_model_path.clone(),
+            None,
+        );
+        let (draft_paths, is_gguf) = loader
+            .prepare_draft_model_weights(econfig.hf_token.clone(), econfig.hf_token_path.clone())?;
+        if is_gguf {
+            candle_core::bail!("DFlash draft models must use safetensors weights");
+        }
+
+        let config_data = std::fs::read(draft_paths.get_config_filename())
+            .map_err(|e| candle_core::Error::Msg(format!("Failed to read DFlash config: {e}")))?;
+        let draft_config: crate::models::dflash::DFlashModelConfig =
+            serde_json::from_slice(&config_data).map_err(|e| {
+                candle_core::Error::Msg(format!("Failed to parse DFlash config: {e}"))
+            })?;
+        let drafter = crate::core::dflash_drafter::DFlashDrafter::new(
+            &draft_config,
+            &draft_paths.get_weight_filenames(),
+            comm,
+            DType::BF16,
+            device,
+            econfig.num_speculative_tokens,
+        )?;
+        crate::log_info!("External DFlash draft model loaded successfully");
+        Ok(Some(drafter))
+    }
+
+    pub fn has_dflash_drafter(&self) -> bool {
+        self.dflash_drafter.is_some()
     }
 
     /// Initialize MTP head for speculative decoding.
@@ -993,31 +1053,85 @@ impl ModelRunner {
         let _prefill_guard = set_linear_is_prefill(is_prefill);
         let kv_guard = self.get_kv_cache();
         let kv_pairs = kv_guard.as_pairs();
-        let logits = crate::model_call!(
-            &self.model,
-            forward,
-            (&input_ids, &positions, kv_pairs, &input_metadata),
-            {
-                Qwen3 => false,
-                Qwen3MoE => false,
-                Qwen3_5 => false,
-                Qwen3_5MoE => false,
-                LLaMa => false,
-                LLaMa4 => images,
-                Phi4 => false,
-                GLM4 => false,
-                GLM4MoE => false,
-                GLM4MoeLite => false,
-                DeepSeek => false,
-                DeepSeekV4 => false,
-                GLM5 => false,
-                Mistral3VL => images,
-                Gemma3 => images,
-                Gemma4 => false,
-                Qwen3VL => images,
-                MiniMax => false,
+        let logits = if let Some(drafter) = self.dflash_drafter.as_ref() {
+            let target_layer_ids = drafter.target_layer_ids();
+            let (logits, hidden_states) = match &self.model {
+                Model::Qwen3_5(model) => model.forward_with_hidden_states(
+                    &input_ids,
+                    &positions,
+                    kv_pairs,
+                    &input_metadata,
+                    false,
+                    target_layer_ids,
+                )?,
+                Model::Qwen3_5MoE(model) => model.forward_with_hidden_states(
+                    &input_ids,
+                    &positions,
+                    kv_pairs,
+                    &input_metadata,
+                    false,
+                    target_layer_ids,
+                )?,
+                Model::Qwen3VL(model) => model.forward_with_hidden_states(
+                    &input_ids,
+                    &positions,
+                    kv_pairs,
+                    &input_metadata,
+                    false,
+                    target_layer_ids,
+                )?,
+                _ => candle_core::bail!("DFlash currently supports Qwen3.5 target models"),
+            };
+            let projected = drafter.extract_and_concat_hidden(&hidden_states)?;
+            let mut offset = 0usize;
+            match &seqs {
+                Seqs::SeqRefs(sequences) => {
+                    for sequence in *sequences {
+                        let count = sequence
+                            .prefill_chunk_tokens(self.config.effective_prefill_chunk_size());
+                        drafter.store_decode_hidden(
+                            &projected.narrow(0, offset, count)?,
+                            sequence.id,
+                        )?;
+                        offset += count;
+                    }
+                }
+                Seqs::DecodeVec(sequences) => {
+                    for sequence in *sequences {
+                        drafter
+                            .store_decode_hidden(&projected.narrow(0, offset, 1)?, sequence.id)?;
+                        offset += 1;
+                    }
+                }
             }
-        )?;
+            logits
+        } else {
+            crate::model_call!(
+                &self.model,
+                forward,
+                (&input_ids, &positions, kv_pairs, &input_metadata),
+                {
+                    Qwen3 => false,
+                    Qwen3MoE => false,
+                    Qwen3_5 => false,
+                    Qwen3_5MoE => false,
+                    LLaMa => false,
+                    LLaMa4 => images,
+                    Phi4 => false,
+                    GLM4 => false,
+                    GLM4MoE => false,
+                    GLM4MoeLite => false,
+                    DeepSeek => false,
+                    DeepSeekV4 => false,
+                    GLM5 => false,
+                    Mistral3VL => images,
+                    Gemma3 => images,
+                    Gemma4 => false,
+                    Qwen3VL => images,
+                    MiniMax => false,
+                }
+            )?
+        };
         drop(kv_guard);
         let output_ids = self.sample(&logits, seqs, is_prefill)?;
         #[cfg(feature = "nvtx")]
@@ -1197,21 +1311,15 @@ impl ModelRunner {
 
         let slot_mapping = Tensor::from_vec(slot_mapping, (s_len,), &self.device)?;
 
-        // Provide block_tables + context_lens when any sequence in the batch has
-        // prior cached KV (cu_seqlens_k > cu_seqlens_q). This enables the paged
-        // attention prefill kernel to attend to the full KV context.
-        let (block_tables, context_lens) = if cu_seqlens_k.last() > cu_seqlens_q.last() {
-            let block_tables_t = self.prepare_block_tables(seqs)?;
-            let context_lens: Vec<u32> = seqs
-                .iter()
-                .zip(prefill_tokens.iter())
-                .map(|(seq, &num_tokens)| (seq.num_cached_tokens + num_tokens) as u32)
-                .collect();
-            let context_lens = Tensor::from_vec(context_lens, seqs.len(), &self.device)?;
-            (Some(block_tables_t), Some(context_lens))
-        } else {
-            (None, None)
-        };
+        let block_tables_t = self.prepare_block_tables(seqs)?;
+        let context_lens_vec: Vec<u32> = seqs
+            .iter()
+            .zip(prefill_tokens.iter())
+            .map(|(seq, &num_tokens)| (seq.num_cached_tokens + num_tokens) as u32)
+            .collect();
+        let context_lens_t = Tensor::from_vec(context_lens_vec.clone(), seqs.len(), &self.device)?;
+        let block_tables = Some(block_tables_t);
+        let context_lens = Some(context_lens_t);
         let cu_seqlens_q_vec = cu_seqlens_q.clone();
         let cu_seqlens_q = Tensor::from_vec(cu_seqlens_q, (q_len,), &self.device)?;
         let cu_seqlens_k = Tensor::from_vec(cu_seqlens_k, (k_len,), &self.device)?;

@@ -3352,6 +3352,7 @@ impl FusedMoeNvfp4 {
                 is_prefill,
                 None,
                 projection.scales_swizzled.as_ref(),
+                None,
             )?,
             Nvfp4GateUpWeights::Separate { gate, up } => {
                 let gate_output = moe::moe_gemm_nvfp4(
@@ -3366,6 +3367,7 @@ impl FusedMoeNvfp4 {
                     is_prefill,
                     None,
                     gate.scales_swizzled.as_ref(),
+                    None,
                 )?;
                 let up_output = moe::moe_gemm_nvfp4(
                     &xs,
@@ -3379,6 +3381,7 @@ impl FusedMoeNvfp4 {
                     is_prefill,
                     None,
                     up.scales_swizzled.as_ref(),
+                    None,
                 )?;
                 Tensor::cat(&[&gate_output, &up_output], 2)?
             }
@@ -3404,6 +3407,7 @@ impl FusedMoeNvfp4 {
             is_prefill,
             down_topk_weights,
             self.down_scales_swizzled.as_ref(),
+            None,
         )?
         .reshape((num_tokens, self.routing.num_experts_per_tok, hidden_dim))?
         .sum(1)?;

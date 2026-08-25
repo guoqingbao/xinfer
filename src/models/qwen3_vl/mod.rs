@@ -767,6 +767,39 @@ impl Qwen3VLForConditionalGeneration {
         }
     }
 
+    /// Forward pass returning intermediate text-backbone states for DFlash.
+    pub fn forward_with_hidden_states(
+        &self,
+        input_ids: &Tensor,
+        positions: &Tensor,
+        kv_caches: Option<&Vec<(Tensor, Tensor)>>,
+        input_metadata: &InputMetadata,
+        embeded_inputs: bool,
+        target_layer_ids: &[usize],
+    ) -> Result<(Tensor, Vec<Tensor>)> {
+        match &self.text_model {
+            Qwen3TextModel::Dense35(model) => model.forward_with_hidden_states(
+                input_ids,
+                positions,
+                kv_caches,
+                input_metadata,
+                embeded_inputs,
+                target_layer_ids,
+            ),
+            Qwen3TextModel::MoE35(model) => model.forward_with_hidden_states(
+                input_ids,
+                positions,
+                kv_caches,
+                input_metadata,
+                embeded_inputs,
+                target_layer_ids,
+            ),
+            _ => candle_core::bail!(
+                "forward_with_hidden_states only supported for Qwen3.5 text models"
+            ),
+        }
+    }
+
     /// Apply lm_head to hidden states (for MTP drafting).
     pub fn forward_lm_head(&self, hidden: &Tensor) -> Result<Tensor> {
         match &self.text_model {

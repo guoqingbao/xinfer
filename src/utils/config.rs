@@ -477,6 +477,15 @@ pub struct EngineConfig {
     /// None means MTP is disabled.
     #[serde(default)]
     pub mtp_num_speculative_tokens: Option<usize>,
+    /// Optional DFlash/DFlash2 external draft model identifier.
+    #[serde(default)]
+    pub draft_model_id: Option<String>,
+    /// Optional local directory containing DFlash/DFlash2 weights.
+    #[serde(default)]
+    pub draft_model_path: Option<String>,
+    /// Number of tokens proposed by the external draft model per step.
+    #[serde(default)]
+    pub num_speculative_tokens: Option<usize>,
     pub enable_tool_grammar: bool,
 }
 
@@ -591,6 +600,15 @@ pub struct EngineConfig {
     #[pyo3(get, set)]
     #[serde(default)]
     pub mtp_num_speculative_tokens: Option<usize>,
+    #[pyo3(get, set)]
+    #[serde(default)]
+    pub draft_model_id: Option<String>,
+    #[pyo3(get, set)]
+    #[serde(default)]
+    pub draft_model_path: Option<String>,
+    #[pyo3(get, set)]
+    #[serde(default)]
+    pub num_speculative_tokens: Option<usize>,
     #[pyo3(get, set)]
     pub enable_tool_grammar: bool,
 }
@@ -715,6 +733,9 @@ impl EngineConfig {
             master_addr,
             master_port,
             mtp_num_speculative_tokens,
+            draft_model_id: None,
+            draft_model_path: None,
+            num_speculative_tokens: None,
             enable_tool_grammar,
         }
     }

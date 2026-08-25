@@ -1833,6 +1833,7 @@ impl Module for LnNvfp4 {
             self.bias.as_ref(),
             linear_is_prefill(),
             self.weight_scale_swizzled.as_ref(),
+            None,
         )?;
 
         if orig_dims.len() > 2 {

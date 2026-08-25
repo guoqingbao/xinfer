@@ -1015,21 +1015,6 @@ impl Qwen3_5MoEForCausalLM {
         self.mamba_cache.write().reset_all()
     }
 
-    pub fn save_mamba_slot_state(&self, seq_id: usize) -> Result<(Vec<Tensor>, Vec<Tensor>)> {
-        self.mamba_cache.read().save_slot_state(seq_id)
-    }
-
-    pub fn restore_mamba_slot_state(
-        &self,
-        seq_id: usize,
-        conv_states: &[Tensor],
-        recurrent_states: &[Tensor],
-    ) -> Result<()> {
-        self.mamba_cache
-            .write()
-            .restore_slot_state(seq_id, conv_states, recurrent_states)
-    }
-
     pub fn dtype(&self) -> DType {
         self.dtype
     }
