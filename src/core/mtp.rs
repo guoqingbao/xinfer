@@ -11,6 +11,11 @@
 use candle_core::{Result, Tensor, D};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use crate::utils::guided_decoding::GuidedDecoding;
+use crate::core::speculative::Drafter;
+use crate::models::qwen3_5_mtp::Qwen3_5MtpHead;
+use std::sync::Arc;
+
 // ---------------------------------------------------------------------------
 // Verification & stats (pure functions, no model dependencies)
 // ---------------------------------------------------------------------------
@@ -26,6 +31,12 @@ pub struct MtpVerifyResult {
     pub num_accepted: usize,
     /// Total number proposed.
     pub num_proposed: usize,
+    /// Grammar-legal prefix length (how many drafts the FSM allows).
+    pub grammar_prefix: usize,
+    /// Target-agreement prefix length (how many drafts the target argmax matches).
+    pub target_prefix: usize,
+    /// True if the continuation was a grammar-forced (ff) token rather than a masked target pick.
+    pub continuation_is_ff: bool,
 }
 
 /// Verify draft tokens against target model logits (greedy / argmax).
@@ -58,6 +69,9 @@ pub fn verify_draft_greedy(
             continuation_token: first_token,
             num_accepted: 0,
             num_proposed,
+            grammar_prefix: num_proposed,
+            target_prefix: 0,
+            continuation_is_ff: false,
         });
     }
 
@@ -89,6 +103,90 @@ pub fn verify_draft_greedy(
         continuation_token,
         num_accepted,
         num_proposed,
+        grammar_prefix: num_proposed,
+        target_prefix: num_accepted,
+        continuation_is_ff: false,
+    })
+}
+
+/// How many leading draft tokens (starting at verify row `offset`) match the target argmax.
+fn target_agree_prefix_at(verify_logits: &Tensor, offset: usize, draft_tokens: &[u32]) -> Result<usize> {
+    if draft_tokens.is_empty() {
+        return Ok(0);
+    }
+    let target_vec: Vec<u32> = verify_logits
+        .to_dtype(candle_core::DType::F32)?
+        .argmax(D::Minus1)?
+        .to_vec1()?;
+    let mut t = 0;
+    for i in 0..draft_tokens.len() {
+        if target_vec.get(offset + i).copied() == Some(draft_tokens[i]) {
+t += 1;
+        } else {
+            break;
+        }
+    }
+    Ok(t)
+}
+
+/// Grammar-aware draft verification (the firewall). A draft token is accepted only if BOTH the
+/// target model agrees (argmax) AND the guidance FSM allows it; the continuation is the
+/// FSM-masked target choice (or the grammar-forced token). Non-guided sequences take the fast
+/// batched argmax path (`verify_draft_greedy`).
+///
+/// `verify_logits` is `[N+1, vocab]`: row i predicts draft[i] (i < N), row N is the bonus.
+pub fn verify_draft_masked(
+    verify_logits: &Tensor,
+    draft_tokens: &[u32],
+    guided: &GuidedDecoding,
+    seq_id: usize,
+) -> Result<MtpVerifyResult> {
+    let num_proposed = draft_tokens.len();
+
+    if !guided.is_guided(seq_id) {
+        let t = target_agree_prefix_at(verify_logits, 0, draft_tokens)?;
+        let k = t;
+        let cont_row = verify_logits.get(k.min(num_proposed))?;
+        let continuation = cont_row
+            .to_dtype(candle_core::DType::F32)?
+            .argmax(D::Minus1)?
+            .to_scalar::<u32>()?;
+        return Ok(MtpVerifyResult {
+            accepted_tokens: draft_tokens[..k].to_vec(),
+            continuation_token: continuation,
+            num_accepted: k,
+            num_proposed,
+            grammar_prefix: num_proposed,
+            target_prefix: k,
+            continuation_is_ff: false,
+        });
+    }
+
+    let g = guided.validate_tokens(seq_id, draft_tokens)?;
+    let t = target_agree_prefix_at(verify_logits, 0, draft_tokens)?;
+    let k = g.min(t);
+
+    for &tok in &draft_tokens[..k] {
+        guided.commit_token(seq_id, tok);
+    }
+
+    let cont_row = verify_logits.get(k)?;
+    let (continuation, used_ff) = if let Some(ff) = guided.ff_tokens(seq_id).into_iter().next() {
+        (ff, true)
+    } else {
+        let masked = guided.mask_row(seq_id, &cont_row)?;
+        (masked.argmax(D::Minus1)?.to_scalar::<u32>()?, false)
+    };
+    guided.commit_token(seq_id, continuation);
+
+    Ok(MtpVerifyResult {
+        accepted_tokens: draft_tokens[..k].to_vec(),
+        continuation_token: continuation,
+        num_accepted: k,
+        num_proposed,
+        grammar_prefix: g,
+        target_prefix: t,
+        continuation_is_ff: used_ff,
     })
 }
 
@@ -332,7 +430,7 @@ impl ModelRunner {
     /// post-norm hidden state is accessible via take_last_hidden_for_mtp),
     /// falling back to eager forward_with_hidden.
     #[allow(unused)]
-    fn mtp_decode_step1(&self, seqs: Seqs, _seq_info: &MtpSeqInfo) -> Result<(u32, Tensor)> {
+    pub(crate) fn mtp_decode_step1(&self, seqs: Seqs, _seq_info: &MtpSeqInfo) -> Result<(u32, Tensor)> {
         let (input_ids, positions, mut input_metadata) = match &seqs {
             Seqs::SeqRefs(seqs_ref) => self.prepare_decode(*seqs_ref)?,
             Seqs::DecodeVec(decode_seqs) => self.prepare_decode(decode_seqs.iter())?,
@@ -493,53 +591,118 @@ impl ModelRunner {
     ///   4. Verify: run main model on [anchor, draft_0, ..., draft_{K-1}] using native flash
     ///   5. On partial rejection: roll back GDN state to the accepted token boundary
     ///   6. Greedy-accept matching prefix; take bonus token at first mismatch
+    /// MTP verify forward: CUDA-graph replay when captured, else an eager target forward.
+    /// Returns the verify logits (MTP collects no hidden states).
+    pub(crate) fn mtp_verify_forward(
+        &self,
+        verify_ids: &Tensor,
+        verify_positions: &Tensor,
+        kv_pairs: Option<&Vec<(Tensor, Tensor)>>,
+        metadata: &InputMetadata,
+        verify_len: usize,
+    ) -> Result<Tensor> {
+        let _prefill_guard = set_linear_is_prefill(true);
+        #[cfg(all(feature = "cuda", feature = "graph"))]
+        let use_mtp_graph = self
+            .mtp_capturer
+            .as_ref()
+            .map_or(false, |c| c.is_mtp_captured(verify_len));
+        #[cfg(not(all(feature = "cuda", feature = "graph")))]
+        let use_mtp_graph = false;
+
+        let result = if use_mtp_graph {
+            #[cfg(all(feature = "cuda", feature = "graph"))]
+            {
+                self.mtp_capturer.as_ref().unwrap().replay_mtp(
+                    verify_ids,
+                    verify_positions,
+                    metadata,
+                )
+            }
+            #[cfg(not(all(feature = "cuda", feature = "graph")))]
+            {
+                unreachable!()
+            }
+        } else {
+            let res = match self.model() {
+                Model::Qwen3_5(model) => model.forward(
+                    verify_ids,
+                    verify_positions,
+                    kv_pairs,
+                    metadata,
+                    false,
+                ),
+                Model::Qwen3_5MoE(model) => model.forward(
+                    verify_ids,
+                    verify_positions,
+                    kv_pairs,
+                    metadata,
+                    false,
+                ),
+                Model::Qwen3VL(model) => model.forward(
+                    verify_ids,
+                    verify_positions,
+                    kv_pairs,
+                    metadata,
+                    None,
+                ),
+                _ => unreachable!(),
+            };
+            res
+        };
+        drop(_prefill_guard);
+        result
+    }
+
+    /// MTP speculative decode: route through the shared core with the MTP drafter.
     pub fn run_mtp_decode(&self, seqs: Seqs) -> Result<Vec<Vec<u32>>> {
-        let mtp_head = match &self.mtp_head {
-            Some(h) => h.clone(),
+        match &self.mtp_head {
+            Some(head) => {
+                let drafter = MtpDrafter {
+                    head: head.clone(),
+                    num_spec: self.mtp_num_speculative,
+                };
+                self.run_spec_decode(seqs, &drafter)
+            }
             None => {
                 let output = self.run(seqs, false)?;
-                return Ok(output.into_iter().map(|t| vec![t]).collect());
+                Ok(output.into_iter().map(|t| vec![t]).collect())
             }
-        };
-
-        let (batch_size, seq_infos) = match &seqs {
-            Seqs::SeqRefs(s) => {
-                let infos: Vec<MtpSeqInfo> = s
-                    .iter()
-                    .map(|seq| MtpSeqInfo {
-                        id: seq.id,
-                        len: seq.len(),
-                        block_table: seq.block_table.clone(),
-                    })
-                    .collect();
-                (s.len(), infos)
-            }
-            Seqs::DecodeVec(d) => {
-                let infos: Vec<MtpSeqInfo> = d
-                    .iter()
-                    .map(|ds| MtpSeqInfo {
-                        id: ds.id,
-                        len: ds.len,
-                        block_table: ds.block_tables.clone(),
-                    })
-                    .collect();
-                (d.len(), infos)
-            }
-        };
-
-        if batch_size != 1 {
-            let output = self.run(seqs, false)?;
-            return Ok(output.into_iter().map(|t| vec![t]).collect());
         }
+    }
 
-        let seq_info = &seq_infos[0];
-        let num_draft = self.mtp_num_speculative;
+}
 
-        // Step 1: Main model decode for logits + hidden state.
-        let (anchor_token, seq_hidden) = self.mtp_decode_step1(seqs, seq_info)?;
+/// Wraps the MTP head as a `Drafter`: `propose` runs the anchor decode + MTP-head draft
+/// (steps 1-2); `verify_forward` uses the MTP CUDA-graph replay when captured.
+pub struct MtpDrafter {
+    head: Arc<Qwen3_5MtpHead>,
+    num_spec: usize,
+}
 
-        // Step 2: Draft K tokens using MTP head (GPU-resident, no per-step CPU sync)
-        let embed_weight = match self.model() {
+impl Drafter for MtpDrafter {
+    fn name(&self) -> &'static str {
+        "mtp"
+    }
+
+    fn anchor(&self, runner: &ModelRunner, seqs: Seqs, seq: &MtpSeqInfo) -> Result<(u32, Option<Tensor>)> {
+        // Step 1: main-model decode for the anchor + hidden state.
+        let (anchor_token, seq_hidden) = runner.mtp_decode_step1(seqs, seq)?;
+        Ok((anchor_token, Some(seq_hidden)))
+    }
+
+    fn draft(
+        &self,
+        runner: &ModelRunner,
+        seq: &MtpSeqInfo,
+        anchor: u32,
+        hidden: &Option<Tensor>,
+    ) -> Result<Vec<u32>> {
+        let seq_hidden = hidden.as_ref().ok_or_else(|| {
+            candle_core::Error::Msg("MTP draft requires the backbone hidden state".into())
+        })?;
+        // Step 2: draft K tokens with the MTP head (GPU-resident), from after the ff run.
+        let embed_weight = match runner.model() {
             Model::Qwen3_5(m) => m.embed_weight().clone(),
             Model::Qwen3_5MoE(m) => m.embed_weight().clone(),
             Model::Qwen3VL(m) => m
@@ -549,133 +712,55 @@ impl ModelRunner {
             _ => unreachable!(),
         };
         let lm_head_fn = |hidden: &Tensor| -> Result<Tensor> {
-            match self.model() {
+            match runner.model() {
                 Model::Qwen3_5(m) => m.forward_lm_head(hidden),
                 Model::Qwen3_5MoE(m) => m.forward_lm_head(hidden),
                 Model::Qwen3VL(m) => m.forward_lm_head(hidden),
                 _ => unreachable!(),
             }
         };
-
-        let base_position = seq_info.len.saturating_sub(1);
-        let anchor_token_tensor = Tensor::from_vec(vec![anchor_token], (1,), self.device())?;
-        let (draft_tokens, _last_hidden) = mtp_head.draft_tokens_gpu(
-            &seq_hidden,
-            &anchor_token_tensor,
-            num_draft,
+        let base_position = seq.len.saturating_sub(1);
+        let known_tokens: Vec<u32> = vec![anchor];
+        if runner.guided_decoding.is_guided(seq.id) {
+            // Grammar-aware: produce the draft logits, then bias the picks toward FSM-legal tokens.
+            let logits = self.head.draft_logits_gpu(
+                seq_hidden,
+                &known_tokens,
+                self.num_spec,
+                &embed_weight,
+                lm_head_fn,
+                base_position,
+            )?;
+            if crate::utils::env::spec_granular_mask() {
+                return runner.guided_decoding.masked_drafts(seq.id, &logits);
+            }
+            let masked = runner.guided_decoding.mask_rows(seq.id, &logits)?;
+            return masked
+                .to_dtype(candle_core::DType::F32)?
+                .argmax(candle_core::D::Minus1)?
+                .to_vec1::<u32>();
+        }
+        let (draft_tokens, _last_hidden) = self.head.draft_tokens_gpu(
+            seq_hidden,
+            &known_tokens,
+            self.num_spec,
             &embed_weight,
             lm_head_fn,
             base_position,
         )?;
+        Ok(draft_tokens)
+    }
 
-        if draft_tokens.is_empty() {
-            return Ok(vec![vec![anchor_token]]);
-        }
-
-        // Step 3: Verify draft tokens via prefill-style forward on [anchor, draft_0..K-1].
-        let mut verify_tokens = vec![anchor_token];
-        verify_tokens.extend_from_slice(&draft_tokens);
-        let verify_len = verify_tokens.len();
-
-        let block_size = self.block_size();
-        let slot_mappings =
-            self.compute_slot_mappings(seq_info, verify_len, block_size, "verify")?;
-
-        let verify_input_ids = Tensor::from_vec(verify_tokens, (verify_len,), self.device())?;
-        let verify_positions_tensor = Tensor::from_vec(
-            (0..verify_len)
-                .map(|i| (seq_info.len + i) as i64)
-                .collect::<Vec<_>>(),
-            (verify_len,),
-            self.device(),
-        )?;
-
-        let verify_metadata =
-            self.build_mtp_metadata(seq_info, &slot_mappings[..verify_len], verify_len)?;
-
-        let _prefill_guard = set_linear_is_prefill(true);
-
-        #[cfg(all(feature = "cuda", feature = "graph"))]
-        let use_mtp_graph = self
-            .mtp_capturer
-            .as_ref()
-            .map_or(false, |c| c.is_mtp_captured(verify_len));
-        #[cfg(not(all(feature = "cuda", feature = "graph")))]
-        let use_mtp_graph = false;
-
-        let all_logits_result = if use_mtp_graph {
-            #[cfg(all(feature = "cuda", feature = "graph"))]
-            {
-                self.mtp_capturer.as_ref().unwrap().replay_mtp(
-                    &verify_input_ids,
-                    &verify_positions_tensor,
-                    &verify_metadata,
-                )
-            }
-            #[cfg(not(all(feature = "cuda", feature = "graph")))]
-            {
-                unreachable!()
-            }
-        } else {
-            let kv_cache = self.get_kv_cache();
-            let kv_pairs = kv_cache.as_pairs();
-            let res = match self.model() {
-                Model::Qwen3_5(model) => model.forward(
-                    &verify_input_ids,
-                    &verify_positions_tensor,
-                    kv_pairs,
-                    &verify_metadata,
-                    false,
-                ),
-                Model::Qwen3_5MoE(model) => model.forward(
-                    &verify_input_ids,
-                    &verify_positions_tensor,
-                    kv_pairs,
-                    &verify_metadata,
-                    false,
-                ),
-                Model::Qwen3VL(model) => model.forward(
-                    &verify_input_ids,
-                    &verify_positions_tensor,
-                    kv_pairs,
-                    &verify_metadata,
-                    None,
-                ),
-                _ => unreachable!(),
-            };
-            drop(kv_cache);
-            res
-        };
-        let all_logits = all_logits_result?;
-
-        let verify_result = verify_draft_greedy(&all_logits, &draft_tokens)?;
-
-        if verify_result.num_accepted < verify_result.num_proposed {
-            let commit_len = 1 + verify_result.num_accepted;
-            // Full-attention KV cache does not need explicit rollback: the next cycle's
-            // verify will overwrite rejected positions via append_kv_cache before the
-            // attention kernel reads them, and FlashInfer uses kCausal masking.
-            // GDN/Mamba state, however, is mutated in-place and must be rolled back.
-            let restored = self.mtp_rollback_mamba(seq_info.id, commit_len)?;
-            if !restored {
-                candle_core::bail!(
-                    "MTP failed to roll back mamba-state snapshot for seq {} to {} verified token(s)",
-                    seq_info.id,
-                    commit_len
-                );
-            }
-        }
-
-        let mut result_tokens = Vec::with_capacity(2 + verify_result.num_accepted);
-        result_tokens.push(anchor_token);
-        result_tokens.extend_from_slice(&verify_result.accepted_tokens);
-        result_tokens.push(verify_result.continuation_token);
-
-        mtp_stats_update(verify_result.num_proposed, verify_result.num_accepted);
-        if MTP_TOTAL_STEPS.load(Ordering::Relaxed) % 256 == 0 {
-            crate::log_info!("{}", mtp_stats_summary());
-        }
-
-        Ok(vec![result_tokens])
+    fn verify_forward(
+        &self,
+        runner: &ModelRunner,
+        verify_ids: &Tensor,
+        verify_positions: &Tensor,
+        kv_pairs: Option<&Vec<(Tensor, Tensor)>>,
+        metadata: &InputMetadata,
+        verify_len: usize,
+    ) -> Result<(Tensor, Vec<Tensor>)> {
+        let logits = runner.mtp_verify_forward(verify_ids, verify_positions, kv_pairs, metadata, verify_len)?;
+        Ok((logits, vec![]))
     }
 }

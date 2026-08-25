@@ -3,7 +3,7 @@
 
 use crate::models::dflash::{DFlashDraftModel, DFlashModelConfig};
 use crate::models::layers::VarBuilderX;
-use candle_core::{DType, Device, IndexOp, Result, Tensor, D};
+use candle_core::{DType, Device, Result, Tensor};
 use std::collections::HashMap;
 use std::sync::Mutex;
 
@@ -43,15 +43,25 @@ impl DFlashDrafter {
             DEFAULT_CONTEXT_WINDOW,
             std::cmp::max(1, draft_config.max_position_embeddings),
         );
+        let has_conv = draft_config
+            .dflash_config
+            .as_ref()
+            .is_some_and(|dc| dc.conv_kernel_size.is_some() && dc.conv_group_size.is_some());
+        let has_selector = draft_config
+            .dflash_config
+            .as_ref()
+            .is_some_and(|dc| dc.selector_rank.is_some() && dc.selector_top_k.is_some());
 
         crate::log_info!(
-            "DFlash drafter initialized: {} layers, num_speculative_tokens={}, target_layer_ids={:?}, mask_token_id={}, context_window={}, yarn_scaling_factor={:?}",
+            "DFlash drafter initialized: {} layers, num_speculative_tokens={}, target_layer_ids={:?}, mask_token_id={}, context_window={}, yarn_scaling_factor={:?}, dflash2_conv={}, dflash2_selector={}",
             draft_config.num_hidden_layers,
             block_size,
             target_layer_ids,
             mask_token_id,
             context_window,
             yarn_factor,
+            has_conv,
+            has_selector,
         );
 
         Ok(Self {
@@ -77,36 +87,34 @@ impl DFlashDrafter {
     /// Draft `num_speculative_tokens` ids: embed `[last_token, MASK..MASK]` with the target's
     /// embedding table, run the draft model cross-attending to `target_hidden`, and argmax the
     /// last N positions through the target's lm_head.
-    pub fn draft_tokens(
+    /// The number of speculative (MASK) tokens per step.
+    pub fn num_speculative(&self) -> usize {
+        self.num_speculative_tokens
+    }
+
+    /// Build the DFlash2 block [anchor, MASK x n], run the draft model, and return the
+    /// target lm_head logits + hiddens over the n MASK positions.
+    pub fn draft_logits(
         &self,
         target_hidden: &Tensor,
         embed_fn: &dyn Fn(&Tensor) -> Result<Tensor>,
         lm_head_fn: &dyn Fn(&Tensor) -> Result<Tensor>,
-        last_tokens: &[u32],
-    ) -> Result<Vec<u32>> {
-        assert_eq!(
-            last_tokens.len(),
-            1,
-            "DFlash currently supports batch_size=1 for drafting"
-        );
-
-        let n = self.num_speculative_tokens;
-        if n == 0 {
-            return Ok(Vec::new());
-        }
-        let mut draft_token_ids: Vec<u32> = Vec::with_capacity(n);
-
-        let mut block_ids = vec![self.mask_token_id; n + 1];
-        block_ids[0] = last_tokens[0];
+        anchor: u32,
+        n_mask: usize,
+    ) -> Result<(Tensor, Tensor)> {
+        let dtype = self.draft_model.dtype();
+        // Block = [anchor, MASK x n_mask].
+        let mut block_ids = Vec::with_capacity(1 + n_mask);
+        block_ids.push(anchor);
+        block_ids.extend(std::iter::repeat(self.mask_token_id).take(n_mask));
+        let block_len = block_ids.len();
 
         let block_tensor = Tensor::from_vec(
             block_ids.iter().map(|&x| x as i64).collect::<Vec<_>>(),
-            (n + 1,),
+            (block_len,),
             &self.device,
         )?;
-
-        let noise_embedding = embed_fn(&block_tensor)?;
-        let noise_embedding = noise_embedding.to_dtype(DType::BF16)?;
+        let noise_embedding = embed_fn(&block_tensor)?.to_dtype(dtype)?;
 
         let target_hidden_2d = if target_hidden.rank() == 3 {
             let (_, ctx, h) = target_hidden.dims3()?;
@@ -114,9 +122,9 @@ impl DFlashDrafter {
         } else {
             target_hidden.clone()
         };
-        let target_hidden_bf16 = target_hidden_2d.to_dtype(DType::BF16)?;
+        let target_hidden_cast = target_hidden_2d.to_dtype(dtype)?;
 
-        let ctx_len = target_hidden_bf16.dim(0)?;
+        let ctx_len = target_hidden_cast.dim(0)?;
         let noise_2d = if noise_embedding.rank() == 3 {
             let (_, s, h) = noise_embedding.dims3()?;
             noise_embedding.reshape((s, h))?
@@ -124,29 +132,24 @@ impl DFlashDrafter {
             noise_embedding
         };
 
-        let total_len = ctx_len + n + 1;
+        let total_len = ctx_len + block_len;
         let positions: Vec<i64> = (0..total_len as i64).collect();
         let positions_tensor = Tensor::from_vec(positions, (total_len,), &self.device)?;
 
         let draft_hidden =
             self.draft_model
-                .forward(&target_hidden_bf16, &noise_2d, &positions_tensor)?;
+                .forward(&target_hidden_cast, &noise_2d, &positions_tensor)?;
+        self.draft_model.draft_logits(&draft_hidden, n_mask, lm_head_fn)
+    }
 
-        let total_out = draft_hidden.dim(0)?;
-        let draft_logits = lm_head_fn(&draft_hidden.narrow(0, total_out - n, n)?)?;
-
-        for i in 0..n {
-            let logit_slice = draft_logits.i(i)?;
-            let argmax_result = logit_slice.argmax(D::Minus1)?;
-            let token_id = if argmax_result.rank() > 0 {
-                argmax_result.flatten_all()?.i(0)?.to_vec0::<u32>()?
-            } else {
-                argmax_result.to_vec0::<u32>()?
-            };
-            draft_token_ids.push(token_id);
-        }
-
-        Ok(draft_token_ids)
+    /// Select draft tokens from pre-computed logits (DFlash2 selector, else argmax).
+    pub fn select_from_logits(
+        &self,
+        logits: &Tensor,
+        hidden_n: &Tensor,
+        sel_anchor: u32,
+    ) -> Result<Vec<u32>> {
+        self.draft_model.select_from_logits(logits, hidden_n, sel_anchor)
     }
 
     /// Append `projected` (one or more projected context rows) to the per-sequence window,

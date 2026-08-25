@@ -1,6 +1,6 @@
 use crate::utils::env::soft_mask_disabled;
 use crate::utils::guidance::{GuidanceState, ParserFactory};
-use candle_core::{Result, Tensor};
+use candle_core::{D, Result, Tensor};
 use llguidance::api::TopLevelGrammar;
 use parking_lot::RwLock;
 use std::collections::{hash_map::Entry, HashMap, HashSet};
@@ -268,6 +268,140 @@ impl GuidedDecoding {
         let mut mismatch = self.mismatch.write();
         let _ = mismatch.remove(&seq_id);
     }
+
+    /// True if `seq_id` has an active (non-failed) grammar FSM state.
+    pub fn is_guided(&self, seq_id: usize) -> bool {
+        let states = self.states.read();
+        let failed = self.failed.read();
+        states.contains_key(&seq_id) && !failed.contains(&seq_id)
+    }
+
+    /// Non-mutating: grammar-legal prefix length of `tokens` from the seq's current state.
+    pub fn validate_tokens(&self, seq_id: usize, tokens: &[u32]) -> Result<usize> {
+        if tokens.is_empty() {
+            return Ok(0);
+        }
+        let mut states = self.states.write();
+        match states.get_mut(&seq_id) {
+            Some(state) => state
+                .validate_tokens(tokens)
+                .map_err(|e| candle_core::Error::Msg(e.to_string())),
+            None => Ok(tokens.len()),
+        }
+    }
+
+    /// Commit a single token to the seq's FSM (advances state; tracks reasoning).
+    pub fn commit_token(&self, seq_id: usize, token: u32) {
+        let mut states = self.states.write();
+        let mut failed = self.failed.write();
+        if let Some(state) = states.get_mut(&seq_id) {
+            if state.is_finished() {
+                return;
+            }
+            if let Err(err) = state.commit_token(token) {
+                if failed.insert(seq_id) {
+                    crate::log_warn!(
+                        "[Seq {}] Failed to commit guided token {}: {}. Disabling constraints.",
+                        seq_id,
+                        token,
+                        err
+                    );
+                }
+                let _ = states.remove(&seq_id);
+            }
+        }
+    }
+
+    /// Grammar-forced token(s) at the seq's current state (empty if none).
+    pub fn ff_tokens(&self, seq_id: usize) -> Vec<u32> {
+        let mut states = self.states.write();
+        states.get_mut(&seq_id).map(|s| s.compute_ff_tokens()).unwrap_or_default()
+    }
+
+/// Apply the seq's current grammar VOB to a single logit row; returns the masked row.
+    /// No-op (returns the row) if the seq is not guided.
+    pub fn mask_row(&self, seq_id: usize, row: &Tensor) -> Result<Tensor> {
+        let mut states = self.states.write();
+        let state = match states.get_mut(&seq_id) {
+            Some(s) => s,
+            None => return Ok(row.clone()),
+        };
+        let mask = match state.compute_mask_or_eos() {
+            Ok(m) => m,
+            Err(e) => return Err(candle_core::Error::Msg(e.to_string())),
+        };
+        drop(states);
+        apply_vob_to_row(row, &mask)
+    }
+
+    /// Apply the seq's current grammar VOB to every row of `logits` [n, vocab] (batched). For
+    /// simple deny-set grammars the mask is ~identical across positions, so one VOB suffices.
+    pub fn mask_rows(&self, seq_id: usize, logits: &Tensor) -> Result<Tensor> {
+        let mut states = self.states.write();
+        let state = match states.get_mut(&seq_id) {
+            Some(s) => s,
+            None => return Ok(logits.clone()),
+        };
+        let mask = match state.compute_mask_or_eos() {
+            Ok(m) => m,
+            Err(e) => return Err(candle_core::Error::Msg(e.to_string())),
+        };
+        drop(states);
+        let vocab_size = logits.dims().last().copied().unwrap_or(0) as usize;
+        if mask_allows_all(&mask, vocab_size) {
+            return Ok(logits.clone());
+        }
+        let n = logits.dim(0)?;
+        let mut allow = vec![0u8; vocab_size];
+        write_allow_row(&mut allow, &mask, vocab_size);
+        let allow = Tensor::from_vec(allow, (vocab_size,), logits.device())?;
+        let allow_2d = allow.expand((n, vocab_size))?;
+        let disallowed = Tensor::full(f32::NEG_INFINITY, logits.shape().clone(), logits.device())?;
+Ok(allow_2d.where_cond(logits, &disallowed)?)
+    }
+
+    /// Sequentially mask `draft_logits` [n, vocab] with a CLONE of the seq's FSM (precise
+    /// per-position gating). Returns the n grammar-biased draft tokens. Live FSM untouched.
+    pub fn masked_drafts(&self, seq_id: usize, draft_logits: &Tensor) -> Result<Vec<u32>> {
+        let mut state = {
+            let states = self.states.read();
+            match states.get(&seq_id) {
+                Some(s) => s.deep_clone(),
+                None => {
+                    return draft_logits
+                        .to_dtype(candle_core::DType::F32)?
+                        .argmax(candle_core::D::Minus1)?
+                        .to_vec1::<u32>();
+                }
+            }
+        };
+        let n = draft_logits.dim(0)?;
+        let mut tokens = Vec::with_capacity(n);
+        for i in 0..n {
+            let row = draft_logits.get(i)?;
+            let mask = state
+                .compute_mask_or_eos()
+                .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
+            let masked = apply_vob_to_row(&row, &mask)?;
+            let tok = masked.argmax(candle_core::D::Minus1)?.to_scalar::<u32>()?;
+            state.commit_token(tok).map_err(|e| candle_core::Error::Msg(e.to_string()))?;
+            tokens.push(tok);
+        }
+        Ok(tokens)
+    }
+}
+
+/// Apply a grammar VOB to a single logit row (disallowed -> -inf). No-op if the mask allows all.
+fn apply_vob_to_row(row: &Tensor, mask: &SimpleVob) -> Result<Tensor> {
+    let vocab_size = row.dims().last().copied().unwrap_or(0) as usize;
+    if mask_allows_all(mask, vocab_size) {
+        return Ok(row.clone());
+    }
+    let mut allow = vec![0u8; vocab_size];
+    write_allow_row(&mut allow, mask, vocab_size);
+    let allow = Tensor::from_vec(allow, row.shape().clone(), row.device())?;
+    let disallowed = Tensor::full(f32::NEG_INFINITY, row.shape().clone(), row.device())?;
+    Ok(allow.where_cond(row, &disallowed)?)
 }
 
 fn mask_allows_all(mask: &SimpleVob, vocab_size: usize) -> bool {

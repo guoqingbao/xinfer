@@ -144,7 +144,7 @@ pub struct ModelRunner {
     cached_sampling: RwLock<Option<CachedSamplingParams>>,
     seq_tokens: RwLock<HashMap<usize, Vec<u32>>>,
     restored_prefix_sequences: RwLock<HashSet<usize>>,
-    guided_decoding: GuidedDecoding,
+    pub(crate) guided_decoding: GuidedDecoding,
     transfer: Option<Arc<Transfer>>,
     is_first_rank: bool,
     pub(crate) model_type: ModelType,
@@ -293,6 +293,8 @@ impl ModelRunner {
             && is_mtp_model_type
             && (has_mtp_config || has_mtp_weights)
             && has_mtp_weights;
+        config.dflash_enabled = econfig.draft_model_id.is_some()
+            || econfig.draft_model_path.is_some();
 
         let model = crate::build_model!(
             model_type,
@@ -487,7 +489,7 @@ impl ModelRunner {
                 );
             }
         }
-        if is_hybrid_mamba_model && config.mtp_enabled {
+        if is_hybrid_mamba_model && (config.mtp_enabled || config.dflash_enabled) {
             // MTP verification mutates Qwen3.5 linear-attention state speculatively.
             // Keep at least one snapshot per active sequence so rejected drafts can
             // be rolled back before replaying only the accepted prefix.
@@ -770,6 +772,10 @@ impl ModelRunner {
             return Ok(None);
         }
 
+        // The DFlash checkpoint is BF16; resolve it with the same graceful degradation the
+        // primary model uses (BF16 -> F16 on pre-SM80, where BF16 compute is unavailable).
+        let dflash_dtype = crate::utils::get_dtype(None);
+
         crate::log_info!("Loading DFlash draft model...");
 
         let loader = crate::utils::downloader::Downloader::new(
@@ -788,12 +794,12 @@ impl ModelRunner {
                 .map_err(|e| candle_core::Error::Msg(format!("Failed to parse DFlash config: {}", e)))?;
 
         let draft_vb =
-            crate::models::layers::VarBuilderX::new(&draft_paths, is_gguf, DType::BF16, device)?;
+            crate::models::layers::VarBuilderX::new(&draft_paths, is_gguf, dflash_dtype, device)?;
 
         let drafter = crate::core::dflash_drafter::DFlashDrafter::new(
             &draft_config,
             &draft_vb,
-            DType::BF16,
+            dflash_dtype,
             device,
             econfig.num_speculative_tokens,
             econfig.yarn_scaling_factor,
@@ -1830,6 +1836,8 @@ impl ModelRunner {
         let mut restored = self.restored_prefix_sequences.write();
         let _ = restored.remove(&id);
         self.guided_decoding.finish(id);
+        // Clean up the per-seq spec stats (the server displays them via the cross-process fetch).
+        let _ = crate::core::speculative::spec_seq_report(id);
         match &self.model {
             Model::Qwen3_5(model) => model.release_sequence_state(id),
             Model::Qwen3_5MoE(model) => model.release_sequence_state(id),

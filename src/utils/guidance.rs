@@ -221,6 +221,26 @@ impl GuidanceState {
         }
         self.matcher.compute_ff_tokens()
     }
+
+    /// Non-mutating: how many of `tokens` are grammar-legal from the current state.
+    /// Used by speculative-decoding acceptance to cap the draft prefix without advancing.
+    pub fn validate_tokens(&mut self, tokens: &[u32]) -> Result<usize> {
+        if !self.reasoning_ended {
+            return Ok(tokens.len());
+        }
+        self.matcher.validate_tokens(tokens)
+    }
+
+    /// Deep copy of this FSM state (independent matcher), for projecting drafts without mutating
+    /// the live state.
+    pub fn deep_clone(&self) -> Self {
+        Self {
+            matcher: self.matcher.deep_clone(),
+            llm_tokens: self.llm_tokens.clone(),
+            reasoning_end_ids: self.reasoning_end_ids.clone(),
+            reasoning_ended: self.reasoning_ended,
+        }
+    }
 }
 
 #[cfg(test)]

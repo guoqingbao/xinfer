@@ -14,7 +14,7 @@
 | **⚡** | Fast | Native Flash Attention, FlashInfer, CUDA Graphs, continuous batching, prefix caching, PD disaggregation. Up to **197 tok/s** decode for `30B+` models on consumer GPUs |
 | **🪶** | Tiny footprint | Core scheduling + attention logic in **< 5 000 lines** of Rust |
 | **🌍** | Cross-platform | CUDA (Linux/Windows), Metal (macOS). Same binary, same API |
-| **🏭** | Production-ready | OpenAI/Anthropic-compatible APIs, built-in ChatGPT-style Web UI, MCP tool calling, structured outputs, embedding + tokenizer endpoints, multi-token prediction (MTP) |
+| **🏭** | Production-ready | OpenAI/Anthropic-compatible APIs, built-in ChatGPT-style Web UI, MCP tool calling, structured outputs, embedding + tokenizer endpoints, speculative decoding (MTP + DFlash) |
 | **🗜️** | Aggressive KV compression | TurboQuant (`2–4 bit` KV cache) extends context up to **4.3×** with minimal quality loss. Run `30B+` MoE models with **millions of context** on single 24/32 GB GPUs |
 | **🔥** | V100 + NVFP4 | First-ever NVFP4 + low-bit KV cache on V100 — no hardware FP4 needed, coherent output on legacy GPUs |
 | **🐍** | Lightweight Python bindings | Optional PyO3 wheel when you need a Python entry point |
@@ -61,12 +61,17 @@ xinfer --m /home/Qwen3.6-35B-A3B --d 0,1 --ui-server
 python3 -m xinfer.server --m Qwen/Qwen3.6-27B-FP8 --kvcache-dtype turbo4 --ui-server
 ```
 
-**MTP**
-```bash
-xinfer --w /home/Qwen3.6-35B-A3B --d 0,1 --ui-server --mtp 2
-```
+**MTP** (grammar-aware)
+ ```bash
+ xinfer --w /home/Qwen3.6-35B-A3B --d 0,1 --ui-server --mtp 2
+ ```
 
-> **Tip:** Open `http://IP:8001` for the built-in chat UI, or use `http://IP:8000/v1/` as your API `Base URL`.
+ **DFlash** (separate draft model; grammar-aware)
+ ```bash
+ xinfer --m Qwen/Qwen3.8-27B --draft-model-id z-lab/Qwen3.8-27B-DFlash2 --num-speculative-tokens 3
+ ```
+
+ > **Tip:** Open `http://IP:8001` for the built-in chat UI, or use `http://IP:8000/v1/` as your API `Base URL`.
 
 ---
 
@@ -592,6 +597,7 @@ SM90_LOWER_PRECISION_GDN_PREFILL=1 xinfer --m Qwen/Qwen3.5-35B-A3B-FP8 --ui-serv
 * [x] **Support Turboquant (4-bit, 3-bit) KvCache**
 * [ ] TentorRT-LLM
 * [x] **Multi-token Prediciton (MTP)**
+ * [x] **DFlash speculative decoding (separate draft model, grammar-aware)**
 
 ---
 

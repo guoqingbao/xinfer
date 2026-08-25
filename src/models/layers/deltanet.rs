@@ -728,7 +728,7 @@ impl GatedDeltaNet {
             .ok();
         let scale = 1.0f64 / (head_k_dim as f64).sqrt();
         let d_conv = key_dim * 2 + value_dim;
-        let (conv_mtp_state, recurrent_mtp_state) = if config.mtp_enabled {
+        let (conv_mtp_state, recurrent_mtp_state) = if config.mtp_enabled || config.dflash_enabled {
             let max_verify_tokens = 16;
             (
                 Some(Tensor::zeros(

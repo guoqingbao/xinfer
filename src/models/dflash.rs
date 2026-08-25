@@ -7,6 +7,8 @@ use crate::models::layers::distributed::ReplicatedLinear;
 use crate::models::layers::others::{rms_norm, NormX};
 use crate::models::layers::VarBuilderX;
 use candle_core::{DType, Device, Result, Tensor, D};
+#[cfg(feature = "cuda")]
+use attention_rs::sort::ArgSortOp;
 
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct DFlashConfig {
@@ -14,6 +16,14 @@ pub struct DFlashConfig {
     pub target_layer_ids: Option<Vec<usize>>,
     #[serde(default)]
     pub block_size: Option<usize>,
+    #[serde(default)]
+    pub conv_group_size: Option<usize>,
+    #[serde(default)]
+    pub conv_kernel_size: Option<usize>,
+    #[serde(default)]
+    pub selector_rank: Option<usize>,
+    #[serde(default)]
+    pub selector_top_k: Option<usize>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -185,6 +195,191 @@ impl DFlashMLP {
     }
 }
 
+/// Grouped dynamic causal convolution (DFlash2 `attention_conv` / `mlp_conv`).
+/// A `taps`-tap causal depthwise-grouped conv whose per-group kernels are a static base plus an
+/// input-dependent projection. `prepare` convolves a sublayer's input and returns the kernel for
+/// `finish` to convolve the sublayer's output; both come from one projection of the input.
+pub struct GroupedDynamicCausalConv {
+    base_kernel: Tensor, // [2, taps, hidden]
+    kernel_projection: ReplicatedLinear, // hidden -> 2*taps*num_groups
+    num_groups: usize,
+    group_size: usize,
+    taps: usize,
+}
+
+impl GroupedDynamicCausalConv {
+    pub fn new(
+        vb: &VarBuilderX,
+        hidden_size: usize,
+        taps: usize,
+        group_size: usize,
+        dtype: DType,
+    ) -> Result<Self> {
+        let num_groups = hidden_size / group_size;
+        let base_kernel = vb
+            .get((2, taps, hidden_size), "base_kernel")?
+            .to_dtype(dtype)?;
+        let kernel_projection = ReplicatedLinear::load_no_bias(
+            hidden_size,
+            2 * taps * num_groups,
+            vb.pp("kernel_projection"),
+            &None,
+            &None,
+            dtype,
+        )?;
+        Ok(Self {
+            base_kernel,
+            kernel_projection,
+            num_groups,
+            group_size,
+            taps,
+        })
+    }
+
+    fn convolve(&self, hidden: &Tensor, delta: &Tensor, base_row: &Tensor) -> Result<Tensor> {
+        let seq = hidden.dim(0)?;
+        let blocks = hidden.reshape((seq, self.num_groups, self.group_size))?;
+        let base_4d = base_row.reshape((1, self.taps, self.num_groups, self.group_size))?;
+        let delta_4d = delta.unsqueeze(3)?; // [seq, taps, num_groups, 1]
+        let coefficients = base_4d.broadcast_add(&delta_4d)?; // [seq, taps, num_groups, group_size]
+        let mut out = (coefficients
+            .narrow(1, 0, 1)?
+            .reshape((seq, self.num_groups, self.group_size))?
+            * &blocks)?;
+        for tap in 1..self.taps {
+            let prev = blocks.narrow(0, 0, seq - tap)?; // [seq-tap, ng, gs]
+            let pad = Tensor::zeros(
+                (tap, self.num_groups, self.group_size),
+                hidden.dtype(),
+                hidden.device(),
+            )?;
+            let shifted = Tensor::cat(&[&pad, &prev], 0)?; // [seq, ng, gs]
+            let coeff_tap = coefficients
+                .narrow(1, tap, 1)?
+                .reshape((seq, self.num_groups, self.group_size))?;
+            out = (out + (&coeff_tap * &shifted)?)?;
+        }
+        out.reshape((seq, self.num_groups * self.group_size))
+    }
+
+    /// Convolve the sublayer input; returns `(convolved_input, finish_delta)`.
+    pub fn prepare(&self, hidden: &Tensor) -> Result<(Tensor, Tensor)> {
+        let seq = hidden.dim(0)?;
+        let delta = self.kernel_projection.forward(hidden)?; // [seq, 2*taps*ng]
+        let delta = delta.reshape((seq, 2, self.taps, self.num_groups))?;
+        let prep_delta = delta.narrow(1, 0, 1)?.reshape((seq, self.taps, self.num_groups))?;
+        let fin_delta = delta.narrow(1, 1, 1)?.reshape((seq, self.taps, self.num_groups))?;
+        let convolved = self.convolve(hidden, &prep_delta, &self.base_kernel.narrow(0, 0, 1)?)?;
+        Ok((convolved, fin_delta))
+    }
+
+    /// Convolve the sublayer output using the delta returned by `prepare`.
+    pub fn finish(&self, hidden: &Tensor, fin_delta: &Tensor) -> Result<Tensor> {
+        self.convolve(hidden, fin_delta, &self.base_kernel.narrow(0, 1, 1)?)
+    }
+}
+
+/// DFlash2 candidate selector: scores KxK transitions between adjacent proposal slots via a
+/// low-rank bilinear form over predecessor/successor codebooks, then walks the greedy path.
+pub struct CandidateSelector {
+    hidden_projection: ReplicatedLinear, // hidden -> rank
+    predecessor_codebook: Tensor, // [vocab, rank]
+    successor_codebook: Tensor, // [vocab, rank]
+    top_k: usize,
+}
+
+impl CandidateSelector {
+    pub fn new(
+        vb: &VarBuilderX,
+        hidden_size: usize,
+        vocab_size: usize,
+        rank: usize,
+        top_k: usize,
+        dtype: DType,
+    ) -> Result<Self> {
+        let hidden_projection = ReplicatedLinear::load_no_bias(
+            hidden_size,
+            rank,
+            vb.pp("hidden_projection"),
+            &None,
+            &None,
+            dtype,
+        )?;
+        let predecessor_codebook = vb
+            .get((vocab_size, rank), "predecessor_codebook")?
+            .to_dtype(dtype)?;
+        let successor_codebook = vb
+            .get((vocab_size, rank), "successor_codebook")?
+            .to_dtype(dtype)?;
+        Ok(Self {
+            hidden_projection,
+            predecessor_codebook,
+            successor_codebook,
+            top_k,
+        })
+    }
+
+    /// Greedy candidate walk. `logits`/`hidden` are `[n, *]` over the draft positions; `anchor`
+    /// is the verified token preceding them. Returns one selected token per position.
+    pub fn select(&self, logits: &Tensor, hidden: &Tensor, anchor: u32) -> Result<Vec<u32>> {
+        let seq = logits.dim(0)?;
+        let k = self.top_k;
+        let device = logits.device();
+
+        // Top-K candidate ids + their logit values per position.
+        #[cfg(feature = "cuda")]
+        let (sorted, asort) = logits.sort(false)?;
+        #[cfg(not(feature = "cuda"))]
+        let (sorted, asort) = logits.to_device(&Device::Cpu)?.sort_last_dim(false)?;
+        let candidate_ids = asort.narrow(D::Minus1, 0, k)?.to_dtype(DType::I64)?; // [seq, k]
+        let unary = sorted.narrow(D::Minus1, 0, k)?; // [seq, k]
+
+        // Project hidden to the selector rank.
+        let hidden_proj = self.hidden_projection.forward(hidden)?; // [seq, rank]
+
+        // Predecessor ids: slot 0 -> anchor (k copies); slot l -> candidate_ids[l-1].
+        let anchor_row = Tensor::full(anchor as i64, (1, k), device)?;
+        let pred_tail = candidate_ids.narrow(0, 0, seq.saturating_sub(1))?; // [seq-1, k]
+        let predecessor_ids = Tensor::cat(&[&anchor_row, &pred_tail], 0)?; // [seq, k]
+
+        let predecessors = self.predecessor_codebook.index_select(&predecessor_ids, 0)?; // [seq, k, rank]
+        let keys = self.successor_codebook.index_select(&candidate_ids, 0)?; // [seq, k, rank]
+
+        // score[seq, p, c] = unary[seq, c] + sum_r (predecessors[seq, p, r] * hidden_proj[seq, r]) * keys[seq, c, r]
+        let gated = (&predecessors * &hidden_proj.unsqueeze(1)?)?; // [seq, k, rank]
+        let bilinear = gated.matmul(&keys.transpose(1, 2)?)?; // [seq, k_pred, k_cand]
+        let unary = unary.to_dtype(bilinear.dtype())?;
+        let scores = (&bilinear + &unary.unsqueeze(1)?)?; // [seq, k_pred, k_cand]
+
+        // Greedy walk on the (tiny) CPU-side score lattice.
+        let scores_cpu: Vec<Vec<Vec<f32>>> = scores
+            .to_dtype(DType::F32)?
+            .to_device(&Device::Cpu)?
+            .to_vec3()?;
+        let cand_cpu: Vec<Vec<u32>> = candidate_ids
+            .to_dtype(DType::U32)?
+            .to_device(&Device::Cpu)?
+            .to_vec2()?;
+        let mut path = Vec::with_capacity(seq);
+        let mut prev_cand = 0usize;
+        for l in 0..seq {
+            let p = if l == 0 { 0 } else { prev_cand };
+            let mut best_c = 0usize;
+            let mut best_v = f32::NEG_INFINITY;
+            for c in 0..k {
+                let v = scores_cpu[l][p][c];
+                if v > best_v {
+                    best_v = v;
+                    best_c = c;
+                }
+            }
+            path.push(cand_cpu[l][best_c]);
+            prev_cand = best_c;
+        }
+        Ok(path)
+    }
+}
+
 pub struct DFlashAttention {
     q_proj: ReplicatedLinear,
     k_proj: ReplicatedLinear,
@@ -330,6 +525,8 @@ pub struct DFlashDecoderLayer {
     mlp: DFlashMLP,
     input_layernorm: NormX,
     post_attention_layernorm: NormX,
+    attention_conv: Option<GroupedDynamicCausalConv>,
+    mlp_conv: Option<GroupedDynamicCausalConv>,
 }
 
 impl DFlashDecoderLayer {
@@ -356,11 +553,39 @@ impl DFlashDecoderLayer {
             false,
         )?;
 
+        // DFlash2 grouped dynamic convs (absent in v1 checkpoints).
+        let conv_params = config
+            .dflash_config
+            .as_ref()
+            .and_then(|dc| Some((dc.conv_kernel_size?, dc.conv_group_size?)));
+        let (attention_conv, mlp_conv) = match conv_params {
+            Some((taps, group_size)) => {
+                let a = GroupedDynamicCausalConv::new(
+                    &vb.pp("attention_conv"),
+                    config.hidden_size,
+                    taps,
+                    group_size,
+                    dtype,
+                )?;
+                let m = GroupedDynamicCausalConv::new(
+                    &vb.pp("mlp_conv"),
+                    config.hidden_size,
+                    taps,
+                    group_size,
+                    dtype,
+                )?;
+                (Some(a), Some(m))
+            }
+            None => (None, None),
+        };
+
         Ok(Self {
             self_attn,
             mlp,
             input_layernorm,
             post_attention_layernorm,
+            attention_conv,
+            mlp_conv,
         })
     }
 
@@ -372,15 +597,36 @@ impl DFlashDecoderLayer {
         sin: &Tensor,
     ) -> Result<Tensor> {
         let residual = hidden_states;
-        let hidden_states = self.input_layernorm.forward(hidden_states)?;
-        let attn_output = self
-            .self_attn
-            .forward(&hidden_states, target_hidden, cos, sin)?;
-        let hidden_states = (attn_output + residual)?;
+        let normed = self.input_layernorm.forward(hidden_states)?;
+        let (attn_in, attn_fin) = match &self.attention_conv {
+            Some(conv) => {
+                let (c, d) = conv.prepare(&normed)?;
+                (c, Some(d))
+            }
+            None => (normed.clone(), None),
+        };
+        let attn_out = self.self_attn.forward(&attn_in, target_hidden, cos, sin)?;
+        let attn_out = match (&self.attention_conv, attn_fin) {
+            (Some(conv), Some(delta)) => conv.finish(&attn_out, &delta)?,
+            _ => attn_out,
+        };
+        let hidden_states = (attn_out + residual)?;
+
         let residual = &hidden_states;
-        let hidden_states = self.post_attention_layernorm.forward(&hidden_states)?;
-        let mlp_output = self.mlp.forward(&hidden_states)?;
-        residual + mlp_output
+        let normed2 = self.post_attention_layernorm.forward(&hidden_states)?;
+        let (mlp_in, mlp_fin) = match &self.mlp_conv {
+            Some(conv) => {
+                let (c, d) = conv.prepare(&normed2)?;
+                (c, Some(d))
+            }
+            None => (normed2.clone(), None),
+        };
+        let mlp_out = self.mlp.forward(&mlp_in)?;
+        let mlp_out = match (&self.mlp_conv, mlp_fin) {
+            (Some(conv), Some(delta)) => conv.finish(&mlp_out, &delta)?,
+            _ => mlp_out,
+        };
+        residual + mlp_out
     }
 }
 
@@ -460,6 +706,7 @@ pub struct DFlashDraftModel {
     layers: Vec<DFlashDecoderLayer>,
     norm: NormX,
     rotary_emb: DFlashRotaryEmbedding,
+    candidate_selector: Option<CandidateSelector>,
     pub config: DFlashModelConfig,
     pub target_layer_ids: Vec<usize>,
     pub block_size: usize,
@@ -514,12 +761,28 @@ impl DFlashDraftModel {
 
         let rotary_emb = DFlashRotaryEmbedding::new(config, dtype, device, yarn_factor)?;
 
+        let candidate_selector = match (
+            config.dflash_config.as_ref().and_then(|dc| dc.selector_rank),
+            config.dflash_config.as_ref().and_then(|dc| dc.selector_top_k),
+        ) {
+            (Some(rank), Some(top_k)) => Some(CandidateSelector::new(
+                &vb.pp("candidate_selector"),
+                config.hidden_size,
+                config.vocab_size,
+                rank,
+                top_k,
+                dtype,
+            )?),
+            _ => None,
+        };
+
         Ok(Self {
             fc,
             hidden_norm,
             layers,
             norm,
             rotary_emb,
+            candidate_selector,
             target_layer_ids,
             block_size: config.effective_block_size().unwrap_or(0),
             mask_token_id: config.mask_token_id(),
@@ -537,7 +800,7 @@ impl DFlashDraftModel {
         let selected: Vec<Tensor> = (0..self.target_layer_ids.len())
             .map(|i| all_hidden_states[i + 1].clone())
             .collect();
-        let concatenated = Tensor::cat(&selected, D::Minus1)?;
+        let concatenated = Tensor::cat(&selected, D::Minus1)?.to_dtype(self.dtype)?;
         let projected = self.fc.forward(&concatenated)?;
         self.hidden_norm.forward(&projected)
     }
@@ -561,6 +824,35 @@ impl DFlashDraftModel {
         }
 
         self.norm.forward(&hidden_states)
+    }
+
+    /// The target lm_head logits over the `n` trailing (MASK) positions, plus those hiddens.
+    pub fn draft_logits(
+        &self,
+        draft_hidden: &Tensor,
+        n: usize,
+        lm_head_fn: &dyn Fn(&Tensor) -> Result<Tensor>,
+    ) -> Result<(Tensor, Tensor)> {
+        let total_out = draft_hidden.dim(0)?;
+        let h = draft_hidden.narrow(0, total_out - n, n)?;
+        let logits = lm_head_fn(&h)?;
+        Ok((logits, h))
+    }
+
+    /// Select draft tokens from pre-computed logits: DFlash2 candidate-selector walk when
+    /// available, else plain argmax.
+    pub fn select_from_logits(
+        &self,
+        logits: &Tensor,
+        hidden_n: &Tensor,
+        anchor: u32,
+    ) -> Result<Vec<u32>> {
+        if let Some(selector) = &self.candidate_selector {
+            if let Ok(tokens) = selector.select(logits, hidden_n, anchor) {
+                return Ok(tokens);
+            }
+        }
+        logits.to_dtype(DType::F32)?.argmax(D::Minus1)?.to_vec1::<u32>()
     }
 
     pub fn device(&self) -> &Device {
@@ -624,6 +916,10 @@ mod tests {
             mask_token_id: Some(7),
             target_layer_ids: Some(vec![3, 7, 11]),
             block_size: None,
+            conv_group_size: None,
+            conv_kernel_size: None,
+            selector_rank: None,
+            selector_top_k: None,
         });
         assert_eq!(c.target_layer_ids(), vec![3, 7, 11]);
         assert_eq!(c.mask_token_id(), Some(7));

@@ -683,6 +683,7 @@ mod tests {
             mtp_num_hidden_layers: None,
             mtp_use_dedicated_embeddings: None,
             mtp_enabled: false,
+            dflash_enabled: false,
             expert_dtype: None,
         }
     }

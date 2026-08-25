@@ -103,6 +103,7 @@ pub struct LLMEngine {
     decode_length: HashMap<usize, usize>,
     seq_prefilled_reasoning_end: HashMap<usize, String>,
     seq_prompt_replays: HashMap<usize, Vec<u32>>,
+    seq_spec_stats: HashMap<usize, crate::runner::SpecSeqStatsData>,
     last_check_throughput_time: usize,
     active_requests: HashSet<usize>,
     cancelled_sequences: Vec<usize>,
@@ -580,6 +581,7 @@ impl LLMEngine {
             decode_length: HashMap::new(),
             seq_prefilled_reasoning_end: HashMap::new(),
             seq_prompt_replays: HashMap::new(),
+            seq_spec_stats: HashMap::new(),
             last_check_throughput_time: 0,
             active_requests: HashSet::new(),
             cancelled_sequences: Vec::new(),
@@ -974,7 +976,41 @@ impl LLMEngine {
         self.seq_prompt_replays.remove(&seq_id)
     }
 
+    /// Read a sequence's stored speculative-decode stats (for the end-of-sequence report).
+    pub fn get_seq_spec_stats(&self, seq_id: usize) -> Option<crate::runner::SpecSeqStatsData> {
+        self.seq_spec_stats.get(&seq_id).cloned()
+    }
+
+    /// Fetch a sequence's speculative-decode stats from rank 0. Call before
+    /// `notify_runner_finished`, which drops the runner-side per-seq stats.
+    fn fetch_spec_seq_stats(&self, id: usize) -> crate::runner::SpecSeqStatsData {
+        use crate::runner::{MessageType, SpecSeqStatsData};
+        match &mut *self.runners.write() {
+            RunnerType::Process(ref mut runner_streams) => {
+                if runner_streams.is_empty() {
+                    return SpecSeqStatsData::default();
+                }
+                let stream = &mut runner_streams[0];
+                let _ = send_local(
+                    &mut vec![stream.try_clone().expect("clone failed")],
+                    &MessageType::GetSpecSeqStats(id),
+                    false,
+                );
+                match receive_local(stream, false) {
+                    Ok(MessageType::SpecSeqStatsResponse(_, data)) => data,
+                    _ => SpecSeqStatsData::default(),
+                }
+            }
+            _ => SpecSeqStatsData::default(),
+        }
+    }
+
     pub fn notify_runner_finished(&mut self, id: usize) -> Result<()> {
+        // Fetch the spec stats before FinishDecode (the runner drops them on finish).
+        let spec_stats = self.fetch_spec_seq_stats(id);
+        if spec_stats.steps > 0 {
+            self.seq_spec_stats.insert(id, spec_stats);
+        }
         match &mut *self.runners.write() {
             RunnerType::Thread(model_runner) => Ok(model_runner.finished(id)),
             RunnerType::Process(ref mut runner_streams) => {
@@ -1047,12 +1083,20 @@ impl LLMEngine {
             }
         }
 
-        // Pre-allocate blocks for MTP speculative positions before cloning sequences
+        // Pre-allocate blocks for speculative positions (MTP / DFlash) before cloning sequences
         if !is_prefill {
             if let Some(mtp_tokens) = self.econfig.mtp_num_speculative_tokens {
                 if mtp_tokens > 0 {
                     self.scheduler
                         .pre_allocate_mtp_blocks(&scheduled_ids, mtp_tokens + 1);
+                }
+            }
+            // DFlash verify block width is (num_speculative_tokens + 1); reserve it so
+            // run_dflash_decode doesn't fall back to anchor-only when the CLI count is set.
+            if let Some(dflash_tokens) = self.econfig.num_speculative_tokens {
+                if dflash_tokens > 0 {
+                    self.scheduler
+                        .pre_allocate_mtp_blocks(&scheduled_ids, dflash_tokens + 1);
                 }
             }
         }

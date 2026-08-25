@@ -171,6 +171,20 @@ pub struct InitAck {
     pub ok: bool,
 }
 
+/// Per-sequence speculative-decode stats, sent from a runner to the main process for the
+/// end-of-sequence performance report.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct SpecSeqStatsData {
+    pub mechanism: String,
+    pub steps: usize,
+    pub proposed: usize,
+    pub accepted: usize,
+    pub rejected: usize,
+    pub grammar_bound: usize,
+    pub target_bound: usize,
+    pub ff_continuations: usize,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum MessageType {
     /// Sent by main process to initialize the runner.
@@ -210,6 +224,12 @@ pub enum MessageType {
 
     /// Sent by main process to notify the finished decoding sequences.
     FinishDecode(usize),
+
+    /// Sent by main process to fetch a sequence's speculative-decode stats (rank 0).
+    GetSpecSeqStats(usize),
+
+    /// Sent by runner in response to `GetSpecSeqStats`.
+    SpecSeqStatsResponse(usize, SpecSeqStatsData),
 
     // Hybrid mamba-prefix state management.
     CaptureMambaPrefixState((usize, u64, bool)),
@@ -795,6 +815,14 @@ pub fn run_runner_process(args: Vec<String>) -> anyhow::Result<()> {
             Ok(MessageType::FinishDecode(id)) => {
                 runner.finished(id);
             }
+            Ok(MessageType::GetSpecSeqStats(id)) => {
+                let data = crate::core::speculative::spec_seq_stats_data(id);
+                send_local(
+                    &mut vec![stream.try_clone()?],
+                    &MessageType::SpecSeqStatsResponse(id, data),
+                    false,
+                )?;
+            }
             Ok(MessageType::CaptureMambaPrefixState((seq_id, hash, preserve))) => {
                 let ret = runner.capture_mamba_prefix_state(seq_id, hash, preserve);
                 if ret.is_err() {
@@ -915,6 +943,26 @@ pub fn run_runner_process(args: Vec<String>) -> anyhow::Result<()> {
                         send_local(
                             &mut vec![stream.try_clone()?],
                             &MessageType::RunResponseMTP(vec![]),
+                            false,
+                        )?;
+                    }
+                }
+            }
+            Ok(MessageType::RunDecodeDFlash(sequences)) => {
+                let outputs = runner.run_dflash_decode(Seqs::DecodeVec(&sequences));
+                match outputs {
+                    Ok(multi_tokens) => {
+                        send_local(
+                            &mut vec![stream.try_clone()?],
+                            &MessageType::RunResponseDFlash(multi_tokens),
+                            false,
+                        )?;
+                    }
+                    Err(e) => {
+                        crate::log_error!("Runner DFlash decode error: {:?}", e);
+                        send_local(
+                            &mut vec![stream.try_clone()?],
+                            &MessageType::RunResponseDFlash(vec![]),
                             false,
                         )?;
                     }

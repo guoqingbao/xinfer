@@ -378,6 +378,7 @@ pub fn run_worker_daemon(
             MessageType::RunPrefill(_)
             | MessageType::RunDecode(_)
             | MessageType::RunDecodeMTP(_)
+            | MessageType::RunDecodeDFlash(_)
             | MessageType::RunEmbed(_)
             | MessageType::KVCacheSwap(_)
             | MessageType::CaptureMambaPrefixState(_)

@@ -92,3 +92,31 @@ pub fn soft_mask_disabled() -> bool {
             .unwrap_or(false)
     })
 }
+
+/// Debug: skip FF-token speculation (treat the grammar's forced run as empty) so DFlash/MTP can be
+/// compared with and without the ff prefix on the same rev.
+pub const SPEC_NO_FF_ENV: &str = "XINFER_SPEC_NO_FF";
+
+static SPEC_NO_FF: OnceLock<bool> = OnceLock::new();
+
+pub fn spec_no_ff() -> bool {
+    *SPEC_NO_FF.get_or_init(|| {
+        env::var(SPEC_NO_FF_ENV)
+            .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false)
+    })
+}
+
+/// Debug: use the granular (per-position FSM-walk) draft mask instead of the batched single-VOB
+/// mask (3a). For precise gating when the mask changes across the draft run.
+pub const SPEC_GRANULAR_MASK_ENV: &str = "XINFER_SPEC_GRANULAR_MASK";
+
+static SPEC_GRANULAR_MASK: OnceLock<bool> = OnceLock::new();
+
+pub fn spec_granular_mask() -> bool {
+    *SPEC_GRANULAR_MASK.get_or_init(|| {
+        env::var(SPEC_GRANULAR_MASK_ENV)
+            .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false)
+    })
+}

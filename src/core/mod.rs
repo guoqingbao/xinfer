@@ -2,11 +2,13 @@ pub mod block_manager;
 pub mod dflash;
 pub mod dflash_drafter;
 pub mod engine;
+pub mod fftokens;
 pub mod mtp;
 pub mod prefix_cache;
 pub mod runner;
 pub mod scheduler;
 pub mod sequence;
+pub mod speculative;
 #[cfg(feature = "python")]
 use pyo3::pyclass;
 

@@ -498,43 +498,52 @@ impl Qwen3_5MtpHead {
     pub fn draft_tokens_gpu(
         &self,
         initial_hidden: &Tensor,
-        anchor_token_tensor: &Tensor,
+        known_tokens: &[u32],
         num_tokens: usize,
         embed_weight: &Tensor,
         lm_head_fn: impl Fn(&Tensor) -> Result<Tensor>,
         positions_base: usize,
     ) -> Result<(Vec<u32>, Tensor)> {
-        let mut gpu_draft_tokens: Vec<Tensor> = Vec::with_capacity(num_tokens);
         let mut current_hidden = if initial_hidden.dims().len() == 1 {
             initial_hidden.unsqueeze(0)?
         } else {
             initial_hidden.clone()
         };
-        let mut current_token_t = anchor_token_tensor.reshape((1,))?;
 
-        for step in 0..num_tokens {
-            let token_embed = embed_weight.index_select(&current_token_t, 0)?;
-
-            let pos = (positions_base + step) as i64;
+        // Process the known prefix (anchor + ff run): embed + forward, no prediction.
+        for (i, &tok) in known_tokens.iter().enumerate() {
+            let token_t = Tensor::from_vec(vec![tok as i64], (1,), &self.device)?;
+            let token_embed = embed_weight.index_select(&token_t, 0)?;
+            let pos = (positions_base + i) as i64;
             let positions = Tensor::from_vec(vec![pos], (1,), &self.device)?;
-
             let hidden_out = self.forward_step(&current_hidden, &token_embed, &positions)?;
+            current_hidden = if hidden_out.dims().len() == 2 {
+                hidden_out.get(hidden_out.dim(0)? - 1)?.unsqueeze(0)?
+            } else {
+                hidden_out
+            };
+        }
 
-            let logits = lm_head_fn(&hidden_out.to_dtype(self.dtype)?)?;
+        // Draft num_tokens: predict from the current state, then process the drafted token.
+        let mut gpu_draft_tokens: Vec<Tensor> = Vec::with_capacity(num_tokens);
+        for step in 0..num_tokens {
+            let logits = lm_head_fn(&current_hidden.to_dtype(self.dtype)?)?;
             let logits_last = if logits.dims().len() == 2 {
                 logits.get(logits.dim(0)? - 1)?
             } else {
                 logits
             };
             let next_token_t = logits_last.to_dtype(DType::F32)?.argmax(D::Minus1)?;
-
             gpu_draft_tokens.push(next_token_t.clone());
+            let token_embed = embed_weight.index_select(&next_token_t.reshape((1,))?, 0)?;
+            let pos = (positions_base + known_tokens.len() + step) as i64;
+            let positions = Tensor::from_vec(vec![pos], (1,), &self.device)?;
+            let hidden_out = self.forward_step(&current_hidden, &token_embed, &positions)?;
             current_hidden = if hidden_out.dims().len() == 2 {
                 hidden_out.get(hidden_out.dim(0)? - 1)?.unsqueeze(0)?
             } else {
                 hidden_out
             };
-            current_token_t = next_token_t.reshape((1,))?;
         }
 
         let draft_tokens: Vec<u32> = if gpu_draft_tokens.is_empty() {
@@ -546,6 +555,58 @@ impl Qwen3_5MtpHead {
 
         let final_hidden = current_hidden.squeeze(0)?;
         Ok((draft_tokens, final_hidden))
+    }
+
+    /// Like `draft_tokens_gpu` but returns the stacked per-position draft logits `[n, vocab]`
+    /// (from the argmax chain) instead of the argmax tokens, so the caller can apply a grammar
+    /// mask (projection masking) to bias the picks toward FSM-legal tokens.
+    pub fn draft_logits_gpu(
+        &self,
+        initial_hidden: &Tensor,
+        known_tokens: &[u32],
+        num_tokens: usize,
+        embed_weight: &Tensor,
+        lm_head_fn: impl Fn(&Tensor) -> Result<Tensor>,
+        positions_base: usize,
+    ) -> Result<Tensor> {
+        let mut current_hidden = if initial_hidden.dims().len() == 1 {
+            initial_hidden.unsqueeze(0)?
+        } else {
+            initial_hidden.clone()
+        };
+        for (i, &tok) in known_tokens.iter().enumerate() {
+            let token_t = Tensor::from_vec(vec![tok as i64], (1,), &self.device)?;
+            let token_embed = embed_weight.index_select(&token_t, 0)?;
+            let pos = (positions_base + i) as i64;
+            let positions = Tensor::from_vec(vec![pos], (1,), &self.device)?;
+            let hidden_out = self.forward_step(&current_hidden, &token_embed, &positions)?;
+            current_hidden = if hidden_out.dims().len() == 2 {
+                hidden_out.get(hidden_out.dim(0)? - 1)?.unsqueeze(0)?
+            } else {
+                hidden_out
+            };
+        }
+        let mut logits_list: Vec<Tensor> = Vec::with_capacity(num_tokens);
+        for step in 0..num_tokens {
+            let logits = lm_head_fn(&current_hidden.to_dtype(self.dtype)?)?;
+            let logits_last = if logits.dims().len() == 2 {
+                logits.get(logits.dim(0)? - 1)?
+            } else {
+                logits
+            };
+            logits_list.push(logits_last.clone());
+            let pick = logits_last.to_dtype(DType::F32)?.argmax(D::Minus1)?;
+            let token_embed = embed_weight.index_select(&pick.reshape((1,))?, 0)?;
+            let pos = (positions_base + known_tokens.len() + step) as i64;
+            let positions = Tensor::from_vec(vec![pos], (1,), &self.device)?;
+            let hidden_out = self.forward_step(&current_hidden, &token_embed, &positions)?;
+            current_hidden = if hidden_out.dims().len() == 2 {
+                hidden_out.get(hidden_out.dim(0)? - 1)?.unsqueeze(0)?
+            } else {
+                hidden_out
+            };
+        }
+        Tensor::stack(&logits_list, 0)
     }
 
     /// Legacy draft method with CPU round-trips (kept for compatibility).

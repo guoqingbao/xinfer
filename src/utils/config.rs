@@ -319,6 +319,11 @@ pub struct Config {
     pub mtp_use_dedicated_embeddings: Option<bool>,
     #[serde(skip)]
     pub mtp_enabled: bool,
+    /// Set at runtime when a DFlash draft model is configured. DFlash verify reuses the MTP
+    /// `is_mtp_verify` path, so hybrid (GDN) layers must allocate their conv/recurrent snapshot
+    /// buffers for it too.
+    #[serde(skip)]
+    pub dflash_enabled: bool,
     #[serde(default)]
     pub expert_dtype: Option<String>,
 }
@@ -345,6 +350,7 @@ impl fmt::Debug for Config {
             .field("is_multi_model", &self.is_multi_model)
             .field("is_f16_mode", &self.is_f16_mode)
             .field("mtp_enabled", &self.mtp_enabled)
+            .field("dflash_enabled", &self.dflash_enabled)
             .finish()
     }
 }
