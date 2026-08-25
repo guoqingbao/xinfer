@@ -586,6 +586,13 @@ impl LinearX {
         }
     }
 
+    pub fn as_nvfp4(&self) -> Option<&LnNvfp4> {
+        match self {
+            Self::LnNvfp4(ln) => Some(ln),
+            _ => None,
+        }
+    }
+
     pub fn dense_weight(&self) -> Result<&Tensor> {
         match self {
             Self::Linear(ln) => Ok(ln.weight()),
