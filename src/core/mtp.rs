@@ -884,7 +884,8 @@ impl ModelRunner {
                     self.mtp_decode_step1(Seqs::SeqRefs(&sequences[index..index + 1]), seq_info)?
                 }
                 Seqs::DecodeVec(sequences) => {
-                    self.mtp_decode_step1(Seqs::DecodeVec(&sequences[index..index + 1]), seq_info)?
+                    let single_sequence = vec![sequences[index].clone()];
+                    self.mtp_decode_step1(Seqs::DecodeVec(&single_sequence), seq_info)?
                 }
             };
             let anchor_tensor = Tensor::from_vec(vec![anchor], (1,), self.device())?;
