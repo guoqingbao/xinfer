@@ -47,6 +47,8 @@ pub struct DFlashModelConfig {
     #[serde(default)]
     pub sliding_window: Option<usize>,
     #[serde(default)]
+    pub is_causal: Option<bool>,
+    #[serde(default)]
     pub rope_parameters: Option<serde_json::Value>,
 }
 
@@ -189,31 +191,42 @@ fn apply_rotary_pos_emb(
     Ok((q_embed, k_embed))
 }
 
-/// Causal (+ optional sliding-window) mask for draft queries over [ctx | noise].
-/// Query `i` sits at absolute position `ctx_len + i` and may attend to keys
-/// `j` where `oldest <= j <= ctx_len + i`. HF `sliding_window` includes the
-/// current token (same convention as SGLang's window_left = sliding_window - 1).
+/// Optional sliding-window bias for draft queries over [ctx | noise].
+/// DFlash2 checkpoints set `is_causal=false` (block diffusion / encoder-only), so we
+/// do NOT apply a causal triangle — only a local window when configured.
 fn build_dflash_attn_bias(
     ctx_len: usize,
     q_len: usize,
     sliding_window: Option<usize>,
+    is_causal: bool,
     dtype: DType,
     device: &Device,
-) -> Result<Tensor> {
+) -> Result<Option<Tensor>> {
     let kv_len = ctx_len + q_len;
     let window = sliding_window.unwrap_or(usize::MAX);
+    // Full attention when the whole sequence fits in the window and we are non-causal.
+    if !is_causal && kv_len <= window {
+        return Ok(None);
+    }
     let mut bias = vec![0f32; q_len * kv_len];
     for i in 0..q_len {
         let abs_q = ctx_len + i;
         let oldest = abs_q.saturating_add(1).saturating_sub(window);
+        let newest = if is_causal {
+            abs_q
+        } else {
+            (abs_q + window.saturating_sub(1)).min(kv_len.saturating_sub(1))
+        };
         let row = i * kv_len;
         for j in 0..kv_len {
-            if j > abs_q || j < oldest {
+            if j < oldest || j > newest || (is_causal && j > abs_q) {
                 bias[row + j] = f32::NEG_INFINITY;
             }
         }
     }
-    Ok(Tensor::from_vec(bias, (1, 1, q_len, kv_len), device)?.to_dtype(dtype)?)
+    Ok(Some(
+        Tensor::from_vec(bias, (1, 1, q_len, kv_len), device)?.to_dtype(dtype)?,
+    ))
 }
 
 pub struct DFlashGroupedConv {
@@ -357,6 +370,7 @@ pub struct DFlashAttention {
     head_dim: usize,
     scaling: f64,
     sliding_window: Option<usize>,
+    is_causal: bool,
     dtype: DType,
     device: Device,
 }
@@ -427,6 +441,7 @@ impl DFlashAttention {
             head_dim,
             scaling: (head_dim as f64).powf(-0.5),
             sliding_window: config.sliding_window,
+            is_causal: config.is_causal.unwrap_or(false),
             dtype,
             device: vb.device(),
         })
@@ -480,14 +495,17 @@ impl DFlashAttention {
             v
         };
 
-        let attn_bias = build_dflash_attn_bias(
+        let mut attn_weights = (q.matmul(&k.t()?)? * self.scaling)?;
+        if let Some(attn_bias) = build_dflash_attn_bias(
             ctx_len,
             q_len,
             self.sliding_window,
+            self.is_causal,
             self.dtype,
             &self.device,
-        )?;
-        let attn_weights = (q.matmul(&k.t()?)? * self.scaling)?.broadcast_add(&attn_bias)?;
+        )? {
+            attn_weights = attn_weights.broadcast_add(&attn_bias)?;
+        }
         let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
         let attn_output = attn_weights.matmul(&v)?;
 
