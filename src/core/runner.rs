@@ -1096,6 +1096,7 @@ impl ModelRunner {
         if let (Some(drafter), Some(hs)) = (&self.dflash_drafter, &dflash_hidden) {
             let projected = drafter.extract_and_project_hidden(hs)?;
             let mut offset = 0usize;
+            let context_window = crate::utils::env::dflash_context_window();
             match &seqs {
                 Seqs::SeqRefs(refs) => {
                     for seq in *refs {
@@ -1105,7 +1106,19 @@ impl ModelRunner {
                             1
                         };
                         if count > 0 {
-                            drafter.append_context(seq.id(), &projected.narrow(0, offset, count)?)?;
+                            // Prefill position check: only seed DFlash context when within
+                            // context_window tokens of the prefill end. This prevents DFlash
+                            // from accumulating truncated context during early prefill, which
+                            // degrades draft quality and causes low acceptance rates.
+                            let should_seed = if is_prefill && context_window > 0 {
+                                let remaining = seq.len().saturating_sub(seq.num_cached_tokens);
+                                remaining <= context_window
+                            } else {
+                                true
+                            };
+                            if should_seed {
+                                drafter.append_context(seq.id(), &projected.narrow(0, offset, count)?)?;
+                            }
                             offset += count;
                         }
                     }

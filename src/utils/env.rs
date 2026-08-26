@@ -192,6 +192,6 @@ pub fn dflash_context_window() -> usize {
         env::var(DFLASH_CONTEXT_WINDOW_ENV)
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
-            .unwrap_or(2048)
+            .unwrap_or(4096)  // Default: 4096 (matches DFlash2 training window)
     })
 }
