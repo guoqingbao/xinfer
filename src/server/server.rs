@@ -1179,7 +1179,8 @@ pub async fn chat_completion(
                         if let Some(spec) = engine_clone.read().get_seq_spec_stats(current_seq_id) {
                             if !spec.mechanism.is_empty() {
                                 let label = match spec.mechanism.as_str() {
-                                    "dflash" => "DFlash Speculation",
+                                    "dflash1" => "DFlash v1 Speculation",
+                                    "dflash2" => "DFlash v2 Speculation",
                                     "mtp" => "MTP Speculation",
                                     _ => "Speculative Decoding",
                                 };

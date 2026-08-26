@@ -24,7 +24,11 @@ pub struct DflashDrafter {
 
 impl Drafter for DflashDrafter {
     fn name(&self) -> &'static str {
-        "dflash"
+        if self.inner.draft_model.config.has_v2_components() {
+            "dflash2"
+        } else {
+            "dflash1"
+        }
     }
 
     fn verify_target_layers(&self) -> &[usize] {
