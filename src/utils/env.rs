@@ -158,3 +158,24 @@ pub fn dflash_use_kernels() -> bool {
         DflashBackend::Auto => cfg!(feature = "cuda"),
     }
 }
+
+/// Whether grammar VOB masking is offloaded to the CUDA sampler (the mask is passed to
+/// `sample_cuda_masked` and applied inside the fused top-k stage) instead of biasing the
+/// logits on the CPU via `where_cond`. Default: offload on CUDA builds. Set
+/// `XINFER_MASK_OFFLOAD=0` to force the CPU (where_cond) path.
+pub const MASK_OFFLOAD_ENV: &str = "XINFER_MASK_OFFLOAD";
+
+static MASK_OFFLOAD: OnceLock<bool> = OnceLock::new();
+
+pub fn mask_offload() -> bool {
+    *MASK_OFFLOAD.get_or_init(|| {
+        cfg!(feature = "cuda")
+            && !matches!(
+                env::var(MASK_OFFLOAD_ENV)
+                    .ok()
+                    .as_deref()
+                    .map(|v| v.trim().eq_ignore_ascii_case("0") || v.trim().eq_ignore_ascii_case("false")),
+                Some(true)
+            )
+    })
+}

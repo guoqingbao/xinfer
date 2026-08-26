@@ -545,6 +545,7 @@ xinfer --m Qwen/Qwen3.6-27B-FP8 --ui-server --enable-tool-grammar
 | `XINFER_SSE_BUFFER_SIZE=256` | Size of the bounded SSE streaming buffer per client connection (default: 256). Increase for slow network proxies or high-throughput models. |
 | `SM90_LOWER_PRECISION_GDN_PREFILL=1` | Enable the FlashInfer SM90 persistent kernel for GatedDeltaNet (GDN) prefill on Hopper GPUs (SM90). Delivers faster prefill speedup for Qwen3.5/3.6, with a slight precision trade-off. |
 | `XINFER_DFLASH_BACKEND=auto\|v1\|v2` | DFlash draft-model compute backend. `auto` (default) uses the fused CUDA kernels for DFlash2 checkpoints on CUDA builds and the portable candle path otherwise; `v2` forces the kernels; `v1` forces candle. DFlash1 checkpoints are unaffected (they have no v2 modules). |
+| `XINFER_MASK_OFFLOAD=0` | Force the CPU (where_cond) grammar-mask path for full-token sampling. Default on CUDA builds offloads the mask into the fused CUDA sampler (`sample_cuda_masked`), dropping disallowed vocab inside the top-k stage instead of pre-biasing the logits. |
 
 **Example (Blackwell with high-precision NVFP4 decode):**
 ```bash

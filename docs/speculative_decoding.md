@@ -120,19 +120,21 @@ Per decode step (single sequence; batched steps fall back to plain decode):
    convs), take the last N rows through the target's lm_head:
    - **no grammar**: v1 -> argmax per position; v2 -> selector walk
      (fused kernel or portable, per backend).
-   - **grammar active**: build a per-position allow matrix from the guidance
-     FSM and gate the selection:
-     - static gate (default): repeat the *current* VOB across all N rows
-       (`draft_allow_repeated`). Approximate where the VOB changes across the
-       run; cheap (one GPU expand).
-     - exact gate (`XINFER_SPEC_GRANULAR_MASK=1`): walk a *clone* of the FSM
-       over the draft argmax chain, recording each position's VOB
-       (`draft_allow_walk`). One host-built `[N, vocab]` matrix, one H2D.
-     - v2 backend: the allow matrix is consumed *inside* the fused
-       `dflash_select_candidates_masked` kernel (disallowed candidates are
-       skipped in the argmax scoring; no pre-masking, no host sync).
-     - v1 backend: the logits are pre-masked (disallowed -> -inf) and the
-       portable walk / argmax runs.
+- **grammar active**: build a per-position allow matrix from the guidance
+    FSM and gate the selection. The matrix is u8 (1 = legal, 0 = illegal),
+    matching candle's `where_cond` condition dtype; the v2 kernel path
+    casts it to F32 at the boundary:
+    - static gate (default): repeat the *current* VOB across all N rows
+      (`draft_allow_repeated`). Approximate where the VOB changes across the
+      run; cheap (one GPU expand).
+    - exact gate (`XINFER_SPEC_GRANULAR_MASK=1`): walk a *clone* of the FSM
+      over the draft argmax chain, recording each position's VOB
+      (`draft_allow_walk`). One host-built `[N, vocab]` matrix, one H2D.
+    - kernel backend: the allow matrix is consumed *inside* the fused
+      `dflash_select_candidates_masked` selector walk (disallowed candidates
+      are skipped in the scoring; no pre-masking, no host sync).
+    - candle backend: the logits are pre-masked (disallowed -> -inf via
+      `where_cond`) and the portable walk / argmax runs.
    - During two-phase (tool-use) grammars the FSM defers constraints until the
      reasoning-end token; while reasoning is open the VOB is all-ones, so the
      allow matrix resolves to "no gate" and the plain unmasked path runs.
@@ -161,8 +163,8 @@ When a grammar is active, every emitted token is checked against the guidance
 FSM, not just the anchor:
 
 - the draft candidates are biased toward FSM-legal tokens (see the masking
-  options above; DFlash v1 uses `mask_rows`/`masked_drafts` on the logits,
-  DFlash v2 uses the allow-matrix gate in the selector);
+  options above; the allow-matrix gate is applied in the selector kernel on
+  the v2 backend and as a `where_cond` pre-mask on the v1/candle backend);
 - acceptance requires both target agreement and FSM legality;
 - the continuation is the FSM-masked target choice or a grammar-forced token.
 
@@ -199,3 +201,7 @@ Environment:
 - `XINFER_SPEC_GRANULAR_MASK=1`: use the exact per-position FSM walk for draft
   masking instead of the batched single-VOB mask.
 - `XINFER_SPEC_NO_FF=1`: debug; disable the grammar fast-forward prefix.
+- `XINFER_MASK_OFFLOAD=0`: force the CPU (where_cond) VOB-mask path for full-token
+  sampling. Default (on CUDA builds) offloads the mask into the fused CUDA sampler
+  (`sample_cuda_masked`), so disallowed vocab is dropped inside the top-k stage
+  instead of biasing the logits first.

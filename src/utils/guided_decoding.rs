@@ -211,6 +211,89 @@ impl GuidedDecoding {
         Ok((masked_logits, step))
     }
 
+    /// Build the per-row grammar allow-mask `[requests.len(), vocab]` (u8, 1 = legal,
+    /// 0 = illegal) for the CUDA-sampler offload path. Mirrors `apply`'s state creation /
+    /// failure handling but returns the mask instead of biasing the logits. Returns `None`
+    /// when no row needs gating (no grammar, or every VOB allows the whole vocab), in which
+    /// case the sampler runs unmasked.
+    pub fn build_allow_mask(
+        &self,
+        requests: &[GuidedDecodingRequest<'_>],
+        vocab_size: usize,
+        device: &candle_core::Device,
+    ) -> Result<Option<Tensor>> {
+        if self.factory.is_none() || vocab_size == 0 {
+            return Ok(None);
+        }
+        let factory = self.factory.clone().expect("factory checked non-none above");
+        let batch_size = requests.len();
+        let mut states = self.states.write();
+        let mut failed = self.failed.write();
+        let mut any_gate = false;
+        let mut allow = vec![1u8; batch_size * vocab_size];
+        for (row, request) in requests.iter().enumerate() {
+            let Some(grammar) = request.grammar else {
+                let _ = states.remove(&request.seq_id);
+                let _ = failed.remove(&request.seq_id);
+                continue;
+            };
+            if failed.contains(&request.seq_id) {
+                continue;
+            }
+            let state = match states.entry(request.seq_id) {
+                Entry::Occupied(entry) => entry.into_mut(),
+                Entry::Vacant(entry) => match GuidanceState::new_from_grammar_with_reasoning(
+                    factory.clone(),
+                    grammar,
+                    request.reasoning_end_ids.to_vec(),
+                ) {
+                    Ok(state) => entry.insert(state),
+                    Err(err) => {
+                        failed.insert(request.seq_id);
+                        crate::log_warn!(
+                            "[Seq {}] Failed to create guidance state: {}. Disabling constraints for this sequence.",
+                            request.seq_id,
+                            err
+                        );
+                        continue;
+                    }
+                },
+            };
+            match state.compute_mask_or_eos() {
+                Ok(mask) => {
+                    if mask.len() == 0 {
+                        if failed.insert(request.seq_id) {
+                            crate::log_warn!(
+                                "[Seq {}] Guidance mask length is 0. Disabling constraints for this sequence.",
+                                request.seq_id
+                            );
+                        }
+                        let _ = states.remove(&request.seq_id);
+                        continue;
+                    }
+                    if !mask_allows_all(&mask, vocab_size) {
+                        any_gate = true;
+                        write_allow_row(&mut allow[row * vocab_size..row * vocab_size + vocab_size], &mask, vocab_size);
+                    }
+                }
+                Err(err) => {
+                    if failed.insert(request.seq_id) {
+                        crate::log_warn!(
+                            "[Seq {}] Failed to compute guidance mask: {}. Disabling constraints for this sequence.",
+                            request.seq_id,
+                            err
+                        );
+                    }
+                    let _ = states.remove(&request.seq_id);
+                }
+            }
+        }
+        if !any_gate {
+            return Ok(None);
+        }
+        Ok(Some(Tensor::from_vec(allow, (batch_size, vocab_size), device)?))
+    }
+
     pub fn apply_fast_forward(&self, seq_ids: &[usize], tokens: &mut [u32]) {
         if self.factory.is_none() {
             return;

@@ -36,6 +36,7 @@ impl Drafter for DflashDrafter {
         let target_layer_ids = self.inner.target_layer_ids();
 
         // ---- Step 1: anchor decode + update the projected-hidden context window. ----
+        #[allow(unused_mut)] // `mut` only needed under the flashinfer feature
         let (input_ids, positions, mut input_metadata) = match &seqs {
             Seqs::SeqRefs(seqs_ref) => runner.prepare_decode(*seqs_ref)?,
             Seqs::DecodeVec(decode_seqs) => runner.prepare_decode(decode_seqs.iter())?,
