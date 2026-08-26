@@ -109,6 +109,10 @@ impl DFlashDrafter {
             .extract_and_project_hidden(all_hidden_states)
     }
 
+    pub fn project_layer_hiddens(&self, layer_hiddens: &[Tensor]) -> Result<Tensor> {
+        self.draft_model.project_layer_hiddens(layer_hiddens)
+    }
+
     pub fn draft_tokens(
         &self,
         target_hidden: &Tensor,
@@ -428,39 +432,96 @@ impl ModelRunner {
         )?;
         let verify_metadata = self.build_mtp_metadata(&seq_info, &slot_mappings, verify_len)?;
         let _verify_guard = set_linear_is_prefill(true);
-        let (verify_logits, verify_hidden_states) = {
+
+        // Same pattern as MTP: one verify forward. Prefer CUDA-graph replay when
+        // captured; otherwise eager forward. Both paths set is_mtp_verify and write
+        // layer hiddens into the same preallocated buffers.
+        #[cfg(all(feature = "cuda", feature = "graph"))]
+        let verify_logits = if self
+            .mtp_capturer
+            .as_ref()
+            .map_or(false, |c| c.is_mtp_captured(verify_len))
+        {
+            self.mtp_capturer.as_ref().unwrap().replay_mtp(
+                &verify_input_ids,
+                &verify_positions,
+                &verify_metadata,
+            )?
+        } else {
             let kv_cache = self.get_kv_cache();
             let kv_pairs = kv_cache.as_pairs();
-            let result = match self.model() {
-                Model::Qwen3_5(model) => model.forward_with_hidden_states(
+            let logits = match self.model() {
+                Model::Qwen3_5(model) => model.forward(
                     &verify_input_ids,
                     &verify_positions,
                     kv_pairs,
                     &verify_metadata,
                     false,
-                    drafter.target_layer_ids(),
-                ),
-                Model::Qwen3_5MoE(model) => model.forward_with_hidden_states(
+                )?,
+                Model::Qwen3_5MoE(model) => model.forward(
                     &verify_input_ids,
                     &verify_positions,
                     kv_pairs,
                     &verify_metadata,
                     false,
-                    drafter.target_layer_ids(),
-                ),
-                Model::Qwen3VL(model) => model.forward_with_hidden_states(
+                )?,
+                Model::Qwen3VL(model) => model.forward(
                     &verify_input_ids,
                     &verify_positions,
                     kv_pairs,
                     &verify_metadata,
-                    false,
-                    drafter.target_layer_ids(),
-                ),
+                    None,
+                )?,
                 _ => candle_core::bail!("DFlash currently supports Qwen3.5 target models"),
-            }?;
+            };
             drop(kv_cache);
-            result
+            logits
         };
+        #[cfg(not(all(feature = "cuda", feature = "graph")))]
+        let verify_logits = {
+            let kv_cache = self.get_kv_cache();
+            let kv_pairs = kv_cache.as_pairs();
+            let logits = match self.model() {
+                Model::Qwen3_5(model) => model.forward(
+                    &verify_input_ids,
+                    &verify_positions,
+                    kv_pairs,
+                    &verify_metadata,
+                    false,
+                )?,
+                Model::Qwen3_5MoE(model) => model.forward(
+                    &verify_input_ids,
+                    &verify_positions,
+                    kv_pairs,
+                    &verify_metadata,
+                    false,
+                )?,
+                Model::Qwen3VL(model) => model.forward(
+                    &verify_input_ids,
+                    &verify_positions,
+                    kv_pairs,
+                    &verify_metadata,
+                    None,
+                )?,
+                _ => candle_core::bail!("DFlash currently supports Qwen3.5 target models"),
+            };
+            drop(kv_cache);
+            logits
+        };
+        let layer_hiddens = match self.model() {
+            Model::Qwen3_5(model) => model.take_dflash_verify_hiddens(verify_len),
+            Model::Qwen3_5MoE(model) => model.take_dflash_verify_hiddens(verify_len),
+            Model::Qwen3VL(model) => model.take_dflash_verify_hiddens(verify_len),
+            _ => None,
+        }
+        .ok_or_else(|| {
+            candle_core::Error::Msg(
+                "DFlash verify missing layer-hidden buffers (was preallocate_dflash_verify_buffers called?)"
+                    .into(),
+            )
+        })?;
+        let projected_verify_hidden = drafter.project_layer_hiddens(&layer_hiddens)?;
+
         let verify_result = verify_draft_greedy(&verify_logits, &draft_tokens)?;
         let commit_len = 1 + verify_result.num_accepted;
         if verify_result.num_accepted < verify_result.num_proposed {
@@ -472,7 +533,6 @@ impl ModelRunner {
             }
         }
 
-        let projected_verify_hidden = drafter.extract_and_concat_hidden(&verify_hidden_states)?;
         drafter.replace_with_verified_hidden(&projected_verify_hidden, commit_len, seq_info.id)?;
 
         let mut result_tokens = Vec::with_capacity(commit_len + 1);
@@ -650,6 +710,8 @@ impl ModelRunner {
         )?;
         let verify_metadata = self.build_mtp_metadata_batch(&seq_infos, &slot_mappings, &q_lens)?;
         let _verify_guard = set_linear_is_prefill(true);
+        // Batch verify stays on the same forward_with_hidden_states path; single-seq
+        // uses the MTP-style CUDA-graphable forward + layer buffers above.
         let (verify_logits, verify_hidden_states) = {
             let kv_cache = self.get_kv_cache();
             let kv_pairs = kv_cache.as_pairs();

@@ -836,6 +836,33 @@ impl Qwen3VLForConditionalGeneration {
         }
     }
 
+    pub fn preallocate_dflash_verify_buffers(
+        &self,
+        target_layer_ids: &[usize],
+        max_verify_len: usize,
+    ) -> Result<()> {
+        match &self.text_model {
+            Qwen3TextModel::Dense35(m) => {
+                m.preallocate_dflash_verify_buffers(target_layer_ids, max_verify_len)
+            }
+            Qwen3TextModel::MoE35(m) => {
+                m.preallocate_dflash_verify_buffers(target_layer_ids, max_verify_len)
+            }
+            _ => Ok(()),
+        }
+    }
+
+    pub fn take_dflash_verify_hiddens(
+        &self,
+        num_tokens: usize,
+    ) -> Option<Vec<candle_core::Tensor>> {
+        match &self.text_model {
+            Qwen3TextModel::Dense35(m) => m.take_dflash_verify_hiddens(num_tokens),
+            Qwen3TextModel::MoE35(m) => m.take_dflash_verify_hiddens(num_tokens),
+            _ => None,
+        }
+    }
+
     /// Pre-allocate the MTP hidden state buffer
     pub fn preallocate_mtp_hidden_buffer(&self, max_batch_size: usize) -> Result<()> {
         match &self.text_model {

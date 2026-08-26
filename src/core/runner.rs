@@ -358,7 +358,9 @@ impl ModelRunner {
         );
 
         #[cfg(all(feature = "cuda", feature = "graph"))]
-        let mtp_wrapper = if econfig.mtp_num_speculative_tokens.unwrap_or(0) > 0 {
+        let mtp_wrapper = if econfig.mtp_num_speculative_tokens.unwrap_or(0) > 0
+            || (external_speculative_enabled && econfig.num_speculative_tokens.unwrap_or(0) > 0)
+        {
             Some(crate::graph_wrapper!(
                 &model,
                 device,
@@ -661,7 +663,7 @@ impl ModelRunner {
             );
         }
 
-        let (mtp_head, mtp_num_speculative) = if let Some(num_spec) =
+        let (mtp_head, mut mtp_num_speculative) = if let Some(num_spec) =
             econfig.mtp_num_speculative_tokens
         {
             if requested_mtp_num_speculative == 0 {
@@ -709,6 +711,25 @@ impl ModelRunner {
             (None, 0)
         };
         let dflash_drafter = Self::init_dflash_drafter(econfig, comm.clone(), &device)?;
+        // DFlash reuses the MTP verify CUDA-graph capturer. When only DFlash is
+        // enabled, borrow mtp_num_speculative for capture/replay sizing.
+        if mtp_num_speculative == 0 {
+            if let Some(drafter) = dflash_drafter.as_ref() {
+                mtp_num_speculative = drafter.num_speculative_tokens;
+            }
+        }
+        if let Some(drafter) = dflash_drafter.as_ref() {
+            let verify_len = drafter.num_speculative_tokens + 1;
+            let layer_ids = drafter.target_layer_ids();
+            match &model {
+                Model::Qwen3_5(m) => m.preallocate_dflash_verify_buffers(layer_ids, verify_len)?,
+                Model::Qwen3_5MoE(m) => {
+                    m.preallocate_dflash_verify_buffers(layer_ids, verify_len)?
+                }
+                Model::Qwen3VL(m) => m.preallocate_dflash_verify_buffers(layer_ids, verify_len)?,
+                _ => {}
+            }
+        }
 
         Ok(Self {
             model,
@@ -1942,8 +1963,14 @@ impl ModelRunner {
         if self.mtp_num_speculative > 0 {
             // self.decode_capturer.model.sync()?;
             if let Some(mtp_cap) = &mut self.mtp_capturer {
+                let label = if self.dflash_drafter.is_some() {
+                    "DFlash"
+                } else {
+                    "MTP"
+                };
                 crate::log_info!(
-                    "Capturing MTP verify graphs for up to {} draft tokens...",
+                    "Capturing {} verify graphs for up to {} draft tokens...",
+                    label,
                     self.mtp_num_speculative
                 );
                 mtp_cap.capture_mtp(&self.device, kv_pairs, self.mtp_num_speculative)?;

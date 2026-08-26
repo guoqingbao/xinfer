@@ -189,6 +189,33 @@ fn apply_rotary_pos_emb(
     Ok((q_embed, k_embed))
 }
 
+/// Causal (+ optional sliding-window) mask for draft queries over [ctx | noise].
+/// Query `i` sits at absolute position `ctx_len + i` and may attend to keys
+/// `j` where `oldest <= j <= ctx_len + i`. HF `sliding_window` includes the
+/// current token (same convention as SGLang's window_left = sliding_window - 1).
+fn build_dflash_attn_bias(
+    ctx_len: usize,
+    q_len: usize,
+    sliding_window: Option<usize>,
+    dtype: DType,
+    device: &Device,
+) -> Result<Tensor> {
+    let kv_len = ctx_len + q_len;
+    let window = sliding_window.unwrap_or(usize::MAX);
+    let mut bias = vec![0f32; q_len * kv_len];
+    for i in 0..q_len {
+        let abs_q = ctx_len + i;
+        let oldest = abs_q.saturating_add(1).saturating_sub(window);
+        let row = i * kv_len;
+        for j in 0..kv_len {
+            if j > abs_q || j < oldest {
+                bias[row + j] = f32::NEG_INFINITY;
+            }
+        }
+    }
+    Ok(Tensor::from_vec(bias, (1, 1, q_len, kv_len), device)?.to_dtype(dtype)?)
+}
+
 pub struct DFlashGroupedConv {
     base_kernel: Tensor,
     kernel_projection: ReplicatedLinear,
@@ -329,6 +356,9 @@ pub struct DFlashAttention {
     num_kv_heads: usize,
     head_dim: usize,
     scaling: f64,
+    sliding_window: Option<usize>,
+    dtype: DType,
+    device: Device,
 }
 
 impl DFlashAttention {
@@ -396,6 +426,9 @@ impl DFlashAttention {
             num_kv_heads,
             head_dim,
             scaling: (head_dim as f64).powf(-0.5),
+            sliding_window: config.sliding_window,
+            dtype,
+            device: vb.device(),
         })
     }
 
@@ -447,7 +480,14 @@ impl DFlashAttention {
             v
         };
 
-        let attn_weights = (q.matmul(&k.t()?)? * self.scaling)?;
+        let attn_bias = build_dflash_attn_bias(
+            ctx_len,
+            q_len,
+            self.sliding_window,
+            self.dtype,
+            &self.device,
+        )?;
+        let attn_weights = (q.matmul(&k.t()?)? * self.scaling)?.broadcast_add(&attn_bias)?;
         let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
         let attn_output = attn_weights.matmul(&v)?;
 
@@ -727,6 +767,21 @@ impl DFlashDraftModel {
             .map(|i| all_hidden_states[i + 1].clone())
             .collect();
         let concatenated = Tensor::cat(&selected, D::Minus1)?;
+        let projected = self.fc.forward(&concatenated)?;
+        self.hidden_norm.forward(&projected)
+    }
+
+    /// Project target-layer hiddens already extracted into a draft context vector.
+    /// Used after graph-safe verify forwards that write layer buffers in-place.
+    pub fn project_layer_hiddens(&self, layer_hiddens: &[Tensor]) -> Result<Tensor> {
+        if layer_hiddens.len() != self.target_layer_ids.len() {
+            candle_core::bail!(
+                "DFlash expected {} layer hiddens, got {}",
+                self.target_layer_ids.len(),
+                layer_hiddens.len()
+            );
+        }
+        let concatenated = Tensor::cat(layer_hiddens, D::Minus1)?;
         let projected = self.fc.forward(&concatenated)?;
         self.hidden_norm.forward(&projected)
     }
