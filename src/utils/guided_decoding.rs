@@ -419,13 +419,13 @@ Ok(allow_2d.where_cond(logits, &disallowed)?)
                 .map_err(|e| candle_core::Error::Msg(e.to_string()))?
         };
         if mask_allows_all(&mask, vocab) {
-            crate::log_info!("[dflash-debug] allow_repeated: seq={} VOB allows-all -> None (no gate)", seq_id);
+            // crate::log_info!("[dflash-debug] allow_repeated: seq={} VOB allows-all -> None (no gate)", seq_id);
             return Ok(None);
         }
         let mut row = vec![0u8; vocab];
         write_allow_row(&mut row, &mask, vocab);
         let row = Tensor::from_vec(row, (vocab,), device)?;
-        crate::log_info!("[dflash-debug] allow_repeated: seq={} n={} -> Some({}x{})", seq_id, n, n, vocab);
+        // crate::log_info!("[dflash-debug] allow_repeated: seq={} n={} -> Some({}x{})", seq_id, n, n, vocab);
         Ok(Some(row.unsqueeze(0)?.expand((n, vocab))?))
     }
 
@@ -456,7 +456,7 @@ Ok(allow_2d.where_cond(logits, &disallowed)?)
         let device = logits.device();
         let mut flat = vec![0u8; n * vocab];
         let mut any_gate = false;
-        let mut walk_tokens: Vec<u32> = Vec::with_capacity(n);
+        // let mut walk_tokens: Vec<u32> = Vec::with_capacity(n);
         for i in 0..n {
             let mask = state
                 .compute_mask_or_eos()
@@ -474,16 +474,16 @@ Ok(allow_2d.where_cond(logits, &disallowed)?)
                 .to_dtype(candle_core::DType::F32)?
                 .argmax(candle_core::D::Minus1)?
                 .to_scalar::<u32>()?;
-            walk_tokens.push(tok);
+            // walk_tokens.push(tok);
             state
                 .commit_token(tok)
                 .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
         }
         if !any_gate {
-            crate::log_info!("[dflash-debug] allow_walk: seq={} all-VOB-allows -> None (no gate) walk={:?}", seq_id, &walk_tokens);
+            // crate::log_info!("[dflash-debug] allow_walk: seq={} all-VOB-allows -> None (no gate)", seq_id);
             return Ok(None);
         }
-        crate::log_info!("[dflash-debug] allow_walk: seq={} n={} -> Some({}x{}) walk={:?}", seq_id, n, n, vocab, &walk_tokens);
+        // crate::log_info!("[dflash-debug] allow_walk: seq={} n={} -> Some({}x{})", seq_id, n, n, vocab);
         Ok(Some(Tensor::from_vec(flat, (n, vocab), device)?))
     }
 }
