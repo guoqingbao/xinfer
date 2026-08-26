@@ -66,10 +66,10 @@ python3 -m xinfer.server --m Qwen/Qwen3.6-27B-FP8 --kvcache-dtype turbo4 --ui-se
  xinfer --w /home/Qwen3.6-35B-A3B --d 0,1 --ui-server --mtp 2
  ```
 
- **DFlash** (separate draft model; grammar-aware)
- ```bash
- xinfer --m Qwen/Qwen3.8-27B --draft-model-id z-lab/Qwen3.8-27B-DFlash2 --num-speculative-tokens 3
- ```
+**DFlash** (separate draft model, v1/v2 auto-detected; grammar-aware)
+  ```bash
+  xinfer --m Qwen/Qwen3.8-27B --draft-model-id z-lab/Qwen3.8-27B-DFlash2 --num-speculative-tokens 3
+  ```
 
  > **Tip:** Open `http://IP:8001` for the built-in chat UI, or use `http://IP:8000/v1/` as your API `Base URL`.
 
@@ -544,6 +544,7 @@ xinfer --m Qwen/Qwen3.6-27B-FP8 --ui-server --enable-tool-grammar
 | `XINFER_ENABLE_FLASHMLA` | Enables DeepSeek V4 sparse MLA acceleration when set to `1` or `true`. It is disabled by default (unset), so the precision-preserving custom BF16 sparse-attention kernel is used. |
 | `XINFER_SSE_BUFFER_SIZE=256` | Size of the bounded SSE streaming buffer per client connection (default: 256). Increase for slow network proxies or high-throughput models. |
 | `SM90_LOWER_PRECISION_GDN_PREFILL=1` | Enable the FlashInfer SM90 persistent kernel for GatedDeltaNet (GDN) prefill on Hopper GPUs (SM90). Delivers faster prefill speedup for Qwen3.5/3.6, with a slight precision trade-off. |
+| `XINFER_DFLASH_BACKEND=auto\|v1\|v2` | DFlash draft-model compute backend. `auto` (default) uses the fused CUDA kernels for DFlash2 checkpoints on CUDA builds and the portable candle path otherwise; `v2` forces the kernels; `v1` forces candle. DFlash1 checkpoints are unaffected (they have no v2 modules). |
 
 **Example (Blackwell with high-precision NVFP4 decode):**
 ```bash

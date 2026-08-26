@@ -1,6 +1,6 @@
 use crate::utils::env::soft_mask_disabled;
 use crate::utils::guidance::{GuidanceState, ParserFactory};
-use candle_core::{D, Result, Tensor};
+use candle_core::{Result, Tensor};
 use llguidance::api::TopLevelGrammar;
 use parking_lot::RwLock;
 use std::collections::{hash_map::Entry, HashMap, HashSet};
@@ -388,6 +388,103 @@ Ok(allow_2d.where_cond(logits, &disallowed)?)
             tokens.push(tok);
         }
         Ok(tokens)
+    }
+
+    /// Static grammar gate for the fused DFlash2 selector: repeat the sequence's *current*
+    /// VOB across all `n` draft positions -> `[n, vocab]` u8 allow matrix (1 legal /
+    /// 0 illegal) on `device`. Returns `None` when the seq is unguided/finished or the
+    /// current VOB allows the whole vocab (no gate needed). Approximate (single VOB); the
+    /// verify-time firewall (`verify_draft_masked`) keeps it sound.
+    pub fn draft_allow_repeated(
+        &self,
+        seq_id: usize,
+        n: usize,
+        vocab: usize,
+        device: &candle_core::Device,
+    ) -> Result<Option<Tensor>> {
+        if n == 0 || vocab == 0 {
+            return Ok(None);
+        }
+        let mask = {
+            let mut states = self.states.write();
+            let state = match states.get_mut(&seq_id) {
+                Some(s) => s,
+                None => return Ok(None),
+            };
+            if state.is_finished() {
+                return Ok(None);
+            }
+            state
+                .compute_mask_or_eos()
+                .map_err(|e| candle_core::Error::Msg(e.to_string()))?
+        };
+        if mask_allows_all(&mask, vocab) {
+            crate::log_info!("[dflash-debug] allow_repeated: seq={} VOB allows-all -> None (no gate)", seq_id);
+            return Ok(None);
+        }
+        let mut row = vec![0u8; vocab];
+        write_allow_row(&mut row, &mask, vocab);
+        let row = Tensor::from_vec(row, (vocab,), device)?;
+        crate::log_info!("[dflash-debug] allow_repeated: seq={} n={} -> Some({}x{})", seq_id, n, n, vocab);
+        Ok(Some(row.unsqueeze(0)?.expand((n, vocab))?))
+    }
+
+    /// Exact per-position grammar gate for the fused DFlash2 selector: walk a *clone* of the
+    /// sequence's FSM over the draft `logits` (the same argmax chain as `masked_drafts`),
+    /// recording each position's VOB into a `[n, vocab]` u8 allow matrix. Returns `None` if
+    /// unguided/finished or every position allows the full vocab.
+    pub fn draft_allow_walk(
+        &self,
+        seq_id: usize,
+        logits: &Tensor,
+        vocab: usize,
+    ) -> Result<Option<Tensor>> {
+        let n = logits.dim(0)?;
+        if n == 0 || vocab == 0 {
+            return Ok(None);
+        }
+        let mut state = {
+            let states = self.states.read();
+            match states.get(&seq_id) {
+                Some(s) => s.deep_clone(),
+                None => return Ok(None),
+            }
+        };
+        if state.is_finished() {
+            return Ok(None);
+        }
+        let device = logits.device();
+        let mut flat = vec![0u8; n * vocab];
+        let mut any_gate = false;
+        let mut walk_tokens: Vec<u32> = Vec::with_capacity(n);
+        for i in 0..n {
+            let mask = state
+                .compute_mask_or_eos()
+                .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
+            if mask_allows_all(&mask, vocab) {
+                flat[i * vocab..(i + 1) * vocab].fill(1);
+            } else {
+                any_gate = true;
+                write_allow_row(&mut flat[i * vocab..(i + 1) * vocab], &mask, vocab);
+            }
+            // Advance the clone exactly as masked_drafts does: argmax of the masked row.
+            let row = logits.get(i)?;
+            let masked = apply_vob_to_row(&row, &mask)?;
+            let tok = masked
+                .to_dtype(candle_core::DType::F32)?
+                .argmax(candle_core::D::Minus1)?
+                .to_scalar::<u32>()?;
+            walk_tokens.push(tok);
+            state
+                .commit_token(tok)
+                .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
+        }
+        if !any_gate {
+            crate::log_info!("[dflash-debug] allow_walk: seq={} all-VOB-allows -> None (no gate) walk={:?}", seq_id, &walk_tokens);
+            return Ok(None);
+        }
+        crate::log_info!("[dflash-debug] allow_walk: seq={} n={} -> Some({}x{}) walk={:?}", seq_id, n, n, vocab, &walk_tokens);
+        Ok(Some(Tensor::from_vec(flat, (n, vocab), device)?))
     }
 }
 

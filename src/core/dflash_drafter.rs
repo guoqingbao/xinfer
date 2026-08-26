@@ -53,8 +53,9 @@ impl DFlashDrafter {
             .is_some_and(|dc| dc.selector_rank.is_some() && dc.selector_top_k.is_some());
 
         crate::log_info!(
-            "DFlash drafter initialized: {} layers, num_speculative_tokens={}, target_layer_ids={:?}, mask_token_id={}, context_window={}, yarn_scaling_factor={:?}, dflash2_conv={}, dflash2_selector={}",
+            "DFlash drafter initialized: {} layers, version={}, num_speculative_tokens={}, target_layer_ids={:?}, mask_token_id={}, context_window={}, yarn_scaling_factor={:?}, dflash2_conv={}, dflash2_selector={}, backend={:?}, kernels={}",
             draft_config.num_hidden_layers,
+            if draft_config.has_v2_components() { "dflash2" } else { "dflash1" },
             block_size,
             target_layer_ids,
             mask_token_id,
@@ -62,6 +63,8 @@ impl DFlashDrafter {
             yarn_factor,
             has_conv,
             has_selector,
+            crate::utils::env::dflash_backend(),
+            crate::utils::env::dflash_use_kernels(),
         );
 
         Ok(Self {
@@ -90,6 +93,30 @@ impl DFlashDrafter {
     /// The number of speculative (MASK) tokens per step.
     pub fn num_speculative(&self) -> usize {
         self.num_speculative_tokens
+    }
+
+    /// True when the fused DFlash2 CUDA-kernel backend is active (`XINFER_DFLASH_BACKEND`
+    /// auto/v2 + cuda built). The draft model's conv + candidate selector dispatch on this.
+    pub fn uses_kernels(&self) -> bool {
+        crate::utils::env::dflash_use_kernels()
+    }
+
+    /// Grammar-gated draft-token selection (delegates to the draft model). `allow = None`
+    /// preserves the original unmasked interface; `allow = Some` applies the per-position
+    /// grammar gate (in-kernel on the v2 backend, pre-masked on v1).
+    pub fn select_tokens_masked(
+        &self,
+        logits: &Tensor,
+        hidden_n: &Tensor,
+        anchor: u32,
+        allow: Option<&Tensor>,
+    ) -> Result<Vec<u32>> {
+        crate::log_info!(
+            "[dflash-debug] DFlashDrafter.select_tokens_masked: allow={} has_v2_components={}",
+            allow.is_some(),
+            self.draft_model.config.has_v2_components()
+        );
+        self.draft_model.select_tokens_masked(logits, hidden_n, anchor, allow)
     }
 
     /// Build the DFlash2 block [anchor, MASK x n], run the draft model, and return the

@@ -28,6 +28,9 @@ pub struct DFlashConfig {
 
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct DFlashModelConfig {
+    /// Checkpoint architecture tag: `"DFlashDraftModel"` (v1) vs `"DFlash2DraftModel"` (v2).
+    #[serde(default)]
+    pub architectures: Option<Vec<String>>,
     pub hidden_size: usize,
     pub num_hidden_layers: usize,
     pub num_attention_heads: usize,
@@ -91,6 +94,27 @@ impl DFlashModelConfig {
     pub fn effective_rope_theta(&self) -> Option<f64> {
         self.rope_theta
             .or_else(|| self.rope_parameters.as_ref().and_then(|rp| rp.rope_theta))
+    }
+
+    /// True when the checkpoint carries DFlash2 components (candidate selector and/or grouped
+    /// dynamic convs). DFlash1 checkpoints have neither; this is the auto-detection signal for
+    /// the kernel backend (the `architectures` field, when present, says "DFlash2DraftModel").
+    pub fn has_v2_components(&self) -> bool {
+        if self
+            .architectures
+            .as_ref()
+            .and_then(|a| a.first())
+            .is_some_and(|a| a.contains("DFlash2"))
+        {
+            return true;
+        }
+        self.dflash_config
+            .as_ref()
+            .is_some_and(|dc| {
+                dc.selector_rank.is_some()
+                    || dc.selector_top_k.is_some()
+                    || (dc.conv_kernel_size.is_some() && dc.conv_group_size.is_some())
+            })
     }
 }
 
@@ -205,6 +229,7 @@ pub struct GroupedDynamicCausalConv {
     num_groups: usize,
     group_size: usize,
     taps: usize,
+    block_size: usize,
 }
 
 impl GroupedDynamicCausalConv {
@@ -213,6 +238,7 @@ impl GroupedDynamicCausalConv {
         hidden_size: usize,
         taps: usize,
         group_size: usize,
+        block_size: usize,
         dtype: DType,
     ) -> Result<Self> {
         let num_groups = hidden_size / group_size;
@@ -233,31 +259,70 @@ impl GroupedDynamicCausalConv {
             num_groups,
             group_size,
             taps,
+            block_size,
         })
     }
 
-    fn convolve(&self, hidden: &Tensor, delta: &Tensor, base_row: &Tensor) -> Result<Tensor> {
+    fn convolve(&self, hidden: &Tensor, delta: &Tensor, side: usize) -> Result<Tensor> {
+        // v2: fused CUDA kernel (block-aware causal reset). `delta` is the side-specific
+        // [seq, taps, num_groups] half; the kernel wants the full [2, taps, hidden] base.
+        let use_k = crate::utils::env::dflash_use_kernels();
+        crate::log_info!(
+            "[dflash-debug] conv: side={} seq={} taps={} block={} groups={} use_kernels={}",
+            side, hidden.dim(0)?, self.taps, self.block_size, self.num_groups, use_k
+        );
+        if use_k {
+            #[cfg(feature = "cuda")]
+            {
+                return attention_rs::topk::dflash_grouped_conv(
+                    hidden,
+                    delta,
+                    &self.base_kernel,
+                    self.block_size,
+                    side,
+                );
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                let _ = (hidden, delta, side);
+            }
+        }
+        self.convolve_candle(hidden, delta, side)
+    }
+
+    /// Portable candle conv with the same block-aware causal reset as the fused kernel:
+    /// tap `t` contributes only where `(pos % block_size) >= t`.
+    fn convolve_candle(&self, hidden: &Tensor, delta: &Tensor, side: usize) -> Result<Tensor> {
         let seq = hidden.dim(0)?;
         let blocks = hidden.reshape((seq, self.num_groups, self.group_size))?;
-        let base_4d = base_row.reshape((1, self.taps, self.num_groups, self.group_size))?;
+        let base_4d = self
+            .base_kernel
+            .narrow(0, side, 1)?
+            .reshape((1, self.taps, self.num_groups, self.group_size))?;
         let delta_4d = delta.unsqueeze(3)?; // [seq, taps, num_groups, 1]
         let coefficients = base_4d.broadcast_add(&delta_4d)?; // [seq, taps, num_groups, group_size]
+        let pos_mod = Tensor::from_vec(
+            (0..seq).map(|p| (p % self.block_size) as i64).collect::<Vec<_>>(),
+            (seq, 1, 1),
+            hidden.device(),
+        )?;
         let mut out = (coefficients
             .narrow(1, 0, 1)?
             .reshape((seq, self.num_groups, self.group_size))?
             * &blocks)?;
         for tap in 1..self.taps {
-            let prev = blocks.narrow(0, 0, seq - tap)?; // [seq-tap, ng, gs]
+            let prev = blocks.narrow(0, 0, seq.saturating_sub(tap))?; // [seq-tap, ng, gs]
             let pad = Tensor::zeros(
                 (tap, self.num_groups, self.group_size),
                 hidden.dtype(),
                 hidden.device(),
             )?;
             let shifted = Tensor::cat(&[&pad, &prev], 0)?; // [seq, ng, gs]
+            let valid = pos_mod.ge(tap as i64)?.to_dtype(hidden.dtype())?; // [seq,1,1]
             let coeff_tap = coefficients
                 .narrow(1, tap, 1)?
                 .reshape((seq, self.num_groups, self.group_size))?;
-            out = (out + (&coeff_tap * &shifted)?)?;
+            out = (out + (&coeff_tap * &shifted * &valid)?)?;
         }
         out.reshape((seq, self.num_groups * self.group_size))
     }
@@ -269,13 +334,13 @@ impl GroupedDynamicCausalConv {
         let delta = delta.reshape((seq, 2, self.taps, self.num_groups))?;
         let prep_delta = delta.narrow(1, 0, 1)?.reshape((seq, self.taps, self.num_groups))?;
         let fin_delta = delta.narrow(1, 1, 1)?.reshape((seq, self.taps, self.num_groups))?;
-        let convolved = self.convolve(hidden, &prep_delta, &self.base_kernel.narrow(0, 0, 1)?)?;
+        let convolved = self.convolve(hidden, &prep_delta, 0)?;
         Ok((convolved, fin_delta))
     }
 
     /// Convolve the sublayer output using the delta returned by `prepare`.
     pub fn finish(&self, hidden: &Tensor, fin_delta: &Tensor) -> Result<Tensor> {
-        self.convolve(hidden, fin_delta, &self.base_kernel.narrow(0, 1, 1)?)
+        self.convolve(hidden, fin_delta, 1)
     }
 }
 
@@ -377,6 +442,83 @@ impl CandidateSelector {
             prev_cand = best_c;
         }
         Ok(path)
+    }
+
+    /// Grammar-gated candidate walk. `allow` is an optional per-position allow matrix
+    /// `[seq, vocab]` u8 (1 = legal, 0 = illegal); `None` = unmasked.
+    ///
+    /// On the v2 (CUDA) backend the gate is applied *inside* the fused kernel
+    /// (`dflash_select_candidates_masked`), so no host sync and no pre-masking. On the
+    /// v1 / non-CUDA backend the logits are pre-masked (disallowed -> -inf) and the
+    /// portable `select` walk runs, which naturally excludes the illegal candidates.
+    pub fn select_masked(
+        &self,
+        logits: &Tensor,
+        hidden: &Tensor,
+        anchor: u32,
+        allow: Option<&Tensor>,
+    ) -> Result<Vec<u32>> {
+        crate::log_info!(
+            "[dflash-debug] selector.select_masked: top_k={} allow={} kernels={}",
+            self.top_k,
+            allow.is_some(),
+            crate::utils::env::dflash_use_kernels()
+        );
+        if crate::utils::env::dflash_use_kernels() {
+            #[cfg(feature = "cuda")]
+            {
+                let logits = logits.contiguous()?.to_dtype(DType::F32)?;
+                let (unary, ids) = attention_rs::topk::topk_select(&logits, self.top_k)?;
+                let hp = self.hidden_projection.forward(hidden)?.to_dtype(DType::F32)?;
+                let anchor_t = Tensor::from_vec(vec![anchor], (1,), logits.device())?;
+                // No grammar gate -> the original unmasked fused kernel (old interface).
+                // Active gate -> the masked fused kernel (allow applied in-kernel).
+                let selected = match allow {
+                    None => attention_rs::topk::dflash_select_candidates(
+                        &hp,
+                        &unary,
+                        &ids,
+                        &self.predecessor_codebook,
+                        &self.successor_codebook,
+                        &anchor_t,
+                    )?,
+                    Some(a) => {
+                        // The fused kernel expects an F32 allow matrix; our builders emit u8.
+                        let a_f32 = a.to_dtype(DType::F32)?;
+                        attention_rs::topk::dflash_select_candidates_masked(
+                            &hp,
+                            &unary,
+                            &ids,
+                            &self.predecessor_codebook,
+                            &self.successor_codebook,
+                            &anchor_t,
+                            Some(&a_f32),
+                        )?
+                    }
+                };
+                return Ok(selected.to_vec1::<u32>()?);
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                let _ = allow;
+            }
+        }
+        // Portable path: fold the allow gate into the logits, then run the existing walk.
+        // The allow matrix is u8 (1 = legal, 0 = illegal); where_cond requires a u8/u32/i64
+        // condition, so use it directly (no dtype cast) exactly like GuidedDecoding::mask_rows.
+        let masked = match allow {
+            Some(a) => {
+                let neg_inf = Tensor::full(
+                    f32::NEG_INFINITY,
+                    logits.shape().clone(),
+                    logits.device(),
+                )?
+                .to_dtype(logits.dtype())?;
+                a.where_cond(logits, &neg_inf)?
+            }
+            None => logits.clone(),
+        };
+        self.select(&masked, hidden, anchor)
     }
 }
 
@@ -558,6 +700,7 @@ impl DFlashDecoderLayer {
             .dflash_config
             .as_ref()
             .and_then(|dc| Some((dc.conv_kernel_size?, dc.conv_group_size?)));
+        let block_size = config.effective_block_size().unwrap_or(1);
         let (attention_conv, mlp_conv) = match conv_params {
             Some((taps, group_size)) => {
                 let a = GroupedDynamicCausalConv::new(
@@ -565,6 +708,7 @@ impl DFlashDecoderLayer {
                     config.hidden_size,
                     taps,
                     group_size,
+                    block_size,
                     dtype,
                 )?;
                 let m = GroupedDynamicCausalConv::new(
@@ -572,6 +716,7 @@ impl DFlashDecoderLayer {
                     config.hidden_size,
                     taps,
                     group_size,
+                    block_size,
                     dtype,
                 )?;
                 (Some(a), Some(m))
@@ -839,20 +984,64 @@ impl DFlashDraftModel {
         Ok((logits, h))
     }
 
-    /// Select draft tokens from pre-computed logits: DFlash2 candidate-selector walk when
-    /// available, else plain argmax.
+    /// Select draft tokens from pre-computed logits (no grammar gate): DFlash2 candidate-selector
+    /// walk when available, else plain argmax. On the v2 (CUDA) backend this uses the fused
+    /// unmasked kernel; on v1 / non-CUDA it uses the portable walk. Equivalent to
+    /// `select_masked(..., allow = None)`.
     pub fn select_from_logits(
         &self,
         logits: &Tensor,
         hidden_n: &Tensor,
         anchor: u32,
     ) -> Result<Vec<u32>> {
+        // Original unmasked interface: DFlash2 candidate-selector walk when available
+        // (v2 fused kernel on CUDA, portable candle walk otherwise), else plain argmax.
         if let Some(selector) = &self.candidate_selector {
-            if let Ok(tokens) = selector.select(logits, hidden_n, anchor) {
+            crate::log_info!("[dflash-debug] model.select_from_logits: selector present -> selector walk (unmasked)");
+            if let Ok(tokens) = selector.select_masked(logits, hidden_n, anchor, None) {
                 return Ok(tokens);
             }
+            crate::log_info!("[dflash-debug] model.select_from_logits: selector walk FAILED -> argmax fallback");
+        } else {
+            crate::log_info!("[dflash-debug] model.select_from_logits: no selector (v1) -> plain argmax");
         }
-        logits.to_dtype(DType::F32)?.argmax(D::Minus1)?.to_vec1::<u32>()
+        Ok(logits.to_dtype(DType::F32)?.argmax(D::Minus1)?.to_vec1::<u32>()?)
+    }
+
+    /// Grammar-gated draft-token selection. `allow` is an optional per-position allow matrix
+    /// `[n, vocab]` u8 (1 = legal, 0 = illegal); `None` = unguided. On the v2 (CUDA)
+    /// backend the gate is applied inside the fused candidate-walk kernel; otherwise the
+    /// logits are pre-masked (disallowed -> -inf) and the portable walk / argmax runs.
+    pub fn select_tokens_masked(
+        &self,
+        logits: &Tensor,
+        hidden_n: &Tensor,
+        anchor: u32,
+        allow: Option<&Tensor>,
+    ) -> Result<Vec<u32>> {
+        // No active grammar gate -> the original unmasked interface (v1 candle walk /
+        // v2 fused kernel with allow=nullptr). The old path is preserved verbatim.
+        if allow.is_none() {
+            crate::log_info!("[dflash-debug] model.select_tokens_masked: allow=None -> unmasked (select_from_logits)");
+            return self.select_from_logits(logits, hidden_n, anchor);
+        }
+        if let Some(selector) = &self.candidate_selector {
+            crate::log_info!("[dflash-debug] model.select_tokens_masked: allow=Some + selector -> selector.select_masked");
+            return selector.select_masked(logits, hidden_n, anchor, allow);
+        }
+        // No selector (v1 checkpoint): argmax, honoring the allow gate. The allow matrix is
+        // u8 (1 = legal, 0 = illegal); where_cond requires a u8/u32/i64 condition, so use it
+        // directly (no dtype cast) exactly like GuidedDecoding::mask_rows.
+        crate::log_info!("[dflash-debug] model.select_tokens_masked: allow=Some, NO selector (v1) -> pre-mask argmax");
+        let a = allow.unwrap();
+        let neg_inf = Tensor::full(
+            f32::NEG_INFINITY,
+            logits.shape().clone(),
+            logits.device(),
+        )?
+        .to_dtype(logits.dtype())?;
+        let masked = a.where_cond(logits, &neg_inf)?;
+        masked.to_dtype(DType::F32)?.argmax(D::Minus1)?.to_vec1::<u32>()
     }
 
     pub fn device(&self) -> &Device {

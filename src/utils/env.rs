@@ -120,3 +120,41 @@ pub fn spec_granular_mask() -> bool {
             .unwrap_or(false)
     })
 }
+
+/// DFlash draft backend selector (`XINFER_DFLASH_BACKEND`).
+/// - `auto` (default): use the fused attention-rs CUDA kernels when the draft checkpoint
+///   carries DFlash2 components (candidate selector / grouped convs) AND the `cuda` feature
+///   is built; otherwise the portable candle path.
+/// - `v2`: force the fused kernels (no-op on non-CUDA builds, which fall back to candle).
+/// - `v1`: force the portable candle implementation.
+pub const DFLASH_BACKEND_ENV: &str = "XINFER_DFLASH_BACKEND";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DflashBackend {
+    Auto,
+    V1,
+    V2,
+}
+
+static DFLASH_BACKEND: OnceLock<DflashBackend> = OnceLock::new();
+
+pub fn dflash_backend() -> DflashBackend {
+    *DFLASH_BACKEND.get_or_init(|| {
+        match env::var(DFLASH_BACKEND_ENV).ok().as_deref() {
+            Some(v) if v.trim().eq_ignore_ascii_case("v1") || v.trim() == "1" => DflashBackend::V1,
+            Some(v) if v.trim().eq_ignore_ascii_case("v2") || v.trim() == "2" => DflashBackend::V2,
+            _ => DflashBackend::Auto,
+        }
+    })
+}
+
+/// Whether the fused DFlash2 CUDA-kernel backend is active. `auto` (the default) enables the
+/// kernels on CUDA builds; DFlash1 checkpoints are unaffected because they carry no DFlash2
+/// components (selector / convs), so the kernel paths simply never run for them.
+pub fn dflash_use_kernels() -> bool {
+    match dflash_backend() {
+        DflashBackend::V1 => false,
+        DflashBackend::V2 => cfg!(feature = "cuda"),
+        DflashBackend::Auto => cfg!(feature = "cuda"),
+    }
+}

@@ -178,6 +178,10 @@ pub fn verify_draft_masked(
         (masked.argmax(D::Minus1)?.to_scalar::<u32>()?, false)
     };
     guided.commit_token(seq_id, continuation);
+    crate::log_info!(
+        "[dflash-debug] verify(guided): seq={} proposed={} g={} t={} k={} cont={} ff={} drafts={:?}",
+        seq_id, num_proposed, g, t, k, continuation, used_ff, draft_tokens
+    );
 
     Ok(MtpVerifyResult {
         accepted_tokens: draft_tokens[..k].to_vec(),
