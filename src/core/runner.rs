@@ -729,7 +729,7 @@ impl ModelRunner {
             }
         }
 
-        OkOk(Self {
+        Ok(Self {
             model,
             gpu_kv_cache: Arc::new(Mutex::new(gpu_kv_cache)),
             cpu_kv_cache: Arc::new(Mutex::new(cpu_kv_cache)),

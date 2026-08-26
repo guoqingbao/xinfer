@@ -830,20 +830,184 @@ impl ModelRunner {
     }
 
     /// MTP speculative decode: route through the shared core with the MTP drafter.
+    /// Unguided batches take the batched verify path (ported from 483); single sequences and
+    /// any grammar-guided sequence take the single-seq firewall core.
     pub fn run_mtp_decode(&self, seqs: Seqs) -> Result<Vec<Vec<u32>>> {
-        match &self.mtp_head {
-            Some(head) => {
-                let drafter = MtpDrafter {
-                    head: head.clone(),
-                    num_spec: self.mtp_num_speculative,
-                };
-                self.run_spec_decode(seqs, &drafter)
-            }
+        let head = match &self.mtp_head {
+            Some(h) => h.clone(),
             None => {
                 let output = self.run(seqs, false)?;
-                Ok(output.into_iter().map(|t| vec![t]).collect())
+                return Ok(output.into_iter().map(|t| vec![t]).collect());
             }
+        };
+        let seq_infos: Vec<MtpSeqInfo> = match &seqs {
+            Seqs::SeqRefs(s) => s
+                .iter()
+                .map(|seq| MtpSeqInfo {
+                    id: seq.id,
+                    len: seq.len(),
+                    block_table: seq.block_table.clone(),
+                })
+                .collect(),
+            Seqs::DecodeVec(d) => d
+                .iter()
+                .map(|ds| MtpSeqInfo {
+                    id: ds.id,
+                    len: ds.len,
+                    block_table: ds.block_tables.clone(),
+                })
+                .collect(),
+        };
+        let any_guided = seq_infos.iter().any(|si| self.guided_decoding.is_guided(si.id));
+        if seq_infos.len() > 1 && !any_guided {
+            return self.run_mtp_decode_batch(seqs, &seq_infos, head);
         }
+        let drafter = MtpDrafter {
+            head,
+            num_spec: self.mtp_num_speculative,
+        };
+        self.run_spec_decode(seqs, &drafter)
+    }
+
+    /// Batched MTP verify (ported from 483): one prefill-style target forward over every
+    /// sequence's `[anchor, drafts...]` block. Unguided only (guided sequences stay on the
+    /// single-seq firewall path).
+    fn run_mtp_decode_batch(
+        &self,
+        seqs: Seqs,
+        seq_infos: &[MtpSeqInfo],
+        mtp_head: Arc<Qwen3_5MtpHead>,
+    ) -> Result<Vec<Vec<u32>>> {
+        let embed_weight = match self.model() {
+            Model::Qwen3_5(m) => m.embed_weight().clone(),
+            Model::Qwen3_5MoE(m) => m.embed_weight().clone(),
+            Model::Qwen3VL(m) => m
+                .embed_weight()
+                .expect("Qwen3VL MTP requires Qwen3.5 text backbone")
+                .clone(),
+            _ => unreachable!(),
+        };
+        let lm_head_fn = |hidden: &Tensor| -> Result<Tensor> {
+            match self.model() {
+                Model::Qwen3_5(m) => m.forward_lm_head(hidden),
+                Model::Qwen3_5MoE(m) => m.forward_lm_head(hidden),
+                Model::Qwen3VL(m) => m.forward_lm_head(hidden),
+                _ => unreachable!(),
+            }
+        };
+
+        let mut anchors = Vec::with_capacity(seq_infos.len());
+        let mut draft_tokens = Vec::with_capacity(seq_infos.len());
+        for (index, seq_info) in seq_infos.iter().enumerate() {
+            let (anchor, seq_hidden) = match &seqs {
+                Seqs::SeqRefs(sequences) => {
+                    self.mtp_decode_step1(Seqs::SeqRefs(&sequences[index..index + 1]), seq_info)?
+                }
+                Seqs::DecodeVec(sequences) => {
+                    let single_sequence = vec![sequences[index].clone()];
+                    self.mtp_decode_step1(Seqs::DecodeVec(&single_sequence), seq_info)?
+                }
+            };
+            let known_tokens: Vec<u32> = vec![anchor];
+            let base_position = seq_info.len.saturating_sub(1);
+            let (draft, _) = mtp_head.draft_tokens_gpu(
+                &seq_hidden,
+                &known_tokens,
+                self.mtp_num_speculative,
+                &embed_weight,
+                &lm_head_fn,
+                base_position,
+            )?;
+            anchors.push(anchor);
+            draft_tokens.push(draft);
+        }
+
+        if draft_tokens.iter().any(|draft| draft.is_empty()) {
+            return Ok(anchors.into_iter().map(|anchor| vec![anchor]).collect());
+        }
+
+        let verify_len = self.mtp_num_speculative + 1;
+        let mut verify_tokens = Vec::with_capacity(seq_infos.len() * verify_len);
+        let mut slot_mappings = Vec::with_capacity(seq_infos.len());
+        for (seq_info, (anchor, draft)) in seq_infos.iter().zip(anchors.iter().zip(&draft_tokens)) {
+            verify_tokens.push(*anchor);
+            verify_tokens.extend_from_slice(draft);
+            slot_mappings.push(self.compute_slot_mappings(
+                seq_info,
+                verify_len,
+                self.block_size(),
+                "MTP batch verify",
+            )?);
+        }
+        let q_lens = vec![verify_len; seq_infos.len()];
+        let verify_metadata = self.build_mtp_metadata_batch(seq_infos, &slot_mappings, &q_lens)?;
+        let verify_input_ids = Tensor::from_vec(
+            verify_tokens,
+            (seq_infos.len() * verify_len,),
+            self.device(),
+        )?;
+        let verify_positions = Tensor::from_vec(
+            seq_infos
+                .iter()
+                .flat_map(|seq| seq.len..seq.len + verify_len)
+                .map(|position| position as i64)
+                .collect::<Vec<_>>(),
+            (seq_infos.len() * verify_len,),
+            self.device(),
+        )?;
+
+        let _prefill_guard = set_linear_is_prefill(true);
+        let kv_cache = self.get_kv_cache();
+        let kv_pairs = kv_cache.as_pairs();
+        let all_logits = match self.model() {
+            Model::Qwen3_5(model) => model.forward(
+                &verify_input_ids,
+                &verify_positions,
+                kv_pairs,
+                &verify_metadata,
+                false,
+            ),
+            Model::Qwen3_5MoE(model) => model.forward(
+                &verify_input_ids,
+                &verify_positions,
+                kv_pairs,
+                &verify_metadata,
+                false,
+            ),
+            Model::Qwen3VL(model) => model.forward(
+                &verify_input_ids,
+                &verify_positions,
+                kv_pairs,
+                &verify_metadata,
+                None,
+            ),
+            _ => unreachable!(),
+        }?;
+        drop(kv_cache);
+        drop(_prefill_guard);
+
+        let mut outputs = Vec::with_capacity(seq_infos.len());
+        for (index, (seq_info, draft)) in seq_infos.iter().zip(&draft_tokens).enumerate() {
+            let offset = index * verify_len;
+            let logits = all_logits.narrow(0, offset, verify_len)?;
+            let verify_result = verify_draft_greedy(&logits, draft)?;
+            if verify_result.num_accepted < verify_result.num_proposed {
+                let keep_tokens = 1 + verify_result.num_accepted;
+                if !self.mtp_rollback_mamba(seq_info.id, keep_tokens)? {
+                    candle_core::bail!(
+                        "MTP failed to roll back mamba-state for batch sequence {}",
+                        seq_info.id
+                    );
+                }
+            }
+            let mut result = Vec::with_capacity(verify_result.num_accepted + 2);
+            result.push(anchors[index]);
+            result.extend_from_slice(&verify_result.accepted_tokens);
+            result.push(verify_result.continuation_token);
+            crate::core::speculative::spec_stats_update("mtp", seq_info.id, &verify_result);
+            outputs.push(result);
+        }
+        Ok(outputs)
     }
 
 }
