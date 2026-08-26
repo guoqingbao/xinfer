@@ -1,12 +1,15 @@
-// DFlash draft model: a small, fully-replicated dense transformer that drafts future tokens by
-// reading the target model's hidden states (at `target_layer_ids`) instead of re-reading the KV
-// cache. Loaded separately from the primary model (its own safetensors/gguf checkpoint) and
-// replicated on every tensor-parallel rank (no `comm`, no NCCL in the draft path).
+// DFlash draft model: a small dense transformer that drafts future tokens by reading the target
+// model's hidden states (at `target_layer_ids`) instead of re-reading the KV cache. Loaded
+// separately from the primary model (its own safetensors/gguf checkpoint). The MLP is
+// tensor-parallel (shared `MLP`, NCCL allreduce in the draft forward); attention / conv /
+// selector / fc stay replicated.
 
-use crate::models::layers::distributed::ReplicatedLinear;
+use crate::models::layers::distributed::{Comm, ReplicatedLinear};
+use crate::models::layers::mlp::MLP;
 use crate::models::layers::others::{rms_norm, NormX};
 use crate::models::layers::VarBuilderX;
 use candle_core::{DType, Device, Result, Tensor, D};
+use std::rc::Rc;
 #[cfg(feature = "cuda")]
 use attention_rs::sort::ArgSortOp;
 
@@ -42,6 +45,10 @@ pub struct DFlashModelConfig {
     pub max_position_embeddings: usize,
     pub rope_theta: Option<f64>,
     pub attention_bias: Option<bool>,
+    #[serde(default)]
+    pub sliding_window: Option<usize>,
+    #[serde(default)]
+    pub is_causal: Option<bool>,
     #[serde(default)]
     pub block_size: Option<usize>,
     pub num_target_layers: usize,
@@ -170,53 +177,41 @@ fn apply_rotary_pos_emb(
     Ok((q_embed, k_embed))
 }
 
-/// Replicated (dense, non-TP-sharded) SiLU-Glu MLP. Weight names match a Qwen-style draft
-/// checkpoint (`gate_proj`/`up_proj`/`down_proj`); the gguf aliases are resolved by the loader.
-pub struct DFlashMLP {
-    gate_proj: ReplicatedLinear,
-    up_proj: ReplicatedLinear,
-    down_proj: ReplicatedLinear,
-}
-
-impl DFlashMLP {
-    pub fn new(vb: VarBuilderX, hidden_size: usize, intermediate_size: usize, dtype: DType) -> Result<Self> {
-        let gate_proj = ReplicatedLinear::load_no_bias(
-            hidden_size,
-            intermediate_size,
-            vb.pp("gate_proj"),
-            &None,
-            &None,
-            dtype,
-        )?;
-        let up_proj = ReplicatedLinear::load_no_bias(
-            hidden_size,
-            intermediate_size,
-            vb.pp("up_proj"),
-            &None,
-            &None,
-            dtype,
-        )?;
-        let down_proj = ReplicatedLinear::load_no_bias(
-            intermediate_size,
-            hidden_size,
-            vb.pp("down_proj"),
-            &None,
-            &None,
-            dtype,
-        )?;
-        Ok(Self {
-            gate_proj,
-            up_proj,
-            down_proj,
-        })
+/// Optional causal / sliding-window bias for draft queries over `[ctx | noise]`. DFlash2
+/// checkpoints set `is_causal=false` (block diffusion / encoder-only), so when the whole block
+/// fits the window we return `None` (full attention, no bias tensor).
+fn build_dflash_attn_bias(
+    ctx_len: usize,
+    q_len: usize,
+    sliding_window: Option<usize>,
+    is_causal: bool,
+    dtype: DType,
+    device: &Device,
+) -> Result<Option<Tensor>> {
+    let kv_len = ctx_len + q_len;
+    let window = sliding_window.unwrap_or(usize::MAX);
+    if !is_causal && kv_len <= window {
+        return Ok(None);
     }
-
-    pub fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let gate = self.gate_proj.forward(xs)?;
-        let up = self.up_proj.forward(xs)?;
-        let activated = (candle_nn::ops::silu(&gate)? * up)?;
-        self.down_proj.forward(&activated)
+    let mut bias = vec![0f32; q_len * kv_len];
+    for i in 0..q_len {
+        let abs_q = ctx_len + i;
+        let oldest = abs_q.saturating_add(1).saturating_sub(window);
+        let newest = if is_causal {
+            abs_q
+        } else {
+            (abs_q + window.saturating_sub(1)).min(kv_len.saturating_sub(1))
+        };
+        let row = i * kv_len;
+        for j in 0..kv_len {
+            if j < oldest || j > newest || (is_causal && j > abs_q) {
+                bias[row + j] = f32::NEG_INFINITY;
+            }
+        }
     }
+    Ok(Some(
+        Tensor::from_vec(bias, (1, 1, q_len, kv_len), device)?.to_dtype(dtype)?,
+    ))
 }
 
 /// Grouped dynamic causal convolution (DFlash2 `attention_conv` / `mlp_conv`).
@@ -533,6 +528,10 @@ pub struct DFlashAttention {
     num_kv_heads: usize,
     head_dim: usize,
     scaling: f64,
+    sliding_window: Option<usize>,
+    is_causal: bool,
+    dtype: DType,
+    device: Device,
 }
 
 impl DFlashAttention {
@@ -600,6 +599,10 @@ impl DFlashAttention {
             num_kv_heads,
             head_dim,
             scaling: (head_dim as f64).powf(-0.5),
+            sliding_window: config.sliding_window,
+            is_causal: config.is_causal.unwrap_or(false),
+            dtype,
+            device: vb.device(),
         })
     }
 
@@ -652,7 +655,17 @@ impl DFlashAttention {
             v
         };
 
-        let attn_weights = (q.matmul(&k.t()?)? * self.scaling)?;
+        let mut attn_weights = (q.matmul(&k.t()?)? * self.scaling)?;
+        if let Some(attn_bias) = build_dflash_attn_bias(
+            ctx_len,
+            q_len,
+            self.sliding_window,
+            self.is_causal,
+            self.dtype,
+            &self.device,
+        )? {
+            attn_weights = attn_weights.broadcast_add(&attn_bias)?;
+        }
         let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
         let attn_output = attn_weights.matmul(&v)?;
 
@@ -664,7 +677,7 @@ impl DFlashAttention {
 
 pub struct DFlashDecoderLayer {
     self_attn: DFlashAttention,
-    mlp: DFlashMLP,
+    mlp: MLP,
     input_layernorm: NormX,
     post_attention_layernorm: NormX,
     attention_conv: Option<GroupedDynamicCausalConv>,
@@ -672,13 +685,24 @@ pub struct DFlashDecoderLayer {
 }
 
 impl DFlashDecoderLayer {
-    pub fn new(vb: VarBuilderX, config: &DFlashModelConfig, dtype: DType) -> Result<Self> {
+    pub fn new(
+        vb: VarBuilderX,
+        comm: Rc<Comm>,
+        config: &DFlashModelConfig,
+        dtype: DType,
+    ) -> Result<Self> {
         let self_attn = DFlashAttention::new(vb.pp("self_attn"), config, dtype)?;
-        let mlp = DFlashMLP::new(
+        let mlp = MLP::new(
             vb.pp("mlp"),
+            comm,
             config.hidden_size,
             config.intermediate_size,
+            &candle_nn::Activation::Silu,
+            &None,
+            &None,
+            false,
             dtype,
+            "",
         )?;
         let input_layernorm = rms_norm(
             config.hidden_size,
@@ -862,9 +886,10 @@ pub struct DFlashDraftModel {
 
 impl DFlashDraftModel {
     /// `vb` is a (separately-loaded) var builder pointing at the DFlash checkpoint root.
-    /// The model is fully replicated: no `comm`, no NCCL.
+    /// The MLP is tensor-parallel (`comm`); attention / conv / selector / fc are replicated.
     pub fn new(
         vb: &VarBuilderX,
+        comm: Rc<Comm>,
         config: &DFlashModelConfig,
         dtype: DType,
         device: &Device,
@@ -892,7 +917,12 @@ impl DFlashDraftModel {
 
         let mut layers = Vec::new();
         for i in 0..config.num_hidden_layers {
-            let layer = DFlashDecoderLayer::new(vb.pp(&format!("layers.{}", i)), config, dtype)?;
+            let layer = DFlashDecoderLayer::new(
+                vb.pp(&format!("layers.{}", i)),
+                comm.clone(),
+                config,
+                dtype,
+            )?;
             layers.push(layer);
         }
 
@@ -946,6 +976,21 @@ impl DFlashDraftModel {
             .map(|i| all_hidden_states[i + 1].clone())
             .collect();
         let concatenated = Tensor::cat(&selected, D::Minus1)?.to_dtype(self.dtype)?;
+        let projected = self.fc.forward(&concatenated)?;
+        self.hidden_norm.forward(&projected)
+    }
+
+    /// Project target-layer hiddens (already extracted, no embedding row) into a draft context
+    /// vector. Used after graph-safe verify forwards that write layer buffers in-place.
+    pub fn project_layer_hiddens(&self, layer_hiddens: &[Tensor]) -> Result<Tensor> {
+        if layer_hiddens.len() != self.target_layer_ids.len() {
+            candle_core::bail!(
+                "DFlash expected {} layer hiddens, got {}",
+                self.target_layer_ids.len(),
+                layer_hiddens.len()
+            );
+        }
+        let concatenated = Tensor::cat(layer_hiddens, D::Minus1)?.to_dtype(self.dtype)?;
         let projected = self.fc.forward(&concatenated)?;
         self.hidden_norm.forward(&projected)
     }
@@ -1070,6 +1115,8 @@ mod tests {
             max_position_embeddings: 2048,
             rope_theta: None,
             attention_bias: None,
+            sliding_window: None,
+            is_causal: None,
             block_size: Some(num_draft + 1),
             num_target_layers: num_target,
             dflash_config: None,

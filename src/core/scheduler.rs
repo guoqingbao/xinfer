@@ -659,6 +659,48 @@ impl Scheduler {
                     }
                 }
             }
+            // Speculative (multi-token) rows committed extra tokens; ensure KV room for the next
+            // step (the owner's `postprocess_speculative_extra` safety net).
+            if tokens.len() > 1 && self.running[idx].status != SequenceStatus::Finished {
+                let _ = self.block_manager.ensure_allocate(&mut self.running[idx]);
+            }
+        }
+    }
+
+    /// Dedicated postprocess for speculative *extras* (the tokens after each row's anchor). On an
+    /// EOS inside the extras the sequence is finished (mamba prefix captured, KV cached, blocks
+    /// deallocated); otherwise the extras are appended and KV is ensured for the next step.
+    /// (Ported from the owner's DFlash branch; our generic `postprocess` already handles
+    /// EOS-in-extras, so this is available for the `ensure_allocate` safety net / parity.)
+    pub fn postprocess_speculative_extra(&mut self, ids: &[usize], extras: &[Vec<u32>]) {
+        for (i, extra_tokens) in extras.iter().enumerate() {
+            if i >= ids.len() {
+                break;
+            }
+            let idx = ids[i];
+            if idx >= self.running.len() {
+                continue;
+            }
+            if self.running[idx].status == SequenceStatus::Finished {
+                continue;
+            }
+            let mut finished = false;
+            for &tok in extra_tokens {
+                if self.eos_token_id.contains(&tok) {
+                    self.running[idx].append_token(tok);
+                    self.running[idx].status = SequenceStatus::Finished;
+                    self.block_manager
+                        .capture_mamba_prefix_state(&self.running[idx], self.running[idx].len());
+                    self.block_manager.cache_sequence(&self.running[idx]);
+                    self.block_manager.deallocate(&mut self.running[idx]);
+                    finished = true;
+                    break;
+                }
+                self.running[idx].append_token(tok);
+            }
+            if !finished {
+                let _ = self.block_manager.ensure_allocate(&mut self.running[idx]);
+            }
         }
     }
 

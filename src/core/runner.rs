@@ -354,7 +354,9 @@ impl ModelRunner {
         );
 
         #[cfg(all(feature = "cuda", feature = "graph"))]
-        let mtp_wrapper = if econfig.mtp_num_speculative_tokens.unwrap_or(0) > 0 {
+        let mtp_wrapper = if econfig.mtp_num_speculative_tokens.unwrap_or(0) > 0
+            || (config.dflash_enabled && econfig.num_speculative_tokens.unwrap_or(0) > 0)
+        {
             Some(crate::graph_wrapper!(
                 &model,
                 device,
@@ -657,7 +659,7 @@ impl ModelRunner {
             );
         }
 
-        let (mtp_head, mtp_num_speculative) = if let Some(num_spec) =
+        let (mtp_head, mut mtp_num_speculative) = if let Some(num_spec) =
             econfig.mtp_num_speculative_tokens
         {
             if requested_mtp_num_speculative == 0 {
@@ -705,9 +707,29 @@ impl ModelRunner {
             (None, 0)
         };
 
-        let dflash_drafter = Self::init_dflash_drafter(econfig, &device)?;
+        let dflash_drafter = Self::init_dflash_drafter(econfig, comm.clone(), &device)?;
+        // DFlash reuses the MTP verify CUDA-graph capturer. When only DFlash is enabled,
+        // borrow `mtp_num_speculative` for capture/replay sizing, and preallocate the
+        // graph-safe per-layer hidden buffers (written during `is_mtp_verify` forwards).
+        if mtp_num_speculative == 0 {
+            if let Some(drafter) = dflash_drafter.as_ref() {
+                mtp_num_speculative = drafter.num_speculative_tokens;
+            }
+        }
+        if let Some(drafter) = dflash_drafter.as_ref() {
+            let verify_len = drafter.num_speculative_tokens + 1;
+            let layer_ids = drafter.target_layer_ids();
+            match &model {
+                Model::Qwen3_5(m) => m.preallocate_dflash_verify_buffers(layer_ids, verify_len)?,
+                Model::Qwen3_5MoE(m) => {
+                    m.preallocate_dflash_verify_buffers(layer_ids, verify_len)?
+                }
+                Model::Qwen3VL(m) => m.preallocate_dflash_verify_buffers(layer_ids, verify_len)?,
+                _ => {}
+            }
+        }
 
-        Ok(Self {
+        OkOk(Self {
             model,
             gpu_kv_cache: Arc::new(Mutex::new(gpu_kv_cache)),
             cpu_kv_cache: Arc::new(Mutex::new(cpu_kv_cache)),
@@ -762,9 +784,11 @@ impl ModelRunner {
 
     /// Initialize the DFlash drafter (a separate, replicated draft model) when a draft model is
     /// configured. Runs inside each runner process, so every tensor-parallel rank loads its own
-    /// full copy of the (small) dense draft model.
+    /// copy of the (small) draft model; the MLP is tensor-parallel (NCCL allreduce in the draft
+    /// forward), attention/conv/selector/fc are replicated.
     fn init_dflash_drafter(
         econfig: &EngineConfig,
+        comm: Rc<Comm>,
         device: &Device,
     ) -> Result<Option<Arc<crate::core::dflash_drafter::DFlashDrafter>>> {
         let has_draft = econfig.draft_model_id.is_some() || econfig.draft_model_path.is_some();
@@ -799,6 +823,7 @@ impl ModelRunner {
         let drafter = crate::core::dflash_drafter::DFlashDrafter::new(
             &draft_config,
             &draft_vb,
+            comm,
             dflash_dtype,
             device,
             econfig.num_speculative_tokens,

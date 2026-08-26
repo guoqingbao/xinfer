@@ -420,6 +420,177 @@ impl ModelRunner {
         })
     }
 
+    /// Batched MTP/DFlash verify metadata: one prefill-style `InputMetadata` covering every
+    /// sequence's `[anchor, drafts...]` block. `seqlens` is `None` so the model keeps every row
+    /// (speculative verification needs logits for all tokens, not just each sequence's last).
+    pub(crate) fn build_mtp_metadata_batch(
+        &self,
+        seq_infos: &[MtpSeqInfo],
+        slot_mappings: &[Vec<i64>],
+        q_lens: &[usize],
+    ) -> Result<InputMetadata> {
+        if seq_infos.is_empty()
+            || seq_infos.len() != slot_mappings.len()
+            || seq_infos.len() != q_lens.len()
+        {
+            candle_core::bail!("MTP verify batch metadata has inconsistent dimensions");
+        }
+        let batch_size = seq_infos.len();
+        let total_q_len = q_lens.iter().sum::<usize>();
+        let sequence_ids = seq_infos.iter().map(|seq| seq.id).collect::<Vec<_>>();
+        let total_kv_lens = seq_infos
+            .iter()
+            .zip(q_lens)
+            .map(|(seq, &q_len)| (seq.len + q_len) as u32)
+            .collect::<Vec<_>>();
+        let slot_mapping = slot_mappings.iter().flatten().copied().collect::<Vec<_>>();
+        if slot_mapping.len() != total_q_len {
+            candle_core::bail!("MTP verify batch slot/query count mismatch");
+        }
+        let mamba_slot_mapping = self.prepare_mamba_slot_mapping(&sequence_ids, false)?;
+
+        #[cfg(feature = "flashinfer")]
+        let flashinfer_metadata = if let Some(params) = self.flashinfer_kv_params() {
+            let mut indptr_host = vec![0u32];
+            let mut indices_host = Vec::new();
+            let mut last_len_host = Vec::with_capacity(batch_size);
+            for (seq, &total_kv_len) in seq_infos.iter().zip(&total_kv_lens) {
+                let num_pages = (total_kv_len as usize).div_ceil(params.page_size);
+                if num_pages > seq.block_table.len() {
+                    candle_core::bail!(
+                        "MTP verify needs {} pages for sequence {}, but only {} are allocated",
+                        num_pages,
+                        seq.id,
+                        seq.block_table.len()
+                    );
+                }
+                indices_host.extend_from_slice(&seq.block_table[..num_pages]);
+                indptr_host.push(indices_host.len() as u32);
+                last_len_host.push(((total_kv_len as usize - 1) % params.page_size + 1) as u32);
+            }
+            let mut q_cu_seqlens_host = vec![0u32];
+            let mut batch_indices_host = Vec::with_capacity(total_q_len);
+            let mut append_positions_host = Vec::with_capacity(total_q_len);
+            for (batch_idx, (seq, &q_len)) in seq_infos.iter().zip(q_lens).enumerate() {
+                q_cu_seqlens_host.push(q_cu_seqlens_host.last().copied().unwrap() + q_len as u32);
+                batch_indices_host.extend((0..q_len).map(|_| batch_idx as u32));
+                append_positions_host.extend(seq.len as u32..seq.len as u32 + q_len as u32);
+            }
+            let kv_len_arr_host = total_kv_lens.clone();
+            let prefill_plan_info = Some(attention_rs::flashinfer::prefill_plan(
+                self.device(),
+                &q_cu_seqlens_host,
+                &indptr_host,
+                &kv_len_arr_host,
+                total_q_len as u32,
+                batch_size,
+                params.num_qo_heads,
+                params.num_kv_heads,
+                params.head_dim,
+                params.page_size,
+                params.out_dtype,
+                None,
+                Some(params.kv_dtype),
+                false,
+            )?);
+            Some(attention_rs::FlashInferMetadata {
+                indptr: Tensor::from_vec(indptr_host.clone(), (indptr_host.len(),), self.device())?,
+                indptr_host,
+                indices: Tensor::from_vec(
+                    indices_host.clone(),
+                    (indices_host.len(),),
+                    self.device(),
+                )?,
+                last_len: Tensor::from_vec(
+                    last_len_host.clone(),
+                    (last_len_host.len(),),
+                    self.device(),
+                )?,
+                last_len_host: Some(last_len_host),
+                kv_len_arr_host: Some(kv_len_arr_host),
+                total_num_rows: Some(total_q_len as u32),
+                batch_indices: Some(Tensor::from_vec(
+                    batch_indices_host,
+                    (total_q_len,),
+                    self.device(),
+                )?),
+                positions: Some(Tensor::from_vec(
+                    append_positions_host,
+                    (total_q_len,),
+                    self.device(),
+                )?),
+                use_cuda_graph: false,
+                decode_plan_info: None,
+                prefill_plan_info,
+                mla_decode_plan_info: None,
+                mla_prefill_plan_info: None,
+            })
+        } else {
+            None
+        };
+        #[cfg(not(feature = "flashinfer"))]
+        let flashinfer_metadata = None;
+
+        let mut block_tables_host = Vec::with_capacity(batch_size);
+        let max_blocks = seq_infos
+            .iter()
+            .map(|seq| seq.block_table.len())
+            .max()
+            .unwrap_or(0);
+        let mut block_tables_flat = Vec::with_capacity(batch_size * max_blocks);
+        for seq in seq_infos {
+            block_tables_host.push(seq.block_table.clone());
+            block_tables_flat.extend_from_slice(&seq.block_table);
+            block_tables_flat.resize(
+                block_tables_flat.len() + max_blocks - seq.block_table.len(),
+                0,
+            );
+        }
+        let mut cu_seqlens_q = vec![0u32];
+        let mut cu_seqlens_k = vec![0u32];
+        for (&q_len, &kv_len) in q_lens.iter().zip(&total_kv_lens) {
+            cu_seqlens_q.push(cu_seqlens_q.last().copied().unwrap() + q_len as u32);
+            cu_seqlens_k.push(cu_seqlens_k.last().copied().unwrap() + kv_len);
+        }
+        let max_seqlen_q = q_lens.iter().copied().max().unwrap_or(0);
+        let max_seqlen_k = total_kv_lens.iter().copied().max().unwrap_or(0) as usize;
+        Ok(InputMetadata {
+            is_prefill: true,
+            is_mla: self.is_mla_model(),
+            sequence_ids: Some(sequence_ids),
+            mamba_slot_mapping,
+            slot_mapping: Tensor::from_vec(slot_mapping, (total_q_len,), self.device())?,
+            block_tables: Some(Tensor::from_vec(
+                block_tables_flat,
+                (batch_size, max_blocks),
+                self.device(),
+            )?),
+            block_tables_host: Some(block_tables_host),
+            context_lens_host: Some(total_kv_lens.clone()),
+            context_lens: Some(Tensor::from_vec(
+                total_kv_lens,
+                (batch_size,),
+                self.device(),
+            )?),
+            cu_seqlens_q: Some(Tensor::from_vec(
+                cu_seqlens_q,
+                (batch_size + 1,),
+                self.device(),
+            )?),
+            cu_seqlens_k: Some(Tensor::from_vec(
+                cu_seqlens_k,
+                (batch_size + 1,),
+                self.device(),
+            )?),
+            max_seqlen_q,
+            max_seqlen_k,
+            max_context_len: max_seqlen_k,
+            seqlens: None,
+            flashinfer_metadata,
+            is_mtp_verify: true,
+        })
+    }
+
     pub(crate) fn mtp_rollback_mamba(&self, seq_id: usize, keep_tokens: usize) -> Result<bool> {
         match self.model() {
             Model::Qwen3_5(m) => m.mtp_rollback_mamba(seq_id, keep_tokens),

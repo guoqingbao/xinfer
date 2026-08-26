@@ -258,9 +258,10 @@ impl Drafter for DflashDrafter {
         vhidden: &[Tensor],
         accepted: usize,
     ) -> Result<()> {
-        // Refresh the context window with the verify block's accepted rows.
+        // Refresh the context window with the verify block's accepted rows. `vhidden` is the
+        // per-layer hiddens (graph path) or the stripped collector (eager path).
         if !vhidden.is_empty() && accepted > 0 {
-            let vproj = self.inner.extract_and_project_hidden(vhidden)?;
+            let vproj = self.inner.project_layer_hiddens(vhidden)?;
             let keep = std::cmp::min(accepted + 1, vproj.dim(0)?);
             if keep > 0 {
                 self.inner.append_context(seq.id, &vproj.narrow(0, 0, keep)?)?;
@@ -268,24 +269,262 @@ impl Drafter for DflashDrafter {
         }
         Ok(())
     }
+
+    /// Verify forward: CUDA-graph replay when captured (hybrid models), else eager.
+    ///
+    /// The graph-safe per-layer hidden buffers are written by the `forward_inner` copy block
+    /// DURING the replayed graph, so the order is: `replay_mtp` (writes buffers) ->
+    /// `take_dflash_verify_hiddens` (reads buffers). Both DFlash v1 and v2 use the identical
+    /// target-verify graph (the drafter version only affects the eager draft step), so this is
+    /// variety-agnostic.
+    fn verify_forward(
+        &self,
+        runner: &ModelRunner,
+        verify_ids: &Tensor,
+        verify_positions: &Tensor,
+        kv_pairs: Option<&Vec<(Tensor, Tensor)>>,
+        metadata: &attention_rs::InputMetadata,
+        verify_len: usize,
+    ) -> Result<(Tensor, Vec<Tensor>)> {
+        #[cfg(all(feature = "cuda", feature = "graph"))]
+        if matches!(
+            runner.model(),
+            Model::Qwen3_5(_) | Model::Qwen3_5MoE(_) | Model::Qwen3VL(_)
+        ) && runner
+            .mtp_capturer
+            .as_ref()
+            .is_some_and(|c| c.is_mtp_captured(verify_len))
+        {
+            let logits = runner
+                .mtp_capturer
+                .as_ref()
+                .unwrap()
+                .replay_mtp(verify_ids, verify_positions, metadata)?;
+            let layer_hiddens = match runner.model() {
+                Model::Qwen3_5(m) => m.take_dflash_verify_hiddens(verify_len),
+                Model::Qwen3_5MoE(m) => m.take_dflash_verify_hiddens(verify_len),
+                Model::Qwen3VL(m) => m.take_dflash_verify_hiddens(verify_len),
+                _ => None,
+            };
+            if let Some(layer_hiddens) = layer_hiddens {
+                return Ok((logits, layer_hiddens));
+            }
+            // Graph replayed but no DFlash buffers for this model: fall through to eager.
+        }
+        // Eager fallback: collect hiddens at the target layers, drop the embedding row.
+        let (logits, collector) = runner.spec_verify_forward(
+            verify_ids,
+            verify_positions,
+            kv_pairs,
+            metadata,
+            self.verify_target_layers(),
+        )?;
+        let layer_hiddens: Vec<Tensor> = collector.into_iter().skip(1).collect();
+        Ok((logits, layer_hiddens))
+    }
 }
 
 impl ModelRunner {
     /// DFlash speculative decode: route through the shared core with the DFlash drafter.
+    /// Unguided batches take the batched verify path; everything else (single seq, or any
+    /// guided seq) takes the single-seq grammar-firewall core.
     pub fn run_dflash_decode(&self, seqs: Seqs) -> Result<Vec<Vec<u32>>> {
         match &self.dflash_drafter {
             Some(inner) => {
-                // crate::log_info!("[dflash-debug] run_dflash_decode: drafter PRESENT -> run_spec_decode");
                 let drafter = DflashDrafter {
                     inner: inner.clone(),
                 };
+                if self.dflash_batch_eligible(&seqs) {
+                    return self.run_dflash_decode_batch(seqs, &drafter);
+                }
                 self.run_spec_decode(seqs, &drafter)
             }
             None => {
-                // crate::log_info!("[dflash-debug] run_dflash_decode: drafter ABSENT -> plain decode fallback (NO drafting)");
                 let output = self.run(seqs, false)?;
                 Ok(output.into_iter().map(|t| vec![t]).collect())
             }
         }
+    }
+
+    /// True when a batched (unguided) DFlash verify is worthwhile: more than one sequence and
+    /// none of them is grammar-guided (guided sequences stay on the single-seq firewall path).
+    fn dflash_batch_eligible(&self, seqs: &Seqs) -> bool {
+        let ids: Vec<usize> = match seqs {
+            Seqs::SeqRefs(refs) => refs.iter().map(|s| s.id).collect(),
+            Seqs::DecodeVec(d) => d.iter().map(|s| s.id).collect(),
+        };
+        ids.len() > 1 && !ids.iter().any(|id| self.guided_decoding.is_guided(*id))
+    }
+
+    /// Batched DFlash speculative verify: one prefill-style target forward over all sequences'
+    /// `[anchor, drafts...]` blocks. Unguided only. Mirrors the owner's `run_dflash_decode_batch`.
+    fn run_dflash_decode_batch(
+        &self,
+        seqs: Seqs,
+        drafter: &DflashDrafter,
+    ) -> Result<Vec<Vec<u32>>> {
+        let inner = &drafter.inner;
+        let seq_infos: Vec<MtpSeqInfo> = match &seqs {
+            Seqs::SeqRefs(refs) => refs
+                .iter()
+                .map(|s| MtpSeqInfo {
+                    id: s.id,
+                    len: s.len(),
+                    block_table: s.block_table.clone(),
+                })
+                .collect(),
+            Seqs::DecodeVec(d) => d
+                .iter()
+                .map(|s| MtpSeqInfo {
+                    id: s.id,
+                    len: s.len,
+                    block_table: s.block_tables.clone(),
+                })
+                .collect(),
+        };
+        let n = inner.num_speculative();
+        let verify_len = 1 + n;
+
+        // 1. Batched anchor forward -> per-seq context update.
+        #[allow(unused_mut)]
+        let (input_ids, positions, mut input_metadata) = match &seqs {
+            Seqs::SeqRefs(seqs_ref) => self.prepare_decode(*seqs_ref)?,
+            Seqs::DecodeVec(decode_seqs) => self.prepare_decode(decode_seqs.iter())?,
+        };
+        let _decode_guard = set_linear_is_prefill(false);
+        #[cfg(feature = "flashinfer")]
+        if let Some(fm) = input_metadata.flashinfer_metadata.as_mut() {
+            if fm.decode_plan_info.is_none() {
+                if let Some(params) = self.flashinfer_kv_params() {
+                    fm.decode_plan_info = Some(attention_rs::flashinfer::decode_plan(
+                        self.device(),
+                        params.kv_dtype,
+                        params.out_dtype,
+                        &fm.indptr_host,
+                        fm.last_len_host.as_deref(),
+                        fm.kv_len_arr_host.as_deref(),
+                        input_ids.dim(0)?,
+                        params.num_qo_heads,
+                        params.num_kv_heads,
+                        params.head_dim,
+                        params.page_size,
+                        fm.use_cuda_graph,
+                    )?);
+                }
+            }
+        }
+        let kv_cache = self.get_kv_cache();
+        let kv_pairs = kv_cache.as_pairs();
+        let (anchor_logits, anchor_collector) = match self.model() {
+            Model::Qwen3_5(m) => m.forward_with_hidden_states(&input_ids, &positions, kv_pairs, &input_metadata, false, inner.target_layer_ids())?,
+            Model::Qwen3_5MoE(m) => m.forward_with_hidden_states(&input_ids, &positions, kv_pairs, &input_metadata, false, inner.target_layer_ids())?,
+            Model::Qwen3VL(m) => m.forward_with_hidden_states(&input_ids, &positions, kv_pairs, &input_metadata, false, inner.target_layer_ids())?,
+            _ => {
+                drop(kv_cache);
+                candle_core::bail!("DFlash batch requires a supported model type");
+            }
+        };
+        drop(kv_cache);
+        drop(_decode_guard);
+        let anchor_tokens = self.sample(&anchor_logits, seqs, false)?;
+        let projected = inner.extract_and_project_hidden(&anchor_collector)?;
+        for (i, si) in seq_infos.iter().enumerate() {
+            inner.append_context(si.id, &projected.narrow(0, i, 1)?)?;
+        }
+
+        // 2. Per-seq draft (block build + run + select, unguided).
+        let embed_fn = |ids: &Tensor| -> Result<Tensor> {
+            match self.model() {
+                Model::Qwen3_5(m) => m.embed_forward(ids),
+                Model::Qwen3_5MoE(m) => m.embed_forward(ids),
+                Model::Qwen3VL(m) => m.embed_forward(ids),
+                _ => candle_core::bail!("DFlash batch not supported for this model type"),
+            }
+        };
+        let lm_head_fn = |h: &Tensor| -> Result<Tensor> {
+            match self.model() {
+                Model::Qwen3_5(m) => m.forward_lm_head(h),
+                Model::Qwen3_5MoE(m) => m.forward_lm_head(h),
+                Model::Qwen3VL(m) => m.forward_lm_head(h),
+                _ => candle_core::bail!("DFlash batch lm_head not accessible"),
+            }
+        };
+        let mut drafts = Vec::with_capacity(seq_infos.len());
+        for (si, &anchor) in seq_infos.iter().zip(&anchor_tokens) {
+            let ctx = inner.context(si.id)?.ok_or_else(|| {
+                candle_core::Error::Msg("DFlash target hidden cache is empty".into())
+            })?;
+            let (logits, hidden_n) = inner.draft_logits(&ctx, &embed_fn, &lm_head_fn, anchor, n)?;
+            drafts.push(inner.select_from_logits(&logits, &hidden_n, anchor)?);
+        }
+
+        // 3. One batched verify.
+        let mut verify_tokens = Vec::with_capacity(seq_infos.len() * verify_len);
+        for (anchor, d) in anchor_tokens.iter().zip(&drafts) {
+            verify_tokens.push(*anchor);
+            verify_tokens.extend_from_slice(d);
+        }
+        let q_lens = vec![verify_len; seq_infos.len()];
+        let slot_mappings = seq_infos
+            .iter()
+            .map(|si| {
+                self.compute_slot_mappings(si, verify_len, self.block_size(), "DFlash batch verify")
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let verify_ids = Tensor::from_vec(
+            verify_tokens,
+            (seq_infos.len() * verify_len,),
+            self.device(),
+        )?;
+        let verify_positions = Tensor::from_vec(
+            seq_infos
+                .iter()
+                .flat_map(|si| si.len..si.len + verify_len)
+                .map(|p| p as i64)
+                .collect::<Vec<_>>(),
+            (seq_infos.len() * verify_len,),
+            self.device(),
+        )?;
+        let verify_metadata = self.build_mtp_metadata_batch(&seq_infos, &slot_mappings, &q_lens)?;
+        let _verify_guard = set_linear_is_prefill(true);
+        let kv_cache = self.get_kv_cache();
+        let kv_pairs = kv_cache.as_pairs();
+        let (verify_logits, verify_collector) = match self.model() {
+            Model::Qwen3_5(m) => m.forward_with_hidden_states(&verify_ids, &verify_positions, kv_pairs, &verify_metadata, false, inner.target_layer_ids())?,
+            Model::Qwen3_5MoE(m) => m.forward_with_hidden_states(&verify_ids, &verify_positions, kv_pairs, &verify_metadata, false, inner.target_layer_ids())?,
+            Model::Qwen3VL(m) => m.forward_with_hidden_states(&verify_ids, &verify_positions, kv_pairs, &verify_metadata, false, inner.target_layer_ids())?,
+            _ => {
+                drop(kv_cache);
+                candle_core::bail!("DFlash batch requires a supported model type");
+            }
+        };
+        drop(kv_cache);
+        drop(_verify_guard);
+        let verify_projected = inner.extract_and_project_hidden(&verify_collector)?;
+
+        // 4. Per-seq accept + rollback + context update + stats.
+        let name = drafter.name();
+        let mut result = Vec::with_capacity(seq_infos.len());
+        for (i, ((si, d), &anchor)) in seq_infos.iter().zip(&drafts).zip(&anchor_tokens).enumerate() {
+            let offset = i * verify_len;
+            let per_seq_logits = verify_logits.narrow(0, offset, verify_len)?;
+            let res = crate::core::mtp::verify_draft_greedy(&per_seq_logits, d)?;
+            let commit_len = 1 + res.num_accepted;
+            if res.num_accepted < res.num_proposed {
+                self.mtp_rollback_mamba(si.id, commit_len)?;
+            }
+            let vproj_row = verify_projected.narrow(0, offset, verify_len)?;
+            let keep = std::cmp::min(res.num_accepted + 1, vproj_row.dim(0)?);
+            if keep > 0 {
+                inner.append_context(si.id, &vproj_row.narrow(0, 0, keep)?)?;
+            }
+            let mut row = Vec::with_capacity(commit_len + 1);
+            row.push(anchor);
+            row.extend_from_slice(&res.accepted_tokens);
+            row.push(res.continuation_token);
+            crate::core::speculative::spec_stats_update(name, si.id, &res);
+            result.push(row);
+        }
+        Ok(result)
     }
 }

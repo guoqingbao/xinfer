@@ -198,6 +198,10 @@ pub struct Qwen3_5ForCausalLM {
     /// Allocated outside the CUDA graph pool so copy_ into it is graph-safe.
     /// Shape: (max_graph_bs, hidden_size), allocated on first decode forward.
     pub mtp_hidden_buffer: std::sync::Mutex<Option<Tensor>>,
+    /// Graph-safe per-layer hidden buffers for DFlash verify (`is_mtp_verify`).
+    /// Each buffer is `(max_verify_len, hidden_size)`, parallel to `dflash_target_layer_ids`.
+    pub dflash_verify_hidden_buffers: std::sync::Mutex<Option<Vec<Tensor>>>,
+    pub dflash_target_layer_ids: std::sync::Mutex<Vec<usize>>,
 }
 
 impl Qwen3_5ForCausalLM {
@@ -484,6 +488,8 @@ impl Qwen3_5ForCausalLM {
             vocab_size,
             is_qvar_builder,
             mtp_hidden_buffer: std::sync::Mutex::new(None),
+            dflash_verify_hidden_buffers: std::sync::Mutex::new(None),
+            dflash_target_layer_ids: std::sync::Mutex::new(Vec::new()),
         })
     }
 
@@ -562,6 +568,33 @@ impl Qwen3_5ForCausalLM {
                 &mut mamba_cache,
                 &seq_slots,
             )?;
+
+            // Graph-safe DFlash verify: copy selected layer hiddens into preallocated buffers.
+            // copy_ is captured into the CUDA graph, so replay updates the same storage.
+            if input_metadata.is_mtp_verify {
+                if let (Ok(ids), Ok(bufs)) = (
+                    self.dflash_target_layer_ids.lock(),
+                    self.dflash_verify_hidden_buffers.lock(),
+                ) {
+                    if let Some(buffers) = bufs.as_ref() {
+                        for (buf_idx, &layer_id) in ids.iter().enumerate() {
+                            if layer_id == i {
+                                if let Some(buf) = buffers.get(buf_idx) {
+                                    let n = xs.dim(0)?;
+                                    if n <= buf.dim(0).unwrap_or(0) {
+                                        if xs.dtype() != buf.dtype() {
+                                            buf.narrow(0, 0, n)?
+                                                .copy_(&xs.to_dtype(buf.dtype())?, 0)?;
+                                        } else {
+                                            buf.narrow(0, 0, n)?.copy_(&xs, 0)?;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
 
             if let (Some(pos_mask), Some(deepstacks)) = (visual_pos_masks, deepstack_visual_embeds)
             {
@@ -810,6 +843,58 @@ impl Qwen3_5ForCausalLM {
             *guard = Some(buf);
         }
         Ok(())
+    }
+
+    /// Pre-allocate DFlash verify layer-hidden buffers outside the CUDA graph pool.
+    /// Must be called before MTP/DFlash verify graph capture.
+    pub fn preallocate_dflash_verify_buffers(
+        &self,
+        target_layer_ids: &[usize],
+        max_verify_len: usize,
+    ) -> Result<()> {
+        // Match residual-stream dtype: GGUF / ISQ / higher-precision promote to F32;
+        // FP8 safetensors keep model dtype (BF16/F16) in the residual stream.
+        let buf_dtype = if self.is_qvar_builder
+            || self.config.quant.is_some()
+            || self.config.higher_precision_required()
+        {
+            DType::F32
+        } else {
+            self.dtype
+        };
+        let mut buffers = Vec::with_capacity(target_layer_ids.len());
+        for _ in target_layer_ids {
+            buffers.push(Tensor::zeros(
+                (max_verify_len, self.config.hidden_size),
+                buf_dtype,
+                &self.device,
+            )?);
+        }
+        if let Ok(mut guard) = self.dflash_verify_hidden_buffers.lock() {
+            *guard = Some(buffers);
+        }
+        if let Ok(mut guard) = self.dflash_target_layer_ids.lock() {
+            *guard = target_layer_ids.to_vec();
+        }
+        Ok(())
+    }
+
+    /// Read DFlash verify layer hiddens written during the last `is_mtp_verify` forward/graph replay.
+    pub fn take_dflash_verify_hiddens(&self, num_tokens: usize) -> Option<Vec<Tensor>> {
+        let ids = self.dflash_target_layer_ids.lock().ok()?;
+        let guard = self.dflash_verify_hidden_buffers.lock().ok()?;
+        let buffers = guard.as_ref()?;
+        if buffers.len() != ids.len() || num_tokens == 0 {
+            return None;
+        }
+        let mut out = Vec::with_capacity(buffers.len());
+        for buf in buffers {
+            if num_tokens > buf.dim(0).ok()? {
+                return None;
+            }
+            out.push(buf.narrow(0, 0, num_tokens).ok()?.contiguous().ok()?);
+        }
+        Some(out)
     }
 
     pub fn set_mamba_prefix_cache_capacity(&self, capacity: usize) {

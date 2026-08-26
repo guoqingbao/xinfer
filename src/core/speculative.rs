@@ -300,7 +300,7 @@ impl ModelRunner {
 
     /// The shared verify forward: target model over the verify block, collecting hidden states at
     /// `target_layers` (empty for MTP/FF). Returns `(logits, hidden_collector)`.
-    fn spec_verify_forward(
+    pub(crate) fn spec_verify_forward(
         &self,
         verify_ids: &Tensor,
         verify_positions: &Tensor,

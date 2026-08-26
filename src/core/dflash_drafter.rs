@@ -1,10 +1,13 @@
-// DFlash drafter: owns the (replicated) DFlash draft model and a bounded per-sequence window of
-// projected target hidden states that feeds the draft model's cross-attention.
+// DFlash drafter: owns the DFlash draft model (MLP tensor-parallel, rest replicated) and a
+// bounded per-sequence window of projected target hidden states that feeds the draft model's
+// cross-attention.
 
 use crate::models::dflash::{DFlashDraftModel, DFlashModelConfig};
+use crate::models::layers::distributed::Comm;
 use crate::models::layers::VarBuilderX;
 use candle_core::{DType, Device, Result, Tensor};
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::Mutex;
 
 pub struct DFlashDrafter {
@@ -22,12 +25,13 @@ impl DFlashDrafter {
     pub fn new(
         draft_config: &DFlashModelConfig,
         draft_vb: &VarBuilderX,
+        comm: Rc<Comm>,
         dtype: DType,
         device: &Device,
         num_speculative_tokens: Option<usize>,
         yarn_factor: Option<f64>,
     ) -> Result<Self> {
-        let draft_model = DFlashDraftModel::new(draft_vb, draft_config, dtype, device, yarn_factor)?;
+        let draft_model = DFlashDraftModel::new(draft_vb, comm, draft_config, dtype, device, yarn_factor)?;
 
         let target_layer_ids = draft_config.target_layer_ids();
         // DFlash config.block_size is the verification block width:
@@ -92,6 +96,12 @@ impl DFlashDrafter {
     pub fn extract_and_project_hidden(&self, all_hidden_states: &[Tensor]) -> Result<Tensor> {
         self.draft_model
             .extract_and_project_hidden(all_hidden_states)
+    }
+
+    /// Project already-extracted target-layer hiddens (no embedding row) into a draft context
+    /// vector. Used by the CUDA-graph verify path (graph-safe per-layer buffers).
+    pub fn project_layer_hiddens(&self, layer_hiddens: &[Tensor]) -> Result<Tensor> {
+        self.draft_model.project_layer_hiddens(layer_hiddens)
     }
 
     /// Draft `num_speculative_tokens` ids: embed `[last_token, MASK..MASK]` with the target's
