@@ -267,10 +267,10 @@ impl GroupedDynamicCausalConv {
         // v2: fused CUDA kernel (block-aware causal reset). `delta` is the side-specific
         // [seq, taps, num_groups] half; the kernel wants the full [2, taps, hidden] base.
         let use_k = crate::utils::env::dflash_use_kernels();
-        crate::log_info!(
-            "[dflash-debug] conv: side={} seq={} taps={} block={} groups={} use_kernels={}",
-            side, hidden.dim(0)?, self.taps, self.block_size, self.num_groups, use_k
-        );
+        // crate::log_info!(
+        //     "[dflash-debug] conv: side={} seq={} taps={} block={} groups={} use_kernels={}",
+        //     side, hidden.dim(0)?, self.taps, self.block_size, self.num_groups, use_k
+        // );
         if use_k {
             #[cfg(feature = "cuda")]
             {
@@ -458,12 +458,12 @@ impl CandidateSelector {
         anchor: u32,
         allow: Option<&Tensor>,
     ) -> Result<Vec<u32>> {
-        crate::log_info!(
-            "[dflash-debug] selector.select_masked: top_k={} allow={} kernels={}",
-            self.top_k,
-            allow.is_some(),
-            crate::utils::env::dflash_use_kernels()
-        );
+        // crate::log_info!(
+        //     "[dflash-debug] selector.select_masked: top_k={} allow={} kernels={}",
+        //     self.top_k,
+        //     allow.is_some(),
+        //     crate::utils::env::dflash_use_kernels()
+        // );
         if crate::utils::env::dflash_use_kernels() {
             #[cfg(feature = "cuda")]
             {
@@ -997,13 +997,13 @@ impl DFlashDraftModel {
         // Original unmasked interface: DFlash2 candidate-selector walk when available
         // (v2 fused kernel on CUDA, portable candle walk otherwise), else plain argmax.
         if let Some(selector) = &self.candidate_selector {
-            crate::log_info!("[dflash-debug] model.select_from_logits: selector present -> selector walk (unmasked)");
+            // crate::log_info!("[dflash-debug] model.select_from_logits: selector present -> selector walk (unmasked)");
             if let Ok(tokens) = selector.select_masked(logits, hidden_n, anchor, None) {
                 return Ok(tokens);
             }
-            crate::log_info!("[dflash-debug] model.select_from_logits: selector walk FAILED -> argmax fallback");
+            // crate::log_info!("[dflash-debug] model.select_from_logits: selector walk FAILED -> argmax fallback");
         } else {
-            crate::log_info!("[dflash-debug] model.select_from_logits: no selector (v1) -> plain argmax");
+            // crate::log_info!("[dflash-debug] model.select_from_logits: no selector (v1) -> plain argmax");
         }
         Ok(logits.to_dtype(DType::F32)?.argmax(D::Minus1)?.to_vec1::<u32>()?)
     }
@@ -1022,17 +1022,17 @@ impl DFlashDraftModel {
         // No active grammar gate -> the original unmasked interface (v1 candle walk /
         // v2 fused kernel with allow=nullptr). The old path is preserved verbatim.
         if allow.is_none() {
-            crate::log_info!("[dflash-debug] model.select_tokens_masked: allow=None -> unmasked (select_from_logits)");
+            // crate::log_info!("[dflash-debug] model.select_tokens_masked: allow=None -> unmasked (select_from_logits)");
             return self.select_from_logits(logits, hidden_n, anchor);
         }
         if let Some(selector) = &self.candidate_selector {
-            crate::log_info!("[dflash-debug] model.select_tokens_masked: allow=Some + selector -> selector.select_masked");
+            // crate::log_info!("[dflash-debug] model.select_tokens_masked: allow=Some + selector -> selector.select_masked");
             return selector.select_masked(logits, hidden_n, anchor, allow);
         }
         // No selector (v1 checkpoint): argmax, honoring the allow gate. The allow matrix is
         // u8 (1 = legal, 0 = illegal); where_cond requires a u8/u32/i64 condition, so use it
         // directly (no dtype cast) exactly like GuidedDecoding::mask_rows.
-        crate::log_info!("[dflash-debug] model.select_tokens_masked: allow=Some, NO selector (v1) -> pre-mask argmax");
+        // crate::log_info!("[dflash-debug] model.select_tokens_masked: allow=Some, NO selector (v1) -> pre-mask argmax");
         let a = allow.unwrap();
         let neg_inf = Tensor::full(
             f32::NEG_INFINITY,

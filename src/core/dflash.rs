@@ -130,10 +130,10 @@ impl Drafter for DflashDrafter {
 
         let anchor_token = runner.sample(&logits, seqs, false)?[0];
         let step1_proj = self.inner.extract_and_project_hidden(&hidden_collector)?;
-        crate::log_info!(
-            "[dflash-debug] anchor: seq={} anchor_tok={} step1_proj_rows={} collector_len={}",
-            seq_id, anchor_token, step1_proj.dim(0)?, hidden_collector.len()
-        );
+        // crate::log_info!(
+        //     "[dflash-debug] anchor: seq={} anchor_tok={} step1_proj_rows={} collector_len={}",
+        //     seq_id, anchor_token, step1_proj.dim(0)?, hidden_collector.len()
+        // );
         self.inner.append_context(seq_id, &step1_proj)?;
 
         Ok((anchor_token, None))
@@ -172,17 +172,17 @@ impl Drafter for DflashDrafter {
         // ---- Step 2: draft N tokens (block = [anchor, MASK x N]). ----
         let ctx = match self.inner.context(seq_id)? {
             Some(c) => {
-                crate::log_info!("[dflash-debug] draft: seq={} ctx_rows={}", seq_id, c.dim(0)?);
+                // crate::log_info!("[dflash-debug] draft: seq={} ctx_rows={}", seq_id, c.dim(0)?);
                 c
             }
             None => {
-                crate::log_info!("[dflash-debug] draft: seq={} CONTEXT EMPTY -> no drafts", seq_id);
+                // crate::log_info!("[dflash-debug] draft: seq={} CONTEXT EMPTY -> no drafts", seq_id);
                 return Ok(vec![]);
             }
         };
         let n_mask = self.inner.num_speculative();
         if n_mask == 0 {
-            crate::log_info!("[dflash-debug] draft: seq={} n_mask=0 -> no drafts", seq_id);
+            // crate::log_info!("[dflash-debug] draft: seq={} n_mask=0 -> no drafts", seq_id);
             return Ok(vec![]);
         }
         let (logits, hidden_n) =
@@ -191,11 +191,12 @@ impl Drafter for DflashDrafter {
         // v2 (fused CUDA kernels): grammar gating is applied *inside* the candidate-walk
         // kernel via a per-position allow matrix. Static repeated VOB by default; the exact
         // per-position FSM walk when XINFER_SPEC_GRANULAR_MASK is set. Unguided -> no gate.
-        crate::log_info!(
-            "[dflash-debug] draft: seq={} n_mask={} logits={}x{} uses_kernels={} is_guided={} granular={}",
-            seq_id, n_mask, logits.dim(0)?, logits.dim(1)?, self.inner.uses_kernels(),
-            runner.guided_decoding.is_guided(seq_id), crate::utils::env::spec_granular_mask()
-        );
+        // [dflash-debug] commented out
+        // crate::log_info!(
+        //     "[dflash-debug] draft: seq={} n_mask={} logits={}x{} uses_kernels={} is_guided={} granular={}",
+        //     seq_id, n_mask, logits.dim(0)?, logits.dim(1)?, self.inner.uses_kernels(),
+        //     runner.guided_decoding.is_guided(seq_id), crate::utils::env::spec_granular_mask()
+        // );
         if self.inner.uses_kernels() {
             let vocab = logits.dim(1)?;
             let allow = if runner.guided_decoding.is_guided(seq_id) {
@@ -209,15 +210,16 @@ impl Drafter for DflashDrafter {
             } else {
                 None
             };
-            let allow_shape = match &allow {
-                Some(a) => format!("Some({}x{})", a.dim(0)?, a.dim(1)?),
-                None => "None".to_string(),
-            };
-            crate::log_info!("[dflash-debug] v2-path: allow={}", allow_shape);
+            // [dflash-debug] commented out
+            // let allow_shape = match &allow {
+            //     Some(a) => format!("Some({}x{})", a.dim(0)?, a.dim(1)?),
+            //     None => "None".to_string(),
+            // };
+            // crate::log_info!("[dflash-debug] v2-path: allow={}", allow_shape);
             let drafts = self
                 .inner
                 .select_tokens_masked(&logits, &hidden_n, anchor, allow.as_ref())?;
-            crate::log_info!("[dflash-debug] v2-path drafts={} tokens={:?}", drafts.len(), &drafts);
+            // crate::log_info!("[dflash-debug] v2-path drafts={} tokens={:?}", drafts.len(), &drafts);
             return Ok(drafts);
         }
 
@@ -227,7 +229,7 @@ impl Drafter for DflashDrafter {
         if runner.guided_decoding.is_guided(seq_id) {
             if crate::utils::env::spec_granular_mask() {
                 let d = runner.guided_decoding.masked_drafts(seq_id, &logits)?;
-                crate::log_info!("[dflash-debug] v1-path guided granular: drafts={} tokens={:?}", d.len(), &d);
+                // crate::log_info!("[dflash-debug] v1-path guided granular: drafts={} tokens={:?}", d.len(), &d);
                 return Ok(d);
             }
             let masked = runner.guided_decoding.mask_rows(seq_id, &logits)?;
@@ -235,11 +237,11 @@ impl Drafter for DflashDrafter {
                 .to_dtype(candle_core::DType::F32)?
                 .argmax(candle_core::D::Minus1)?
                 .to_vec1::<u32>()?;
-            crate::log_info!("[dflash-debug] v1-path guided static: drafts={} tokens={:?}", d.len(), &d);
+            // crate::log_info!("[dflash-debug] v1-path guided static: drafts={} tokens={:?}", d.len(), &d);
             return Ok(d);
         }
         let d = self.inner.select_from_logits(&logits, &hidden_n, anchor)?;
-        crate::log_info!("[dflash-debug] v1-path unguided: drafts={} tokens={:?}", d.len(), &d);
+        // crate::log_info!("[dflash-debug] v1-path unguided: drafts={} tokens={:?}", d.len(), &d);
         Ok(d)
     }
 
@@ -268,14 +270,14 @@ impl ModelRunner {
     pub fn run_dflash_decode(&self, seqs: Seqs) -> Result<Vec<Vec<u32>>> {
         match &self.dflash_drafter {
             Some(inner) => {
-                crate::log_info!("[dflash-debug] run_dflash_decode: drafter PRESENT -> run_spec_decode");
+                // crate::log_info!("[dflash-debug] run_dflash_decode: drafter PRESENT -> run_spec_decode");
                 let drafter = DflashDrafter {
                     inner: inner.clone(),
                 };
                 self.run_spec_decode(seqs, &drafter)
             }
             None => {
-                crate::log_info!("[dflash-debug] run_dflash_decode: drafter ABSENT -> plain decode fallback (NO drafting)");
+                // crate::log_info!("[dflash-debug] run_dflash_decode: drafter ABSENT -> plain decode fallback (NO drafting)");
                 let output = self.run(seqs, false)?;
                 Ok(output.into_iter().map(|t| vec![t]).collect())
             }

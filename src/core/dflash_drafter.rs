@@ -43,28 +43,39 @@ impl DFlashDrafter {
             DEFAULT_CONTEXT_WINDOW,
             std::cmp::max(1, draft_config.max_position_embeddings),
         );
-        let has_conv = draft_config
-            .dflash_config
-            .as_ref()
-            .is_some_and(|dc| dc.conv_kernel_size.is_some() && dc.conv_group_size.is_some());
-        let has_selector = draft_config
-            .dflash_config
-            .as_ref()
-            .is_some_and(|dc| dc.selector_rank.is_some() && dc.selector_top_k.is_some());
+        // [dflash-debug] commented out (only used by the debug init log above)
+        // let has_conv = draft_config
+        //     .dflash_config
+        //     .as_ref()
+        //     .is_some_and(|dc| dc.conv_kernel_size.is_some() && dc.conv_group_size.is_some());
+        // let has_selector = draft_config
+        //     .dflash_config
+        //     .as_ref()
+        //     .is_some_and(|dc| dc.selector_rank.is_some() && dc.selector_top_k.is_some());
 
+        // [dflash-debug] commented out
+        // crate::log_info!(
+        //     "DFlash drafter initialized: {} layers, version={}, num_speculative_tokens={}, target_layer_ids={:?}, mask_token_id={}, context_window={}, yarn_scaling_factor={:?}, dflash2_conv={}, dflash2_selector={}, backend={:?}, kernels={}",
+        //     draft_config.num_hidden_layers,
+        //     if draft_config.has_v2_components() { "dflash2" } else { "dflash1" },
+        //     block_size,
+        //     target_layer_ids,
+        //     mask_token_id,
+        //     context_window,
+        //     yarn_factor,
+        //     has_conv,
+        //     has_selector,
+        //     crate::utils::env::dflash_backend(),
+        //     crate::utils::env::dflash_use_kernels(),
+        // );
         crate::log_info!(
-            "DFlash drafter initialized: {} layers, version={}, num_speculative_tokens={}, target_layer_ids={:?}, mask_token_id={}, context_window={}, yarn_scaling_factor={:?}, dflash2_conv={}, dflash2_selector={}, backend={:?}, kernels={}",
+            "DFlash drafter initialized: {} layers, num_speculative_tokens={}, target_layer_ids={:?}, mask_token_id={}, context_window={}, yarn_scaling_factor={:?}",
             draft_config.num_hidden_layers,
-            if draft_config.has_v2_components() { "dflash2" } else { "dflash1" },
             block_size,
             target_layer_ids,
             mask_token_id,
             context_window,
             yarn_factor,
-            has_conv,
-            has_selector,
-            crate::utils::env::dflash_backend(),
-            crate::utils::env::dflash_use_kernels(),
         );
 
         Ok(Self {
@@ -111,11 +122,11 @@ impl DFlashDrafter {
         anchor: u32,
         allow: Option<&Tensor>,
     ) -> Result<Vec<u32>> {
-        crate::log_info!(
-            "[dflash-debug] DFlashDrafter.select_tokens_masked: allow={} has_v2_components={}",
-            allow.is_some(),
-            self.draft_model.config.has_v2_components()
-        );
+        // crate::log_info!(
+        //     "[dflash-debug] DFlashDrafter.select_tokens_masked: allow={} has_v2_components={}",
+        //     allow.is_some(),
+        //     self.draft_model.config.has_v2_components()
+        // );
         self.draft_model.select_tokens_masked(logits, hidden_n, anchor, allow)
     }
 
