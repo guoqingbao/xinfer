@@ -955,6 +955,9 @@ impl ModelRunner {
             } else {
                 self.decode_capturer.is_captured(input_batch)
             };
+            // DFlash needs the target's hidden states to seed its context window; the
+            // graph-replay path only yields logits, so fall through to the eager forward below.
+            let can_replay = can_replay && self.dflash_drafter.is_none();
             if !is_prefill && can_replay {
                 let logits = match &self.model {
                     Model::Qwen3_5(model) => {
@@ -1049,32 +1052,73 @@ impl ModelRunner {
         let _prefill_guard = set_linear_is_prefill(is_prefill);
         let kv_guard = self.get_kv_cache();
         let kv_pairs = kv_guard.as_pairs();
-        let logits = crate::model_call!(
-            &self.model,
-            forward,
-            (&input_ids, &positions, kv_pairs, &input_metadata),
-            {
-                Qwen3 => false,
-                Qwen3MoE => false,
-                Qwen3_5 => false,
-                Qwen3_5MoE => false,
-                LLaMa => false,
-                LLaMa4 => images,
-                Phi4 => false,
-                GLM4 => false,
-                GLM4MoE => false,
-                GLM4MoeLite => false,
-                DeepSeek => false,
-                DeepSeekV4 => false,
-                GLM5 => false,
-                Mistral3VL => images,
-                Gemma3 => images,
-                Gemma4 => false,
-                Qwen3VL => images,
-                MiniMax => false,
-            }
-        )?;
+        let (logits, dflash_hidden) = if let Some(drafter) = &self.dflash_drafter {
+            // Seed the DFlash context window with this step's projected target hidden states.
+            let target_layers = drafter.target_layer_ids();
+            let (lg, hs) = match &self.model {
+                Model::Qwen3(m) => m.forward_with_hidden_states(&input_ids, &positions, kv_pairs, &input_metadata, false, target_layers)?,
+                Model::Qwen3MoE(m) => m.forward_with_hidden_states(&input_ids, &positions, kv_pairs, &input_metadata, false, target_layers)?,
+                Model::Qwen3_5(m) => m.forward_with_hidden_states(&input_ids, &positions, kv_pairs, &input_metadata, false, target_layers)?,
+                Model::Qwen3_5MoE(m) => m.forward_with_hidden_states(&input_ids, &positions, kv_pairs, &input_metadata, false, target_layers)?,
+                Model::Qwen3VL(m) => m.forward_with_hidden_states(&input_ids, &positions, kv_pairs, &input_metadata, false, target_layers)?,
+                _ => { drop(kv_guard); candle_core::bail!("DFlash seeding requires a supported model type"); }
+            };
+            (lg, Some(hs))
+        } else {
+            let lg = crate::model_call!(
+                &self.model,
+                forward,
+                (&input_ids, &positions, kv_pairs, &input_metadata),
+                {
+                    Qwen3 => false,
+                    Qwen3MoE => false,
+                    Qwen3_5 => false,
+                    Qwen3_5MoE => false,
+                    LLaMa => false,
+                    LLaMa4 => images,
+                    Phi4 => false,
+                    GLM4 => false,
+                    GLM4MoE => false,
+                    GLM4MoeLite => false,
+                    DeepSeek => false,
+                    DeepSeekV4 => false,
+                    GLM5 => false,
+                    Mistral3VL => images,
+                    Gemma3 => images,
+                    Gemma4 => false,
+                    Qwen3VL => images,
+                    MiniMax => false,
+                }
+            )?;
+            (lg, None)
+        };
         drop(kv_guard);
+        if let (Some(drafter), Some(hs)) = (&self.dflash_drafter, &dflash_hidden) {
+            let projected = drafter.extract_and_project_hidden(hs)?;
+            let mut offset = 0usize;
+            match &seqs {
+                Seqs::SeqRefs(refs) => {
+                    for seq in *refs {
+                        let count = if is_prefill {
+                            seq.prefill_chunk_tokens(self.config.effective_prefill_chunk_size())
+                        } else {
+                            1
+                        };
+                        if count > 0 {
+                            drafter.append_context(seq.id(), &projected.narrow(0, offset, count)?)?;
+                            offset += count;
+                        }
+                    }
+                }
+                Seqs::DecodeVec(refs) => {
+                    for ds in refs.iter() {
+                        let row = projected.narrow(0, offset, 1)?;
+                        drafter.append_context(ds.id, &row)?;
+                        offset += 1;
+                    }
+                }
+            }
+        }
         let output_ids = self.sample(&logits, seqs, is_prefill)?;
         #[cfg(feature = "nvtx")]
         nvtx::range_pop!();

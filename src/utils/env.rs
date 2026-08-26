@@ -179,3 +179,19 @@ pub fn mask_offload() -> bool {
             )
     })
 }
+
+/// Cap on the DFlash projected-hidden context window kept per sequence (in rows).
+/// `0` (the default) means unbounded full history, matching the original DFlash branch;
+/// set e.g. `XINFER_DFLASH_CONTEXT_WINDOW=512` to bound memory on very long generations.
+pub const DFLASH_CONTEXT_WINDOW_ENV: &str = "XINFER_DFLASH_CONTEXT_WINDOW";
+
+static DFLASH_CONTEXT_WINDOW: OnceLock<usize> = OnceLock::new();
+
+pub fn dflash_context_window() -> usize {
+    *DFLASH_CONTEXT_WINDOW.get_or_init(|| {
+        env::var(DFLASH_CONTEXT_WINDOW_ENV)
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(0)
+    })
+}

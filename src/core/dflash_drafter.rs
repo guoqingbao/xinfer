@@ -7,9 +7,6 @@ use candle_core::{DType, Device, Result, Tensor};
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-/// Default cap on the projected-context window kept per sequence (bounds memory for long gens).
-const DEFAULT_CONTEXT_WINDOW: usize = 512;
-
 pub struct DFlashDrafter {
     pub draft_model: DFlashDraftModel,
     pub target_layer_ids: Vec<usize>,
@@ -39,10 +36,9 @@ impl DFlashDrafter {
             .or_else(|| draft_config.effective_block_size().map(|w| w.saturating_sub(1)))
             .unwrap_or(0);
         let mask_token_id = draft_config.mask_token_id().unwrap_or(0);
-        let context_window = std::cmp::min(
-            DEFAULT_CONTEXT_WINDOW,
-            std::cmp::max(1, draft_config.max_position_embeddings),
-        );
+        let context_window = crate::utils::env::dflash_context_window();
+        // 0 = unbounded full history (matches the original DFlash branch); a positive value
+        // caps the window to the last N projected rows to bound memory on long generations.
         // [dflash-debug] commented out (only used by the debug init log above)
         // let has_conv = draft_config
         //     .dflash_config
@@ -202,6 +198,11 @@ impl DFlashDrafter {
             Some(prev) => Tensor::cat(&[prev, projected.clone()], 0)?,
             None => projected.clone(),
         };
+        // context_window == 0 means unbounded full history (the original DFlash behavior).
+        if self.context_window == 0 {
+            cached.insert(seq_id, updated);
+            return Ok(());
+        }
         let total = updated.dim(0)?;
         let keep = std::cmp::min(total, self.context_window);
         let windowed = updated.narrow(0, total - keep, keep)?;
