@@ -195,18 +195,59 @@ impl DFlashDrafter {
         if self.draft_model.is_dflash2() {
             return self.draft_model.select_candidates(hidden_n, &logits, anchor);
         }
-        let mut draft_token_ids: Vec<u32> = Vec::with_capacity(n);
-        for i in 0..n {
-            let logit_slice = logits.i(i)?;
-            let argmax_result = logit_slice.argmax(D::Minus1)?;
-            let token_id = if argmax_result.rank() > 0 {
-                argmax_result.flatten_all()?.i(0)?.to_vec0::<u32>()?
-            } else {
-                argmax_result.to_vec0::<u32>()?
-            };
-            draft_token_ids.push(token_id);
-        }
+        // Single GPU argmax over all rows (one op, one D2H) instead of n per-row argmax + n D2H.
+        let draft_token_ids = logits
+            .argmax(D::Minus1)?
+            .to_dtype(DType::U32)?
+            .to_vec1()?;
         Ok(draft_token_ids)
+    }
+
+    /// Grammar-gated draft-token selection, GPU-resident: returns the K draft token ids as a
+    /// `[K]` u32 GPU tensor (no D2H), so the verify block can be built on-device. The v1 path
+    /// is a single argmax; the v2 selector still returns CPU ids (one small H2D) until a
+    /// GPU-native selector lands in attention-rs.
+    pub fn select_draft_tokens_gpu(
+        &self,
+        logits: &Tensor,
+        hidden_n: &Tensor,
+        anchor: u32,
+        guided: &crate::utils::guided_decoding::GuidedDecoding,
+        seq_id: usize,
+    ) -> Result<Tensor> {
+        let n = logits.dim(0)?;
+        let logits = if guided.is_guided(seq_id) {
+            let vocab = logits.dim(1)?;
+            let allow = if crate::utils::env::spec_granular_mask() {
+                guided.draft_allow_walk(seq_id, logits, vocab)?
+            } else {
+                guided.draft_allow_repeated(seq_id, n, vocab, &self.device)?
+            };
+            match allow {
+                Some(a) => {
+                    let neg_inf = Tensor::full(
+                        f32::NEG_INFINITY,
+                        logits.shape().clone(),
+                        &self.device,
+                    )?
+                    .to_dtype(logits.dtype())?;
+                    a.where_cond(logits, &neg_inf)?
+                }
+                None => logits.clone(),
+            }
+        } else {
+            logits.clone()
+        };
+        if self.draft_model.is_dflash2() {
+            let tokens = self.draft_model.select_candidates(hidden_n, &logits, anchor)?;
+            return Tensor::from_vec(
+                tokens.iter().map(|&t| t as i64).collect::<Vec<_>>(),
+                (tokens.len(),),
+                &self.device,
+            )?
+            .to_dtype(DType::U32);
+        }
+        logits.argmax(D::Minus1)?.to_dtype(DType::U32)
     }
 
     /// Full draft step (eager, no graph): build inputs -> draft transformer -> lm_head -> select.
@@ -509,23 +550,26 @@ impl ModelRunner {
             }
         };
         let (draft_logits, draft_hidden_n) = drafter.lm_head_logits(&draft_hidden_full, n, &lm_head_fn)?;
-        let draft_tokens = drafter.select_draft_tokens(
+        let draft_tokens_gpu = drafter.select_draft_tokens_gpu(
             &draft_logits,
             &draft_hidden_n,
             anchor_token,
             &self.guided_decoding,
             seq_info.id,
         )?;
-        if draft_tokens.is_empty() {
+        let draft_count = draft_tokens_gpu.dim(0)?;
+        if draft_count == 0 {
             return Ok(vec![vec![anchor_token]]);
         }
 
-        let mut verify_tokens = vec![anchor_token];
-        verify_tokens.extend_from_slice(&draft_tokens);
-        let verify_len = verify_tokens.len();
+        let verify_len = 1 + draft_count;
         let slot_mappings =
             self.compute_slot_mappings(&seq_info, verify_len, self.block_size(), "DFlash verify")?;
-        let verify_input_ids = Tensor::from_vec(verify_tokens, (verify_len,), self.device())?;
+        // Build the verify block on-device: [anchor, drafts] (no D2H of the draft tokens, no
+        // H2D of the block). The  is a single-token H2D (negligible).
+        let anchor_gpu = Tensor::from_vec(vec![anchor_token as i64], (1,), self.device())?
+            .to_dtype(DType::U32)?;
+        let verify_input_ids = Tensor::cat(&[&anchor_gpu, &draft_tokens_gpu], 0)?;
         let verify_positions = Tensor::from_vec(
             (seq_info.len..seq_info.len + verify_len)
                 .map(|position| position as i64)
@@ -642,9 +686,11 @@ impl ModelRunner {
         };
 
         let verify_result = if self.guided_decoding.is_guided(seq_info.id) {
+            // guided: D2H the draft tokens (small) for the FSM firewall
+            let draft_tokens_cpu = draft_tokens_gpu.to_vec1::<u32>()?;
             crate::core::mtp::verify_draft_masked(
                 &verify_logits,
-                &draft_tokens,
+                &draft_tokens_cpu,
                 &self.guided_decoding,
                 seq_info.id,
             )?
@@ -662,9 +708,12 @@ impl ModelRunner {
                 crate::utils::logits_processor::Sampling::ArgMax
             ) || !crate::utils::env::spec_rejection_sampling()
             {
-                verify_draft_greedy(&verify_logits, &draft_tokens)?
+                // greedy: GPU-resident verify (no D2H of the draft tokens)
+                crate::core::mtp::verify_draft_greedy_gpu(&verify_logits, &draft_tokens_gpu)?
             } else {
-                crate::core::mtp::verify_draft_rejection(&verify_logits, &draft_tokens, &sampling)?
+                // rejection: D2H the draft tokens (small) for the CPU rejection sampling
+                let draft_tokens_cpu = draft_tokens_gpu.to_vec1::<u32>()?;
+                crate::core::mtp::verify_draft_rejection(&verify_logits, &draft_tokens_cpu, &sampling)?
             }
         };
         if self.adaptive_enabled {

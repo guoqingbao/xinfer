@@ -103,6 +103,38 @@ pub fn verify_draft_greedy(
     })
 }
 
+/// GPU-resident greedy verify: the draft tokens stay on the GPU (no D2H before the verify),
+/// the comparison runs on-device, and only the small result (accepted prefix + continuation)
+/// is transferred. `draft_tokens_gpu` is `[K]` u32.
+pub fn verify_draft_greedy_gpu(
+    verify_logits: &Tensor,
+    draft_tokens_gpu: &Tensor,
+) -> Result<MtpVerifyResult> {
+    let num_proposed = draft_tokens_gpu.dim(0)?;
+    let target_gpu = verify_logits.argmax(D::Minus1)?.to_dtype(candle_core::DType::U32)?; // [1+K] u32
+    // Leading matches: target row i == draft token i, for i in 0..K (both u32, on-device).
+    let match_gpu = target_gpu.narrow(0, 0, num_proposed)?.eq(draft_tokens_gpu)?; // [K] bool
+    let match_cpu: Vec<u8> = match_gpu.to_dtype(candle_core::DType::U8)?.to_vec1()?; // small D2H
+    let num_accepted = match_cpu.iter().position(|&m| m == 0).unwrap_or(num_proposed);
+    // continuation = the target argmax at the accepted boundary (row num_accepted).
+    let continuation_token = target_gpu.get(num_accepted)?.to_scalar::<u32>()?;
+    // accepted tokens = the leading draft tokens (small D2H).
+    let accepted_tokens = if num_accepted > 0 {
+        draft_tokens_gpu.narrow(0, 0, num_accepted)?.to_vec1::<u32>()?
+    } else {
+        vec![]
+    };
+    Ok(MtpVerifyResult {
+        accepted_tokens,
+        continuation_token,
+        num_accepted,
+        num_proposed,
+        grammar_prefix: num_proposed,
+        target_prefix: num_accepted,
+        continuation_is_ff: false,
+    })
+}
+
 /// How many leading draft tokens (starting at verify row `offset`) match the target argmax.
 fn target_agree_prefix_at(verify_logits: &Tensor, offset: usize, draft_tokens: &[u32]) -> Result<usize> {
     if draft_tokens.is_empty() {
@@ -898,7 +930,7 @@ impl ModelRunner {
 
         let base_position = seq_info.len.saturating_sub(1);
         let anchor_token_tensor = Tensor::from_vec(vec![anchor_token], (1,), self.device())?;
-        let (draft_tokens, _last_hidden) = mtp_head.draft_tokens_gpu(
+        let (draft_tokens_gpu, _last_hidden) = mtp_head.draft_tokens_gpu_resident(
             &seq_hidden,
             &anchor_token_tensor,
             num_draft,
@@ -906,21 +938,19 @@ impl ModelRunner {
             lm_head_fn,
             base_position,
         )?;
-
-        if draft_tokens.is_empty() {
+        let draft_count = draft_tokens_gpu.dim(0)?;
+        if draft_count == 0 {
             return Ok(vec![vec![anchor_token]]);
         }
 
         // Step 3: Verify draft tokens via prefill-style forward on [anchor, draft_0..K-1].
-        let mut verify_tokens = vec![anchor_token];
-        verify_tokens.extend_from_slice(&draft_tokens);
-        let verify_len = verify_tokens.len();
-
+        // Build the verify block on-device (no D2H of the draft tokens, no H2D of the block).
+        let verify_len = 1 + draft_count;
         let block_size = self.block_size();
         let slot_mappings =
             self.compute_slot_mappings(seq_info, verify_len, block_size, "verify")?;
 
-        let verify_input_ids = Tensor::from_vec(verify_tokens, (verify_len,), self.device())?;
+        let verify_input_ids = Tensor::cat(&[&anchor_token_tensor, &draft_tokens_gpu], 0)?;
         let verify_positions_tensor = Tensor::from_vec(
             (0..verify_len)
                 .map(|i| (seq_info.len + i) as i64)
@@ -1022,7 +1052,9 @@ impl ModelRunner {
         let all_logits = all_logits_result?;
 
         let verify_result = if self.guided_decoding.is_guided(seq_info.id) {
-            verify_draft_masked(&all_logits, &draft_tokens, &self.guided_decoding, seq_info.id)?
+            // guided: D2H the draft tokens (small) for the FSM firewall
+            let draft_tokens_cpu = draft_tokens_gpu.to_vec1::<u32>()?;
+            verify_draft_masked(&all_logits, &draft_tokens_cpu, &self.guided_decoding, seq_info.id)?
         } else {
             // Copy the sampling out and release the guard before the (GPU) verify, so no
             // lock is held across the forward.
@@ -1038,9 +1070,12 @@ impl ModelRunner {
                 crate::utils::logits_processor::Sampling::ArgMax
             ) || !crate::utils::env::spec_rejection_sampling()
             {
-                verify_draft_greedy(&all_logits, &draft_tokens)?
+                // greedy: GPU-resident verify (no D2H of the draft tokens)
+                verify_draft_greedy_gpu(&all_logits, &draft_tokens_gpu)?
             } else {
-                verify_draft_rejection(&all_logits, &draft_tokens, &sampling)?
+                // rejection: D2H the draft tokens (small) for the CPU rejection sampling
+                let draft_tokens_cpu = draft_tokens_gpu.to_vec1::<u32>()?;
+                verify_draft_rejection(&all_logits, &draft_tokens_cpu, &sampling)?
             }
         };
         if self.adaptive_enabled {

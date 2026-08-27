@@ -548,6 +548,55 @@ impl Qwen3_5MtpHead {
         Ok((draft_tokens, final_hidden))
     }
 
+    /// Like `draft_tokens_gpu` but returns the draft token ids as a `[K]` u32 GPU tensor (no
+    /// D2H), so the verify block can be built on-device.
+    pub fn draft_tokens_gpu_resident(
+        &self,
+        initial_hidden: &Tensor,
+        anchor_token_tensor: &Tensor,
+        num_tokens: usize,
+        embed_weight: &Tensor,
+        lm_head_fn: impl Fn(&Tensor) -> Result<Tensor>,
+        positions_base: usize,
+    ) -> Result<(Tensor, Tensor)> {
+        let mut gpu_draft_tokens: Vec<Tensor> = Vec::with_capacity(num_tokens);
+        let mut current_hidden = if initial_hidden.dims().len() == 1 {
+            initial_hidden.unsqueeze(0)?
+        } else {
+            initial_hidden.clone()
+        };
+        let mut current_token_t = anchor_token_tensor.reshape((1,))?;
+
+        for step in 0..num_tokens {
+            let token_embed = embed_weight.index_select(&current_token_t, 0)?;
+            let pos = (positions_base + step) as i64;
+            let positions = Tensor::from_vec(vec![pos], (1,), &self.device)?;
+            let hidden_out = self.forward_step(&current_hidden, &token_embed, &positions)?;
+            let logits = lm_head_fn(&hidden_out.to_dtype(self.dtype)?)?;
+            let logits_last = if logits.dims().len() == 2 {
+                logits.get(logits.dim(0)? - 1)?
+            } else {
+                logits
+            };
+            let next_token_t = logits_last.to_dtype(DType::F32)?.argmax(D::Minus1)?;
+            gpu_draft_tokens.push(next_token_t.clone());
+            current_hidden = if hidden_out.dims().len() == 2 {
+                hidden_out.get(hidden_out.dim(0)? - 1)?.unsqueeze(0)?
+            } else {
+                hidden_out
+            };
+            current_token_t = next_token_t.reshape((1,))?;
+        }
+
+        let draft_tokens_gpu = if gpu_draft_tokens.is_empty() {
+            Tensor::from_vec(Vec::<i64>::new(), (0,), &self.device)?
+        } else {
+            Tensor::stack(&gpu_draft_tokens, 0)?.to_dtype(DType::U32)?
+        };
+        let final_hidden = current_hidden.squeeze(0)?;
+        Ok((draft_tokens_gpu, final_hidden))
+    }
+
     /// Legacy draft method with CPU round-trips (kept for compatibility).
     pub fn draft_tokens(
         &self,

@@ -1885,21 +1885,24 @@ impl ModelRunner {
             cached_params.frequency_penalty.is_some() || cached_params.presence_penalty.is_some();
 
         let logits = if !is_prefill && has_any_penalty {
-            let seq_tokens = self.seq_tokens.write();
-            let reference_tokens: Vec<Vec<u32>> = seq_ids
-                .iter()
-                .map(|id| {
-                    if let Some(tokens) = seq_tokens.get(&id) {
-                        if tokens.len() > 128 {
-                            tokens[tokens.len().saturating_sub(128)..].to_vec()
+            let reference_tokens: Vec<Vec<u32>> = {
+                let seq_tokens = self.seq_tokens.write();
+                seq_ids
+                    .iter()
+                    .map(|id| {
+                        if let Some(tokens) = seq_tokens.get(&id) {
+                            if tokens.len() > 128 {
+                                tokens[tokens.len().saturating_sub(128)..].to_vec()
+                            } else {
+                                vec![]
+                            }
                         } else {
                             vec![]
                         }
-                    } else {
-                        vec![]
-                    }
-                })
-                .collect();
+                    })
+                    .collect()
+            };
+            // guard released before the (GPU) penalty application
 
             self.logit_processor.apply_batch_repeat_penalty(
                 &logits,
