@@ -788,11 +788,45 @@ impl ModelRunner {
         let all_logits_result = if use_mtp_graph {
             #[cfg(all(feature = "cuda", feature = "graph"))]
             {
-                self.mtp_capturer.as_ref().unwrap().replay_mtp(
-                    &verify_input_ids,
-                    &verify_positions_tensor,
-                    &verify_metadata,
-                )
+                // Hold mamba cache across verify-graph replay (same as decode graphs).
+                match self.model() {
+                    Model::Qwen3_5(model) => {
+                        let _guard = model.lock_mamba_cache_for_graph();
+                        self.mtp_capturer.as_ref().unwrap().replay_mtp(
+                            &verify_input_ids,
+                            &verify_positions_tensor,
+                            &verify_metadata,
+                        )
+                    }
+                    Model::Qwen3_5MoE(model) => {
+                        let _guard = model.lock_mamba_cache_for_graph();
+                        self.mtp_capturer.as_ref().unwrap().replay_mtp(
+                            &verify_input_ids,
+                            &verify_positions_tensor,
+                            &verify_metadata,
+                        )
+                    }
+                    Model::Qwen3VL(model) => {
+                        if let Some(_guard) = model.lock_mamba_cache_for_graph() {
+                            self.mtp_capturer.as_ref().unwrap().replay_mtp(
+                                &verify_input_ids,
+                                &verify_positions_tensor,
+                                &verify_metadata,
+                            )
+                        } else {
+                            self.mtp_capturer.as_ref().unwrap().replay_mtp(
+                                &verify_input_ids,
+                                &verify_positions_tensor,
+                                &verify_metadata,
+                            )
+                        }
+                    }
+                    _ => self.mtp_capturer.as_ref().unwrap().replay_mtp(
+                        &verify_input_ids,
+                        &verify_positions_tensor,
+                        &verify_metadata,
+                    ),
+                }
             }
             #[cfg(not(all(feature = "cuda", feature = "graph")))]
             {
