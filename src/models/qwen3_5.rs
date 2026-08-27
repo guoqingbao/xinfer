@@ -939,6 +939,15 @@ impl Qwen3_5ForCausalLM {
     }
 
     pub fn mtp_rollback_mamba(&self, seq_id: usize, keep_tokens: usize) -> Result<bool> {
+        self.mtp_rollback_mamba_at(seq_id, keep_tokens, 0)
+    }
+
+    pub fn mtp_rollback_mamba_at(
+        &self,
+        seq_id: usize,
+        keep_tokens: usize,
+        snapshot_offset: usize,
+    ) -> Result<bool> {
         let mut mamba_cache = self.mamba_cache.write();
         let slots = mamba_cache
             .get_slots_for_sequences(&[seq_id])?
@@ -948,7 +957,12 @@ impl Qwen3_5ForCausalLM {
         let seq_slots = Tensor::from_vec(slots, (1,), &self.device)?;
         for layer in &self.layers {
             if let Qwen3_5AttnType::LinearAttention(gdn) = &layer.attn {
-                gdn.rollback_mtp_verify(&mut mamba_cache, &seq_slots, keep_tokens)?;
+                gdn.rollback_mtp_verify_at(
+                    &mut mamba_cache,
+                    &seq_slots,
+                    keep_tokens,
+                    snapshot_offset,
+                )?;
             }
         }
         Ok(true)

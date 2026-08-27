@@ -2373,7 +2373,7 @@ impl LLMEngine {
                 // Engine lock released -- server can accept new requests during forward pass
 
                 if let Some((scheduled_ids, is_prefill, owned_seqs)) = prep {
-                    let use_dflash = dflash_enabled && !is_prefill;
+                    let use_dflash = dflash_enabled && !is_prefill && owned_seqs.len() == 1;
                     let use_mtp =
                         !use_dflash && mtp_enabled && !is_prefill && owned_seqs.len() == 1;
 

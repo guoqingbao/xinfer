@@ -319,6 +319,10 @@ pub struct Config {
     pub mtp_use_dedicated_embeddings: Option<bool>,
     #[serde(skip)]
     pub mtp_enabled: bool,
+    /// Max packed verify tokens for GDN MTP/DFlash snapshot buffers
+    /// (`max_num_seqs * (num_speculative_tokens + 1)`).
+    #[serde(skip)]
+    pub mtp_max_verify_tokens: usize,
     #[serde(default)]
     pub expert_dtype: Option<String>,
 }
@@ -345,6 +349,7 @@ impl fmt::Debug for Config {
             .field("is_multi_model", &self.is_multi_model)
             .field("is_f16_mode", &self.is_f16_mode)
             .field("mtp_enabled", &self.mtp_enabled)
+            .field("mtp_max_verify_tokens", &self.mtp_max_verify_tokens)
             .finish()
     }
 }

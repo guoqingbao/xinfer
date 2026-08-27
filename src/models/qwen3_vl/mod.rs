@@ -722,9 +722,22 @@ impl Qwen3VLForConditionalGeneration {
     }
 
     pub fn mtp_rollback_mamba(&self, seq_id: usize, keep_tokens: usize) -> Result<bool> {
+        self.mtp_rollback_mamba_at(seq_id, keep_tokens, 0)
+    }
+
+    pub fn mtp_rollback_mamba_at(
+        &self,
+        seq_id: usize,
+        keep_tokens: usize,
+        snapshot_offset: usize,
+    ) -> Result<bool> {
         match &self.text_model {
-            Qwen3TextModel::Dense35(m) => m.mtp_rollback_mamba(seq_id, keep_tokens),
-            Qwen3TextModel::MoE35(m) => m.mtp_rollback_mamba(seq_id, keep_tokens),
+            Qwen3TextModel::Dense35(m) => {
+                m.mtp_rollback_mamba_at(seq_id, keep_tokens, snapshot_offset)
+            }
+            Qwen3TextModel::MoE35(m) => {
+                m.mtp_rollback_mamba_at(seq_id, keep_tokens, snapshot_offset)
+            }
             _ => Ok(false),
         }
     }

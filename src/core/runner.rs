@@ -295,9 +295,17 @@ impl ModelRunner {
             && has_mtp_weights;
         let external_speculative_enabled =
             econfig.draft_model_id.is_some() || econfig.draft_model_path.is_some();
-        if external_speculative_enabled && econfig.num_speculative_tokens.unwrap_or(0) > 0 {
+        let external_num_spec = econfig.num_speculative_tokens.unwrap_or(0);
+        if external_speculative_enabled && external_num_spec > 0 {
             // DFlash verification uses the same per-token GDN snapshots as MTP.
             config.mtp_enabled = true;
+        }
+        // Size GDN MTP snapshot buffers for worst-case packed verify:
+        // max_num_seqs * (speculative_tokens + 1).
+        if config.mtp_enabled {
+            let spec_tokens = requested_mtp_num_speculative.max(external_num_spec).max(1);
+            let max_seqs = econfig.max_num_parallel_reqs.max(1);
+            config.mtp_max_verify_tokens = max_seqs.saturating_mul(spec_tokens.saturating_add(1));
         }
 
         let model = crate::build_model!(
@@ -1915,6 +1923,9 @@ impl ModelRunner {
         let mut restored = self.restored_prefix_sequences.write();
         let _ = restored.remove(&id);
         self.guided_decoding.finish(id);
+        if let Some(drafter) = self.dflash_drafter.as_ref() {
+            drafter.clear_seq_hidden(id);
+        }
         match &self.model {
             Model::Qwen3_5(model) => model.release_sequence_state(id),
             Model::Qwen3_5MoE(model) => model.release_sequence_state(id),

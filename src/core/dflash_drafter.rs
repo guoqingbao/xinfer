@@ -237,6 +237,10 @@ impl DFlashDrafter {
         self.cached_target_hidden.lock().unwrap().clear();
     }
 
+    pub fn clear_seq_hidden(&self, seq_id: usize) {
+        self.cached_target_hidden.lock().unwrap().remove(&seq_id);
+    }
+
     /// Return the accumulated hidden state context for drafting, or None if empty.
     pub fn build_draft_context(&self, seq_id: usize) -> Result<Option<Tensor>> {
         let cached = self.cached_target_hidden.lock().unwrap();
@@ -741,7 +745,7 @@ impl ModelRunner {
             let verify_result = verify_draft_greedy(&per_seq_logits, drafts)?;
             let commit_len = 1 + verify_result.num_accepted;
             if verify_result.num_accepted < verify_result.num_proposed
-                && !self.mtp_rollback_mamba(seq_info.id, commit_len)?
+                && !self.mtp_rollback_mamba_at(seq_info.id, commit_len, offset)?
             {
                 candle_core::bail!(
                     "DFlash failed to roll back mamba state for sequence {}",

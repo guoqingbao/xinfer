@@ -493,10 +493,19 @@ impl ModelRunner {
     }
 
     pub(crate) fn mtp_rollback_mamba(&self, seq_id: usize, keep_tokens: usize) -> Result<bool> {
+        self.mtp_rollback_mamba_at(seq_id, keep_tokens, 0)
+    }
+
+    pub(crate) fn mtp_rollback_mamba_at(
+        &self,
+        seq_id: usize,
+        keep_tokens: usize,
+        snapshot_offset: usize,
+    ) -> Result<bool> {
         match self.model() {
-            Model::Qwen3_5(m) => m.mtp_rollback_mamba(seq_id, keep_tokens),
-            Model::Qwen3_5MoE(m) => m.mtp_rollback_mamba(seq_id, keep_tokens),
-            Model::Qwen3VL(m) => m.mtp_rollback_mamba(seq_id, keep_tokens),
+            Model::Qwen3_5(m) => m.mtp_rollback_mamba_at(seq_id, keep_tokens, snapshot_offset),
+            Model::Qwen3_5MoE(m) => m.mtp_rollback_mamba_at(seq_id, keep_tokens, snapshot_offset),
+            Model::Qwen3VL(m) => m.mtp_rollback_mamba_at(seq_id, keep_tokens, snapshot_offset),
             _ => Ok(false),
         }
     }
@@ -972,7 +981,7 @@ impl ModelRunner {
             let verify_result = verify_draft_greedy(&logits, draft)?;
             if verify_result.num_accepted < verify_result.num_proposed {
                 let keep_tokens = 1 + verify_result.num_accepted;
-                if !self.mtp_rollback_mamba(seq_info.id, keep_tokens)? {
+                if !self.mtp_rollback_mamba_at(seq_info.id, keep_tokens, offset)? {
                     candle_core::bail!(
                         "MTP failed to roll back mamba-state for batch sequence {}",
                         seq_info.id

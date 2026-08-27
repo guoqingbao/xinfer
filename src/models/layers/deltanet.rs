@@ -729,7 +729,10 @@ impl GatedDeltaNet {
         let scale = 1.0f64 / (head_k_dim as f64).sqrt();
         let d_conv = key_dim * 2 + value_dim;
         let (conv_mtp_state, recurrent_mtp_state) = if config.mtp_enabled {
-            let max_verify_tokens = 16;
+            // Must cover packed batch verify: batch_size * (num_speculative + 1).
+            // Default 16 matches historical single-seq verify_len<=16; runner sets
+            // mtp_max_verify_tokens from max_num_parallel_reqs before model build.
+            let max_verify_tokens = config.mtp_max_verify_tokens.max(16);
             (
                 Some(Tensor::zeros(
                     (max_verify_tokens, d_conv, conv_kernel_size - 1),
@@ -1002,16 +1005,36 @@ impl GatedDeltaNet {
     /// Roll back this layer's GDN state to the position after `keep_tokens` tokens
     /// were processed during MTP verification. Indexes into the per-token snapshot
     /// buffers written by the prefill kernels and restores the slot state.
+    ///
+    /// `snapshot_offset` is the starting row in the packed snapshot buffer for this
+    /// sequence (0 for single-seq verify; `seq_idx * verify_len` for batch verify).
     pub fn rollback_mtp_verify(
         &self,
         mamba_cache: &mut MambaCache,
         seq_slots: &Tensor,
         keep_tokens: usize,
     ) -> Result<()> {
+        self.rollback_mtp_verify_at(mamba_cache, seq_slots, keep_tokens, 0)
+    }
+
+    pub fn rollback_mtp_verify_at(
+        &self,
+        mamba_cache: &mut MambaCache,
+        seq_slots: &Tensor,
+        keep_tokens: usize,
+        snapshot_offset: usize,
+    ) -> Result<()> {
         if keep_tokens == 0 {
             return Ok(());
         }
-        let idx = keep_tokens - 1;
+        let idx = snapshot_offset
+            .checked_add(keep_tokens - 1)
+            .ok_or_else(|| {
+                candle_core::Error::Msg(format!(
+                    "MTP rollback index overflow for GDN layer {}",
+                    self.gdn_layer_idx
+                ))
+            })?;
 
         let conv_mtp_state = self.conv_mtp_state.as_ref().ok_or_else(|| {
             candle_core::Error::Msg(format!(
@@ -1019,6 +1042,15 @@ impl GatedDeltaNet {
                 self.gdn_layer_idx
             ))
         })?;
+        if idx >= conv_mtp_state.dim(0)? {
+            candle_core::bail!(
+                "MTP conv snapshot index {} out of range (buffer len {}, offset {}, keep {})",
+                idx,
+                conv_mtp_state.dim(0)?,
+                snapshot_offset,
+                keep_tokens
+            );
+        }
         let conv_snapshot = conv_mtp_state.narrow(0, idx, 1)?;
         let conv_state_dtype = mamba_cache.conv_state(self.gdn_layer_idx).dtype();
         let conv_snapshot = if conv_snapshot.dtype() != conv_state_dtype {
@@ -1034,6 +1066,15 @@ impl GatedDeltaNet {
                 self.gdn_layer_idx
             ))
         })?;
+        if idx >= recurrent_mtp_state.dim(0)? {
+            candle_core::bail!(
+                "MTP recurrent snapshot index {} out of range (buffer len {}, offset {}, keep {})",
+                idx,
+                recurrent_mtp_state.dim(0)?,
+                snapshot_offset,
+                keep_tokens
+            );
+        }
         let rec_snapshot = recurrent_mtp_state.narrow(0, idx, 1)?;
         mamba_cache.set_batch_recurrent_state(self.gdn_layer_idx, seq_slots, &rec_snapshot)?;
 

@@ -137,6 +137,7 @@ impl DFlashModelConfig {
             mtp_num_hidden_layers: None,
             mtp_use_dedicated_embeddings: None,
             mtp_enabled: false,
+            mtp_max_verify_tokens: 0,
             expert_dtype: None,
         }
     }
