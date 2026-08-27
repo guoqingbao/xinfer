@@ -815,7 +815,7 @@ impl DFlashDraftModel {
         let selected: Vec<Tensor> = (0..self.target_layer_ids.len())
             .map(|i| all_hidden_states[i + 1].clone())
             .collect();
-        let concatenated = Tensor::cat(&selected, D::Minus1)?;
+        let concatenated = Tensor::cat(&selected, D::Minus1)?.to_dtype(self.dtype)?;
         let projected = self.fc.forward(&concatenated)?;
         self.hidden_norm.forward(&projected)
     }
@@ -830,7 +830,7 @@ impl DFlashDraftModel {
                 layer_hiddens.len()
             );
         }
-        let concatenated = Tensor::cat(layer_hiddens, D::Minus1)?;
+        let concatenated = Tensor::cat(layer_hiddens, D::Minus1)?.to_dtype(self.dtype)?;
         let projected = self.fc.forward(&concatenated)?;
         self.hidden_norm.forward(&projected)
     }
