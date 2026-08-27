@@ -493,6 +493,7 @@ xinfer --m Qwen/Qwen3.6-27B-FP8 --ui-server --enable-tool-grammar
 | [Add a Model](docs/add_model.md) | Port a new architecture (AI-assisted) |
 | [Test a Model](docs/test_model.md) | Validate model quality (AI-assisted) |
 | [CUDA Precision Probes](docs/precision_probes.md) | Isolate CUDA kernel precision problems |
+| [Speculative Decoding](docs/speculative_decoding.md) | MTP / DFlash draft + verify, grammar, adaptive K |
 
 **Using Agents under xInfer backend:** [xbot](docs/xbot.md) · [OpenCode](docs/opencode.md) · [Kilo Code](docs/kilocode.md) · [Claude Code](docs/claude_code.md) · [Goose](docs/goose.md)
 
@@ -539,6 +540,12 @@ xinfer --m Qwen/Qwen3.6-27B-FP8 --ui-server --enable-tool-grammar
 | `XINFER_ENABLE_FLASHMLA` | Enables DeepSeek V4 sparse MLA acceleration when set to `1` or `true`. It is disabled by default (unset), so the precision-preserving custom BF16 sparse-attention kernel is used. |
 | `XINFER_SSE_BUFFER_SIZE=256` | Size of the bounded SSE streaming buffer per client connection (default: 256). Increase for slow network proxies or high-throughput models. |
 | `SM90_LOWER_PRECISION_GDN_PREFILL=1` | Enable the FlashInfer SM90 persistent kernel for GatedDeltaNet (GDN) prefill on Hopper GPUs (SM90). Delivers faster prefill speedup for Qwen3.5/3.6, with a slight precision trade-off. |
+| `XINFER_SPEC_REJECTION_SAMPLING=1` | Opt-in: verify non-greedy (temperature) targets by rejection sampling so the output distribution matches the target model. Default off (fast greedy argmax verify). See [speculative decoding](docs/speculative_decoding.md). |
+| `XINFER_SPEC_ADAPTIVE_K=1` | Opt-in: scale the draft count K with the rolling acceptance rate (tiered controller). Default off (fixed K = the CLI count). **Currently stalled** - see the note in [speculative decoding](docs/speculative_decoding.md). |
+| `XINFER_SPEC_CONTEXT_WINDOW=4096` | Cap on the DFlash projected-hidden context window kept per sequence (rows). `0` = unbounded (original behavior). Bounds memory on long generations and keeps the draft model within its training window. |
+| `XINFER_SPEC_GRAPH=0` | Opt-out: capture the DFlash draft transformer into a CUDA graph (replayed when the context window is full). Default on; set `0` to force the eager draft. |
+| `XINFER_SPEC_MASK_OFFLOAD=0` | Force the CPU (where_cond) grammar-mask path for full-token sampling. Default on CUDA builds offloads the mask into the fused CUDA sampler (`sample_cuda_masked`), dropping disallowed vocab inside the top-k stage. |
+| `XINFER_SPEC_GRANULAR_MASK=1` | Use the exact per-position FSM-walk draft mask instead of the static repeated-VOB projection. For precise gating when the grammar mask changes across the draft run. |
 
 **Example (Blackwell with high-precision NVFP4 decode):**
 ```bash
