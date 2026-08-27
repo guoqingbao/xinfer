@@ -271,6 +271,44 @@ impl LogitsProcessor {
         Ok(next_tokens)
     }
 
+    /// Sample `sample_with_strategy`, but with an optional per-row grammar allow-mask
+    /// (`[batch, vocab]` u8, 1 = legal) offloaded into the fused CUDA sampler's top-k
+    /// stage, so disallowed vocab is dropped without a separate CPU biasing pass.
+    pub fn sample_with_strategy_masked(
+        &self,
+        logits: &Tensor,
+        sampling: &Sampling,
+        mask: Option<&Tensor>,
+    ) -> Result<Vec<u32>> {
+        #[cfg(feature = "cuda")]
+        {
+            let (k, p, t) = match sampling {
+                Sampling::TopKThenTopP { k, p, temperature } => (*k, *p, *temperature),
+                Sampling::TopK { k, temperature } => (*k, 1.0, *temperature),
+                Sampling::TopP { p, temperature } => (256, *p, *temperature),
+                _ => (0, 0.0, 0.0),
+            };
+            let should_run = matches!(
+                sampling,
+                Sampling::TopKThenTopP { .. } | Sampling::TopK { .. } | Sampling::TopP { .. }
+            );
+            if should_run && k > 0 {
+                let seed = {
+                    use rand::RngCore;
+                    self.rng.lock().next_u64()
+                };
+                let sampler = self.fast_sampler.lock().unwrap();
+                return match mask {
+                    Some(m) => sampler.sample_cuda_masked(logits, k, p as f32, t, seed, Some(m)),
+                    None => sampler.sample_cuda(logits, k, p as f32, t, seed),
+                };
+            }
+        }
+        // Non-CUDA build or unsupported strategy: fall back to the plain sampler. On this
+        // path the caller has already folded the mask into the logits (CPU where_cond).
+        self.sample_with_strategy(logits, sampling)
+    }
+
     pub fn sample(
         &self,
         logits: &Tensor,

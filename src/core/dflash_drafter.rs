@@ -5,33 +5,7 @@ use candle_core::{DType, Device, IndexOp, Result, Tensor, D};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
-
-static DFLASH_TOTAL_PROPOSED: AtomicUsize = AtomicUsize::new(0);
-static DFLASH_TOTAL_ACCEPTED: AtomicUsize = AtomicUsize::new(0);
-static DFLASH_TOTAL_STEPS: AtomicUsize = AtomicUsize::new(0);
-
-fn dflash_stats_update(proposed: usize, accepted: usize) {
-    DFLASH_TOTAL_PROPOSED.fetch_add(proposed, Ordering::Relaxed);
-    DFLASH_TOTAL_ACCEPTED.fetch_add(accepted, Ordering::Relaxed);
-    let steps = DFLASH_TOTAL_STEPS.fetch_add(1, Ordering::Relaxed) + 1;
-    if steps % 64 == 0 {
-        let total_proposed = DFLASH_TOTAL_PROPOSED.load(Ordering::Relaxed);
-        let total_accepted = DFLASH_TOTAL_ACCEPTED.load(Ordering::Relaxed);
-        crate::log_info!(
-            "DFlash Stats: steps={}, proposed={}, accepted={}, average_acceptance_rate={:.2}%",
-            steps,
-            total_proposed,
-            total_accepted,
-            if total_proposed == 0 {
-                0.0
-            } else {
-                total_accepted as f64 / total_proposed as f64 * 100.0
-            }
-        );
-    }
-}
 
 pub struct DFlashDrafter {
     pub draft_model: DFlashDraftModel,
@@ -41,6 +15,7 @@ pub struct DFlashDrafter {
     device: Device,
     _dtype: DType,
     cached_target_hidden: Mutex<HashMap<usize, Tensor>>,
+    context_window: usize,
 }
 
 pub struct SpecDecodeOutput {
@@ -58,11 +33,12 @@ impl DFlashDrafter {
         dtype: DType,
         device: &Device,
         num_speculative_tokens: Option<usize>,
+        yarn_factor: Option<f64>,
     ) -> Result<Self> {
         let draft_vb = unsafe {
             candle_nn::var_builder::ShardedSafeTensors::var_builder(
                 draft_weight_files,
-                DType::BF16,
+                dtype,
                 device,
             )?
         };
@@ -75,7 +51,7 @@ impl DFlashDrafter {
         );
 
         let draft_model =
-            DFlashDraftModel::new(&draft_vb, comm, draft_config, DType::BF16, device)?;
+            DFlashDraftModel::new(&draft_vb, comm, draft_config, dtype, device, yarn_factor)?;
 
         let target_layer_ids = draft_config.target_layer_ids();
         // DFlash config.block_size is the verification block width:
@@ -101,6 +77,7 @@ impl DFlashDrafter {
             device: device.clone(),
             _dtype: dtype,
             cached_target_hidden: Mutex::new(HashMap::new()),
+            context_window: crate::utils::env::spec_context_window(),
         })
     }
 
@@ -113,73 +90,114 @@ impl DFlashDrafter {
         self.draft_model.project_layer_hiddens(layer_hiddens)
     }
 
-    pub fn draft_tokens(
+    /// Build the DFlash draft block inputs (eager): the cast target context, the noise
+    /// embeddings (`[anchor, MASK x n]` via the target embed table), and the 0-based positions.
+    pub fn build_draft_inputs(
         &self,
         target_hidden: &Tensor,
         embed_fn: &dyn Fn(&Tensor) -> Result<Tensor>,
-        lm_head_fn: &dyn Fn(&Tensor) -> Result<Tensor>,
-        last_tokens: &[u32],
-    ) -> Result<Vec<u32>> {
-        let batch_size = last_tokens.len();
-        assert_eq!(
-            batch_size, 1,
-            "DFlash currently supports batch_size=1 for drafting"
-        );
-
-        let n = self.num_speculative_tokens;
-        let mut draft_token_ids: Vec<u32> = Vec::with_capacity(n);
-
-        let mut block_ids = vec![self.mask_token_id; n + 1];
-        block_ids[0] = last_tokens[0];
-
+        anchor: u32,
+        n_mask: usize,
+    ) -> Result<(Tensor, Tensor, Tensor)> {
+        let dtype = self.draft_model.dtype();
+        let mut block_ids = Vec::with_capacity(1 + n_mask);
+        block_ids.push(anchor);
+        block_ids.extend(std::iter::repeat(self.mask_token_id).take(n_mask));
+        let block_len = block_ids.len();
         let block_tensor = Tensor::from_vec(
             block_ids.iter().map(|&x| x as i64).collect::<Vec<_>>(),
-            (n + 1,),
+            (block_len,),
             &self.device,
         )?;
-
-        let noise_embedding = embed_fn(&block_tensor)?;
-        let noise_embedding = noise_embedding.to_dtype(DType::BF16)?;
-
+        let noise_embedding = embed_fn(&block_tensor)?.to_dtype(dtype)?;
         let target_hidden_2d = if target_hidden.rank() == 3 {
             let (_, ctx, h) = target_hidden.dims3()?;
             target_hidden.reshape((ctx, h))?
         } else {
             target_hidden.clone()
         };
-        let target_hidden_bf16 = target_hidden_2d.to_dtype(DType::BF16)?;
-
-        let ctx_len = target_hidden_bf16.dim(0)?;
+        let th_cast = target_hidden_2d.to_dtype(dtype)?;
         let noise_2d = if noise_embedding.rank() == 3 {
             let (_, s, h) = noise_embedding.dims3()?;
             noise_embedding.reshape((s, h))?
         } else {
             noise_embedding
         };
+        let total_len = th_cast.dim(0)? + block_len;
+        let positions = Tensor::from_vec(
+            (0..total_len as i64).collect::<Vec<_>>(),
+            (total_len,),
+            &self.device,
+        )?;
+        Ok((th_cast, noise_2d, positions))
+    }
 
-        let total_len = ctx_len + n + 1;
-        let positions: Vec<i64> = (0..total_len as i64).collect();
-        let positions_tensor = Tensor::from_vec(positions, (total_len,), &self.device)?;
+    /// Run the draft transformer (graphable). Returns draft_hidden `[ctx + block, hidden]`.
+    pub fn draft_forward(
+        &self,
+        target_hidden: &Tensor,
+        noise_embedding: &Tensor,
+        positions: &Tensor,
+    ) -> Result<Tensor> {
+        self.draft_model.forward(target_hidden, noise_embedding, positions)
+    }
 
-        let draft_hidden =
-            self.draft_model
-                .forward(&target_hidden_bf16, &noise_2d, &positions_tensor)?;
+    /// The target lm_head logits over the trailing `n_mask` draft positions (eager).
+    pub fn lm_head_logits(
+        &self,
+        draft_hidden_full: &Tensor,
+        n_mask: usize,
+        lm_head_fn: &dyn Fn(&Tensor) -> Result<Tensor>,
+    ) -> Result<(Tensor, Tensor)> {
+        let total_out = draft_hidden_full.dim(0)?;
+        let hidden_n = draft_hidden_full.narrow(0, total_out - n_mask, n_mask)?;
+        let logits = lm_head_fn(&hidden_n)?;
+        Ok((logits, hidden_n))
+    }
 
-        let total_out = draft_hidden.dim(0)?;
-        let draft_hidden = draft_hidden.narrow(0, total_out - n, n)?;
-        let draft_logits = lm_head_fn(&draft_hidden)?;
-        // DFlash2: candidate selector walks a top-k lattice. Keep greedy argmax as
-        // fallback when selector is unavailable.
+    /// Select draft tokens from pre-computed logits (DFlash2 selector, else argmax), applying
+    /// the grammar mask (projection by default; the exact per-position FSM walk when
+    /// XINFER_SPEC_GRANULAR_MASK is set). Unguided -> no gate.
+    pub fn select_draft_tokens(
+        &self,
+        logits: &Tensor,
+        hidden_n: &Tensor,
+        anchor: u32,
+        guided: &crate::utils::guided_decoding::GuidedDecoding,
+        seq_id: usize,
+    ) -> Result<Vec<u32>> {
+        // The number of draft positions is the logits row count (adaptive K in the
+        // single-seq path, the full count in the batch path).
+        let n = logits.dim(0)?;
+        let logits = if guided.is_guided(seq_id) {
+            let vocab = logits.dim(1)?;
+            let allow = if crate::utils::env::spec_granular_mask() {
+                guided.draft_allow_walk(seq_id, logits, vocab)?
+            } else {
+                guided.draft_allow_repeated(seq_id, n, vocab, &self.device)?
+            };
+            match allow {
+                Some(a) => {
+                    let neg_inf = Tensor::full(
+                        f32::NEG_INFINITY,
+                        logits.shape().clone(),
+                        &self.device,
+                    )?
+                    .to_dtype(logits.dtype())?;
+                    a.where_cond(logits, &neg_inf)?
+                }
+                None => logits.clone(),
+            }
+        } else {
+            logits.clone()
+        };
+        // DFlash2: candidate selector walks a top-k lattice. Keep greedy argmax as fallback.
         if self.draft_model.is_dflash2() {
-            return self.draft_model.select_candidates(
-                &draft_hidden,
-                &draft_logits,
-                last_tokens[0],
-            );
+            return self.draft_model.select_candidates(hidden_n, &logits, anchor);
         }
-
+        let mut draft_token_ids: Vec<u32> = Vec::with_capacity(n);
         for i in 0..n {
-            let logit_slice = draft_logits.i(i)?;
+            let logit_slice = logits.i(i)?;
             let argmax_result = logit_slice.argmax(D::Minus1)?;
             let token_id = if argmax_result.rank() > 0 {
                 argmax_result.flatten_all()?.i(0)?.to_vec0::<u32>()?
@@ -188,8 +206,30 @@ impl DFlashDrafter {
             };
             draft_token_ids.push(token_id);
         }
-
         Ok(draft_token_ids)
+    }
+
+    /// Full draft step (eager, no graph): build inputs -> draft transformer -> lm_head -> select.
+    pub fn draft_tokens(
+        &self,
+        target_hidden: &Tensor,
+        embed_fn: &dyn Fn(&Tensor) -> Result<Tensor>,
+        lm_head_fn: &dyn Fn(&Tensor) -> Result<Tensor>,
+        last_tokens: &[u32],
+        guided: &crate::utils::guided_decoding::GuidedDecoding,
+        seq_id: usize,
+    ) -> Result<Vec<u32>> {
+        assert_eq!(
+            last_tokens.len(),
+            1,
+            "DFlash currently supports batch_size=1 for drafting"
+        );
+        let n = self.num_speculative_tokens;
+        let (th_cast, noise_2d, positions) =
+            self.build_draft_inputs(target_hidden, embed_fn, last_tokens[0], n)?;
+        let draft_hidden_full = self.draft_forward(&th_cast, &noise_2d, &positions)?;
+        let (logits, hidden_n) = self.lm_head_logits(&draft_hidden_full, n, lm_head_fn)?;
+        self.select_draft_tokens(&logits, &hidden_n, last_tokens[0], guided, seq_id)
     }
 
     pub fn verify_tokens(
@@ -267,11 +307,24 @@ impl DFlashDrafter {
         let keep = std::cmp::min(accepted_count, vdim);
         let verified_inputs = verify_hidden.narrow(0, 0, keep)?;
 
-        if let Some(prev) = cached.get(&seq_id).cloned() {
-            cached.insert(seq_id, Tensor::cat(&[prev, verified_inputs], 0)?);
+        let new_ctx = if let Some(prev) = cached.get(&seq_id).cloned() {
+            Tensor::cat(&[prev, verified_inputs], 0)?
         } else {
-            cached.insert(seq_id, verified_inputs);
-        }
+            verified_inputs
+        };
+        // Cap the per-seq context to the last `context_window` rows (0 = unbounded).
+        let new_ctx = if self.context_window > 0 {
+            let total = new_ctx.dim(0)?;
+            let keep = std::cmp::min(total, self.context_window);
+            if keep < total {
+                new_ctx.narrow(0, total - keep, keep)?
+            } else {
+                new_ctx
+            }
+        } else {
+            new_ctx
+        };
+        cached.insert(seq_id, new_ctx);
         Ok(())
     }
 
@@ -279,11 +332,24 @@ impl DFlashDrafter {
     /// Appends to the accumulated context.
     pub fn store_decode_hidden(&self, hidden: &Tensor, seq_id: usize) -> Result<()> {
         let mut cached = self.cached_target_hidden.lock().unwrap();
-        if let Some(prev) = cached.get(&seq_id).cloned() {
-            cached.insert(seq_id, Tensor::cat(&[prev, hidden.clone()], 0)?);
+        let new_ctx = if let Some(prev) = cached.get(&seq_id).cloned() {
+            Tensor::cat(&[prev, hidden.clone()], 0)?
         } else {
-            cached.insert(seq_id, hidden.clone());
-        }
+            hidden.clone()
+        };
+        // Cap the per-seq context to the last `context_window` rows (0 = unbounded).
+        let new_ctx = if self.context_window > 0 {
+            let total = new_ctx.dim(0)?;
+            let w = std::cmp::min(total, self.context_window);
+            if w < total {
+                new_ctx.narrow(0, total - w, w)?
+            } else {
+                new_ctx
+            }
+        } else {
+            new_ctx
+        };
+        cached.insert(seq_id, new_ctx);
         Ok(())
     }
 }
@@ -417,8 +483,39 @@ impl ModelRunner {
                 _ => candle_core::bail!("DFlash currently supports Qwen3.5 target models"),
             }
         };
-        let draft_tokens =
-            drafter.draft_tokens(&target_hidden, &embed_fn, &lm_head_fn, &[anchor_token])?;
+        let n = if self.adaptive_enabled {
+            self.adaptive_spec.lock().unwrap().current_k()
+        } else {
+            drafter.num_speculative_tokens
+        };
+        let (th_cast, noise_2d, positions) =
+            drafter.build_draft_inputs(&target_hidden, &embed_fn, anchor_token, n)?;
+        let draft_hidden_full = {
+            #[cfg(all(feature = "cuda", feature = "graph"))]
+            {
+                if let Some(graph) = self.dflash_draft_graph.as_ref().filter(|g| g.is_captured()) {
+                    if th_cast.dim(0)? == graph.cap() {
+                        graph.replay(&th_cast, &noise_2d, &positions)?
+                    } else {
+                        drafter.draft_forward(&th_cast, &noise_2d, &positions)?
+                    }
+                } else {
+                    drafter.draft_forward(&th_cast, &noise_2d, &positions)?
+                }
+            }
+            #[cfg(not(all(feature = "cuda", feature = "graph")))]
+            {
+                drafter.draft_forward(&th_cast, &noise_2d, &positions)?
+            }
+        };
+        let (draft_logits, draft_hidden_n) = drafter.lm_head_logits(&draft_hidden_full, n, &lm_head_fn)?;
+        let draft_tokens = drafter.select_draft_tokens(
+            &draft_logits,
+            &draft_hidden_n,
+            anchor_token,
+            &self.guided_decoding,
+            seq_info.id,
+        )?;
         if draft_tokens.is_empty() {
             return Ok(vec![vec![anchor_token]]);
         }
@@ -544,7 +641,35 @@ impl ModelRunner {
             (logits, drafter.extract_and_concat_hidden(&hidden_states)?)
         };
 
-        let verify_result = verify_draft_greedy(&verify_logits, &draft_tokens)?;
+        let verify_result = if self.guided_decoding.is_guided(seq_info.id) {
+            crate::core::mtp::verify_draft_masked(
+                &verify_logits,
+                &draft_tokens,
+                &self.guided_decoding,
+                seq_info.id,
+            )?
+        } else {
+            // Copy the sampling out and release the guard before the (GPU) verify.
+            let sampling = {
+                let cached = self.cached_sampling.read();
+                cached
+                    .as_ref()
+                    .map(|c| c.sampling.clone())
+                    .unwrap_or(crate::utils::logits_processor::Sampling::ArgMax)
+            };
+            if matches!(
+                sampling,
+                crate::utils::logits_processor::Sampling::ArgMax
+            ) || !crate::utils::env::spec_rejection_sampling()
+            {
+                verify_draft_greedy(&verify_logits, &draft_tokens)?
+            } else {
+                crate::core::mtp::verify_draft_rejection(&verify_logits, &draft_tokens, &sampling)?
+            }
+        };
+        if self.adaptive_enabled {
+            self.adaptive_spec.lock().unwrap().update(&[verify_result.num_accepted]);
+        }
         let commit_len = 1 + verify_result.num_accepted;
         if verify_result.num_accepted < verify_result.num_proposed {
             if !self.mtp_rollback_mamba(seq_info.id, commit_len)? {
@@ -561,7 +686,8 @@ impl ModelRunner {
         result_tokens.push(anchor_token);
         result_tokens.extend_from_slice(&verify_result.accepted_tokens);
         result_tokens.push(verify_result.continuation_token);
-        dflash_stats_update(verify_result.num_proposed, verify_result.num_accepted);
+        let name = if drafter.draft_model.is_dflash2() { "DFlash2" } else { "DFlash1" };
+        crate::core::spec_stats::spec_stats_update(name, seq_info.id, &verify_result);
         Ok(vec![result_tokens])
     }
 
@@ -689,6 +815,8 @@ impl ModelRunner {
                 &embed_fn,
                 &lm_head_fn,
                 &[anchor_token],
+                &self.guided_decoding,
+                seq_info.id,
             )?);
         }
         let verify_len = 1 + drafter.num_speculative_tokens;
@@ -796,7 +924,8 @@ impl ModelRunner {
             output.push(anchor_token);
             output.extend_from_slice(&verify_result.accepted_tokens);
             output.push(verify_result.continuation_token);
-            dflash_stats_update(verify_result.num_proposed, verify_result.num_accepted);
+            let name = if drafter.draft_model.is_dflash2() { "DFlash2" } else { "DFlash1" };
+            crate::core::spec_stats::spec_stats_update(name, seq_info.id, &verify_result);
             result.push(output);
         }
         Ok(result)

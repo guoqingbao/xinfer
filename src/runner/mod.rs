@@ -171,6 +171,20 @@ pub struct InitAck {
     pub ok: bool,
 }
 
+/// Per-sequence speculative-decode stats, fetched across the process boundary
+/// at sequence end for the server's performance report.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct SpecSeqStatsData {
+    pub mechanism: String,
+    pub steps: usize,
+    pub proposed: usize,
+    pub accepted: usize,
+    pub rejected: usize,
+    pub grammar_bound: usize,
+    pub target_bound: usize,
+    pub ff_continuations: usize,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum MessageType {
     /// Sent by main process to initialize the runner.
@@ -208,6 +222,12 @@ pub enum MessageType {
 
     /// Sent by main process to notify the finished decoding sequences.
     FinishDecode(usize),
+
+    /// Sent by main process to fetch a sequence's speculative-decode stats (rank 0).
+    GetSpecSeqStats(usize),
+
+    /// Sent by runner in response to `GetSpecSeqStats`.
+    SpecSeqStatsResponse(usize, SpecSeqStatsData),
 
     // Hybrid mamba-prefix state management.
     CaptureMambaPrefixState((usize, u64, bool)),
@@ -808,6 +828,14 @@ pub fn run_runner_process(args: Vec<String>) -> anyhow::Result<()> {
             }
             Ok(MessageType::FinishDecode(id)) => {
                 runner.finished(id);
+            }
+            Ok(MessageType::GetSpecSeqStats(id)) => {
+                let data = crate::core::spec_stats::spec_seq_stats_data(id);
+                send_local(
+                    &mut vec![stream.try_clone()?],
+                    &MessageType::SpecSeqStatsResponse(id, data),
+                    false,
+                )?;
             }
             Ok(MessageType::CaptureMambaPrefixState((seq_id, hash, preserve))) => {
                 let ret = runner.capture_mamba_prefix_state(seq_id, hash, preserve);

@@ -838,6 +838,7 @@ impl<M: CudaGraphModule> GraphCapturer<M> {
         device: &Device,
         kv_caches: Option<&Vec<(Tensor, Tensor)>>,
         mtp_num_speculative: usize,
+        label: &'static str,
     ) -> Result<()> {
         if mtp_num_speculative == 0 {
             return Ok(());
@@ -1016,7 +1017,8 @@ impl<M: CudaGraphModule> GraphCapturer<M> {
         }
 
         crate::log_warn!(
-            "Captured MTP verify graph len={} (flashinfer={})",
+            "Captured {} verify graph len={} (flashinfer={})",
+            label,
             verify_len,
             use_flashinfer
         );
@@ -1183,3 +1185,84 @@ pub type CudaGraphFn = Box<
         + Send
         + Sync,
 >;
+
+/// CUDA graph for the DFlash draft transformer (opt-in, `XINFER_SPEC_GRAPH`).
+/// Captures the draft forward `(target_hidden, noise_embedding, positions) -> draft_hidden` at
+/// the full context cap. Inputs are preallocated default-pool buffers; the output is D2D-copied
+/// into a stable default-pool buffer (the `AUTO_FREE_ON_LAUNCH` contract), so replay reads a
+/// stable address. The lm_head + selection run eagerly on the replayed output.
+pub struct DFlashDraftGraph {
+    graph: Option<Arc<CudaGraph>>,
+    target_hidden: Tensor,
+    noise_embedding: Tensor,
+    positions: Tensor,
+    out: Tensor,
+    device: Device,
+}
+
+impl DFlashDraftGraph {
+    pub fn new(cap: usize, block: usize, hidden: usize, dtype: DType, device: &Device) -> Result<Self> {
+        Ok(Self {
+            graph: None,
+            target_hidden: Tensor::zeros((cap, hidden), dtype, device)?,
+            noise_embedding: Tensor::zeros((block, hidden), dtype, device)?,
+            positions: Tensor::zeros((cap + block,), DType::I64, device)?,
+            out: Tensor::zeros((cap + block, hidden), dtype, device)?,
+            device: device.clone(),
+        })
+    }
+
+    /// Capture the draft forward (`draft_fwd` runs the draft transformer) into a CUDA graph.
+    pub fn capture<F: FnOnce(&Tensor, &Tensor, &Tensor) -> Result<Tensor>>(
+        &mut self,
+        draft_fwd: F,
+    ) -> Result<()> {
+        let stream = self.device.as_cuda_device()?.cu_stream().clone();
+        CudaGraph::begin_capture(
+            stream,
+            CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED,
+        )?;
+        {
+            let out = draft_fwd(&self.target_hidden, &self.noise_embedding, &self.positions)?;
+            self.out.copy_(&out, 0)?;
+            // `out` is a graph-pool allocation; dropping it while capture is still
+            // active makes cudarc skip the cuMemFree (the graph pool owns it and
+            // AUTO_FREE_ON_LAUNCH frees it at replay). Dropping it after end_capture
+            // faults with CUDA_ERROR_INVALID_VALUE.
+        }
+        let graph = CudaGraph::end_capture(
+            stream,
+            CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH as u32 as u64,
+        )?;
+        self.graph = Some(Arc::new(graph));
+        Ok(())
+    }
+
+    /// Replay the captured draft forward with the real inputs; returns the draft hidden
+    /// (`[cap + block, hidden]`; the caller narrows the trailing `block` rows for the lm_head).
+    pub fn replay(
+        &self,
+        target_hidden: &Tensor,
+        noise_embedding: &Tensor,
+        positions: &Tensor,
+    ) -> Result<Tensor> {
+        let graph = self
+            .graph
+            .as_ref()
+            .ok_or_else(|| candle_core::Error::Msg("DFlash draft graph not captured".into()))?;
+        self.target_hidden.copy_(target_hidden, 0)?;
+        self.noise_embedding.copy_(noise_embedding, 0)?;
+        self.positions.copy_(positions, 0)?;
+        graph.launch()?;
+        Ok(self.out.clone())
+    }
+
+    pub fn is_captured(&self) -> bool {
+        self.graph.is_some()
+    }
+
+    /// The context cap the graph was captured for (the draft context window size).
+    pub fn cap(&self) -> usize {
+        self.target_hidden.dim(0).unwrap_or(0)
+    }
+}

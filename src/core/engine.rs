@@ -113,6 +113,7 @@ pub struct LLMEngine {
     pub tool_config: ToolConfig,
     pub img_cfg: Option<ImageProcessConfig>,
     pub guidance_tokens: GuidanceTokens,
+    seq_spec_stats: HashMap<usize, crate::runner::SpecSeqStatsData>,
 }
 
 impl LLMEngine {
@@ -590,6 +591,7 @@ impl LLMEngine {
             img_cfg,
             model_name,
             guidance_tokens,
+            seq_spec_stats: HashMap::new(),
         }));
 
         Self::start_engine(engine.clone());
@@ -975,6 +977,11 @@ impl LLMEngine {
     }
 
     pub fn notify_runner_finished(&mut self, id: usize) -> Result<()> {
+        // Fetch the per-seq spec stats before FinishDecode (which drops them runner-side).
+        let spec_stats = self.fetch_spec_seq_stats(id);
+        if !spec_stats.mechanism.is_empty() {
+            self.seq_spec_stats.insert(id, spec_stats);
+        }
         match &mut *self.runners.write() {
             RunnerType::Thread(model_runner) => Ok(model_runner.finished(id)),
             RunnerType::Process(ref mut runner_streams) => {
@@ -1001,6 +1008,34 @@ impl LLMEngine {
                 }
                 Ok(())
             }
+        }
+    }
+
+    /// The cached per-seq spec stats (for the server's end-of-sequence report).
+    pub fn get_seq_spec_stats(&self, seq_id: usize) -> Option<crate::runner::SpecSeqStatsData> {
+        self.seq_spec_stats.get(&seq_id).cloned()
+    }
+
+    /// Fetch a sequence's speculative-decode stats from rank 0 (Process mode only).
+    fn fetch_spec_seq_stats(&self, id: usize) -> crate::runner::SpecSeqStatsData {
+        use crate::runner::SpecSeqStatsData;
+        match &mut *self.runners.write() {
+            RunnerType::Process(ref mut runner_streams) => {
+                if runner_streams.is_empty() {
+                    return SpecSeqStatsData::default();
+                }
+                let stream = &mut runner_streams[0];
+                let _ = send_local(
+                    &mut vec![stream.try_clone().expect("clone failed")],
+                    &MessageType::GetSpecSeqStats(id),
+                    false,
+                );
+                match receive_local(stream, false) {
+                    Ok(MessageType::SpecSeqStatsResponse(_, data)) => data,
+                    _ => SpecSeqStatsData::default(),
+                }
+            }
+            _ => SpecSeqStatsData::default(),
         }
     }
 

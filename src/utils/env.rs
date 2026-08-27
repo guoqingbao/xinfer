@@ -92,3 +92,105 @@ pub fn soft_mask_disabled() -> bool {
             .unwrap_or(false)
     })
 }
+
+/// Debug: use the granular (per-position FSM-walk) draft mask instead of the batched
+/// single-VOB mask. For precise gating when the mask changes across the draft run.
+pub const SPEC_GRANULAR_MASK_ENV: &str = "XINFER_SPEC_GRANULAR_MASK";
+
+static SPEC_GRANULAR_MASK: OnceLock<bool> = OnceLock::new();
+
+pub fn spec_granular_mask() -> bool {
+    *SPEC_GRANULAR_MASK.get_or_init(|| {
+        env::var(SPEC_GRANULAR_MASK_ENV)
+            .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false)
+    })
+}
+
+/// Whether grammar VOB masking is offloaded to the CUDA sampler (the mask is passed to
+/// `sample_cuda_masked` and applied inside the fused top-k stage) instead of biasing the
+/// logits on the CPU via `where_cond`. Default: offload on CUDA builds. Set
+/// `XINFER_SPEC_MASK_OFFLOAD=0` to force the CPU (where_cond) path.
+pub const SPEC_MASK_OFFLOAD_ENV: &str = "XINFER_SPEC_MASK_OFFLOAD";
+
+static SPEC_MASK_OFFLOAD: OnceLock<bool> = OnceLock::new();
+
+pub fn spec_mask_offload() -> bool {
+    *SPEC_MASK_OFFLOAD.get_or_init(|| {
+        cfg!(feature = "cuda")
+            && !matches!(
+                env::var(SPEC_MASK_OFFLOAD_ENV)
+                    .ok()
+                    .as_deref()
+                    .map(|v| v.trim().eq_ignore_ascii_case("0") || v.trim().eq_ignore_ascii_case("false")),
+                Some(true)
+            )
+    })
+}
+
+/// Cap on the DFlash projected-hidden context window kept per sequence (in rows).
+/// `0` means unbounded full history, matching the original DFlash branch;
+/// set e.g. `XINFER_SPEC_CONTEXT_WINDOW=512` to bound memory on very long generations.
+pub const SPEC_CONTEXT_WINDOW_ENV: &str = "XINFER_SPEC_CONTEXT_WINDOW";
+
+static SPEC_CONTEXT_WINDOW: OnceLock<usize> = OnceLock::new();
+
+pub fn spec_context_window() -> usize {
+    *SPEC_CONTEXT_WINDOW.get_or_init(|| {
+        env::var(SPEC_CONTEXT_WINDOW_ENV)
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(4096) // Default: 4096 (matches DFlash2 training window)
+    })
+}
+
+/// Opt-out: capture the DFlash draft transformer into a CUDA graph (replayed when the context
+/// window is full). Default ON; set `XINFER_SPEC_GRAPH=0` to force the eager draft.
+pub const SPEC_GRAPH_ENV: &str = "XINFER_SPEC_GRAPH";
+
+static SPEC_GRAPH: OnceLock<bool> = OnceLock::new();
+
+pub fn spec_graph() -> bool {
+    *SPEC_GRAPH.get_or_init(|| {
+        !matches!(
+            env::var(SPEC_GRAPH_ENV)
+                .ok()
+                .as_deref()
+                .map(|v| v.trim().eq_ignore_ascii_case("0") || v.trim().eq_ignore_ascii_case("false")),
+            Some(true)
+        )
+    })
+}
+
+/// Opt-in: adaptive draft length (K scales with the rolling acceptance rate).
+/// Default OFF (fixed K = the CLI `--num-speculative-tokens|mtp` count). Set
+/// `XINFER_SPEC_ADAPTIVE_K=1` to enable the tiered controller.
+pub const SPEC_ADAPTIVE_K_ENV: &str = "XINFER_SPEC_ADAPTIVE_K";
+
+static SPEC_ADAPTIVE_K: OnceLock<bool> = OnceLock::new();
+
+pub fn spec_adaptive_k() -> bool {
+    *SPEC_ADAPTIVE_K.get_or_init(|| {
+        env::var(SPEC_ADAPTIVE_K_ENV)
+            .ok()
+            .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false)
+    })
+}
+
+/// Opt-in: use rejection-sampling verify for non-greedy (temperature) targets, which
+/// preserves the target distribution. Default OFF, in which case all unguided targets use
+/// the fast greedy (argmax-agreement) verify (the 483 path). Set
+/// `XINFER_SPEC_REJECTION_SAMPLING=1` to enable distribution-correct sampling.
+pub const SPEC_REJECTION_SAMPLING_ENV: &str = "XINFER_SPEC_REJECTION_SAMPLING";
+
+static SPEC_REJECTION_SAMPLING: OnceLock<bool> = OnceLock::new();
+
+pub fn spec_rejection_sampling() -> bool {
+    *SPEC_REJECTION_SAMPLING.get_or_init(|| {
+        env::var(SPEC_REJECTION_SAMPLING_ENV)
+            .ok()
+            .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false)
+    })
+}

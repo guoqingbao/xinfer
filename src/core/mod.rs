@@ -1,3 +1,4 @@
+pub mod adaptive_k;
 pub mod block_manager;
 pub mod dflash_drafter;
 pub mod engine;
@@ -6,6 +7,7 @@ pub mod prefix_cache;
 pub mod runner;
 pub mod scheduler;
 pub mod sequence;
+pub mod spec_stats;
 #[cfg(feature = "python")]
 use pyo3::pyclass;
 

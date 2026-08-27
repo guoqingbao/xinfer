@@ -479,7 +479,7 @@ impl YarnRotaryEmbedding {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn new_yarn(
+    pub fn new_yarn(
         dtype: DType,
         dev: &Device,
         rope_theta: f32,

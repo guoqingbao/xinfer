@@ -9,7 +9,6 @@
 // keeping runner.rs and engine.rs focused on the standard inference path.
 
 use candle_core::{Result, Tensor, D};
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 // ---------------------------------------------------------------------------
 // Verification & stats (pure functions, no model dependencies)
@@ -26,6 +25,12 @@ pub struct MtpVerifyResult {
     pub num_accepted: usize,
     /// Total number proposed.
     pub num_proposed: usize,
+    /// Grammar-legal prefix length (how many drafts the FSM allows).
+    pub grammar_prefix: usize,
+    /// Target-agreement prefix length (how many drafts the target argmax matches).
+    pub target_prefix: usize,
+    /// True if the continuation was a grammar-forced (ff) token rather than a masked target pick.
+    pub continuation_is_ff: bool,
 }
 
 /// Verify draft tokens against target model logits (greedy / argmax).
@@ -58,6 +63,9 @@ pub fn verify_draft_greedy(
             continuation_token: first_token,
             num_accepted: 0,
             num_proposed,
+            grammar_prefix: num_proposed,
+            target_prefix: 0,
+            continuation_is_ff: false,
         });
     }
 
@@ -89,66 +97,211 @@ pub fn verify_draft_greedy(
         continuation_token,
         num_accepted,
         num_proposed,
+        grammar_prefix: num_proposed,
+        target_prefix: num_accepted,
+        continuation_is_ff: false,
     })
 }
 
-/// Global MTP statistics tracker.
-pub static MTP_TOTAL_PROPOSED: AtomicUsize = AtomicUsize::new(0);
-pub static MTP_TOTAL_ACCEPTED: AtomicUsize = AtomicUsize::new(0);
-pub static MTP_TOTAL_STEPS: AtomicUsize = AtomicUsize::new(0);
-
-pub fn mtp_stats_update(proposed: usize, accepted: usize) {
-    MTP_TOTAL_PROPOSED.fetch_add(proposed, Ordering::Relaxed);
-    MTP_TOTAL_ACCEPTED.fetch_add(accepted, Ordering::Relaxed);
-    MTP_TOTAL_STEPS.fetch_add(1, Ordering::Relaxed);
-}
-
-pub fn mtp_stats_acceptance_rate() -> f64 {
-    let proposed = MTP_TOTAL_PROPOSED.load(Ordering::Relaxed);
-    let accepted = MTP_TOTAL_ACCEPTED.load(Ordering::Relaxed);
-    if proposed == 0 {
-        0.0
-    } else {
-        accepted as f64 / proposed as f64
+/// How many leading draft tokens (starting at verify row `offset`) match the target argmax.
+fn target_agree_prefix_at(verify_logits: &Tensor, offset: usize, draft_tokens: &[u32]) -> Result<usize> {
+    if draft_tokens.is_empty() {
+        return Ok(0);
     }
-}
-
-pub fn mtp_stats_avg_tokens_per_step() -> f64 {
-    let steps = MTP_TOTAL_STEPS.load(Ordering::Relaxed);
-    let accepted = MTP_TOTAL_ACCEPTED.load(Ordering::Relaxed);
-    if steps == 0 {
-        1.0
-    } else {
-        // Each step produces: 1 anchor + accepted drafts + 1 continuation
-        (accepted + 2 * steps) as f64 / steps as f64
+    let target_vec: Vec<u32> = verify_logits
+        .to_dtype(candle_core::DType::F32)?
+        .argmax(D::Minus1)?
+        .to_vec1()?;
+    let mut t = 0;
+    for i in 0..draft_tokens.len() {
+        if target_vec.get(offset + i).copied() == Some(draft_tokens[i]) {
+            t += 1;
+        } else {
+            break;
+        }
     }
+    Ok(t)
 }
 
-pub fn mtp_stats_summary() -> String {
-    let proposed = MTP_TOTAL_PROPOSED.load(Ordering::Relaxed);
-    let accepted = MTP_TOTAL_ACCEPTED.load(Ordering::Relaxed);
-    let steps = MTP_TOTAL_STEPS.load(Ordering::Relaxed);
-    format!(
-        "MTP Stats: proposed={}, accepted={}, acceptance_rate={:.2}%, avg_tokens/step={:.2}",
-        proposed,
-        accepted,
-        if proposed > 0 {
-            accepted as f64 / proposed as f64 * 100.0
-        } else {
-            0.0
-        },
-        if steps > 0 {
-            (accepted + 2 * steps) as f64 / steps as f64
-        } else {
-            1.0
-        },
-    )
+/// Grammar-aware draft verification (the firewall). A draft token is accepted only if BOTH the
+/// target model agrees (argmax) AND the guidance FSM allows it; the continuation is the
+/// FSM-masked target choice (or the grammar-forced token). Non-guided sequences take the fast
+/// batched argmax path (`verify_draft_greedy`).
+///
+/// `verify_logits` is `[N+1, vocab]`: row i predicts draft[i] (i < N), row N is the bonus.
+pub fn verify_draft_masked(
+    verify_logits: &Tensor,
+    draft_tokens: &[u32],
+    guided: &crate::utils::guided_decoding::GuidedDecoding,
+    seq_id: usize,
+) -> Result<MtpVerifyResult> {
+    let num_proposed = draft_tokens.len();
+
+    if !guided.is_guided(seq_id) {
+        let t = target_agree_prefix_at(verify_logits, 0, draft_tokens)?;
+        let k = t;
+        let cont_row = verify_logits.get(k.min(num_proposed))?;
+        let continuation = cont_row
+            .to_dtype(candle_core::DType::F32)?
+            .argmax(D::Minus1)?
+            .to_scalar::<u32>()?;
+        return Ok(MtpVerifyResult {
+            accepted_tokens: draft_tokens[..k].to_vec(),
+            continuation_token: continuation,
+            num_accepted: k,
+            num_proposed,
+            grammar_prefix: num_proposed,
+            target_prefix: k,
+            continuation_is_ff: false,
+        });
+    }
+
+    let g = guided.validate_tokens(seq_id, draft_tokens)?;
+    let t = target_agree_prefix_at(verify_logits, 0, draft_tokens)?;
+    let k = g.min(t);
+
+    for &tok in &draft_tokens[..k] {
+        guided.commit_token(seq_id, tok);
+    }
+
+    let cont_row = verify_logits.get(k)?;
+    let (continuation, used_ff) = if let Some(ff) = guided.ff_tokens(seq_id).into_iter().next() {
+        (ff, true)
+    } else {
+        let masked = guided.mask_row(seq_id, &cont_row)?;
+        (masked.argmax(D::Minus1)?.to_scalar::<u32>()?, false)
+    };
+    guided.commit_token(seq_id, continuation);
+
+    Ok(MtpVerifyResult {
+        accepted_tokens: draft_tokens[..k].to_vec(),
+        continuation_token: continuation,
+        num_accepted: k,
+        num_proposed,
+        grammar_prefix: g,
+        target_prefix: t,
+        continuation_is_ff: used_ff,
+    })
 }
 
-pub fn mtp_stats_reset() {
-    MTP_TOTAL_PROPOSED.store(0, Ordering::Relaxed);
-    MTP_TOTAL_ACCEPTED.store(0, Ordering::Relaxed);
-    MTP_TOTAL_STEPS.store(0, Ordering::Relaxed);
+/// Sample a token from a CPU probability vector via a cumsum walk on a uniform coin in [0,1).
+fn categorical_sample(dist: &[f32], coin: f32) -> u32 {
+    let mut cum = 0.0f32;
+    for (i, &p) in dist.iter().enumerate() {
+        cum += p;
+        if coin < cum {
+            return i as u32;
+        }
+    }
+    dist.len().saturating_sub(1) as u32
+}
+
+/// The target sampling distribution (softmax + top-k + top-p) per row, as CPU vectors, for
+/// rejection sampling. One GPU softmax + one D2H transfer; the top-k/top-p masks run on CPU
+/// (correct first port; optimize later).
+fn target_distributions(
+    verify_logits: &Tensor,
+    sampling: &crate::utils::logits_processor::Sampling,
+) -> Result<Vec<Vec<f32>>> {
+    use crate::utils::logits_processor::Sampling;
+    let (k, p, temp) = match sampling {
+        Sampling::All { temperature } => (usize::MAX, 1.0f32, *temperature),
+        Sampling::TopK { k, temperature } => (*k, 1.0, *temperature),
+        Sampling::TopP { p, temperature } => (usize::MAX, *p, *temperature),
+        Sampling::TopKThenTopP { k, p, temperature } => (*k, *p, *temperature),
+        Sampling::ArgMax => (usize::MAX, 1.0, 0.0),
+    };
+    let logits = verify_logits.to_dtype(candle_core::DType::F32)?;
+    let scaled = if temp > 0.0 {
+        logits.broadcast_div(&Tensor::full(temp, logits.shape(), logits.device())?)?
+    } else {
+        logits
+    };
+    let dist = candle_nn::ops::softmax_last_dim(&scaled)?;
+    let mut dist_cpu = dist.to_vec2::<f32>()?;
+    for row in dist_cpu.iter_mut() {
+        if k < row.len() || p < 1.0 {
+            let mut order: Vec<usize> = (0..row.len()).collect();
+            order.sort_by(|&a, &b| row[b].total_cmp(&row[a]));
+            if k < row.len() {
+                for &i in order.iter().skip(k) {
+                    row[i] = 0.0;
+                }
+            }
+            if p < 1.0 {
+                let mut cum = 0.0f32;
+                let mut keep = 0usize;
+                for &i in order.iter() {
+                    cum += row[i];
+                    keep += 1;
+                    if cum >= p {
+                        break;
+                    }
+                }
+                for &i in order.iter().skip(keep) {
+                    row[i] = 0.0;
+                }
+            }
+            let sum: f32 = row.iter().sum();
+            if sum > 0.0 {
+                for v in row.iter_mut() {
+                    *v /= sum;
+                }
+            }
+        }
+    }
+    Ok(dist_cpu)
+}
+
+/// Rejection-sampling verify for a non-greedy target (temperature > 0). The draft is greedy
+/// (one-hot), so a draft token x is accepted with probability p_target(x); on rejection the
+/// continuation is sampled from (p_target - one_hot(x))^+ (normalized), preserving the target
+/// distribution. Ported from vLLM's chain (topk=1) speculative sampling.
+pub fn verify_draft_rejection(
+    verify_logits: &Tensor,
+    draft_tokens: &[u32],
+    sampling: &crate::utils::logits_processor::Sampling,
+) -> Result<MtpVerifyResult> {
+    use rand::Rng;
+    let k = draft_tokens.len();
+    let dists = target_distributions(verify_logits, sampling)?;
+    let mut rng = rand::rng();
+    let mut accepted = 0usize;
+    let mut continuation = 0u32;
+    for i in 0..k {
+        let dist = &dists[i];
+        let x = draft_tokens[i] as usize;
+        let p_x = dist.get(x).copied().unwrap_or(0.0);
+        let coin: f32 = rng.random_range(0.0..1.0);
+        if coin < p_x {
+            accepted = i + 1;
+        } else {
+            let mut residual = dist.clone();
+            if x < residual.len() {
+                residual[x] = 0.0;
+            }
+            let sum: f32 = residual.iter().sum();
+            if sum > 0.0 {
+                for v in residual.iter_mut() {
+                    *v /= sum;
+                }
+            }
+            continuation = categorical_sample(&residual, rng.random_range(0.0..1.0));
+            break;
+        }
+    }
+    if accepted == k {
+        continuation = categorical_sample(&dists[k], rng.random_range(0.0..1.0));
+    }
+    Ok(MtpVerifyResult {
+        accepted_tokens: draft_tokens[..accepted].to_vec(),
+        continuation_token: continuation,
+        num_accepted: accepted,
+        num_proposed: k,
+        grammar_prefix: k,
+        target_prefix: accepted,
+        continuation_is_ff: false,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -715,7 +868,11 @@ impl ModelRunner {
         }
 
         let seq_info = &seq_infos[0];
-        let num_draft = self.mtp_num_speculative;
+        let num_draft = if self.adaptive_enabled {
+            self.adaptive_spec.lock().unwrap().current_k()
+        } else {
+            self.mtp_num_speculative
+        };
 
         // Step 1: Main model decode for logits + hidden state.
         let (anchor_token, seq_hidden) = self.mtp_decode_step1(seqs, seq_info)?;
@@ -864,7 +1021,31 @@ impl ModelRunner {
         };
         let all_logits = all_logits_result?;
 
-        let verify_result = verify_draft_greedy(&all_logits, &draft_tokens)?;
+        let verify_result = if self.guided_decoding.is_guided(seq_info.id) {
+            verify_draft_masked(&all_logits, &draft_tokens, &self.guided_decoding, seq_info.id)?
+        } else {
+            // Copy the sampling out and release the guard before the (GPU) verify, so no
+            // lock is held across the forward.
+            let sampling = {
+                let cached = self.cached_sampling.read();
+                cached
+                    .as_ref()
+                    .map(|c| c.sampling.clone())
+                    .unwrap_or(crate::utils::logits_processor::Sampling::ArgMax)
+            };
+            if matches!(
+                sampling,
+                crate::utils::logits_processor::Sampling::ArgMax
+            ) || !crate::utils::env::spec_rejection_sampling()
+            {
+                verify_draft_greedy(&all_logits, &draft_tokens)?
+            } else {
+                verify_draft_rejection(&all_logits, &draft_tokens, &sampling)?
+            }
+        };
+        if self.adaptive_enabled {
+            self.adaptive_spec.lock().unwrap().update(&[verify_result.num_accepted]);
+        }
 
         if verify_result.num_accepted < verify_result.num_proposed {
             let commit_len = 1 + verify_result.num_accepted;
@@ -887,10 +1068,7 @@ impl ModelRunner {
         result_tokens.extend_from_slice(&verify_result.accepted_tokens);
         result_tokens.push(verify_result.continuation_token);
 
-        mtp_stats_update(verify_result.num_proposed, verify_result.num_accepted);
-        if MTP_TOTAL_STEPS.load(Ordering::Relaxed) % 256 == 0 {
-            crate::log_info!("{}", mtp_stats_summary());
-        }
+        crate::core::spec_stats::spec_stats_update("MTP", seq_info.id, &verify_result);
 
         Ok(vec![result_tokens])
     }
@@ -1026,7 +1204,7 @@ impl ModelRunner {
             result.push(anchors[index]);
             result.extend_from_slice(&verify_result.accepted_tokens);
             result.push(verify_result.continuation_token);
-            mtp_stats_update(verify_result.num_proposed, verify_result.num_accepted);
+            crate::core::spec_stats::spec_stats_update("MTP", seq_info.id, &verify_result);
             outputs.push(result);
         }
         Ok(outputs)

@@ -141,10 +141,10 @@ pub struct ModelRunner {
     #[cfg(feature = "flashinfer")]
     pub(crate) flashinfer_kv_params: Option<FlashInferKvParams>,
     logit_processor: LogitsProcessor,
-    cached_sampling: RwLock<Option<CachedSamplingParams>>,
+    pub(crate) cached_sampling: RwLock<Option<CachedSamplingParams>>,
     seq_tokens: RwLock<HashMap<usize, Vec<u32>>>,
     restored_prefix_sequences: RwLock<HashSet<usize>>,
-    guided_decoding: GuidedDecoding,
+    pub(crate) guided_decoding: GuidedDecoding,
     transfer: Option<Arc<Transfer>>,
     is_first_rank: bool,
     pub(crate) model_type: ModelType,
@@ -154,6 +154,14 @@ pub struct ModelRunner {
     pub(crate) mtp_num_speculative: usize,
     /// Optional external DFlash/DFlash2 drafter.
     pub(crate) dflash_drafter: Option<crate::core::dflash_drafter::DFlashDrafter>,
+    /// Opt-in CUDA graph for the DFlash draft transformer (`XINFER_SPEC_GRAPH`).
+    #[cfg(all(feature = "cuda", feature = "graph"))]
+    pub(crate) dflash_draft_graph: Option<crate::utils::graph::DFlashDraftGraph>,
+    /// SGLang-style tiered adaptive draft-length controller (K scales with acceptance).
+    pub(crate) adaptive_spec: std::sync::Mutex<crate::core::adaptive_k::AdaptiveSpecController>,
+    /// Whether adaptive K is enabled (XINFER_SPEC_ADAPTIVE_K). When false, the decode paths
+    /// use the fixed count and skip the adaptive_spec lock entirely (lock-free hot path).
+    pub(crate) adaptive_enabled: bool,
 }
 
 impl ModelRunner {
@@ -739,6 +747,28 @@ impl ModelRunner {
             }
         }
 
+        #[cfg(all(feature = "cuda", feature = "graph"))]
+        let dflash_draft_graph = if crate::utils::env::spec_graph() {
+            if let Some(drafter) = dflash_drafter.as_ref() {
+                let cap = crate::utils::env::spec_context_window().max(1);
+                let block = drafter.num_speculative_tokens + 1;
+                let hidden = drafter.draft_model.config.hidden_size;
+                let dtype = drafter.draft_model.dtype();
+                Some(crate::utils::graph::DFlashDraftGraph::new(cap, block, hidden, dtype, &device)?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // Adaptive K: the controller's max tier is the active drafter's configured count
+        // (DFlash and MTP are mutually exclusive, so only one is non-zero).
+        let adaptive_max_k = dflash_drafter
+            .as_ref()
+            .map(|d| d.num_speculative_tokens)
+            .unwrap_or(mtp_num_speculative);
+
         Ok(Self {
             model,
             gpu_kv_cache: Arc::new(Mutex::new(gpu_kv_cache)),
@@ -789,6 +819,12 @@ impl ModelRunner {
             mtp_head,
             mtp_num_speculative,
             dflash_drafter,
+            #[cfg(all(feature = "cuda", feature = "graph"))]
+            dflash_draft_graph,
+            adaptive_spec: std::sync::Mutex::new(
+                crate::core::adaptive_k::AdaptiveSpecController::new(adaptive_max_k),
+            ),
+            adaptive_enabled: crate::utils::env::spec_adaptive_k(),
         })
     }
 
@@ -830,9 +866,10 @@ impl ModelRunner {
             &draft_config,
             &draft_paths.get_weight_filenames(),
             comm,
-            DType::BF16,
+            crate::utils::get_dtype(None),
             device,
             econfig.num_speculative_tokens,
+            econfig.yarn_scaling_factor,
         )?;
         crate::log_info!("External DFlash draft model loaded successfully");
         Ok(Some(drafter))
@@ -1113,15 +1150,27 @@ impl ModelRunner {
             };
             let projected = drafter.extract_and_concat_hidden(&hidden_states)?;
             let mut offset = 0usize;
+            let context_window = crate::utils::env::spec_context_window();
             match &seqs {
                 Seqs::SeqRefs(sequences) => {
                     for sequence in *sequences {
                         let count = sequence
                             .prefill_chunk_tokens(self.config.effective_prefill_chunk_size());
-                        drafter.store_decode_hidden(
-                            &projected.narrow(0, offset, count)?,
-                            sequence.id,
-                        )?;
+                        // Prefill position check: only seed DFlash context when within
+                        // context_window tokens of the prefill end. Prevents accumulating
+                        // truncated early-prefill context (which degrades draft quality).
+                        let should_seed = if is_prefill && context_window > 0 {
+                            sequence.len().saturating_sub(sequence.num_cached_tokens)
+                                <= context_window
+                        } else {
+                            true
+                        };
+                        if should_seed {
+                            drafter.store_decode_hidden(
+                                &projected.narrow(0, offset, count)?,
+                                sequence.id,
+                            )?;
+                        }
                         offset += count;
                     }
                 }
@@ -1884,18 +1933,35 @@ impl ModelRunner {
             let (guided_logits, guided_step) = self
                 .guided_decoding
                 .apply(&original_guided_logits, &guided_requests)?;
-            let sample_logits = if guided_positions.len() == seq_ids.len() {
-                guided_logits
+            let guided_tokens: Vec<u32> = if crate::utils::env::spec_mask_offload() {
+                // GPU offload: pass the allow-mask to the fused sampler instead of biasing the
+                // logits; sample the original (unbiased) logits.
+                let mask = self
+                    .guided_decoding
+                    .build_allow_mask(&guided_requests, logits.dim(1)?, logits.device())?;
+                let mut tokens = self.logit_processor.sample_with_strategy_masked(
+                    &logits,
+                    &cached_params.sampling,
+                    mask.as_ref(),
+                )?;
+                self.guided_decoding.apply_fast_forward(&seq_ids, &mut tokens);
+                self.guided_decoding.commit(&seq_ids, &tokens, guided_step);
+                tokens
             } else {
-                let guided_delta = (&guided_logits - &original_guided_logits)?;
-                logits.index_add(&guided_indices, &guided_delta, 0)?
+                let sample_logits = if guided_positions.len() == seq_ids.len() {
+                    guided_logits
+                } else {
+                    let guided_delta = (&guided_logits - &original_guided_logits)?;
+                    logits.index_add(&guided_indices, &guided_delta, 0)?
+                };
+                let mut tokens =
+                    self.sample_processed_logits(&sample_logits, &cached_params.sampling)?;
+                self.guided_decoding
+                    .apply_fast_forward(&seq_ids, &mut tokens);
+                self.guided_decoding.commit(&seq_ids, &tokens, guided_step);
+                tokens
             };
-            let mut tokens =
-                self.sample_processed_logits(&sample_logits, &cached_params.sampling)?;
-            self.guided_decoding
-                .apply_fast_forward(&seq_ids, &mut tokens);
-            self.guided_decoding.commit(&seq_ids, &tokens, guided_step);
-            tokens
+            guided_tokens
         };
 
         // Track tokens for sequences when penalties are enabled
@@ -1926,6 +1992,8 @@ impl ModelRunner {
         if let Some(drafter) = self.dflash_drafter.as_ref() {
             drafter.clear_seq_hidden(id);
         }
+        // Clean up the per-seq spec stats window (the server displays them via the cross-process fetch).
+        let _ = crate::core::spec_stats::spec_seq_report(id);
         match &self.model {
             Model::Qwen3_5(model) => model.release_sequence_state(id),
             Model::Qwen3_5MoE(model) => model.release_sequence_state(id),
@@ -1984,7 +2052,16 @@ impl ModelRunner {
                     label,
                     self.mtp_num_speculative
                 );
-                mtp_cap.capture_mtp(&self.device, kv_pairs, self.mtp_num_speculative)?;
+                mtp_cap.capture_mtp(&self.device, kv_pairs, self.mtp_num_speculative, label)?;
+            }
+        }
+
+        // Opt-in DFlash draft graph (XINFER_SPEC_GRAPH): capture the draft transformer.
+        if let Some(graph) = self.dflash_draft_graph.as_mut() {
+            if let Some(drafter) = self.dflash_drafter.as_ref() {
+                let dm = &drafter.draft_model;
+                crate::log_info!("Capturing DFlash draft graph...");
+                graph.capture(|th, ne, pos| dm.forward(th, ne, pos))?;
             }
         }
 

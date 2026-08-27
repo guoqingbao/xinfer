@@ -653,9 +653,38 @@ pub struct DFlashRotaryEmbedding {
 }
 
 impl DFlashRotaryEmbedding {
-    pub fn new(config: &DFlashModelConfig, dtype: DType, device: &Device) -> Result<Self> {
+    pub fn new(config: &DFlashModelConfig, dtype: DType, device: &Device, yarn_factor: Option<f64>) -> Result<Self> {
         let head_dim = config.head_dim();
         let rope_theta = config.rope_theta();
+        let max_pos = config.max_position_embeddings;
+
+        // When the backbone uses dynamic YARN scaling, the draft model's RoPE must be
+        // scaled by the same factor so its positional encoding stays consistent with the
+        // target model at extended context lengths.
+        if let Some(factor) = yarn_factor.filter(|f| *f > 1.0) {
+            let (beta_fast, beta_slow, extrapolation_factor, attn_factor) =
+                crate::utils::derive_yarn_parameters(factor);
+            let yarn = crate::models::layers::rotary_emb::YarnRotaryEmbedding::new_yarn(
+                dtype,
+                device,
+                rope_theta as f32,
+                head_dim,
+                max_pos,
+                max_pos,
+                beta_fast as f32,
+                beta_slow as f32,
+                attn_factor as f32,
+                extrapolation_factor as f32,
+                factor as f32,
+            )?;
+            // new_yarn returns half-width (table_len, head_dim/2) tables; DFlash uses the
+            // doubled (interleaved) layout (table_len, head_dim).
+            return Ok(Self {
+                cos: Tensor::cat(&[&yarn.cos, &yarn.cos], D::Minus1)?,
+                sin: Tensor::cat(&[&yarn.sin, &yarn.sin], D::Minus1)?,
+            });
+        }
+
         let inv_freq: Vec<f32> = (0..head_dim)
             .step_by(2)
             .map(|i| 1f32 / rope_theta.powf(i as f64 / head_dim as f64) as f32)
@@ -663,9 +692,9 @@ impl DFlashRotaryEmbedding {
         let inv_freq_len = inv_freq.len();
         let inv_freq =
             Tensor::from_vec(inv_freq, (1, inv_freq_len), device)?.to_dtype(DType::F32)?;
-        let t = Tensor::arange(0u32, config.max_position_embeddings as u32, device)?
+        let t = Tensor::arange(0u32, max_pos as u32, device)?
             .to_dtype(DType::F32)?
-            .reshape((config.max_position_embeddings, 1))?;
+            .reshape((max_pos, 1))?;
         let freqs = t.matmul(&inv_freq)?;
         let cos_half = freqs.cos()?.to_dtype(dtype)?;
         let sin_half = freqs.sin()?.to_dtype(dtype)?;
@@ -704,6 +733,7 @@ impl DFlashDraftModel {
         config: &DFlashModelConfig,
         dtype: DType,
         device: &Device,
+        yarn_factor: Option<f64>,
     ) -> Result<Self> {
         let target_layer_ids = config.target_layer_ids();
         let fc_in_dim = target_layer_ids.len() * config.hidden_size;
@@ -744,7 +774,7 @@ impl DFlashDraftModel {
             false,
         )?;
 
-        let rotary_emb = DFlashRotaryEmbedding::new(config, dtype, device)?;
+        let rotary_emb = DFlashRotaryEmbedding::new(config, dtype, device, yarn_factor)?;
         let candidate_selector = if config.is_dflash2() {
             let dflash_config = config.dflash_config.as_ref().ok_or_else(|| {
                 candle_core::Error::Msg("DFlash2 config is missing dflash_config".into())
