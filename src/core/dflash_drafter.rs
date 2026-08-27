@@ -529,17 +529,38 @@ impl ModelRunner {
         } else {
             drafter.num_speculative_tokens
         };
+        // Pad the draft block to the captured size so the draft graph replays at
+        // every tier (graph->graph, no flip). The draft attention is causal, so
+        // the first `n` rows of the padded block are exact; the logits are
+        // narrowed back to `n` below.
+        #[cfg(all(feature = "cuda", feature = "graph"))]
+        let use_draft_graph = {
+            let ctx_rows = if target_hidden.rank() == 3 {
+                target_hidden.dims3()?.1
+            } else {
+                target_hidden.dim(0)?
+            };
+            self.dflash_draft_graph
+                .as_ref()
+                .map_or(false, |g| g.is_captured() && g.cap() == ctx_rows)
+        };
+        #[cfg(not(all(feature = "cuda", feature = "graph")))]
+        let use_draft_graph = false;
+        let n_pad = if use_draft_graph {
+            drafter.num_speculative_tokens.max(n)
+        } else {
+            n
+        };
         let (th_cast, noise_2d, positions) =
-            drafter.build_draft_inputs(&target_hidden, &embed_fn, anchor_token, n)?;
+            drafter.build_draft_inputs(&target_hidden, &embed_fn, anchor_token, n_pad)?;
         let draft_hidden_full = {
             #[cfg(all(feature = "cuda", feature = "graph"))]
             {
-                if let Some(graph) = self.dflash_draft_graph.as_ref().filter(|g| g.is_captured()) {
-                    if th_cast.dim(0)? == graph.cap() {
-                        graph.replay(&th_cast, &noise_2d, &positions)?
-                    } else {
-                        drafter.draft_forward(&th_cast, &noise_2d, &positions)?
-                    }
+                if use_draft_graph {
+                    self.dflash_draft_graph
+                        .as_ref()
+                        .unwrap()
+                        .replay(&th_cast, &noise_2d, &positions)?
                 } else {
                     drafter.draft_forward(&th_cast, &noise_2d, &positions)?
                 }
@@ -549,7 +570,13 @@ impl ModelRunner {
                 drafter.draft_forward(&th_cast, &noise_2d, &positions)?
             }
         };
-        let (draft_logits, draft_hidden_n) = drafter.lm_head_logits(&draft_hidden_full, n, &lm_head_fn)?;
+        let (draft_logits, draft_hidden_n) =
+            drafter.lm_head_logits(&draft_hidden_full, n_pad, &lm_head_fn)?;
+        let (draft_logits, draft_hidden_n) = if n < n_pad {
+            (draft_logits.narrow(0, 0, n)?, draft_hidden_n.narrow(0, 0, n)?)
+        } else {
+            (draft_logits, draft_hidden_n)
+        };
         let draft_tokens_gpu = drafter.select_draft_tokens_gpu(
             &draft_logits,
             &draft_hidden_n,

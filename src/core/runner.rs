@@ -162,6 +162,10 @@ pub struct ModelRunner {
     /// Whether adaptive K is enabled (XINFER_SPEC_ADAPTIVE_K). When false, the decode paths
     /// use the fixed count and skip the adaptive_spec lock entirely (lock-free hot path).
     pub(crate) adaptive_enabled: bool,
+    /// The adaptive-K tier (capture) set: one verify CUDA graph per tier, so a tier
+    /// move is a graph->graph swap (SGLang-style). Shared by the controller and
+    /// `warmup_capture`.
+    pub(crate) adaptive_tiers: Vec<usize>,
 }
 
 impl ModelRunner {
@@ -768,6 +772,9 @@ impl ModelRunner {
             .as_ref()
             .map(|d| d.num_speculative_tokens)
             .unwrap_or(mtp_num_speculative);
+        // The tier set is the capture set: one verify graph per tier (SGLang-style),
+        // so a tier move is a graph->graph swap, never a graph->eager flip.
+        let adaptive_tiers = crate::core::adaptive_k::adaptive_tiers(adaptive_max_k);
 
         Ok(Self {
             model,
@@ -822,9 +829,13 @@ impl ModelRunner {
             #[cfg(all(feature = "cuda", feature = "graph"))]
             dflash_draft_graph,
             adaptive_spec: std::sync::Mutex::new(
-                crate::core::adaptive_k::AdaptiveSpecController::new(adaptive_max_k),
+                crate::core::adaptive_k::AdaptiveSpecController::new(
+                    adaptive_max_k,
+                    &adaptive_tiers,
+                ),
             ),
             adaptive_enabled: crate::utils::env::spec_adaptive_k(),
+            adaptive_tiers,
         })
     }
 
@@ -2050,12 +2061,21 @@ impl ModelRunner {
                 } else {
                     "MTP"
                 };
+                // Adaptive K: one verify graph per tier (largest-first inside
+                // capture_mtp), so a tier move is a graph->graph swap. Fixed K:
+                // the single max-size graph (today's behavior).
+                let verify_lens = if self.adaptive_enabled {
+                    self.adaptive_tiers.iter().map(|t| t + 1).collect::<Vec<_>>()
+                } else {
+                    vec![self.mtp_num_speculative + 1]
+                };
                 crate::log_info!(
-                    "Capturing {} verify graphs for up to {} draft tokens...",
+                    "Capturing {} verify graph(s) for {} tier size(s) {:?}...",
                     label,
-                    self.mtp_num_speculative
+                    verify_lens.len(),
+                    verify_lens
                 );
-                mtp_cap.capture_mtp(&self.device, kv_pairs, self.mtp_num_speculative, label)?;
+                mtp_cap.capture_mtp(&self.device, kv_pairs, &verify_lens, label)?;
             }
         }
 

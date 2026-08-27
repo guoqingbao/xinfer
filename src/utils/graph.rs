@@ -375,14 +375,28 @@ pub struct GraphCaptureVars {
     pub outputs: BTreeMap<usize, Tensor>,
 }
 
-pub struct MtpGraphCaptureVars {
+/// Per-tier (verify_len) buffers for the MTP/DFlash verify graphs: the shapes
+/// that track the tier. Size-independent buffers live in `MtpGraphCaptureVars`.
+/// The captured graph references these storages, so replay overwrites them in
+/// place before launch (shallow clones in the capture metadata share storage).
+pub struct MtpGraphSizeVars {
     pub input_ids: Tensor,
     pub positions: Tensor,
-    pub mamba_slot_mapping: Tensor,
     pub slot_mapping: Tensor,
+    pub cu_seqlens_q: Tensor,
+    #[cfg(feature = "flashinfer")]
+    pub flashinfer_batch_indices: Tensor,
+    #[cfg(feature = "flashinfer")]
+    pub flashinfer_positions: Tensor,
+    /// Stable (default-pool) logits buffer the captured graph D2D-copies into,
+    /// so replay reads a stable address (AUTO_FREE_ON_LAUNCH contract).
+    pub output: Tensor,
+}
+
+pub struct MtpGraphCaptureVars {
+    pub mamba_slot_mapping: Tensor,
     pub context_lens: Tensor,
     pub block_tables: Tensor,
-    pub cu_seqlens_q: Tensor,
     pub cu_seqlens_k: Tensor,
     #[cfg(feature = "flashinfer")]
     pub flashinfer_indptr: Tensor,
@@ -390,11 +404,8 @@ pub struct MtpGraphCaptureVars {
     pub flashinfer_indices: Tensor,
     #[cfg(feature = "flashinfer")]
     pub flashinfer_last_len: Tensor,
-    #[cfg(feature = "flashinfer")]
-    pub flashinfer_batch_indices: Tensor,
-    #[cfg(feature = "flashinfer")]
-    pub flashinfer_positions: Tensor,
-    pub outputs: BTreeMap<usize, Tensor>,
+    /// Per-tier buffers, keyed by verify_len (one captured graph per tier).
+    pub sizes: BTreeMap<usize, MtpGraphSizeVars>,
 }
 
 pub struct GraphCapturer<M: CudaGraphModule> {
@@ -837,10 +848,10 @@ impl<M: CudaGraphModule> GraphCapturer<M> {
         &mut self,
         device: &Device,
         kv_caches: Option<&Vec<(Tensor, Tensor)>>,
-        mtp_num_speculative: usize,
+        verify_lens: &[usize],
         label: &'static str,
     ) -> Result<()> {
-        if mtp_num_speculative == 0 {
+        if verify_lens.is_empty() {
             return Ok(());
         }
 
@@ -849,20 +860,16 @@ impl<M: CudaGraphModule> GraphCapturer<M> {
         );
         let _prefill_guard = set_linear_is_prefill(true);
         self.device = Some(device.clone());
-        let verify_len = mtp_num_speculative + 1;
         let max_num_blocks = (self.max_model_len + self.block_size - 1) / self.block_size;
 
-        // Capture must use in-bounds, decode-consistent page metadata. Zeroed
-        // cu_seqlens / last_len=max_model_len previously caused FlashInfer/GDN
-        // OOB during capture; multirank NCCL sync surfaces that as
+        // Size-independent buffers shared by all tiers. Capture must use
+        // in-bounds, decode-consistent page metadata. Zeroed cu_seqlens /
+        // last_len=max_model_len previously caused FlashInfer/GDN OOB during
+        // capture; multirank NCCL sync surfaces that as
         // CUDA_ERROR_ILLEGAL_ADDRESS on InputMetadata drop.
-        let input_ids = Tensor::zeros((verify_len,), DType::U32, device)?;
-        let positions = Tensor::zeros((verify_len,), DType::I64, device)?;
         let mamba_slot_mapping = Tensor::zeros((1,), DType::I64, device)?;
-        let slot_mapping = Tensor::zeros((verify_len,), DType::I64, device)?;
         let context_lens = Tensor::from_vec(vec![self.max_model_len as u32], (1,), device)?;
         let block_tables = Tensor::zeros((1, max_num_blocks), DType::U32, device)?;
-        let cu_seqlens_q = Tensor::from_vec(vec![0u32, verify_len as u32], (2,), device)?;
         let cu_seqlens_k = Tensor::from_vec(vec![0u32, self.max_model_len as u32], (2,), device)?;
 
         #[cfg(feature = "flashinfer")]
@@ -881,16 +888,6 @@ impl<M: CudaGraphModule> GraphCapturer<M> {
                 Tensor::from_vec(vec![last_page_len], (1,), device)?,
             )
         };
-        #[cfg(feature = "flashinfer")]
-        let flashinfer_batch_indices = Tensor::zeros((verify_len,), DType::U32, device)?;
-        #[cfg(feature = "flashinfer")]
-        let flashinfer_positions = {
-            // Mirror runtime MTP verify append positions at max context:
-            // [max_model_len - verify_len, ..., max_model_len - 1].
-            let start = self.max_model_len.saturating_sub(verify_len) as u32;
-            let pos: Vec<u32> = (0..verify_len as u32).map(|i| start + i).collect();
-            Tensor::from_vec(pos, (verify_len,), device)?
-        };
 
         #[cfg(feature = "flashinfer")]
         let use_flashinfer = self.flashinfer_kv_params.is_some();
@@ -899,138 +896,178 @@ impl<M: CudaGraphModule> GraphCapturer<M> {
 
         let capture_in_warmup = use_flashinfer;
 
-        #[cfg(feature = "flashinfer")]
-        let flashinfer_metadata = if let Some(params) = self.flashinfer_kv_params {
-            let indptr_host = vec![0u32, max_num_blocks as u32];
-            let kv_len_arr_host = vec![self.max_model_len as u32];
-            let q_cu_seqlens_host = vec![0u32, verify_len as u32];
-            let last_len_host = vec![last_page_len];
-
-            let prefill_plan_info = attention_rs::flashinfer::graph_prefill_plan(
-                device,
-                &q_cu_seqlens_host,
-                &indptr_host,
-                &kv_len_arr_host,
-                verify_len as u32,
-                1,
-                params.num_qo_heads,
-                params.num_kv_heads,
-                params.head_dim,
-                params.page_size,
-                params.out_dtype,
-                None,
-                Some(params.kv_dtype),
-            )?;
-
-            Some(attention_rs::FlashInferMetadata {
-                indptr: flashinfer_indptr.clone(),
-                indptr_host,
-                indices: flashinfer_indices.clone(),
-                last_len: flashinfer_last_len.clone(),
-                last_len_host: Some(last_len_host),
-                kv_len_arr_host: Some(kv_len_arr_host),
-                total_num_rows: Some(verify_len as u32),
-                batch_indices: Some(flashinfer_batch_indices.clone()),
-                positions: Some(flashinfer_positions.clone()),
-                use_cuda_graph: true,
-                decode_plan_info: None,
-                prefill_plan_info: Some(prefill_plan_info),
-                mla_decode_plan_info: None,
-                mla_prefill_plan_info: None,
-            })
-        } else {
-            None
-        };
-        #[cfg(not(feature = "flashinfer"))]
-        let flashinfer_metadata = None;
-
-        let input_metadata = InputMetadata {
-            is_prefill: true,
-            is_mla: self.is_mla,
-            sequence_ids: Some(vec![0]),
-            mamba_slot_mapping: Some(mamba_slot_mapping.clone()),
-            slot_mapping: slot_mapping.clone(),
-            block_tables: Some(block_tables.clone()),
-            block_tables_host: None,
-            context_lens_host: None,
-            context_lens: Some(context_lens.clone()),
-            cu_seqlens_q: Some(cu_seqlens_q.clone()),
-            cu_seqlens_k: Some(cu_seqlens_k.clone()),
-            max_seqlen_q: verify_len,
-            max_seqlen_k: self.max_model_len,
-            max_context_len: self.max_model_len,
-            seqlens: None,
-            flashinfer_metadata,
-            is_mtp_verify: true,
-        };
-
-        let mut outputs = BTreeMap::<usize, Tensor>::new();
-        let mut stable_logits: Option<Tensor> = None;
+        let mut sizes: BTreeMap<usize, MtpGraphSizeVars> = BTreeMap::new();
         let _guard = candle_core::cuda_backend::cuda_param_cache_scope(true);
 
-        for phase in CapturePhase::ALL {
-            let should_capture =
-                !phase.is_cache_prewarm() && (!phase.is_warmup() || capture_in_warmup);
-            if should_capture {
-                self.model.start_capture(verify_len)?;
-            }
-            if phase.is_warmup() {
-                let out = self.model.forward(
-                    &input_ids,
-                    &positions,
-                    kv_caches,
-                    &input_metadata,
-                    false,
+        // Largest tier first: the shared capture pool peaks at the biggest
+        // graph; smaller tiers reuse it (AUTO_FREE_ON_LAUNCH).
+        let mut lens: Vec<usize> = verify_lens.to_vec();
+        lens.sort_unstable_by(|a, b| b.cmp(a));
+        for verify_len in lens {
+            // Per-tier buffers (shapes track the tier).
+            let input_ids = Tensor::zeros((verify_len,), DType::U32, device)?;
+            let positions = Tensor::zeros((verify_len,), DType::I64, device)?;
+            let slot_mapping = Tensor::zeros((verify_len,), DType::I64, device)?;
+            let cu_seqlens_q = Tensor::from_vec(vec![0u32, verify_len as u32], (2,), device)?;
+
+            #[cfg(feature = "flashinfer")]
+            let flashinfer_batch_indices = Tensor::zeros((verify_len,), DType::U32, device)?;
+            #[cfg(feature = "flashinfer")]
+            let flashinfer_positions = {
+                // Mirror runtime MTP verify append positions at max context:
+                // [max_model_len - verify_len, ..., max_model_len - 1].
+                let start = self.max_model_len.saturating_sub(verify_len) as u32;
+                let pos: Vec<u32> = (0..verify_len as u32).map(|i| start + i).collect();
+                Tensor::from_vec(pos, (verify_len,), device)?
+            };
+
+            #[cfg(feature = "flashinfer")]
+            let flashinfer_metadata = if let Some(params) = self.flashinfer_kv_params {
+                let indptr_host = vec![0u32, max_num_blocks as u32];
+                let kv_len_arr_host = vec![self.max_model_len as u32];
+                let q_cu_seqlens_host = vec![0u32, verify_len as u32];
+                let last_len_host = vec![last_page_len];
+
+                let prefill_plan_info = attention_rs::flashinfer::graph_prefill_plan(
+                    device,
+                    &q_cu_seqlens_host,
+                    &indptr_host,
+                    &kv_len_arr_host,
+                    verify_len as u32,
+                    1,
+                    params.num_qo_heads,
+                    params.num_kv_heads,
+                    params.head_dim,
+                    params.page_size,
+                    params.out_dtype,
+                    None,
+                    Some(params.kv_dtype),
                 )?;
-                // Allocate the stable logits buffer on the default pool during
-                // uncaptured cache-prewarm so AUTO_FREE_ON_LAUNCH does not
-                // invalidate the address read after graph replay.
-                if phase.is_cache_prewarm() {
-                    stable_logits = Some(Tensor::zeros(out.shape(), out.dtype(), device)?);
+
+                Some(attention_rs::FlashInferMetadata {
+                    indptr: flashinfer_indptr.clone(),
+                    indptr_host,
+                    indices: flashinfer_indices.clone(),
+                    last_len: flashinfer_last_len.clone(),
+                    last_len_host: Some(last_len_host),
+                    kv_len_arr_host: Some(kv_len_arr_host),
+                    total_num_rows: Some(verify_len as u32),
+                    batch_indices: Some(flashinfer_batch_indices.clone()),
+                    positions: Some(flashinfer_positions.clone()),
+                    use_cuda_graph: true,
+                    decode_plan_info: None,
+                    prefill_plan_info: Some(prefill_plan_info),
+                    mla_decode_plan_info: None,
+                    mla_prefill_plan_info: None,
+                })
+            } else {
+                None
+            };
+            #[cfg(not(feature = "flashinfer"))]
+            let flashinfer_metadata = None;
+
+            let input_metadata = InputMetadata {
+                is_prefill: true,
+                is_mla: self.is_mla,
+                sequence_ids: Some(vec![0]),
+                mamba_slot_mapping: Some(mamba_slot_mapping.clone()),
+                slot_mapping: slot_mapping.clone(),
+                block_tables: Some(block_tables.clone()),
+                block_tables_host: None,
+                context_lens_host: None,
+                context_lens: Some(context_lens.clone()),
+                cu_seqlens_q: Some(cu_seqlens_q.clone()),
+                cu_seqlens_k: Some(cu_seqlens_k.clone()),
+                max_seqlen_q: verify_len,
+                max_seqlen_k: self.max_model_len,
+                max_context_len: self.max_model_len,
+                seqlens: None,
+                flashinfer_metadata,
+                is_mtp_verify: true,
+            };
+
+            let mut stable_logits: Option<Tensor> = None;
+            for phase in CapturePhase::ALL {
+                let should_capture =
+                    !phase.is_cache_prewarm() && (!phase.is_warmup() || capture_in_warmup);
+                if should_capture {
+                    self.model.start_capture(verify_len)?;
+                }
+                if phase.is_warmup() {
+                    let out = self.model.forward(
+                        &input_ids,
+                        &positions,
+                        kv_caches,
+                        &input_metadata,
+                        false,
+                    )?;
+                    // Allocate the stable logits buffer on the default pool during
+                    // uncaptured cache-prewarm so AUTO_FREE_ON_LAUNCH does not
+                    // invalidate the address read after graph replay.
+                    if phase.is_cache_prewarm() {
+                        stable_logits = Some(Tensor::zeros(out.shape(), out.dtype(), device)?);
+                    }
+                    #[cfg(feature = "cuda")]
+                    if !should_capture {
+                        device.synchronize()?;
+                    }
+                } else {
+                    let out = self.model.forward(
+                        &input_ids,
+                        &positions,
+                        kv_caches,
+                        &input_metadata,
+                        false,
+                    )?;
+                    let stable = stable_logits.as_ref().ok_or_else(|| {
+                        candle_core::Error::msg(
+                            "MTP graph capture missing stable logits buffer (cache prewarm failed)",
+                        )
+                    })?;
+                    // D2D into non-pool storage; this copy is part of the captured graph.
+                    stable.copy_(&out, 0)?;
+                }
+                if should_capture {
+                    self.model.end_capture(!phase.is_warmup())?;
                 }
                 #[cfg(feature = "cuda")]
-                if !should_capture {
-                    device.synchronize()?;
-                }
-            } else {
-                let out = self.model.forward(
-                    &input_ids,
-                    &positions,
-                    kv_caches,
-                    &input_metadata,
-                    false,
-                )?;
-                let stable = stable_logits.as_ref().ok_or_else(|| {
-                    candle_core::Error::msg(
-                        "MTP graph capture missing stable logits buffer (cache prewarm failed)",
-                    )
-                })?;
-                // D2D into non-pool storage; this copy is part of the captured graph.
-                stable.copy_(&out, 0)?;
-                outputs.insert(verify_len, stable.clone());
+                device.synchronize()?;
             }
-            if should_capture {
-                self.model.end_capture(!phase.is_warmup())?;
-            }
-            #[cfg(feature = "cuda")]
-            device.synchronize()?;
+
+            // Move the per-tier buffers into the map once, after all phases are done
+            // (the loop only borrows them, so this is a true move, not a clone).
+            let stable = stable_logits.take().ok_or_else(|| {
+                candle_core::Error::msg(
+                    "MTP graph capture missing stable logits buffer (cache prewarm failed)",
+                )
+            })?;
+            sizes.insert(
+                verify_len,
+                MtpGraphSizeVars {
+                    input_ids,
+                    positions,
+                    slot_mapping,
+                    cu_seqlens_q,
+                    #[cfg(feature = "flashinfer")]
+                    flashinfer_batch_indices,
+                    #[cfg(feature = "flashinfer")]
+                    flashinfer_positions,
+                    output: stable,
+                },
+            );
+
+            crate::log_warn!(
+                "Captured {} verify graph len={} (flashinfer={})",
+                label,
+                verify_len,
+                use_flashinfer
+            );
         }
 
-        crate::log_warn!(
-            "Captured {} verify graph len={} (flashinfer={})",
-            label,
-            verify_len,
-            use_flashinfer
-        );
-
         self.mtp_graph_vars = Some(MtpGraphCaptureVars {
-            input_ids,
-            positions,
             mamba_slot_mapping,
-            slot_mapping,
             context_lens,
             block_tables,
-            cu_seqlens_q,
             cu_seqlens_k,
             #[cfg(feature = "flashinfer")]
             flashinfer_indptr,
@@ -1038,11 +1075,7 @@ impl<M: CudaGraphModule> GraphCapturer<M> {
             flashinfer_indices,
             #[cfg(feature = "flashinfer")]
             flashinfer_last_len,
-            #[cfg(feature = "flashinfer")]
-            flashinfer_batch_indices,
-            #[cfg(feature = "flashinfer")]
-            flashinfer_positions,
-            outputs,
+            sizes,
         });
         Ok(())
     }
@@ -1050,7 +1083,7 @@ impl<M: CudaGraphModule> GraphCapturer<M> {
     pub fn is_mtp_captured(&self, verify_len: usize) -> bool {
         self.mtp_graph_vars
             .as_ref()
-            .map_or(false, |v| v.outputs.contains_key(&verify_len))
+            .map_or(false, |v| v.sizes.contains_key(&verify_len))
     }
 
     pub fn replay_mtp(
@@ -1070,22 +1103,24 @@ impl<M: CudaGraphModule> GraphCapturer<M> {
             .as_ref()
             .ok_or_else(|| candle_core::Error::msg("MTP graphs not captured"))?;
 
-        if !mtp_vars.outputs.contains_key(&verify_len) {
-            candle_core::bail!("MTP verify graph for len {} is not captured!", verify_len);
-        }
+        let size_vars = mtp_vars.sizes.get(&verify_len).ok_or_else(|| {
+            candle_core::Error::msg(format!(
+                "MTP verify graph for len {verify_len} is not captured!"
+            ))
+        })?;
 
-        mtp_vars.input_ids.zero_()?;
-        mtp_vars.input_ids.copy_(input_ids, 0)?;
-        mtp_vars.positions.zero_()?;
-        mtp_vars.positions.copy_(positions, 0)?;
+        size_vars.input_ids.zero_()?;
+        size_vars.input_ids.copy_(input_ids, 0)?;
+        size_vars.positions.zero_()?;
+        size_vars.positions.copy_(positions, 0)?;
 
         if let Some(ms_mapping) = input_metadata.mamba_slot_mapping.as_ref() {
             mtp_vars.mamba_slot_mapping.zero_()?;
             mtp_vars.mamba_slot_mapping.copy_(ms_mapping, 0)?;
         }
 
-        mtp_vars.slot_mapping.zero_()?;
-        mtp_vars
+        size_vars.slot_mapping.zero_()?;
+        size_vars
             .slot_mapping
             .copy_(&input_metadata.slot_mapping, 0)?;
 
@@ -1103,7 +1138,7 @@ impl<M: CudaGraphModule> GraphCapturer<M> {
         }
 
         if let Some(cu_q) = input_metadata.cu_seqlens_q.as_ref() {
-            mtp_vars.cu_seqlens_q.copy_(cu_q, 0)?;
+            size_vars.cu_seqlens_q.copy_(cu_q, 0)?;
         }
         if let Some(cu_k) = input_metadata.cu_seqlens_k.as_ref() {
             mtp_vars.cu_seqlens_k.copy_(cu_k, 0)?;
@@ -1123,10 +1158,10 @@ impl<M: CudaGraphModule> GraphCapturer<M> {
             let positions = fm.positions.as_ref().ok_or_else(|| {
                 candle_core::Error::msg("mtp replay requires flashinfer positions")
             })?;
-            mtp_vars.flashinfer_batch_indices.zero_()?;
-            mtp_vars.flashinfer_batch_indices.copy_(batch_indices, 0)?;
-            mtp_vars.flashinfer_positions.zero_()?;
-            mtp_vars.flashinfer_positions.copy_(positions, 0)?;
+            size_vars.flashinfer_batch_indices.zero_()?;
+            size_vars.flashinfer_batch_indices.copy_(batch_indices, 0)?;
+            size_vars.flashinfer_positions.zero_()?;
+            size_vars.flashinfer_positions.copy_(positions, 0)?;
 
             if let Some(params) = self.flashinfer_kv_params {
                 let dev = self
@@ -1157,7 +1192,7 @@ impl<M: CudaGraphModule> GraphCapturer<M> {
 
         self.model.replay(verify_len)?;
 
-        mtp_vars.outputs[&verify_len].contiguous()
+        size_vars.output.contiguous()
     }
 }
 

@@ -20,13 +20,46 @@ pub struct AdaptiveSpecController {
     up_hysteresis: f64,
 }
 
+/// The tier (capture) set for adaptive K: `XINFER_SPEC_ADAPTIVE_TIERS` clamped to
+/// `1..=max_k`, deduped, sorted, with `max_k` always included (the controller starts
+/// at the full tier). Default: `[1, 3, max_k]` (SGLang-shaped low/mid/full). Every
+/// tier in this set has a pre-captured verify graph, so a tier move is a
+/// graph->graph swap, never a graph->eager flip.
+pub fn adaptive_tiers(max_k: usize) -> Vec<usize> {
+    let max_k = max_k.max(1);
+    let mut tiers = crate::utils::env::spec_adaptive_tiers()
+        .map(|v| v.into_iter().filter(|t| *t >= 1 && *t <= max_k).collect::<Vec<_>>())
+        .unwrap_or_default();
+    if tiers.is_empty() {
+        tiers = if max_k >= 3 {
+            vec![1, 3, max_k]
+        } else {
+            (1..=max_k).collect()
+        };
+    }
+    tiers.push(max_k);
+    tiers.sort_unstable();
+    tiers.dedup();
+    tiers
+}
+
 impl AdaptiveSpecController {
-    /// `max_k` is the configured maximum draft count (the CLI `#`); the candidate tiers are
-    /// `1..=max_k`. Adaptive behavior is gated by `XINFER_SPEC_ADAPTIVE_K` (default off, in
-    /// which case `current_k()` always returns `max_k` and `update()` is a no-op).
-    pub fn new(max_k: usize) -> Self {
+    /// `max_k` is the configured maximum draft count (the CLI `#`); `tiers` is the
+    /// candidate set (see `adaptive_tiers`). Adaptive behavior is gated by
+    /// `XINFER_SPEC_ADAPTIVE_K` (default off, in which case `current_k()` always
+    /// returns `max_k` and `update()` is a no-op).
+    pub fn new(max_k: usize, tiers: &[usize]) -> Self {
         let max_k = max_k.max(1);
-        let candidate_steps: Vec<usize> = (1..=max_k).collect();
+        let mut candidate_steps: Vec<usize> = if tiers.is_empty() {
+            (1..=max_k).collect()
+        } else {
+            tiers.iter().filter(|t| **t >= 1 && **t <= max_k).cloned().collect()
+        };
+        if candidate_steps.is_empty() || *candidate_steps.last().unwrap() != max_k {
+            candidate_steps.push(max_k);
+            candidate_steps.sort_unstable();
+            candidate_steps.dedup();
+        }
         let current_idx = candidate_steps.len() - 1;
         Self {
             enabled: crate::utils::env::spec_adaptive_k(),
@@ -123,7 +156,7 @@ mod tests {
     #[test]
     fn disabled_returns_full_k() {
         // env defaults off -> current_k() is always the full count, update() is a no-op.
-        let mut c = AdaptiveSpecController::new(4);
+        let mut c = AdaptiveSpecController::new(4, &adaptive_tiers(4));
         c.enabled = false;
         for _ in 0..40 {
             c.update(&[0]);
@@ -133,7 +166,7 @@ mod tests {
 
     #[test]
     fn starts_at_max_and_stays_while_acceptance_is_high() {
-        let mut c = AdaptiveSpecController::new(4);
+        let mut c = AdaptiveSpecController::new(4, &adaptive_tiers(4));
         c.enabled = true;
         assert_eq!(c.current_k(), 4);
         // High acceptance (full 4) should keep the max tier.
@@ -145,7 +178,7 @@ mod tests {
 
     #[test]
     fn drops_when_acceptance_is_low() {
-        let mut c = AdaptiveSpecController::new(4);
+        let mut c = AdaptiveSpecController::new(4, &adaptive_tiers(4));
         c.enabled = true;
         for _ in 0..40 {
             c.update(&[0]); // nothing accepted
@@ -155,11 +188,42 @@ mod tests {
 
     #[test]
     fn floors_at_one() {
-        let mut c = AdaptiveSpecController::new(4);
+        let mut c = AdaptiveSpecController::new(4, &adaptive_tiers(4));
         c.enabled = true;
         for _ in 0..200 {
             c.update(&[0]);
         }
         assert_eq!(c.current_k(), 1);
+    }
+
+    #[test]
+    fn default_tiers_are_sglang_shaped() {
+        // XINFER_SPEC_ADAPTIVE_TIERS unset -> [1, 3, max_k] (low/mid/full).
+        assert_eq!(adaptive_tiers(8), vec![1, 3, 8]);
+        assert_eq!(adaptive_tiers(4), vec![1, 3, 4]);
+        assert_eq!(adaptive_tiers(2), vec![1, 2]);
+        assert_eq!(adaptive_tiers(1), vec![1]);
+    }
+
+    #[test]
+    fn sparse_tiers_move_in_steps() {
+        // Tiers [1, 3, 8]: a re-eval steps one tier down while the EMA is still
+        // above the lower threshold, floors at 1, and climbs back on acceptance.
+        let mut c = AdaptiveSpecController::new(8, &[1, 3, 8]);
+        c.enabled = true;
+        assert_eq!(c.current_k(), 8);
+        for _ in 0..14 {
+            c.update(&[0]);
+        }
+        c.update(&[8]); // bc=15: first re-eval (EMA ~1.85) -> one tier down
+        assert_eq!(c.current_k(), 3);
+        for _ in 0..10 {
+            c.update(&[0]); // bc=25: EMA ~0.2 -> floor
+        }
+        assert_eq!(c.current_k(), 1);
+        for _ in 0..40 {
+            c.update(&[8]);
+        }
+        assert_eq!(c.current_k(), 8);
     }
 }

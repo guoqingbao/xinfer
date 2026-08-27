@@ -194,3 +194,27 @@ pub fn spec_rejection_sampling() -> bool {
             .unwrap_or(false)
     })
 }
+
+/// Optional tier set for adaptive K: a comma-separated list of draft counts
+/// (e.g. `XINFER_SPEC_ADAPTIVE_TIERS=1,3,8`). Values are clamped to
+/// `1..=max_k`, deduped and sorted, and `max_k` is always included so the
+/// controller starts at the full tier. Default (unset): `[1, 3, max_k]`
+/// (SGLang-shaped low/mid/full). The tier set is the capture set: one verify
+/// CUDA graph is captured per tier, so a tier move is a graph->graph swap.
+pub const SPEC_ADAPTIVE_TIERS_ENV: &str = "XINFER_SPEC_ADAPTIVE_TIERS";
+
+static SPEC_ADAPTIVE_TIERS: OnceLock<Option<Vec<usize>>> = OnceLock::new();
+
+pub fn spec_adaptive_tiers() -> Option<Vec<usize>> {
+    SPEC_ADAPTIVE_TIERS.get_or_init(|| {
+        env::var(SPEC_ADAPTIVE_TIERS_ENV)
+            .ok()
+            .map(|v| {
+                v.split(',')
+                    .filter_map(|t| t.trim().parse::<usize>().ok())
+                    .collect::<Vec<_>>()
+            })
+            .filter(|v: &Vec<usize>| !v.is_empty())
+    })
+    .clone()
+}
