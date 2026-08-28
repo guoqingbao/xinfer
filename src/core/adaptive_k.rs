@@ -146,14 +146,16 @@ impl AdaptiveSpecController {
         }
 
         self.current_idx = idx;
-        if idx != old_idx {
-            crate::log_info!(
-                "[adaptive-k] tier move: {} -> {} (ema_accept_len={:.2})",
-                self.candidate_steps[old_idx],
-                self.candidate_steps[idx],
-                self.ema_accept_len
-            );
-        }
+        // Per-step tier-move log is commented out; the per-sequence spec report
+        // (server.rs) now carries the K distribution (k_moves/k_min/k_max/avg_k).
+        // if idx != old_idx {
+        //     crate::log_info!(
+        //         "[adaptive-k] tier move: {} -> {} (ema_accept_len={:.2})",
+        //         self.candidate_steps[old_idx],
+        //         self.candidate_steps[idx],
+        //         self.ema_accept_len
+        //     );
+        // }
     }
 }
 
