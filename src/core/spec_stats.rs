@@ -18,14 +18,27 @@ pub struct SpecCounters {
     pub grammar_bound: usize,
     pub target_bound: usize,
     pub ff_continuations: usize,
+    /// Adaptive-K distribution (drafts proposed per step = the active K).
+    k_min: Option<usize>,
+    k_max: Option<usize>,
+    k_moves: usize,
+    prev_k: Option<usize>,
 }
 
 impl SpecCounters {
     fn add(&mut self, res: &MtpVerifyResult) {
         self.steps += 1;
-        self.proposed += res.num_proposed;
+        let k = res.num_proposed;
+        self.proposed += k;
         self.accepted += res.num_accepted;
         self.rejected += res.num_proposed.saturating_sub(res.num_accepted);
+        // Track the K (drafts-proposed) distribution for adaptive-K observability.
+        self.k_min = Some(self.k_min.map(|m| m.min(k)).unwrap_or(k));
+        self.k_max = Some(self.k_max.map(|m| m.max(k)).unwrap_or(k));
+        if self.prev_k.is_some() && self.prev_k != Some(k) {
+            self.k_moves += 1;
+        }
+        self.prev_k = Some(k);
         // grammar_bound / target_bound / ff_continuations are populated by the
         // grammar firewall (ported separately); 0 for now.
     }
@@ -94,6 +107,9 @@ pub fn spec_seq_stats_data(seq_id: usize) -> SpecSeqStatsData {
             grammar_bound: c.grammar_bound,
             target_bound: c.target_bound,
             ff_continuations: c.ff_continuations,
+            k_min: c.k_min.unwrap_or(0),
+            k_max: c.k_max.unwrap_or(0),
+            k_moves: c.k_moves,
         })
         .unwrap_or_default()
 }

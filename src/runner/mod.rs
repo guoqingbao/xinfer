@@ -183,6 +183,12 @@ pub struct SpecSeqStatsData {
     pub grammar_bound: usize,
     pub target_bound: usize,
     pub ff_continuations: usize,
+    /// Adaptive-K observ: min/max drafts-proposed per step and the number of
+    /// steps where K changed from the previous step (tier transitions).
+    /// For fixed K these are k_min == k_max == K and k_moves == 0.
+    pub k_min: usize,
+    pub k_max: usize,
+    pub k_moves: usize,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

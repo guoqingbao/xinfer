@@ -1189,8 +1189,13 @@ pub async fn chat_completion(
                                 } else {
                                     1.0
                                 };
+                                let avg_k = if spec.steps > 0 {
+                                    spec.proposed as f64 / spec.steps as f64
+                                } else {
+                                    0.0
+                                };
                                 crate::log_info!(
-                                    "[Seq {}] {}: steps={} proposed={} accepted={} rate={:.1}% avg_tok/step={:.2} grammar_bound={} target_bound={}",
+                                    "[Seq {}] {}: steps={} proposed={} accepted={} rate={:.1}% avg_tok/step={:.2} avg_k={:.2} k_min={} k_max={} k_moves={} grammar_bound={} target_bound={}",
                                     current_seq_id,
                                     label,
                                     spec.steps,
@@ -1198,6 +1203,10 @@ pub async fn chat_completion(
                                     spec.accepted,
                                     rate,
                                     avg,
+                                    avg_k,
+                                    spec.k_min,
+                                    spec.k_max,
+                                    spec.k_moves,
                                     spec.grammar_bound,
                                     spec.target_bound
                                 );

@@ -146,6 +146,14 @@ impl AdaptiveSpecController {
         }
 
         self.current_idx = idx;
+        if idx != old_idx {
+            crate::log_info!(
+                "[adaptive-k] tier move: {} -> {} (ema_accept_len={:.2})",
+                self.candidate_steps[old_idx],
+                self.candidate_steps[idx],
+                self.ema_accept_len
+            );
+        }
     }
 }
 
