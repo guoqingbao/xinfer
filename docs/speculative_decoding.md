@@ -50,6 +50,27 @@ FSM walk when `XINFER_SPEC_GRANULAR_MASK=1`. The anchor sampling can offload the
 mask into the fused CUDA sampler (`XINFER_SPEC_MASK_OFFLOAD`, default on for CUDA
 builds).
 
+### Hardware mask offload
+The grammar constraint can be enforced **on the GPU, inside the fused sampler
+kernel**, instead of masking the logit row on the CPU. The mechanism:
+- Each guided sequence's FSM exposes a current **VOB** (the set of legal
+  tokens). That is projected to a dense `[b, vocab]` F32 allow-matrix
+  (1.0 = legal, 0.0 = illegal).
+- The matrix's **device pointer** is passed into `sample_cuda_masked`
+  (attention-rs), which applies it in the top-k stage of the fused sampling
+  kernel. Disallowed tokens are never sampled, and the logit row never
+  round-trips to the CPU (no D2H + CPU top-k/p sort).
+- **Normal operation**: `build_allow_mask` builds the per-row matrix for anchor
+  sampling.
+- **Drafting**: two builders produce the `[K, vocab]` draft matrix -
+  `draft_allow_repeated` (default; repeats the *current* VOB across all K
+  positions - cheap, assumes the FSM state is stable over the draft) and
+  `draft_allow_walk` (`XINFER_SPEC_GRANULAR_MASK=1`; clones the FSM and walks
+  it position-by-position over the draft logits - exact when the state changes
+  fast, e.g. inside a tool-call's structured fields).
+- Toggle: `XINFER_SPEC_MASK_OFFLOAD` (default on for CUDA builds; `0` falls
+  back to the CPU `where_cond` mask path).
+
 ### Adaptive draft length (K)
 `XINFER_SPEC_ADAPTIVE_K=1` enables a tiered controller that scales the draft
 count K with the rolling acceptance rate. Off by default (fixed K = the CLI

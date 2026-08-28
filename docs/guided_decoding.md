@@ -75,6 +75,11 @@ Relevant code:
 - `src/core/runner.rs`
 - `src/utils/guidance.rs`
 
+> On CUDA builds the grammar mask can be enforced inside the fused sampler
+> kernel (no CPU logit round-trip) via `XINFER_SPEC_MASK_OFFLOAD`; see
+> [`speculative_decoding.md`](speculative_decoding.md#hardware-mask-offload)
+> for the mechanism.
+
 ## Supported Request Surfaces
 
 ### OpenAI-compatible request fields
