@@ -1931,8 +1931,8 @@ impl ModelRunner {
             logits.to_owned()
         };
 
-        let guided_requests = guided_decoding_requests(&seqs, &seq_ids);
-        let guided_positions: Vec<usize> = guided_requests
+        let all_requests = guided_decoding_requests(&seqs, &seq_ids);
+        let guided_positions: Vec<usize> = all_requests
             .iter()
             .enumerate()
             .filter_map(|(index, request)| request.grammar.is_some().then_some(index))
@@ -1948,17 +1948,19 @@ impl ModelRunner {
             let original_guided_logits = logits.index_select(&guided_indices, 0)?;
             let guided_requests: Vec<_> = guided_positions
                 .iter()
-                .map(|&index| guided_requests[index])
+                .map(|&index| all_requests[index])
                 .collect();
             let (guided_logits, guided_step) = self
                 .guided_decoding
                 .apply(&original_guided_logits, &guided_requests)?;
             let guided_tokens: Vec<u32> = if crate::utils::env::spec_mask_offload() {
                 // GPU offload: pass the allow-mask to the fused sampler instead of biasing the
-                // logits; sample the original (unbiased) logits.
+                // logits; sample the original (unbiased) logits. The mask must cover the FULL
+                // batch (one row per sequence) so its row count matches `logits`; non-guided
+                // rows are all-1 (allow-all).
                 let mask = self
                     .guided_decoding
-                    .build_allow_mask(&guided_requests, logits.dim(1)?, logits.device())?;
+                    .build_allow_mask(&all_requests, logits.dim(1)?, logits.device())?;
                 let mut tokens = self.logit_processor.sample_with_strategy_masked(
                     &logits,
                     &cached_params.sampling,
