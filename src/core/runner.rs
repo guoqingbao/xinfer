@@ -1102,12 +1102,26 @@ impl ModelRunner {
             match &seqs {
                 Seqs::SeqRefs(sequences) => {
                     for sequence in *sequences {
-                        let count = sequence
-                            .prefill_chunk_tokens(self.config.effective_prefill_chunk_size());
-                        drafter.store_decode_hidden(
-                            &projected.narrow(0, offset, count)?,
-                            sequence.id,
-                        )?;
+                        let count = sequence.prefill_chunk_tokens(
+                            sequence
+                                .active_prefill_chunk
+                                .unwrap_or(self.config.effective_prefill_chunk_size()),
+                        );
+                        // Prefill position check: only seed DFlash context when within
+                        // context_window tokens of the prefill end. Prevents accumulating
+                        // truncated early-prefill context (which degrades draft quality).
+                        let should_seed = if is_prefill && context_window > 0 {
+                            sequence.len().saturating_sub(sequence.num_cached_tokens)
+                                <= context_window
+                        } else {
+                            true
+                        };
+                        if should_seed {
+                            drafter.store_decode_hidden(
+                                &projected.narrow(0, offset, count)?,
+                                sequence.id,
+                            )?;
+                        }
                         offset += count;
                     }
                 }
@@ -1248,9 +1262,12 @@ impl ModelRunner {
         let mut max_seqlen_q = 0;
         let mut max_seqlen_k = 0;
         let mut slot_mapping = Vec::new();
-        let chunk_size = self.config.effective_prefill_chunk_size();
         let mut max_context_len = 0;
         for (seq_idx, seq) in seqs.iter().enumerate() {
+            // Adaptive chunk size stamped by the scheduler (fallback: static config).
+            let chunk_size = seq
+                .active_prefill_chunk
+                .unwrap_or(self.config.effective_prefill_chunk_size());
             let num_tokens = seq.prefill_chunk_tokens(chunk_size);
             input_ids
                 .extend(&seq.token_ids[seq.num_cached_tokens..seq.num_cached_tokens + num_tokens]);

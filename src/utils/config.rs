@@ -1,5 +1,6 @@
 // src/utils/config.rs
 use crate::transfer::PdConfig;
+use crate::core::qos::QosConfig;
 use llguidance::api::TopLevelGrammar;
 #[cfg(feature = "python")]
 use pyo3::pyclass;
@@ -471,6 +472,17 @@ pub struct EngineConfig {
     pub disable_cuda_graph: bool,
     #[serde(default = "default_prefill_chunk_size")]
     pub prefill_chunk_size: usize,
+    /// Hard ceiling for the adaptive prefill chunk (default: `prefill_chunk_size`).
+    /// Under decode pressure the scheduler shrinks the chunk toward this cap.
+    #[serde(default)]
+    pub max_prefill_chunk_tokens: Option<usize>,
+    /// Floor for the adaptive prefill chunk (default: 256). The chunk never
+    /// shrinks below this even under heavy decode pressure.
+    #[serde(default)]
+    pub min_prefill_chunk_tokens: Option<usize>,
+    /// QoS scheduling (class-aware adaptive prefill/decode).
+    #[serde(default)]
+    pub qos: QosConfig,
     #[serde(default = "default_num_nodes")]
     pub num_nodes: usize,
     #[serde(default)]
@@ -586,6 +598,18 @@ pub struct EngineConfig {
     #[pyo3(get, set)]
     #[serde(default = "default_prefill_chunk_size")]
     pub prefill_chunk_size: usize,
+    /// Hard ceiling for the adaptive prefill chunk (default: `prefill_chunk_size`).
+    #[pyo3(get, set)]
+    #[serde(default)]
+    pub max_prefill_chunk_tokens: Option<usize>,
+    /// Floor for the adaptive prefill chunk (default: 256).
+    #[pyo3(get, set)]
+    #[serde(default)]
+    pub min_prefill_chunk_tokens: Option<usize>,
+    /// QoS scheduling (class-aware adaptive prefill/decode).
+    #[pyo3(get, set)]
+    #[serde(default)]
+    pub qos: QosConfig,
     #[pyo3(get, set)]
     #[serde(default = "default_num_nodes")]
     pub num_nodes: usize,
@@ -722,6 +746,9 @@ impl EngineConfig {
             prefill_chunk_size: normalize_prefill_chunk_size(
                 prefill_chunk_size.unwrap_or(DEFAULT_PREFILL_CHUNK_SIZE),
             ),
+            max_prefill_chunk_tokens: None,
+            min_prefill_chunk_tokens: None,
+            qos: QosConfig::default(),
             num_nodes,
             node_rank,
             master_addr,
