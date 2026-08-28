@@ -2408,14 +2408,14 @@ impl LLMEngine {
                 // Engine lock released -- server can accept new requests during forward pass
 
                 if let Some((scheduled_ids, is_prefill, owned_seqs)) = prep {
-                    // By default drafting is single-sequence only (owned_seqs.len() == 1).
-                    // XINFER_SPEC_PARALLEL_DRAFT=1 skips that gate so concurrent
-                    // sequences each draft (batched verify).
+                    // MTP supports batched verify, so it drafts in parallel by default. DFlash's
+                    // draft model can't batch (GDN narrow fails on multi-seq), so its
+                    // multi-seq path stays opt-in via XINFER_SPEC_PARALLEL_DRAFT until
+                    // per-seq drafters land.
                     let parallel_draft = crate::utils::env::spec_parallel_draft();
                     let single_seq = owned_seqs.len() == 1;
                     let use_dflash = dflash_enabled && !is_prefill && (single_seq || parallel_draft);
-                    let use_mtp =
-                        !use_dflash && mtp_enabled && !is_prefill && (single_seq || parallel_draft);
+                    let use_mtp = !use_dflash && mtp_enabled && !is_prefill;
 
                     let forward_result: Result<Vec<Vec<u32>>> = if use_mtp {
                         Self::run_forward_mtp(&runners, &owned_seqs)
