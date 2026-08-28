@@ -178,6 +178,23 @@ pub fn spec_adaptive_k() -> bool {
     })
 }
 
+/// Opt-in: allow speculative drafting for multi-sequence (parallel) decode steps.
+/// Default OFF - drafting runs only for a single active sequence (the
+/// `owned_seqs.len() == 1` gate). Set `XINFER_SPEC_PARALLEL_DRAFT=1` to skip
+/// that gate so concurrent sequences each draft (batched verify).
+pub const SPEC_PARALLEL_DRAFT_ENV: &str = "XINFER_SPEC_PARALLEL_DRAFT";
+
+static SPEC_PARALLEL_DRAFT: OnceLock<bool> = OnceLock::new();
+
+pub fn spec_parallel_draft() -> bool {
+    *SPEC_PARALLEL_DRAFT.get_or_init(|| {
+        env::var(SPEC_PARALLEL_DRAFT_ENV)
+            .ok()
+            .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false)
+    })
+}
+
 /// Opt-in: use rejection-sampling verify for non-greedy (temperature) targets, which
 /// preserves the target distribution. Default OFF, in which case all unguided targets use
 /// the fast greedy (argmax-agreement) verify (the 483 path). Set
