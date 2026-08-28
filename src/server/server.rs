@@ -3,7 +3,7 @@ use super::logger::ChatCompletionLogger;
 use super::GrammarRequest;
 use super::{
     build_messages_and_images, normalize_reasoning_controls,
-    streaming::{ChatResponse, Streamer},
+    streaming::{ChatResponse, OutputReservoir, Streamer},
     ChatResponder, DetokenizeRequest, DetokenizeResponse, EmbeddingRequest, EmbeddingResponse,
     EncodingFormat, TokenizeInput, TokenizeRequest, TokenizeResponse,
 };
@@ -86,6 +86,24 @@ impl ReasoningContentRouter {
         } else {
             ctx.send_token(&stripped)
         }
+    }
+
+    /// Decide how a content token should be delivered (content vs reasoning)
+    /// WITHOUT sending it. Returns `None` when there is nothing to deliver
+    /// (empty after marker stripping). Used by the output reservoir, which buffers
+    /// the decision and drains it at a steady cadence.
+    fn route(&self, text: &str, parser_in_reasoning: bool) -> Option<(String, bool)> {
+        if text.is_empty() {
+            return None;
+        }
+        if !self.enabled {
+            return Some((text.to_string(), false));
+        }
+        let stripped = strip_reasoning_markers(text);
+        if stripped.is_empty() {
+            return None;
+        }
+        Some((stripped, parser_in_reasoning))
     }
 }
 
@@ -314,6 +332,16 @@ impl StreamingContext {
         self.response_tx
             .try_send(ChatResponse::Chunk(chunk))
             .is_ok()
+    }
+
+    /// Deliver a routed chunk (content or reasoning) - the single delivery point
+    /// the output reservoir drains through.
+    fn send_chunk(&self, text: &str, is_reasoning: bool) -> bool {
+        if is_reasoning {
+            self.send_reasoning_token(text)
+        } else {
+            self.send_token(text)
+        }
     }
 
     /// Send initial assistant role delta chunk for OpenAI streaming compatibility.
@@ -656,6 +684,13 @@ pub async fn chat_completion(
             let mut current_stream = stream;
             let current_seq_id = seq_id;
 
+            // Output reservoir: smooths bursty token delivery into a steady drip.
+            // Default on; XINFER_STREAM_RESERVOIR=0 restores the legacy push path.
+            let reservoir_enabled = crate::utils::env::stream_reservoir();
+            let mut reservoir = OutputReservoir::new(reservoir_enabled);
+            let mut drain_timer = tokio::time::interval(reservoir.drain_interval());
+            drain_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
             loop {
                 let item = tokio::select! {
                     item = current_stream.recv() => item,
@@ -671,6 +706,28 @@ pub async fn chat_completion(
                             let mut e = engine_clone.write();
                             e.cancel(current_seq_id);
                             break;
+                        }
+                        continue;
+                    }
+                    _ = async {
+                        if reservoir_enabled {
+                            drain_timer.tick().await;
+                        } else {
+                            std::future::pending::<()>().await;
+                        }
+                    } => {
+                        // Drain the reservoir at a steady cadence (smooth delivery).
+                        if reservoir_enabled {
+                            for _ in 0..reservoir.drain_batch() {
+                                match reservoir.pop() {
+                                    Some((rtext, is_reasoning)) => {
+                                        if !stream_ctx.send_chunk(&rtext, is_reasoning) {
+                                            break; // client gone; disconnect branch cancels
+                                        }
+                                    }
+                                    None => break,
+                                }
+                            }
                         }
                         continue;
                     }
@@ -731,15 +788,18 @@ pub async fn chat_completion(
                                     }
                                     // Capture reasoning state before token processing for routing
                                     let was_in_reasoning = tool_parser.in_reasoning();
-                                    if !reasoning_router.send(&text, was_in_reasoning, &stream_ctx)
-                                    {
-                                        crate::log_error!(
-                                            "[Seq {}] Stream send error (disconnected)",
-                                            current_seq_id
-                                        );
-                                        let mut e = engine_clone.write();
-                                        e.cancel(current_seq_id);
-                                        break;
+                                    if let Some((rtext, is_reasoning)) = reasoning_router.route(&text, was_in_reasoning) {
+                                        if reservoir_enabled {
+                                            reservoir.push(rtext, is_reasoning);
+                                        } else if !stream_ctx.send_chunk(&rtext, is_reasoning) {
+                                            crate::log_error!(
+                                                "[Seq {}] Stream send error (disconnected)",
+                                                current_seq_id
+                                            );
+                                            let mut e = engine_clone.write();
+                                            e.cancel(current_seq_id);
+                                            break;
+                                        }
                                     }
                                 }
                                 StreamResult::Buffering => {
@@ -827,10 +887,14 @@ pub async fn chat_completion(
                                     if let Some(ref l) = stream_logger {
                                         l.log_stream_token(&safe_text);
                                     }
-                                    if !reasoning_router.send(&safe_text, false, &stream_ctx) {
-                                        let mut e = engine_clone.write();
-                                        e.cancel(current_seq_id);
-                                        break;
+                                    if let Some((rtext, is_reasoning)) = reasoning_router.route(&safe_text, false) {
+                                        if reservoir_enabled {
+                                            reservoir.push(rtext, is_reasoning);
+                                        } else if !stream_ctx.send_chunk(&rtext, is_reasoning) {
+                                            let mut e = engine_clone.write();
+                                            e.cancel(current_seq_id);
+                                            break;
+                                        }
                                     }
                                 }
                                 StreamResult::ToolCalls(tools) => {
@@ -854,14 +918,18 @@ pub async fn chat_completion(
                             if let Some(ref l) = stream_logger {
                                 l.log_stream_token(&token);
                             }
-                            if !reasoning_router.send(&token, was_in_reasoning, &stream_ctx) {
-                                crate::log_error!(
-                                    "[Seq {}] Stream send error (disconnected)",
-                                    current_seq_id
-                                );
-                                let mut e = engine_clone.write();
-                                e.cancel(current_seq_id);
-                                break;
+                            if let Some((rtext, is_reasoning)) = reasoning_router.route(&token, was_in_reasoning) {
+                                if reservoir_enabled {
+                                    reservoir.push(rtext, is_reasoning);
+                                } else if !stream_ctx.send_chunk(&rtext, is_reasoning) {
+                                    crate::log_error!(
+                                        "[Seq {}] Stream send error (disconnected)",
+                                        current_seq_id
+                                    );
+                                    let mut e = engine_clone.write();
+                                    e.cancel(current_seq_id);
+                                    break;
+                                }
                             }
                         }
                     }
@@ -873,6 +941,16 @@ pub async fn chat_completion(
                         _stop_sequence,
                     )) => {
                         total_decoded_tokens += final_decoded_length;
+
+                        // Flush the output reservoir (deliver any pending content chunks)
+                        // before the end-of-stream tool finalization.
+                        if reservoir_enabled {
+                            while let Some((rtext, is_reasoning)) = reservoir.pop() {
+                                if !stream_ctx.send_chunk(&rtext, is_reasoning) {
+                                    break;
+                                }
+                            }
+                        }
 
                         // Flush any buffered content at end of stream
                         if should_parse_tools {
@@ -1175,6 +1253,52 @@ pub async fn chat_completion(
                             decode_time_taken,
                             total_decoded_tokens as f32 / decode_time_taken.max(0.001)
                         );
+
+if let Some(spec) = engine_clone.read().get_seq_spec_stats(current_seq_id) {
+                            if !spec.mechanism.is_empty() {
+                                let label = format!("{} Speculation", spec.mechanism);
+                                let rate = if spec.proposed > 0 {
+                                    spec.accepted as f64 / spec.proposed as f64 * 100.0
+                                } else {
+                                    0.0
+                                };
+                                let avg = if spec.steps > 0 {
+                                    (spec.accepted + 2 * spec.steps) as f64 / spec.steps as f64
+                                } else {
+                                    1.0
+                                };
+                                let avg_k = if spec.steps > 0 {
+                                    spec.proposed as f64 / spec.steps as f64
+                                } else {
+                                    0.0
+                                };
+                                crate::log_info!(
+                                    "[Seq {}] {}: steps={} proposed={} accepted={} rate={:.1}% avg_tok/step={:.2} | k(mov/min/max/avg): {}/{}/{:.2}/{} | bound(tgt/grm): {}/{}",
+                                    current_seq_id,
+                                    label,
+                                    spec.steps,
+                                    spec.proposed,
+                                    spec.accepted,
+                                    rate,
+                                    avg,
+                                    spec.k_moves,
+                                    spec.k_min,
+                                    spec.k_max,
+                                    avg_k,
+                                    spec.target_bound,
+                                    spec.grammar_bound
+                                );
+                            }
+                        }
+
+                        // QoS/scheduling report: shown for every sequence that has captured stats.
+                        if let Some(sched) = engine_clone.read().get_seq_sched_stats(current_seq_id) {
+                            crate::log_info!(
+                                "[Seq {}] Scheduling: {}",
+                                current_seq_id,
+                                sched.report()
+                            );
+                        }
 
                         break;
                     }
