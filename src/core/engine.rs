@@ -114,6 +114,8 @@ pub struct LLMEngine {
     pub img_cfg: Option<ImageProcessConfig>,
     pub guidance_tokens: GuidanceTokens,
     seq_spec_stats: HashMap<usize, crate::runner::SpecSeqStatsData>,
+    /// Per-sequence QoS/scheduling stats, captured at sequence end (conditional display).
+    seq_sched_stats: HashMap<usize, crate::core::qos::SchedSeqStats>,
 }
 
 impl LLMEngine {
@@ -592,6 +594,7 @@ impl LLMEngine {
             model_name,
             guidance_tokens,
             seq_spec_stats: HashMap::new(),
+            seq_sched_stats: HashMap::new(),
         }));
 
         Self::start_engine(engine.clone());
@@ -713,13 +716,17 @@ impl LLMEngine {
                 params.stop_sequences = Some(resolved_stop_sequences);
             }
         }
-        let seq = Sequence::new(
+        let mut seq = Sequence::new(
             token_ids,
             self.econfig.block_size,
             params,
             images,
             image_idx,
         );
+        // QoS: infer the class from the request's max output tokens (short output
+        // => latency-sensitive agentic; large => throughput). Explicit hints can
+        // override this later.
+        seq.qos_class = self.econfig.qos.infer_class(seq.sampling_params.max_tokens);
 
         let prompt_required_blocks = self.scheduler.block_manager.required_blocks(&seq);
         let requested_decode_blocks = max_tokens.div_ceil(self.econfig.block_size);
@@ -982,6 +989,10 @@ impl LLMEngine {
         if !spec_stats.mechanism.is_empty() {
             self.seq_spec_stats.insert(id, spec_stats);
         }
+        // Capture the per-seq QoS/scheduling stats (scheduler-side, same process).
+        if let Some(sched_stats) = self.scheduler.sched_stats_for(id) {
+            self.seq_sched_stats.insert(id, sched_stats);
+        }
         match &mut *self.runners.write() {
             RunnerType::Thread(model_runner) => Ok(model_runner.finished(id)),
             RunnerType::Process(ref mut runner_streams) => {
@@ -1014,6 +1025,11 @@ impl LLMEngine {
     /// The cached per-seq spec stats (for the server's end-of-sequence report).
     pub fn get_seq_spec_stats(&self, seq_id: usize) -> Option<crate::runner::SpecSeqStatsData> {
         self.seq_spec_stats.get(&seq_id).cloned()
+    }
+
+    /// The cached per-seq QoS/scheduling stats (for the server's end-of-sequence report).
+    pub fn get_seq_sched_stats(&self, seq_id: usize) -> Option<crate::core::qos::SchedSeqStats> {
+        self.seq_sched_stats.get(&seq_id).cloned()
     }
 
     /// Fetch a sequence's speculative-decode stats from rank 0 (Process mode only).

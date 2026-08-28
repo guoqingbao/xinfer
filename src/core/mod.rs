@@ -4,6 +4,7 @@ pub mod dflash_drafter;
 pub mod engine;
 pub mod mtp;
 pub mod prefix_cache;
+pub mod qos;
 pub mod runner;
 pub mod scheduler;
 pub mod sequence;

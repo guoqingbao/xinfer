@@ -1,4 +1,5 @@
 // src/core/sequence.rs
+use crate::core::qos::QosClass;
 use crate::utils::config::SamplingParams;
 use crate::utils::image::ImageData;
 use serde::{Deserialize, Serialize};
@@ -45,6 +46,14 @@ pub struct Sequence {
     /// processed this step.
     #[serde(default)]
     pub active_prefill_chunk: Option<usize>,
+    /// QoS class (Latency vs Throughput), set at request arrival; drives
+    /// priority admission, class-weighted chunk sizing, and reservations.
+    #[serde(default)]
+    pub qos_class: QosClass,
+    /// Per-sequence scheduling/contention stats, accumulated by the scheduler and
+    /// reported at sequence end (conditional). Owned on the sequence (no locks).
+    #[serde(default)]
+    pub sched_stats: crate::core::qos::SchedSeqStats,
     pub mamba_prefix_hash: Option<u64>,
     #[serde(skip)]
     pub mamba_prefix_warmup_tokens: Option<usize>,
@@ -183,6 +192,8 @@ impl Sequence {
             block_table: Vec::new(),
             num_cached_tokens: 0,
             active_prefill_chunk: None,
+            qos_class: QosClass::default(),
+            sched_stats: Default::default(),
             mamba_prefix_hash: None,
             mamba_prefix_warmup_tokens: None,
             // DeepSeek V4: non-final prefill chunks end on native-token boundaries.

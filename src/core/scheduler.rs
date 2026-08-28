@@ -236,31 +236,15 @@ impl Scheduler {
     pub fn schedule(&mut self) -> Result<(Vec<usize>, bool)> {
         let mut scheduled_ids = Vec::new();
         let mut num_tokens = 0;
-        // Adaptive prefill chunk: shrink the chunk as decode pressure rises so a
-        // prefill step cannot starve running decodes (bounds their ITL). With no
-        // decodes waiting (pressure 0) the chunk is the full cap (today's behavior).
+        // QoS: derive the adaptive prefill chunk from class-weighted decode load.
+        // A Latency decode weighs more, so prefill chunks shrink harder to protect
+        // its ITL; with no decodes the chunk is the full cap (today's behavior).
         let base_chunk = self.cfg.effective_prefill_chunk_size();
         let cap = self.cfg.max_prefill_chunk_tokens.unwrap_or(base_chunk);
         let floor = self.cfg.min_prefill_chunk_tokens.unwrap_or(256);
-        let decode_pressure = self
-            .running
-            .iter()
-            .filter(|s| s.num_cached_tokens >= s.len())
-            .count();
-        let chunk_size = if decode_pressure == 0 {
-            cap
-        } else {
-            (cap / (1 + decode_pressure)).max(floor)
-        };
-        if decode_pressure > 0 {
-            tracing::debug!(
-                "[adaptive-chunk] prefill step: decode_pressure={} chunk_size={} (cap={} floor={})",
-                decode_pressure,
-                chunk_size,
-                cap,
-                floor
-            );
-        }
+        let qos = &self.cfg.qos;
+        let decode_load = qos.weighted_decode_load(&self.running);
+        let chunk_size = qos.adaptive_chunk(cap, floor, decode_load);
 
         // PD server: Check for new incoming prefill requests
         if self.is_pd_server() {
@@ -296,7 +280,77 @@ impl Scheduler {
         // admitting another waiting prefill batch.
         let pre_existing_running = self.running.len();
         let max_seqs_limit = self.active_sequence_limit();
-        let token_budget = self.cfg.max_num_batched_tokens;
+        // QoS conservativeness scales the per-step prefill token budget down under
+        // load (SGLang-style); 1.0 = current behavior.
+        let token_budget = self.cfg.qos.effective_budget(self.cfg.max_num_batched_tokens);
+
+        // QoS priority admission: serve Latency-class requests ahead of Throughput,
+        // preserving FIFO within each class (stable partition of the waiting queue).
+        let mut priority_active = false;
+        if self.cfg.qos.enabled {
+            let mut latency = Vec::new();
+            let mut throughput = Vec::new();
+            for s in self.waiting.drain(..) {
+                if s.qos_class.is_latency() {
+                    latency.push(s);
+                } else {
+                    throughput.push(s);
+                }
+            }
+            priority_active = !latency.is_empty() && !throughput.is_empty();
+            self.waiting = latency
+                .into_iter()
+                .chain(throughput.into_iter())
+                .collect::<VecDeque<Sequence>>();
+        }
+
+        // QoS reservations (opt-in): reserve running slots + KV blocks for the
+        // Latency class so a Throughput flood cannot wedge or evict a latency request.
+        let latency_slot_reserve = self.cfg.qos.latency_slot_reserve.unwrap_or(0);
+        let thr_slot_capacity = max_seqs_limit.saturating_sub(latency_slot_reserve);
+        let mut thr_in_use = self
+            .running
+            .iter()
+            .filter(|s| !s.qos_class.is_latency())
+            .count();
+        let kv_reserve_frac = self.cfg.qos.latency_kv_reserve_frac;
+
+        // QoS diagnostics: snapshot the contention vector (debug-logged when active).
+        let contention = crate::core::qos::Contention {
+            decode_load,
+            latency_waiting: self.waiting.iter().filter(|s| s.qos_class.is_latency()).count(),
+            throughput_waiting: self
+                .waiting
+                .iter()
+                .filter(|s| !s.qos_class.is_latency())
+                .count(),
+            slot_fill: if max_seqs_limit > 0 {
+                pre_existing_running as f32 / max_seqs_limit as f32
+            } else {
+                0.0
+            },
+            mem_headroom: {
+                let total = self.block_manager.get_num_total_blocks();
+                if total > 0 {
+                    self.block_manager.get_num_free_blocks() as f32 / total as f32
+                } else {
+                    0.0
+                }
+            },
+        };
+        if self.cfg.qos.enabled
+            && (contention.decode_load > 0.0 || contention.latency_waiting > 0)
+        {
+            tracing::debug!(
+                "[qos] contention={:?} chunk_size={} budget={}",
+                contention,
+                chunk_size,
+                token_budget
+            );
+        }
+
+        let slot_fill = contention.slot_fill;
+        let mem_pressure = 1.0 - contention.mem_headroom;
 
         while let Some(mut seq) = self.waiting.pop_front() {
             // Try to transfer prefill requests to PD server when applicable
@@ -306,6 +360,19 @@ impl Scheduler {
 
             let effective_tokens = seq.prefill_chunk_tokens(chunk_size);
 
+            // QoS reservation gates: a Throughput request must not consume the
+            // Latency slot / KV reserve.
+            let is_thr = !seq.qos_class.is_latency();
+            let thr_slot_full = is_thr && thr_in_use >= thr_slot_capacity;
+            let thr_kv_full = is_thr
+                && kv_reserve_frac.is_some_and(|frac| {
+                    let free = self.block_manager.get_num_free_blocks();
+                    let total = self.block_manager.get_num_total_blocks();
+                    total > 0 && (free as f32) < (total as f32 * frac)
+                });
+            // Record the class even for a sequence that ends up gated this step.
+            seq.sched_stats.qos_class = seq.qos_class;
+
             if self.running.len() >= max_seqs_limit
                 || scheduled_ids.len() >= max_seqs_limit
                 || num_tokens + effective_tokens > token_budget
@@ -313,7 +380,12 @@ impl Scheduler {
                 // interleaved scheduling: alternate prefill/decode for fairness
                 // only block when there are pre-existing decode sequences
                 || (self.is_last_prefill && pre_existing_running > 0)
+                || thr_slot_full
+                || thr_kv_full
             {
+                if is_thr && (thr_slot_full || thr_kv_full) {
+                    seq.sched_stats.reservation_blocked += 1;
+                }
                 // Put it back and break out if cannot schedule more
                 self.waiting.push_front(seq);
                 break;
@@ -326,8 +398,22 @@ impl Scheduler {
             // Stamp the adaptive chunk size so the runner's prepare_prefill and the
             // scheduler's filter_prefill_finished process exactly what was budgeted.
             seq.active_prefill_chunk = Some(chunk_size);
+            // QoS per-seq stats: record the adaptive adjustments that fired for this step.
+            seq.sched_stats.prefill_steps += 1;
+            if chunk_size < cap {
+                seq.sched_stats.chunk_shrunk += 1;
+            }
+            if priority_active && !is_thr {
+                seq.sched_stats.priority_admitted += 1;
+            }
+            seq.sched_stats.peak_decode_load = seq.sched_stats.peak_decode_load.max(decode_load);
+            seq.sched_stats.peak_slot_fill = seq.sched_stats.peak_slot_fill.max(slot_fill);
+            seq.sched_stats.peak_mem_pressure = seq.sched_stats.peak_mem_pressure.max(mem_pressure);
             num_tokens += effective_tokens;
             self.running.push(seq);
+            if is_thr {
+                thr_in_use += 1;
+            }
             scheduled_ids.push(self.running.len() - 1); // index of newly pushed seq
         }
 
@@ -347,6 +433,10 @@ impl Scheduler {
             {
                 preempt_ids.push(idx);
             }
+        }
+        // QoS per-seq stats: count preemption pressure on each affected sequence.
+        for &idx in &preempt_ids {
+            self.running[idx].sched_stats.preempted += 1;
         }
 
         // Client: Check for finished prefills
@@ -393,6 +483,7 @@ impl Scheduler {
                             self.running[idx].id
                         );
                         self.try_swap_out(idx, true);
+                        self.running[idx].sched_stats.swapped += 1;
                     }
                 }
             }
@@ -437,6 +528,17 @@ impl Scheduler {
     /// Provide immutable access to sequences by indexes (for model inference)
     pub fn get_sequences(&self, ids: &[usize]) -> Vec<&Sequence> {
         ids.iter().map(|&i| &self.running[i]).collect()
+    }
+
+    /// Look up a sequence's accumulated QoS/scheduling stats by id (searches the
+    /// running, cached, and waiting pools). Returns a clone, or None if absent.
+    pub fn sched_stats_for(&self, id: usize) -> Option<crate::core::qos::SchedSeqStats> {
+        self.running
+            .iter()
+            .chain(self.cached.iter())
+            .chain(self.waiting.iter())
+            .find(|s| s.id == id)
+            .map(|s| s.sched_stats.clone())
     }
 
     /// For prefill sequences that rely on cached prefix tokens, verify mamba state snapshots

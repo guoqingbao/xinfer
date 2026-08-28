@@ -1213,6 +1213,19 @@ label,
                             }
                         }
 
+                        // QoS/scheduling report: shown only if an adaptive adjustment
+                        // fired for this sequence (chunk shrink, priority, reservation,
+                        // preemption, or swap).
+                        if let Some(sched) = engine_clone.read().get_seq_sched_stats(current_seq_id) {
+                            if sched.had_adjustment() {
+                                crate::log_info!(
+                                    "[Seq {}] Scheduling: {}",
+                                    current_seq_id,
+                                    sched.report()
+                                );
+                            }
+                        }
+
                         break;
                     }
                     StreamItem::Error(e) => {
