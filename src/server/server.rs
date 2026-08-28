@@ -1195,20 +1195,20 @@ pub async fn chat_completion(
                                     0.0
                                 };
                                 crate::log_info!(
-                                    "[Seq {}] {}: steps={} proposed={} accepted={} rate={:.1}% avg_tok/step={:.2} avg_k={:.2} k_min={} k_max={} k_moves={} grammar_bound={} target_bound={}",
+                                    "[Seq {}] {}: steps={} proposed={} accepted={} rate={:.1}% avg_tok/step={:.2} | k(mov/min/max/avg): {}/{}/{:.2}/{} | bound(tgt/grm): {}/{}",
                                     current_seq_id,
-                                    label,
+label,
                                     spec.steps,
                                     spec.proposed,
                                     spec.accepted,
                                     rate,
                                     avg,
-                                    avg_k,
+                                    spec.k_moves,
                                     spec.k_min,
                                     spec.k_max,
-                                    spec.k_moves,
-                                    spec.grammar_bound,
-                                    spec.target_bound
+                                    avg_k,
+                                    spec.target_bound,
+                                    spec.grammar_bound
                                 );
                             }
                         }

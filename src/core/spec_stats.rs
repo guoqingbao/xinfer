@@ -43,6 +43,9 @@ impl SpecCounters {
         // grammar firewall (ported separately); 0 for now.
     }
 
+    // Runner-side dynamic-K / spec-stats display is commented out; only the
+    // per-sequence output (server.rs) is shown. Retained for reference.
+    /*
     pub fn summary(&self, label: &str) -> String {
         let rate = if self.proposed > 0 {
             self.accepted as f64 / self.proposed as f64 * 100.0
@@ -68,6 +71,7 @@ impl SpecCounters {
             self.ff_continuations
         )
     }
+    */
 }
 
 /// Per-sequence window, reported (and dropped) when the sequence finishes.
@@ -91,7 +95,10 @@ pub fn spec_seq_report(seq_id: usize) -> Option<String> {
     if c.steps == 0 {
         return None;
     }
-    Some(c.summary(&format!("seq {}", seq_id)))
+    // Runner-side display is commented out; only the per-sequence output
+    // (server.rs) is shown. The map cleanup above is retained.
+    // Some(c.summary(&format!("seq {}", seq_id)))
+    None
 }
 
 /// Look up a sequence's speculative stats (without removing them) for cross-process reporting.
