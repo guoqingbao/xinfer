@@ -1222,8 +1222,15 @@ impl LLMEngine {
 
                 match response {
                     MessageType::RunResponse(output_ids) => {
-                        if output_ids.len() == 0 {
-                            candle_core::bail!("Runner step error, no response!")
+                        if output_ids.is_empty() {
+                            // Runner hit a transient error (e.g. drafter mask
+                            // mismatch). Log and signal retry; do NOT kill the
+                            // entire engine. The sequence stays in the running
+                            // list and will be retried on the next tick.
+                            crate::log_warn!(
+                                "Runner returned empty response (transient error, will retry next tick)"
+                            );
+                            Ok(vec![]) // empty = "no progress this tick"
                         } else {
                             Ok(output_ids)
                         }
@@ -1265,7 +1272,9 @@ impl LLMEngine {
                         Ok(multi_tokens)
                     }
                     MessageType::RunResponseMTP(_) => {
-                        candle_core::bail!("MTP runner returned empty response")
+                        // Transient error: log and retry next tick.
+                        crate::log_warn!("MTP runner returned empty (transient error, retrying)");
+                        Ok(vec![])
                     }
                     other => {
                         candle_core::bail!("Unexpected MTP response type: {:?}", other)
@@ -1348,7 +1357,8 @@ impl LLMEngine {
                 match receive_local(&mut stream, false)? {
                     MessageType::RunResponseDFlash(tokens) if !tokens.is_empty() => Ok(tokens),
                     MessageType::RunResponseDFlash(_) => {
-                        candle_core::bail!("DFlash runner returned empty response")
+                        crate::log_warn!("DFlash runner returned empty (transient error, retrying)");
+                        Ok(vec![])
                     }
                     other => candle_core::bail!("Unexpected DFlash response type: {:?}", other),
                 }
@@ -2421,6 +2431,16 @@ impl LLMEngine {
 
                     match forward_result {
                         Ok(multi_output_ids) => {
+                            // If all outputs are empty, the runner hit a transient
+                            // error (e.g. drafter mask mismatch). Skip finish_step
+                            // and retry on the next tick. Sequences stay in the
+                            // running list; no data is lost.
+                            if multi_output_ids.iter().all(|ids| ids.is_empty()) {
+                                crate::log_warn!(
+                                    "[Engine Loop] All runners returned empty (transient error), retrying next tick"
+                                );
+                                continue;
+                            }
                             let mut guard = engine.write();
                             match guard.finish_step(scheduled_ids, is_prefill, multi_output_ids) {
                                 Ok(n) => task_processed = n,
