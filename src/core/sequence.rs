@@ -38,6 +38,13 @@ pub struct Sequence {
     pub output_ids: Vec<u32>,
     pub block_table: Vec<u32>,
     pub num_cached_tokens: usize,
+    /// The adaptive prefill chunk size stamped by the scheduler for this step
+    /// (`None` = use the static `effective_prefill_chunk_size`). Travels with the
+    /// sequence clone across the process boundary so the runner's `prepare_prefill`
+    /// and the scheduler's `filter_prefill_finished` agree on how many tokens were
+    /// processed this step.
+    #[serde(default)]
+    pub active_prefill_chunk: Option<usize>,
     pub mamba_prefix_hash: Option<u64>,
     #[serde(skip)]
     pub mamba_prefix_warmup_tokens: Option<usize>,
@@ -175,6 +182,7 @@ impl Sequence {
             output_ids: Vec::new(),
             block_table: Vec::new(),
             num_cached_tokens: 0,
+            active_prefill_chunk: None,
             mamba_prefix_hash: None,
             mamba_prefix_warmup_tokens: None,
             // DeepSeek V4: non-final prefill chunks end on native-token boundaries.

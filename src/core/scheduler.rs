@@ -236,7 +236,31 @@ impl Scheduler {
     pub fn schedule(&mut self) -> Result<(Vec<usize>, bool)> {
         let mut scheduled_ids = Vec::new();
         let mut num_tokens = 0;
-        let chunk_size = self.cfg.effective_prefill_chunk_size();
+        // Adaptive prefill chunk: shrink the chunk as decode pressure rises so a
+        // prefill step cannot starve running decodes (bounds their ITL). With no
+        // decodes waiting (pressure 0) the chunk is the full cap (today's behavior).
+        let base_chunk = self.cfg.effective_prefill_chunk_size();
+        let cap = self.cfg.max_prefill_chunk_tokens.unwrap_or(base_chunk);
+        let floor = self.cfg.min_prefill_chunk_tokens.unwrap_or(256);
+        let decode_pressure = self
+            .running
+            .iter()
+            .filter(|s| s.num_cached_tokens >= s.len())
+            .count();
+        let chunk_size = if decode_pressure == 0 {
+            cap
+        } else {
+            (cap / (1 + decode_pressure)).max(floor)
+        };
+        if decode_pressure > 0 {
+            tracing::debug!(
+                "[adaptive-chunk] prefill step: decode_pressure={} chunk_size={} (cap={} floor={})",
+                decode_pressure,
+                chunk_size,
+                cap,
+                floor
+            );
+        }
 
         // PD server: Check for new incoming prefill requests
         if self.is_pd_server() {
@@ -299,6 +323,9 @@ impl Scheduler {
                 self.block_manager.allocate(&mut seq)?;
             }
             seq.status = SequenceStatus::Running;
+            // Stamp the adaptive chunk size so the runner's prepare_prefill and the
+            // scheduler's filter_prefill_finished process exactly what was budgeted.
+            seq.active_prefill_chunk = Some(chunk_size);
             num_tokens += effective_tokens;
             self.running.push(seq);
             scheduled_ids.push(self.running.len() - 1); // index of newly pushed seq
@@ -825,10 +852,13 @@ impl Scheduler {
         let mut remove_ids = Vec::new();
         let mut chunked_info: Vec<(usize, usize, usize)> = Vec::new(); // (seq_id, cached, remain)
         let mut chunk_finished_info: Vec<(usize, usize)> = Vec::new(); // (seq_id, total_len)
-        let chunk_size = self.cfg.effective_prefill_chunk_size();
         for (i, id) in scheduled_ids.iter().enumerate() {
             if *id < self.running.len() {
                 let seq = &self.running[*id];
+                // Use the adaptive chunk size stamped by schedule() (fallback: static).
+                let chunk_size = seq
+                    .active_prefill_chunk
+                    .unwrap_or(self.cfg.effective_prefill_chunk_size());
                 let chunk_tokens = seq.prefill_chunk_tokens(chunk_size);
                 if chunk_tokens == 0 || seq.num_cached_tokens + chunk_tokens >= seq.len() {
                     let _ = self

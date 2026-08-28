@@ -471,6 +471,14 @@ pub struct EngineConfig {
     pub disable_cuda_graph: bool,
     #[serde(default = "default_prefill_chunk_size")]
     pub prefill_chunk_size: usize,
+    /// Hard ceiling for the adaptive prefill chunk (default: `prefill_chunk_size`).
+    /// Under decode pressure the scheduler shrinks the chunk toward this cap.
+    #[serde(default)]
+    pub max_prefill_chunk_tokens: Option<usize>,
+    /// Floor for the adaptive prefill chunk (default: 256). The chunk never
+    /// shrinks below this even under heavy decode pressure.
+    #[serde(default)]
+    pub min_prefill_chunk_tokens: Option<usize>,
     #[serde(default = "default_num_nodes")]
     pub num_nodes: usize,
     #[serde(default)]
@@ -591,6 +599,14 @@ pub struct EngineConfig {
     #[pyo3(get, set)]
     #[serde(default = "default_prefill_chunk_size")]
     pub prefill_chunk_size: usize,
+    /// Hard ceiling for the adaptive prefill chunk (default: `prefill_chunk_size`).
+    #[pyo3(get, set)]
+    #[serde(default)]
+    pub max_prefill_chunk_tokens: Option<usize>,
+    /// Floor for the adaptive prefill chunk (default: 256).
+    #[pyo3(get, set)]
+    #[serde(default)]
+    pub min_prefill_chunk_tokens: Option<usize>,
     #[pyo3(get, set)]
     #[serde(default = "default_num_nodes")]
     pub num_nodes: usize,
