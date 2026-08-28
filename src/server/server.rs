@@ -1232,18 +1232,41 @@ pub async fn chat_completion(
 
                         crate::log_warn!("--- Performance Metrics ---");
                         if prompt_time_taken > 0.0 {
+                            let cached = engine_clone
+                                .read()
+                                .get_num_cached_tokens_for_seq(current_seq_id)
+                                .unwrap_or(0);
+                            let actual_prefill = prompt_length.saturating_sub(cached);
+                            if cached > 0 {
+                                crate::log_info!(
+                                    "[Seq {}] ⏱️ Prompt: {} tokens ({} cached + {} actual) in {:.2}s ({:.2} t/s actual, {:.2} t/s synthetic)",
+                                    current_seq_id,
+                                    prompt_length,
+                                    cached,
+                                    actual_prefill,
+                                    prompt_time_taken,
+                                    actual_prefill as f32 / prompt_time_taken.max(0.001),
+                                    prompt_length as f32 / prompt_time_taken.max(0.001)
+                                );
+                            } else {
+                                crate::log_info!(
+                                    "[Seq {}] ⏱️ Prompt: {} tokens in {:.2}s ({:.2} t/s)",
+                                    current_seq_id,
+                                    prompt_length,
+                                    prompt_time_taken,
+                                    prompt_length as f32 / prompt_time_taken.max(0.001)
+                                );
+                            }
+                        } else {
+                            let cached = engine_clone
+                                .read()
+                                .get_num_cached_tokens_for_seq(current_seq_id)
+                                .unwrap_or(prompt_length);
                             crate::log_info!(
-                                "[Seq {}] ⏱️ Prompt: {} tokens in {:.2}s ({:.2} t/s)",
+                                "[Seq {}] ⏱️ Prompt: {} tokens (fully cached, {} from prefix cache)",
                                 current_seq_id,
                                 prompt_length,
-                                prompt_time_taken,
-                                prompt_length as f32 / prompt_time_taken.max(0.001)
-                            );
-                        } else {
-                            crate::log_info!(
-                                "[Seq {}] ⏱️ Prompt: {} tokens (cached)",
-                                current_seq_id,
-                                prompt_length
+                                cached
                             );
                         }
                         crate::log_info!(

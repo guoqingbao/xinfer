@@ -128,6 +128,22 @@ pub fn spec_mask_offload() -> bool {
     })
 }
 
+/// Use the VOB bitset path for grammar sampling (8x less data than F32 mask).
+/// Requires `XINFER_SPEC_MASK_OFFLOAD=1` (default on CUDA) AND this flag.
+pub const VOB_SAMPLING_ENV: &str = "XINFER_VOB_SAMPLING";
+
+static VOB_SAMPLING: OnceLock<bool> = OnceLock::new();
+
+pub fn vob_sampling() -> bool {
+    *VOB_SAMPLING.get_or_init(|| {
+        cfg!(feature = "cuda")
+            && env::var(VOB_SAMPLING_ENV)
+                .ok()
+                .map(|v| v.trim() == "1" || v.trim().eq_ignore_ascii_case("true"))
+                .unwrap_or(false)
+    })
+}
+
 /// Cap on the DFlash projected-hidden context window kept per sequence (in rows).
 /// `0` means unbounded full history, matching the original DFlash branch;
 /// set e.g. `XINFER_SPEC_CONTEXT_WINDOW=512` to bound memory on very long generations.
@@ -284,6 +300,21 @@ static QOS: OnceLock<bool> = OnceLock::new();
 pub fn qos_enabled() -> bool {
     *QOS.get_or_init(|| {
         env::var(QOS_ENV)
+            .ok()
+            .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false)
+    })
+}
+
+/// `XINFER_DFA_GRAMMAR=1` enables the GPU-resident DFA grammar path.
+/// When off (default), the existing CPU parser walk is used.
+pub const DFA_GRAMMAR_ENV: &str = "XINFER_DFA_GRAMMAR";
+
+static DFA_GRAMMAR: OnceLock<bool> = OnceLock::new();
+
+pub fn dfa_grammar_enabled() -> bool {
+    *DFA_GRAMMAR.get_or_init(|| {
+        env::var(DFA_GRAMMAR_ENV)
             .ok()
             .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes"))
             .unwrap_or(false)
