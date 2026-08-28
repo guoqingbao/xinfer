@@ -2091,6 +2091,12 @@ impl ModelRunner {
                 let dm = &drafter.draft_model;
                 crate::log_info!("Capturing DFlash draft graph...");
                 graph.capture(|th, ne, pos| dm.forward(th, ne, pos))?;
+                crate::log_warn!(
+                    "Captured DFlash draft graph cap={} block={} hidden={}",
+                    graph.cap(),
+                    graph.block(),
+                    graph.hidden()
+                );
             }
         }
 

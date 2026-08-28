@@ -1300,4 +1300,14 @@ impl DFlashDraftGraph {
     pub fn cap(&self) -> usize {
         self.target_hidden.dim(0).unwrap_or(0)
     }
+
+    /// The draft block width (anchor + MASK rows) the graph was captured for.
+    pub fn block(&self) -> usize {
+        self.noise_embedding.dim(0).unwrap_or(0)
+    }
+
+    /// The draft model hidden size.
+    pub fn hidden(&self) -> usize {
+        self.target_hidden.dim(1).unwrap_or(0)
+    }
 }
