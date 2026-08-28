@@ -410,7 +410,36 @@ impl ModelRunner {
             Seqs::DecodeVec(ref decoded) => decoded.len(),
         };
         if batch_size > 1 {
-            return self.run_dflash_decode_batch(seqs);
+            // Parallel DFlash: run each sequence's single-seq DFlash step separately.
+            // The batched verify (run_dflash_decode_batch) crashes in the target's
+            // GDN layer on multi-seq input; per-seq single-seq verifies are GDN-safe.
+            // Cap the drafting slots; sequences beyond the cap plain-decode.
+            let slots = crate::utils::env::dflash_parallel_slots();
+            let mut results: Vec<Vec<u32>> = Vec::with_capacity(batch_size);
+            match seqs {
+                Seqs::SeqRefs(refs) => {
+                    for (i, &seq) in refs.iter().enumerate() {
+                        let single = Seqs::SeqRefs(&[seq]);
+                        if i < slots {
+                            results.extend(self.run_dflash_decode(single)?);
+                        } else {
+                            results.push(self.run(single, false)?);
+                        }
+                    }
+                }
+                Seqs::DecodeVec(decoded) => {
+                    for (i, dseq) in decoded.iter().enumerate() {
+                        let single = vec![dseq.clone()];
+                        let s = Seqs::DecodeVec(&single);
+                        if i < slots {
+                            results.extend(self.run_dflash_decode(s)?);
+                        } else {
+                            results.push(self.run(s, false)?);
+                        }
+                    }
+                }
+            }
+            return Ok(results);
         }
         let Some(drafter) = self.dflash_drafter.as_ref() else {
             let output = self.run(seqs, false)?;
@@ -767,6 +796,9 @@ impl ModelRunner {
         Ok(vec![result_tokens])
     }
 
+    #[allow(dead_code)]
+    // Retained for when the target's GDN layer supports a batched verify; the
+    // parallel path currently runs per-seq single-seq steps instead.
     fn run_dflash_decode_batch(&self, seqs: Seqs) -> Result<Vec<Vec<u32>>> {
         let Some(drafter) = self.dflash_drafter.as_ref() else {
             let output = self.run(seqs, false)?;

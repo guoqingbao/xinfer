@@ -195,6 +195,22 @@ pub fn spec_parallel_draft() -> bool {
     })
 }
 
+/// Cap on how many concurrent sequences get a DFlash drafter slot when parallel
+/// drafting is enabled (`XINFER_SPEC_PARALLEL_DRAFT`). Sequences beyond the cap
+/// fall back to plain decode. Default 2.
+pub const DFLASH_PARALLEL_SLOTS_ENV: &str = "XINFER_DFLASH_PARALLEL_SLOTS";
+
+static DFLASH_PARALLEL_SLOTS: OnceLock<usize> = OnceLock::new();
+
+pub fn dflash_parallel_slots() -> usize {
+    *DFLASH_PARALLEL_SLOTS.get_or_init(|| {
+        env::var(DFLASH_PARALLEL_SLOTS_ENV)
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(2)
+    })
+}
+
 /// Opt-in: use rejection-sampling verify for non-greedy (temperature) targets, which
 /// preserves the target distribution. Default OFF, in which case all unguided targets use
 /// the fast greedy (argmax-agreement) verify (the 483 path). Set
