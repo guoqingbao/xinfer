@@ -25,6 +25,10 @@ pub struct Scheduler {
     /// so response finalization can still read it. Bounded by
     /// `FINISHED_CACHED_TOKENS_MAX`.
     finished_cached_tokens: HashMap<usize, usize>,
+    /// Per-seq QoS/scheduling stats retained briefly after `clear_finished()`
+    /// (which drops the Sequence) so the end-of-sequence report can still
+    /// read them. Bounded by `FINISHED_CACHED_TOKENS_MAX`.
+    finished_sched_stats: HashMap<usize, crate::core::qos::SchedSeqStats>,
     eos_token_id: Vec<u32>,
     /// Token IDs that represent the end of a tool call (e.g., </tool_call> tokens)
     tool_call_end_token_ids: Vec<u32>,
@@ -157,6 +161,7 @@ impl Scheduler {
             ),
             next_seq_id: 0,
             finished_cached_tokens: HashMap::new(),
+            finished_sched_stats: HashMap::new(),
             eos_token_id: match &config.eos_token_id {
                 Some(EosTokenId::Single(eos)) => vec![*eos],
                 Some(EosTokenId::Multiple(eos)) => eos.into_iter().map(|x| *x).collect(),
@@ -239,12 +244,21 @@ impl Scheduler {
         // QoS: derive the adaptive prefill chunk from class-weighted decode load.
         // A Latency decode weighs more, so prefill chunks shrink harder to protect
         // its ITL; with no decodes the chunk is the full cap (today's behavior).
+        // Gated by XINFER_QOS (env) OR config qos.enabled; off => prior static chunk.
+        let qos_on = crate::utils::env::qos_enabled() || self.cfg.qos.enabled;
         let base_chunk = self.cfg.effective_prefill_chunk_size();
         let cap = self.cfg.max_prefill_chunk_tokens.unwrap_or(base_chunk);
         let floor = self.cfg.min_prefill_chunk_tokens.unwrap_or(256);
-        let qos = &self.cfg.qos;
-        let decode_load = qos.weighted_decode_load(&self.running);
-        let chunk_size = qos.adaptive_chunk(cap, floor, decode_load);
+        let decode_load = if qos_on {
+            self.cfg.qos.weighted_decode_load(&self.running)
+        } else {
+            0.0
+        };
+        let chunk_size = if qos_on {
+            self.cfg.qos.adaptive_chunk(cap, floor, decode_load)
+        } else {
+            base_chunk
+        };
 
         // PD server: Check for new incoming prefill requests
         if self.is_pd_server() {
@@ -282,12 +296,16 @@ impl Scheduler {
         let max_seqs_limit = self.active_sequence_limit();
         // QoS conservativeness scales the per-step prefill token budget down under
         // load (SGLang-style); 1.0 = current behavior.
-        let token_budget = self.cfg.qos.effective_budget(self.cfg.max_num_batched_tokens);
+        let token_budget = if qos_on {
+            self.cfg.qos.effective_budget(self.cfg.max_num_batched_tokens)
+        } else {
+            self.cfg.max_num_batched_tokens
+        };
 
         // QoS priority admission: serve Latency-class requests ahead of Throughput,
         // preserving FIFO within each class (stable partition of the waiting queue).
         let mut priority_active = false;
-        if self.cfg.qos.enabled {
+        if qos_on {
             let mut latency = Vec::new();
             let mut throughput = Vec::new();
             for s in self.waiting.drain(..) {
@@ -306,14 +324,22 @@ impl Scheduler {
 
         // QoS reservations (opt-in): reserve running slots + KV blocks for the
         // Latency class so a Throughput flood cannot wedge or evict a latency request.
-        let latency_slot_reserve = self.cfg.qos.latency_slot_reserve.unwrap_or(0);
+        let latency_slot_reserve = if qos_on {
+            self.cfg.qos.latency_slot_reserve.unwrap_or(0)
+        } else {
+            0
+        };
         let thr_slot_capacity = max_seqs_limit.saturating_sub(latency_slot_reserve);
         let mut thr_in_use = self
             .running
             .iter()
             .filter(|s| !s.qos_class.is_latency())
             .count();
-        let kv_reserve_frac = self.cfg.qos.latency_kv_reserve_frac;
+        let kv_reserve_frac = if qos_on {
+            self.cfg.qos.latency_kv_reserve_frac
+        } else {
+            None
+        };
 
         // QoS diagnostics: snapshot the contention vector (debug-logged when active).
         let contention = crate::core::qos::Contention {
@@ -338,7 +364,7 @@ impl Scheduler {
                 }
             },
         };
-        if self.cfg.qos.enabled
+        if qos_on
             && (contention.decode_load > 0.0 || contention.latency_waiting > 0)
         {
             tracing::debug!(
@@ -531,7 +557,8 @@ impl Scheduler {
     }
 
     /// Look up a sequence's accumulated QoS/scheduling stats by id (searches the
-    /// running, cached, and waiting pools). Returns a clone, or None if absent.
+    /// running, cached, and waiting pools, then the retained finished map).
+    /// Returns a clone, or None if absent.
     pub fn sched_stats_for(&self, id: usize) -> Option<crate::core::qos::SchedSeqStats> {
         self.running
             .iter()
@@ -539,6 +566,7 @@ impl Scheduler {
             .chain(self.waiting.iter())
             .find(|s| s.id == id)
             .map(|s| s.sched_stats.clone())
+            .or_else(|| self.finished_sched_stats.get(&id).cloned())
     }
 
     /// For prefill sequences that rely on cached prefix tokens, verify mamba state snapshots
@@ -847,21 +875,27 @@ impl Scheduler {
     pub fn clear_finished(&mut self) {
         let is_pd_server = self.is_pd_server();
         let mut finished_counts = Vec::new();
+        let mut finished_sched = Vec::new();
         for seq in &self.running {
             if seq.status == SequenceStatus::Finished {
                 if is_pd_server {
                     self.print_free_blocks();
                 }
                 finished_counts.push((seq.id, seq.num_cached_tokens));
+                finished_sched.push((seq.id, seq.sched_stats.clone()));
             }
         }
         for seq in &self.waiting {
             if seq.status == SequenceStatus::Finished {
                 finished_counts.push((seq.id, seq.num_cached_tokens));
+                finished_sched.push((seq.id, seq.sched_stats.clone()));
             }
         }
         for (seq_id, num_cached_tokens) in finished_counts {
             self.remember_finished_cached_tokens(seq_id, num_cached_tokens);
+        }
+        for (seq_id, stats) in finished_sched {
+            self.remember_finished_sched_stats(seq_id, stats);
         }
         self.running
             .retain(|seq| seq.status != SequenceStatus::Finished);
@@ -1433,6 +1467,20 @@ impl Scheduler {
                 break;
             };
             self.finished_cached_tokens.remove(&oldest_seq_id);
+        }
+    }
+
+    fn remember_finished_sched_stats(
+        &mut self,
+        seq_id: usize,
+        stats: crate::core::qos::SchedSeqStats,
+    ) {
+        self.finished_sched_stats.insert(seq_id, stats);
+        while self.finished_sched_stats.len() > FINISHED_CACHED_TOKENS_MAX {
+            let Some(oldest_seq_id) = self.finished_sched_stats.keys().min().copied() else {
+                break;
+            };
+            self.finished_sched_stats.remove(&oldest_seq_id);
         }
     }
 

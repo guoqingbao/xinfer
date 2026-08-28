@@ -54,7 +54,7 @@ pub struct QosConfig {
 impl Default for QosConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: false,
             latency_weight: 2.0,
             throughput_weight: 1.0,
             conservativeness: 1.0,
@@ -69,7 +69,7 @@ impl QosConfig {
     /// Infer a class from a request's max output tokens (short output => Latency).
     pub fn infer_class(&self, max_tokens: Option<usize>) -> QosClass {
         match max_tokens {
-            Some(mt) if self.enabled && mt <= self.latency_max_tokens => QosClass::Latency,
+            Some(mt) if mt <= self.latency_max_tokens => QosClass::Latency,
             _ => QosClass::Throughput,
         }
     }
@@ -78,9 +78,6 @@ impl QosConfig {
     /// Only fully-prefilled (decoding) sequences contribute; a Latency decode weighs
     /// more so prefill chunks shrink harder to protect its ITL.
     pub fn weighted_decode_load(&self, running: &[Sequence]) -> f32 {
-        if !self.enabled {
-            return 0.0;
-        }
         running
             .iter()
             .filter(|s| s.num_cached_tokens >= s.len())
@@ -104,7 +101,7 @@ impl QosConfig {
 
     /// Effective per-step prefill token budget after conservativeness.
     pub fn effective_budget(&self, token_budget: usize) -> usize {
-        if !self.enabled || self.conservativeness >= 1.0 {
+        if self.conservativeness >= 1.0 {
             return token_budget;
         }
         (token_budget as f32 * self.conservativeness.max(0.0)) as usize

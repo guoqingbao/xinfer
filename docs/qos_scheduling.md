@@ -18,7 +18,7 @@ short output => Latency). Each `schedule()` step computes a **contention
 vector** and makes four coupled decisions:
 
 ```
-                 contentionion = {
+                 contention = {
                      decode_load   : class-weighted # of running DECODES
                      latency_wait  : # Latency seqs in waiting
                      thr_wait      : # Throughput seqs in waiting
@@ -56,11 +56,51 @@ vector** and makes four coupled decisions:
    - (opt-in) U2 is guaranteed slots + KV reserve, so U1 can't wedge/evict it.
 ```
 
+## Batching & limits
+
+Batches never grow unbounded. Each step is capped by four independent ceilings;
+when they're hit the scheduler preempts/swaps rather than grows.
+
+| Ceiling | Mechanism | Logic |
+|---|---|---|
+| **Slots** | `active_sequence_limit()` = `min(max_num_parallel_reqs, mamba_cache_capacity)` | caps concurrent running sequences (prefill admission *and* decode). Hybrid GDN/Mamba models also cap by Mamba slots. |
+| **Tokens/step** | `max_num_batched_tokens` (x `qos.conservativeness`) | caps total prefill tokens per step; admission stops when the budget is hit. |
+| **KV memory** | `block_manager.can_allocate` / `can_append` | when blocks run out, the decode phase preempts (recompute) or swaps out (CPU) the oldest sequence, and evicts prefix-cache under pressure. |
+| **QoS reserves** | `latency_slot_reserve` / `latency_kv_reserve_frac` (opt-in) | Throughput admissions are gated so they can't consume the Latency reserve. |
+
+### Prefill vs decode steps
+- A step is either a **prefill** step (admit chunks from `waiting`) or a **decode**
+  step (advance running decodes by one token). The `is_last_prefill` guard forces
+  alternation (P, D, P, D, ...) when decodes are already running, so a decode is
+  never starved behind back-to-back prefills.
+- Mid-prefill sequences are re-queued to `waiting` after each chunk
+  (`filter_prefill_finished`); only fully-prefilled sequences stay in `running`
+  and begin decoding.
+
+### KV-pressure handling (decode phase)
+When `can_append` fails (no free block for the next token):
+1. **Preempt** - the sequence is marked for recompute (its KV is released).
+2. **Swap out** - the oldest preempted sequence's KV moves to CPU memory
+   (`try_swap_out`), when the CUDA swap path is enabled.
+3. **Evict prefix cache** - if KV exceeds `KVCACHE_SWAP_THRESHOLD` (0.95),
+   reusable prefix blocks are evicted to free space.
+
+So under memory pressure the engine sheds load (preempt/swap/evict) instead of
+growing the batch; a lone uncontended request still prefills at full `cap` but
+can never exceed the slot/token/KV ceilings.
+
+## Master switch
+
+QoS is off by default (prior FIFO + static-chunk behavior). Enable it with the
+`XINFER_QOS=1` env var (or `qos.enabled` in the config). The tuning knobs
+below only take effect when QoS is on.
+
 ## Knobs (`EngineConfig.qos`)
 
 | Knob | Default | Effect |
 |---|---|---|
-| `qos.enabled` | true | master switch (false = legacy FIFO + static chunk) |
+| `XINFER_QOS` (env) | off | master switch; `1` enables QoS (restores prior FIFO + static chunk when off) |
+| `qos.enabled` (config) | false | OR'd with `XINFER_QOS`; either enables QoS |
 | `qos.latency_weight` | 2.0 | how much a Latency decode shrinks prefill chunks |
 | `qos.throughput_weight` | 1.0 | how much a Throughput decode shrinks prefill chunks |
 | `qos.conservativeness` | 1.0 | per-step prefill token budget multiplier (<1 = admit less) |

@@ -251,3 +251,21 @@ pub fn spec_adaptive_tiers() -> Option<Vec<usize>> {
     })
     .clone()
 }
+
+/// Master switch for class-aware QoS scheduling (priority admission,
+/// class-weighted chunk sizing, reservations, conservativeness). Default OFF,
+/// which restores the prior FIFO + static-chunk behavior. Set
+/// `XINFER_QOS=1` to enable. (The config field `qos.enabled` is an OR'd
+/// alternative for config-file users.)
+pub const QOS_ENV: &str = "XINFER_QOS";
+
+static QOS: OnceLock<bool> = OnceLock::new();
+
+pub fn qos_enabled() -> bool {
+    *QOS.get_or_init(|| {
+        env::var(QOS_ENV)
+            .ok()
+            .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false)
+    })
+}
