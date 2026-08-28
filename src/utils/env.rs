@@ -162,6 +162,26 @@ pub fn spec_graph() -> bool {
     })
 }
 
+/// Master switch for the per-stream output reservoir, which smooths bursty token
+/// delivery into a steady drip (decouples production from client delivery).
+/// Default ON; set `XINFER_STREAM_RESERVOIR=0` to restore the legacy immediate-push
+/// streaming behavior.
+pub const STREAM_RESERVOIR_ENV: &str = "XINFER_STREAM_RESERVOIR";
+
+static STREAM_RESERVOIR: OnceLock<bool> = OnceLock::new();
+
+pub fn stream_reservoir() -> bool {
+    *STREAM_RESERVOIR.get_or_init(|| {
+        !matches!(
+            env::var(STREAM_RESERVOIR_ENV)
+                .ok()
+                .as_deref()
+                .map(|v| v.trim().eq_ignore_ascii_case("0") || v.trim().eq_ignore_ascii_case("false")),
+            Some(true)
+        )
+    })
+}
+
 /// Opt-in: adaptive draft length (K scales with the rolling acceptance rate).
 /// Default OFF (fixed K = the CLI `--num-speculative-tokens|mtp` count). Set
 /// `XINFER_SPEC_ADAPTIVE_K=1` to enable the tiered controller.
