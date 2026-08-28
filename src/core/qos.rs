@@ -142,15 +142,6 @@ pub struct SchedSeqStats {
 }
 
 impl SchedSeqStats {
-    /// True if any adaptive adjustment fired for this sequence (gates the display).
-    pub fn had_adjustment(&self) -> bool {
-        self.chunk_shrunk > 0
-            || self.priority_admitted > 0
-            || self.reservation_blocked > 0
-            || self.preempted > 0
-            || self.swapped > 0
-    }
-
     /// One-line body for the per-sequence report (the caller adds the `[Seq N]` prefix).
     pub fn report(&self) -> String {
         format!(
