@@ -67,6 +67,34 @@ pub fn verify_draft_greedy(
     })
 }
 
+/// Validate draft tokens against a DFA. Returns the number of leading tokens
+/// that are grammar-legal (stops at first illegal token).
+/// If `dfa` is None, returns `tokens.len()` (no constraint).
+pub fn dfa_validate_draft(
+    dfa: Option<&llguidance::hw_dfa::HwDfa>,
+    start_state: u32,
+    tokens: &[u32],
+) -> usize {
+    let Some(dfa) = dfa else { return tokens.len() };
+    let mut state = start_state;
+    for &token in tokens {
+        match dfa.advance(state, token) {
+            Some(next) => state = next,
+            None => break,
+        }
+    }
+    // Count how many were accepted
+    let mut count = 0;
+    let mut s = start_state;
+    for &token in tokens {
+        match dfa.advance(s, token) {
+            Some(next) => { s = next; count += 1; }
+            None => break,
+        }
+    }
+    count
+}
+
 struct WindowedAcceptanceStats {
     label: &'static str,
     window_capacity: usize,

@@ -1,4 +1,5 @@
 use crate::core::sequence::{DecodeSequence, Sequence};
+pub use crate::core::runner::SpecSeqStatsData;
 use crate::models::layers::distributed::Id;
 use crate::server::EmbeddingStrategy;
 use crate::utils::config::{Config, EngineConfig, ModelType};
@@ -265,6 +266,11 @@ pub enum MessageType {
     UsableMemoryLeft(EngineConfig),
     /// shutdown subprocesses
     Shutdown,
+
+    /// Fetch per-seq speculative decoding stats from rank 0.
+    GetSpecSeqStats(usize),
+    /// Response to GetSpecSeqStats.
+    SpecSeqStatsResponse(usize, crate::core::runner::SpecSeqStatsData),
 }
 
 //inter-node communication
