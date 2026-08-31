@@ -521,8 +521,8 @@ pub struct DFlashDecoderLayer {
     mlp: MLP,
     input_layernorm: NormX,
     post_attention_layernorm: NormX,
-    attention_conv: Option<DFlashGroupedConv>,
-    mlp_conv: Option<DFlashGroupedConv>,
+    attention_conv: DFlashGroupedConv,
+    mlp_conv: DFlashGroupedConv,
 }
 
 impl DFlashDecoderLayer {
@@ -559,7 +559,7 @@ impl DFlashDecoderLayer {
             DType::F32,
             false,
         )?;
-        let (attention_conv, mlp_conv) = if config.is_dflash2() {
+        let (attention_conv, mlp_conv) = {
             let dflash_config = config.dflash_config.as_ref().ok_or_else(|| {
                 candle_core::Error::Msg("DFlash2 config is missing dflash_config".into())
             })?;
@@ -571,25 +571,23 @@ impl DFlashDecoderLayer {
             })?;
             let block_size = config.block_size();
             (
-                Some(DFlashGroupedConv::new(
+                DFlashGroupedConv::new(
                     vb.pp("attention_conv"),
                     config.hidden_size,
                     group_size,
                     taps,
                     block_size,
                     dtype,
-                )?),
-                Some(DFlashGroupedConv::new(
+                )?,
+                DFlashGroupedConv::new(
                     vb.pp("mlp_conv"),
                     config.hidden_size,
                     group_size,
                     taps,
                     block_size,
                     dtype,
-                )?),
+                )?,
             )
-        } else {
-            (None, None)
         };
 
         Ok(Self {
@@ -611,38 +609,20 @@ impl DFlashDecoderLayer {
     ) -> Result<Tensor> {
         let residual = hidden_states;
         let hidden_states = self.input_layernorm.forward(hidden_states)?;
-        let (hidden_states, attention_coefficients) = if let Some(conv) = &self.attention_conv {
-            let (hidden_states, coefficients) = conv.prepare(&hidden_states)?;
-            (hidden_states, Some(coefficients))
-        } else {
-            (hidden_states, None)
-        };
+        let (hidden_states, attention_coefficients) =
+            self.attention_conv.prepare(&hidden_states)?;
         let attn_output = self
             .self_attn
             .forward(&hidden_states, target_hidden, cos, sin)?;
-        let attn_output = if let (Some(conv), Some(coefficients)) =
-            (&self.attention_conv, &attention_coefficients)
-        {
-            conv.finish(&attn_output, coefficients)?
-        } else {
-            attn_output
-        };
+        let attn_output = self
+            .attention_conv
+            .finish(&attn_output, &attention_coefficients)?;
         let hidden_states = (attn_output + residual)?;
         let residual = &hidden_states;
         let hidden_states = self.post_attention_layernorm.forward(&hidden_states)?;
-        let (hidden_states, mlp_coefficients) = if let Some(conv) = &self.mlp_conv {
-            let (hidden_states, coefficients) = conv.prepare(&hidden_states)?;
-            (hidden_states, Some(coefficients))
-        } else {
-            (hidden_states, None)
-        };
+        let (hidden_states, mlp_coefficients) = self.mlp_conv.prepare(&hidden_states)?;
         let mlp_output = self.mlp.forward(&hidden_states)?;
-        let mlp_output =
-            if let (Some(conv), Some(coefficients)) = (&self.mlp_conv, &mlp_coefficients) {
-                conv.finish(&mlp_output, coefficients)?
-            } else {
-                mlp_output
-            };
+        let mlp_output = self.mlp_conv.finish(&mlp_output, &mlp_coefficients)?;
         residual + mlp_output
     }
 }
@@ -694,7 +674,7 @@ pub struct DFlashDraftModel {
     pub mask_token_id: Option<u32>,
     device: Device,
     dtype: DType,
-    candidate_selector: Option<DFlashCandidateSelector>,
+    candidate_selector: DFlashCandidateSelector,
 }
 
 impl DFlashDraftModel {
@@ -705,6 +685,11 @@ impl DFlashDraftModel {
         dtype: DType,
         device: &Device,
     ) -> Result<Self> {
+        if !config.is_dflash2() {
+            candle_core::bail!(
+                "DFlashDraftModel requires a DFlash2 checkpoint (selector_top_k / DFlash2 architecture)"
+            );
+        }
         let target_layer_ids = config.target_layer_ids();
         let fc_in_dim = target_layer_ids.len() * config.hidden_size;
 
@@ -745,25 +730,21 @@ impl DFlashDraftModel {
         )?;
 
         let rotary_emb = DFlashRotaryEmbedding::new(config, dtype, device)?;
-        let candidate_selector = if config.is_dflash2() {
-            let dflash_config = config.dflash_config.as_ref().ok_or_else(|| {
-                candle_core::Error::Msg("DFlash2 config is missing dflash_config".into())
-            })?;
-            Some(DFlashCandidateSelector::new(
-                vb.pp("candidate_selector"),
-                config.hidden_size,
-                config.vocab_size,
-                dflash_config.selector_rank.ok_or_else(|| {
-                    candle_core::Error::Msg("DFlash2 config is missing selector_rank".into())
-                })?,
-                dflash_config.selector_top_k.ok_or_else(|| {
-                    candle_core::Error::Msg("DFlash2 config is missing selector_top_k".into())
-                })?,
-                dtype,
-            )?)
-        } else {
-            None
-        };
+        let dflash_config = config.dflash_config.as_ref().ok_or_else(|| {
+            candle_core::Error::Msg("DFlash2 config is missing dflash_config".into())
+        })?;
+        let candidate_selector = DFlashCandidateSelector::new(
+            vb.pp("candidate_selector"),
+            config.hidden_size,
+            config.vocab_size,
+            dflash_config.selector_rank.ok_or_else(|| {
+                candle_core::Error::Msg("DFlash2 config is missing selector_rank".into())
+            })?,
+            dflash_config.selector_top_k.ok_or_else(|| {
+                candle_core::Error::Msg("DFlash2 config is missing selector_top_k".into())
+            })?,
+            dtype,
+        )?;
 
         Ok(Self {
             fc,
@@ -781,17 +762,20 @@ impl DFlashDraftModel {
         })
     }
 
-    pub fn extract_and_project_hidden(&self, all_hidden_states: &[Tensor]) -> Result<Tensor> {
+    pub fn concat_target_hiddens(&self, all_hidden_states: &[Tensor]) -> Result<Tensor> {
         let selected: Vec<Tensor> = (0..self.target_layer_ids.len())
             .map(|i| all_hidden_states[i + 1].clone())
             .collect();
-        let concatenated = Tensor::cat(&selected, D::Minus1)?;
+        Tensor::cat(&selected, D::Minus1)?.to_dtype(self.dtype)
+    }
+
+    pub fn extract_and_project_hidden(&self, all_hidden_states: &[Tensor]) -> Result<Tensor> {
+        let concatenated = self.concat_target_hiddens(all_hidden_states)?;
         let projected = self.fc.forward(&concatenated)?;
         self.hidden_norm.forward(&projected)
     }
 
-    /// Project target-layer hiddens already extracted into a draft context vector.
-    /// Used after graph-safe verify forwards that write layer buffers in-place.
+    /// Project per-layer verify buffers (no embedding prefix) into draft context rows.
     pub fn project_layer_hiddens(&self, layer_hiddens: &[Tensor]) -> Result<Tensor> {
         if layer_hiddens.len() != self.target_layer_ids.len() {
             candle_core::bail!(
@@ -800,7 +784,7 @@ impl DFlashDraftModel {
                 layer_hiddens.len()
             );
         }
-        let concatenated = Tensor::cat(layer_hiddens, D::Minus1)?;
+        let concatenated = Tensor::cat(layer_hiddens, D::Minus1)?.to_dtype(self.dtype)?;
         let projected = self.fc.forward(&concatenated)?;
         self.hidden_norm.forward(&projected)
     }
@@ -828,7 +812,7 @@ impl DFlashDraftModel {
     }
 
     pub fn is_dflash2(&self) -> bool {
-        self.candidate_selector.is_some()
+        true
     }
 
     pub fn select_candidates(
@@ -838,10 +822,6 @@ impl DFlashDraftModel {
         anchor_token: u32,
     ) -> Result<Vec<u32>> {
         self.candidate_selector
-            .as_ref()
-            .ok_or_else(|| {
-                candle_core::Error::Msg("DFlash2 candidate selector is unavailable".into())
-            })?
             .select(hidden_states, logits, anchor_token)
     }
 

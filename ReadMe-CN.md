@@ -60,10 +60,22 @@ xinfer --m /home/Qwen3.6-35B-A3B --d 0,1 --ui-server
 python3 -m xinfer.server --m Qwen/Qwen3.6-27B-FP8 --kvcache-dtype turbo4 --ui-server
 ```
 
-**MTP**
+**推测解码（MTP 与 DFlash2）**
+
+内置 MTP（目标模型需包含 MTP 层）：
+
 ```bash
-xinfer --w /home/Qwen3.6-35B-A3B --d 0,1 --ui-server --mtp 2
+xinfer --m Qwen/Qwen3.5-35B-A3B --d 0,1 --ui-server --num-speculative-tokens 3
 ```
+
+外部 DFlash2 草稿模型：
+
+```bash
+xinfer --m Qwen/Qwen3.8-... --d 0,1 --ui-server \
+  --draft-model <dflash2-草稿-id或路径> --num-speculative-tokens 7
+```
+
+详见 [docs/speculative_decoding-CN.md](docs/speculative_decoding-CN.md)（英文：[speculative_decoding.md](docs/speculative_decoding.md)）。
 
 > **提示：** 浏览器打开 `http://IP:8001` 即可使用内置对话界面，或使用 `http://IP:8000/v1/` 作为 API 服务 `Base URL`。
 
@@ -527,7 +539,8 @@ xinfer --m Qwen/Qwen3.6-27B-FP8 --ui-server --enable-tool-grammar
 | `--frequency-penalty` | 高频惩罚（−2 到 2） |
 | `--mcp-config` | MCP 服务器 JSON 配置 |
 | `--mcp-command` / `--mcp-args` | 单个 MCP 服务器命令及参数 |
-| `--mtp` | 启用MTP (只针对包含MTP层的模型) ，例如 `--mtp 2`，单次推理2个tokens |
+| `--num-speculative-tokens` | 每步推测草稿 token 数。在含 MTP 层的模型上启用**内置 MTP**，例如 `--num-speculative-tokens 3` |
+| `--draft-model` | 外部 **DFlash2** 草稿模型（HuggingFace ID 或本地目录）。设置后使用 DFlash2，而非内置 MTP。 |
 
 ### 环境变量
 
@@ -589,11 +602,12 @@ SM90_LOWER_PRECISION_GDN_PREFILL=1 xinfer --m Qwen/Qwen3.5-35B-A3B-FP8 --ui-serv
 * [x] **MXFP4/NVFP4 模型支持**
 * [x] **支持 Turboquant（4 位、3 位）KvCache**
 * [ ] TentorRT-LLM
-* [x] Multi-token Prediction (MTP)
+* [x] **多 token 预测（MTP）与 DFlash2 推测解码**
 ---
 
 ## 📚 参考项目
 
+- [推测解码（MTP 与 DFlash2）](docs/speculative_decoding-CN.md)
 - [Candle-vLLM](https://github.com/EricLBuehler/candle-vllm)
 - Python nano-vllm
 

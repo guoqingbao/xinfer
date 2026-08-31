@@ -913,6 +913,25 @@ impl Qwen3_5MoEForCausalLM {
         )
     }
 
+    pub fn forward_collecting_layers(
+        &self,
+        input_ids: &Tensor,
+        positions: &Tensor,
+        kv_caches: Option<&Vec<(Tensor, Tensor)>>,
+        input_metadata: &InputMetadata,
+        embeded_inputs: bool,
+        target_layer_ids: &[usize],
+    ) -> Result<(Tensor, Vec<Tensor>)> {
+        self.forward_with_hidden_states(
+            input_ids,
+            positions,
+            kv_caches,
+            input_metadata,
+            embeded_inputs,
+            target_layer_ids,
+        )
+    }
+
     pub fn forward_with_hidden_states(
         &self,
         input_ids: &Tensor,
@@ -964,6 +983,31 @@ impl Qwen3_5MoEForCausalLM {
             )?;
             if target_layer_ids.contains(&i) {
                 hidden_states_collector.push(xs.clone());
+            }
+
+            if input_metadata.is_mtp_verify {
+                if let (Ok(ids), Ok(bufs)) = (
+                    self.dflash_target_layer_ids.lock(),
+                    self.dflash_verify_hidden_buffers.lock(),
+                ) {
+                    if let Some(buffers) = bufs.as_ref() {
+                        for (buf_idx, &layer_id) in ids.iter().enumerate() {
+                            if layer_id == i {
+                                if let Some(buf) = buffers.get(buf_idx) {
+                                    let n = xs.dim(0)?;
+                                    if n <= buf.dim(0).unwrap_or(0) {
+                                        if xs.dtype() != buf.dtype() {
+                                            buf.narrow(0, 0, n)?
+                                                .copy_(&xs.to_dtype(buf.dtype())?, 0)?;
+                                        } else {
+                                            buf.narrow(0, 0, n)?.copy_(&xs, 0)?;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
         if !seqlens.is_empty() {

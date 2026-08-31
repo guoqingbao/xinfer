@@ -248,12 +248,9 @@ async fn main() -> Result<()> {
         args.master_addr.clone(),
         args.master_port,
         args.enable_tool_grammar,
-        None,
-    )
-    .with_mtp(args.mtp);
-    econfig.draft_model_id = args.draft_model_id.clone();
-    econfig.draft_model_path = args.draft_model_path.clone();
-    econfig.num_speculative_tokens = args.num_speculative_tokens;
+        args.num_speculative_tokens,
+    );
+    econfig.draft_model = args.draft_model.clone();
 
     // Multi-node worker nodes run a daemon loop instead of the full engine
     if econfig.num_nodes > 1 && econfig.node_rank > 0 {

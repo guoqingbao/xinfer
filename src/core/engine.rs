@@ -1047,19 +1047,15 @@ impl LLMEngine {
             }
         }
 
-        // Pre-allocate blocks for MTP speculative positions before cloning sequences
+        // Pre-allocate blocks for speculative verify positions before cloning sequences
         if !is_prefill {
-            if let Some(mtp_tokens) = self.econfig.mtp_num_speculative_tokens {
-                if mtp_tokens > 0 {
-                    self.scheduler
-                        .pre_allocate_mtp_blocks(&scheduled_ids, mtp_tokens + 1);
-                }
-            }
-            if let Some(dflash_tokens) = self.econfig.num_speculative_tokens {
-                if dflash_tokens > 0 {
-                    self.scheduler
-                        .pre_allocate_mtp_blocks(&scheduled_ids, dflash_tokens + 1);
-                }
+            if self.econfig.num_speculative_tokens.unwrap_or(0) > 0
+                && (crate::speculative::uses_builtin_mtp(&self.econfig)
+                    || crate::speculative::uses_dflash(&self.econfig))
+            {
+                let spec_tokens = self.econfig.num_speculative_tokens.unwrap_or(0);
+                self.scheduler
+                    .pre_allocate_mtp_blocks(&scheduled_ids, spec_tokens + 1);
             }
         }
 
@@ -2333,9 +2329,8 @@ impl LLMEngine {
             let engine = engine.clone();
             let (is_pd_server, runners, mtp_enabled, dflash_enabled) = {
                 let guard = engine.read();
-                let has_mtp = guard.econfig.mtp_num_speculative_tokens.is_some();
-                let has_dflash = guard.econfig.draft_model_id.is_some()
-                    || guard.econfig.draft_model_path.is_some();
+                let has_mtp = crate::speculative::uses_builtin_mtp(&guard.econfig);
+                let has_dflash = crate::speculative::uses_dflash(&guard.econfig);
                 (
                     guard.is_pd_mode() && guard.is_pd_server(),
                     guard.runners.clone(),

@@ -576,6 +576,8 @@ impl Qwen3_5ForCausalLM {
         visual_pos_masks: &Option<Tensor>,
         deepstack_visual_embeds: &Option<Vec<Tensor>>,
         return_hidden: bool,
+        collect_layer_ids: Option<&[usize]>,
+        collected_layers: &mut Option<Vec<Tensor>>,
     ) -> Result<Tensor> {
         let seqlens = input_metadata.seqlens.clone().unwrap_or_default();
 
@@ -593,6 +595,10 @@ impl Qwen3_5ForCausalLM {
         } else {
             self.embed_forward(input_ids)?
         };
+
+        if collect_layer_ids.is_some() {
+            *collected_layers = Some(vec![xs.clone()]);
+        }
 
         let mut kv_cache_idx = 0usize;
         let seq_slots = self.resolve_seq_slots(input_metadata, xs.dim(0)?)?;
@@ -620,6 +626,13 @@ impl Qwen3_5ForCausalLM {
                 &mut mamba_cache,
                 &seq_slots,
             )?;
+
+            if let (Some(layer_ids), Some(layers)) = (collect_layer_ids, collected_layers.as_mut())
+            {
+                if layer_ids.contains(&i) {
+                    layers.push(xs.clone());
+                }
+            }
 
             // Graph-safe DFlash verify: copy selected layer hiddens into preallocated buffers.
             // copy_ is captured into the CUDA graph, so replay updates the same storage.
@@ -655,6 +668,24 @@ impl Qwen3_5ForCausalLM {
                     xs = xs.apply_deep_stack(pos_mask, &deepstacks[i])?;
                 }
             }
+        }
+
+        if collect_layer_ids.is_some() {
+            let logits_xs = if !seqlens.is_empty() {
+                let indices: Vec<_> = seqlens.iter().map(|x| x - 1).collect();
+                let batch = indices.len();
+                xs.index_select(&Tensor::from_vec(indices, (batch,), xs.device())?, 0)?
+            } else {
+                xs
+            };
+            let logits_xs = self.norm.forward(&logits_xs)?;
+            return if self.is_qvar_builder {
+                self.lm_head.forward(&logits_xs)
+            } else {
+                self.lm_head
+                    .forward(&logits_xs.to_dtype(self.dtype)?)?
+                    .to_dtype(DType::F32)
+            };
         }
 
         if !seqlens.is_empty() && !return_hidden {
@@ -695,6 +726,7 @@ impl Qwen3_5ForCausalLM {
         input_metadata: &InputMetadata,
         embeded_inputs: bool,
     ) -> Result<Tensor> {
+        let mut none_layers = None;
         self.forward_inner(
             input_ids,
             positions,
@@ -704,6 +736,8 @@ impl Qwen3_5ForCausalLM {
             &None,
             &None,
             false,
+            None,
+            &mut none_layers,
         )
     }
 
@@ -715,6 +749,7 @@ impl Qwen3_5ForCausalLM {
         input_metadata: &InputMetadata,
         embeded_inputs: bool,
     ) -> Result<Tensor> {
+        let mut none_layers = None;
         self.forward_inner(
             input_ids,
             positions,
@@ -724,6 +759,8 @@ impl Qwen3_5ForCausalLM {
             &None,
             &None,
             true,
+            None,
+            &mut none_layers,
         )
     }
 
@@ -737,6 +774,7 @@ impl Qwen3_5ForCausalLM {
         input_metadata: &InputMetadata,
         embeded_inputs: bool,
     ) -> Result<(Tensor, Tensor)> {
+        let mut none_layers = None;
         let hidden = self.forward_inner(
             input_ids,
             positions,
@@ -746,22 +784,15 @@ impl Qwen3_5ForCausalLM {
             &None,
             &None,
             true,
+            None,
+            &mut none_layers,
         )?;
-        let logits = if self.is_qvar_builder {
-            self.lm_head.forward(&hidden)?
-        } else {
-            self.lm_head
-                .forward(&hidden.to_dtype(self.dtype)?)?
-                .to_dtype(DType::F32)?
-        };
+        let logits = self.forward_lm_head(&hidden)?;
         Ok((logits, hidden))
     }
 
-    /// Forward pass returning the hidden states needed by an external draft model.
-    ///
-    /// The returned list contains the embedding output followed by the outputs of
-    /// the requested transformer layers, in the same order as `target_layer_ids`.
-    pub fn forward_with_hidden_states(
+    /// Forward pass returning logits plus intermediate layer hidden states for DFlash.
+    pub fn forward_collecting_layers(
         &self,
         input_ids: &Tensor,
         positions: &Tensor,
@@ -770,67 +801,20 @@ impl Qwen3_5ForCausalLM {
         embeded_inputs: bool,
         target_layer_ids: &[usize],
     ) -> Result<(Tensor, Vec<Tensor>)> {
-        let seqlens = input_metadata.seqlens.clone().unwrap_or_default();
-        let attention_mask = get_attention_causal_mask(
-            &self.device,
-            self.dtype,
+        let mut collected_layers = None;
+        let logits = self.forward_inner(
+            input_ids,
             positions,
-            seqlens.clone(),
-            self.config.sliding_window,
-            input_metadata.is_prefill,
-        );
-        let mut xs = if embeded_inputs {
-            input_ids.clone()
-        } else {
-            self.embed_forward(input_ids)?
-        };
-        let mut hidden_states = vec![xs.clone()];
-        let mut kv_cache_idx = 0usize;
-        let seq_slots = self.resolve_seq_slots(input_metadata, xs.dim(0)?)?;
-        let mut mamba_cache = self.mamba_cache.write();
-
-        for (i, layer) in self.layers.iter().enumerate() {
-            let cache = if layer.is_full_attention() {
-                if let Some(kv_caches) = kv_caches {
-                    let current = &kv_caches[kv_cache_idx];
-                    kv_cache_idx += 1;
-                    Some((&current.0, &current.1))
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-            xs = layer.forward(
-                &xs,
-                attention_mask.as_ref(),
-                positions,
-                cache,
-                input_metadata,
-                &mut mamba_cache,
-                &seq_slots,
-            )?;
-            if target_layer_ids.contains(&i) {
-                hidden_states.push(xs.clone());
-            }
-        }
-
-        let logits_xs = if !seqlens.is_empty() {
-            let indices: Vec<_> = seqlens.iter().map(|x| x - 1).collect();
-            let batch = indices.len();
-            xs.index_select(&Tensor::from_vec(indices, (batch,), xs.device())?, 0)?
-        } else {
-            xs.clone()
-        };
-        let logits_xs = self.norm.forward(&logits_xs)?;
-        let logits = if self.is_qvar_builder {
-            self.lm_head.forward(&logits_xs)?
-        } else {
-            self.lm_head
-                .forward(&logits_xs.to_dtype(self.dtype)?)?
-                .to_dtype(DType::F32)?
-        };
-        Ok((logits, hidden_states))
+            kv_caches,
+            input_metadata,
+            embeded_inputs,
+            &None,
+            &None,
+            false,
+            Some(target_layer_ids),
+            &mut collected_layers,
+        )?;
+        Ok((logits, collected_layers.unwrap_or_default()))
     }
 
     pub fn forward_with_deepstack(
@@ -843,6 +827,7 @@ impl Qwen3_5ForCausalLM {
         visual_pos_masks: &Option<Tensor>,
         deepstack_visual_embeds: &Option<Vec<Tensor>>,
     ) -> Result<Tensor> {
+        let mut none_layers = None;
         self.forward_inner(
             input_ids,
             positions,
@@ -852,6 +837,8 @@ impl Qwen3_5ForCausalLM {
             visual_pos_masks,
             deepstack_visual_embeds,
             false,
+            None,
+            &mut none_layers,
         )
     }
 

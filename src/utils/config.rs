@@ -478,19 +478,14 @@ pub struct EngineConfig {
     pub master_addr: Option<String>,
     #[serde(default = "default_master_port")]
     pub master_port: u16,
-    /// MTP (Multi-Token Prediction) speculative decoding: number of draft tokens per step.
-    /// None means MTP is disabled.
-    #[serde(default)]
-    pub mtp_num_speculative_tokens: Option<usize>,
-    /// Optional DFlash/DFlash2 external draft model identifier.
-    #[serde(default)]
-    pub draft_model_id: Option<String>,
-    /// Optional local directory containing DFlash/DFlash2 weights.
-    #[serde(default)]
-    pub draft_model_path: Option<String>,
-    /// Number of tokens proposed by the external draft model per step.
+    /// Number of speculative draft tokens per decode step.
+    /// With built-in MTP heads (e.g. Qwen3.5), enables MTP decoding.
+    /// With `--draft-model`, enables external DFlash2 decoding.
     #[serde(default)]
     pub num_speculative_tokens: Option<usize>,
+    /// External DFlash2 draft model (HuggingFace id or local directory).
+    #[serde(default)]
+    pub draft_model: Option<String>,
     pub enable_tool_grammar: bool,
 }
 
@@ -604,16 +599,10 @@ pub struct EngineConfig {
     pub master_port: u16,
     #[pyo3(get, set)]
     #[serde(default)]
-    pub mtp_num_speculative_tokens: Option<usize>,
-    #[pyo3(get, set)]
-    #[serde(default)]
-    pub draft_model_id: Option<String>,
-    #[pyo3(get, set)]
-    #[serde(default)]
-    pub draft_model_path: Option<String>,
-    #[pyo3(get, set)]
-    #[serde(default)]
     pub num_speculative_tokens: Option<usize>,
+    #[pyo3(get, set)]
+    #[serde(default)]
+    pub draft_model: Option<String>,
     #[pyo3(get, set)]
     pub enable_tool_grammar: bool,
 }
@@ -630,8 +619,8 @@ impl EngineConfig {
         }
     }
 
-    pub fn with_mtp(mut self, mtp_tokens: Option<usize>) -> Self {
-        self.mtp_num_speculative_tokens = mtp_tokens;
+    pub fn with_num_speculative_tokens(mut self, tokens: Option<usize>) -> Self {
+        self.num_speculative_tokens = tokens;
         self
     }
 }
@@ -677,7 +666,7 @@ impl EngineConfig {
         master_addr: Option<String>,
         master_port: u16,
         enable_tool_grammar: bool,
-        mtp_num_speculative_tokens: Option<usize>,
+        num_speculative_tokens: Option<usize>,
     ) -> Self {
         let mut device_ids = device_ids.unwrap_or_default();
         if device_ids.is_empty() {
@@ -737,10 +726,8 @@ impl EngineConfig {
             node_rank,
             master_addr,
             master_port,
-            mtp_num_speculative_tokens,
-            draft_model_id: None,
-            draft_model_path: None,
-            num_speculative_tokens: None,
+            num_speculative_tokens,
+            draft_model: None,
             enable_tool_grammar,
         }
     }

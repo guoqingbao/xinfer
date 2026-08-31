@@ -152,8 +152,8 @@ pub struct ModelRunner {
     pub(crate) mtp_head: Option<Arc<Qwen3_5MtpHead>>,
     /// Number of speculative tokens to draft per step
     pub(crate) mtp_num_speculative: usize,
-    /// Optional external DFlash/DFlash2 drafter.
-    pub(crate) dflash_drafter: Option<crate::core::dflash_drafter::DFlashDrafter>,
+    /// Optional external DFlash2 drafter.
+    pub(crate) dflash_drafter: Option<crate::speculative::DFlashDrafter>,
 }
 
 impl ModelRunner {
@@ -285,25 +285,26 @@ impl ModelRunner {
         stream: Option<LocalStream>,
     ) -> Result<Self> {
         attention_rs::reset_paged_attention_layer_counter();
-        let requested_mtp_num_speculative = econfig.mtp_num_speculative_tokens.unwrap_or(0);
+        let requested_num_speculative = econfig.num_speculative_tokens.unwrap_or(0);
+        let uses_dflash = crate::speculative::uses_dflash(econfig);
+        let uses_builtin_mtp = crate::speculative::uses_builtin_mtp(econfig) && !uses_dflash;
         let is_mtp_model_type = Self::is_mtp_model_type(&model_type);
         let has_mtp_config = config.mtp_num_hidden_layers.unwrap_or(0) > 0;
         let has_mtp_weights = Self::has_mtp_weights(vb, config);
-        config.mtp_enabled = requested_mtp_num_speculative > 0
+        let mut builtin_mtp_enabled = uses_builtin_mtp
+            && requested_num_speculative > 0
             && is_mtp_model_type
             && (has_mtp_config || has_mtp_weights)
             && has_mtp_weights;
-        let external_speculative_enabled =
-            econfig.draft_model_id.is_some() || econfig.draft_model_path.is_some();
-        let external_num_spec = econfig.num_speculative_tokens.unwrap_or(0);
-        if external_speculative_enabled && external_num_spec > 0 {
-            // DFlash verification uses the same per-token GDN snapshots as MTP.
+        if uses_dflash {
             config.mtp_enabled = true;
+        } else {
+            config.mtp_enabled = builtin_mtp_enabled;
         }
         // Size GDN MTP snapshot buffers for worst-case packed verify:
         // max_num_seqs * (speculative_tokens + 1).
         if config.mtp_enabled {
-            let spec_tokens = requested_mtp_num_speculative.max(external_num_spec).max(1);
+            let spec_tokens = requested_num_speculative.max(1);
             let max_seqs = econfig.max_num_parallel_reqs.max(1);
             config.mtp_max_verify_tokens = max_seqs.saturating_mul(spec_tokens.saturating_add(1));
         }
@@ -366,9 +367,7 @@ impl ModelRunner {
         );
 
         #[cfg(all(feature = "cuda", feature = "graph"))]
-        let mtp_wrapper = if econfig.mtp_num_speculative_tokens.unwrap_or(0) > 0
-            || (external_speculative_enabled && econfig.num_speculative_tokens.unwrap_or(0) > 0)
-        {
+        let mtp_wrapper = if uses_dflash || (uses_builtin_mtp && requested_num_speculative > 0) {
             Some(crate::graph_wrapper!(
                 &model,
                 device,
@@ -671,59 +670,68 @@ impl ModelRunner {
             );
         }
 
-        let (mtp_head, mut mtp_num_speculative) = if let Some(num_spec) =
-            econfig.mtp_num_speculative_tokens
-        {
-            if requested_mtp_num_speculative == 0 {
-                (None, 0)
-            } else if config.mtp_enabled {
-                match crate::models::qwen3_5_mtp::Qwen3_5MtpHead::new(
-                    vb,
-                    comm.clone(),
-                    config,
-                    dtype,
-                    is_rope_i,
-                    &device,
-                ) {
-                    Ok(head) => {
-                        crate::log_info!(
-                            "MTP head loaded: {} speculative tokens per step",
-                            num_spec
-                        );
-                        (Some(Arc::new(head)), num_spec)
+        let (mtp_head, mut mtp_num_speculative) = if uses_builtin_mtp {
+            if let Some(num_spec) = econfig.num_speculative_tokens {
+                if requested_num_speculative == 0 {
+                    (None, 0)
+                } else if builtin_mtp_enabled {
+                    match crate::models::qwen3_5_mtp::Qwen3_5MtpHead::new(
+                        vb,
+                        comm.clone(),
+                        config,
+                        dtype,
+                        is_rope_i,
+                        &device,
+                    ) {
+                        Ok(head) => {
+                            crate::log_info!(
+                                "MTP head loaded: {} speculative tokens per step",
+                                num_spec
+                            );
+                            (Some(Arc::new(head)), num_spec)
+                        }
+                        Err(e) => {
+                            crate::log_warn!("Failed to load MTP head: {}. MTP disabled.", e);
+                            (None, 0)
+                        }
                     }
-                    Err(e) => {
-                        crate::log_warn!("Failed to load MTP head: {}. MTP disabled.", e);
-                        (None, 0)
-                    }
-                }
-            } else if !is_mtp_model_type {
-                crate::log_info!(
-                    "MTP requested but model type {:?} does not support MTP. MTP disabled.",
-                    model_type
-                );
-                (None, 0)
-            } else if !has_mtp_weights {
-                crate::log_info!(
-                    "MTP requested but model weights do not contain MTP layers. MTP disabled."
-                );
-                (None, 0)
-            } else {
-                crate::log_info!(
+                } else if !is_mtp_model_type {
+                    crate::log_info!(
+                        "MTP requested but model type {:?} does not support MTP. MTP disabled.",
+                        model_type
+                    );
+                    (None, 0)
+                } else if !has_mtp_weights {
+                    crate::log_info!(
+                        "MTP requested but model weights do not contain MTP layers. MTP disabled."
+                    );
+                    (None, 0)
+                } else {
+                    crate::log_info!(
                         "MTP requested but model config has no MTP layers (mtp_num_hidden_layers={}). MTP disabled.",
                         config.mtp_num_hidden_layers.unwrap_or(0)
                     );
+                    (None, 0)
+                }
+            } else {
                 (None, 0)
             }
         } else {
             (None, 0)
         };
-        let dflash_drafter = Self::init_dflash_drafter(econfig, comm.clone(), &device)?;
-        // DFlash reuses the MTP verify CUDA-graph capturer. When only DFlash is
-        // enabled, borrow mtp_num_speculative for capture/replay sizing.
+        let dflash_drafter =
+            crate::speculative::dflash::init_dflash_drafter(econfig, comm.clone(), &device)?;
+        // DFlash2 reuses the MTP verify CUDA-graph capturer. When only DFlash2 is
+        // enabled, borrow num_speculative for capture/replay sizing.
         if mtp_num_speculative == 0 {
             if let Some(drafter) = dflash_drafter.as_ref() {
                 mtp_num_speculative = drafter.num_speculative_tokens;
+                if econfig.num_speculative_tokens.is_none() {
+                    econfig.num_speculative_tokens = Some(drafter.num_speculative_tokens);
+                }
+                let max_seqs = econfig.max_num_parallel_reqs.max(1);
+                config.mtp_max_verify_tokens =
+                    max_seqs.saturating_mul(drafter.num_speculative_tokens.saturating_add(1));
             }
         }
         if let Some(drafter) = dflash_drafter.as_ref() {
@@ -790,52 +798,6 @@ impl ModelRunner {
             mtp_num_speculative,
             dflash_drafter,
         })
-    }
-
-    fn init_dflash_drafter(
-        econfig: &EngineConfig,
-        comm: Rc<Comm>,
-        device: &Device,
-    ) -> Result<Option<crate::core::dflash_drafter::DFlashDrafter>> {
-        if econfig.draft_model_id.is_none() && econfig.draft_model_path.is_none() {
-            return Ok(None);
-        }
-
-        if !matches!(
-            econfig.num_speculative_tokens,
-            Some(tokens) if tokens > 0
-        ) {
-            candle_core::bail!("DFlash requires --num-speculative-tokens to be greater than zero");
-        }
-
-        crate::log_info!("Loading external DFlash draft model...");
-        let loader = crate::utils::downloader::Downloader::new(
-            econfig.draft_model_id.clone(),
-            econfig.draft_model_path.clone(),
-            None,
-        );
-        let (draft_paths, is_gguf) = loader
-            .prepare_draft_model_weights(econfig.hf_token.clone(), econfig.hf_token_path.clone())?;
-        if is_gguf {
-            candle_core::bail!("DFlash draft models must use safetensors weights");
-        }
-
-        let config_data = std::fs::read(draft_paths.get_config_filename())
-            .map_err(|e| candle_core::Error::Msg(format!("Failed to read DFlash config: {e}")))?;
-        let draft_config: crate::models::dflash::DFlashModelConfig =
-            serde_json::from_slice(&config_data).map_err(|e| {
-                candle_core::Error::Msg(format!("Failed to parse DFlash config: {e}"))
-            })?;
-        let drafter = crate::core::dflash_drafter::DFlashDrafter::new(
-            &draft_config,
-            &draft_paths.get_weight_filenames(),
-            comm,
-            DType::BF16,
-            device,
-            econfig.num_speculative_tokens,
-        )?;
-        crate::log_info!("External DFlash draft model loaded successfully");
-        Ok(Some(drafter))
     }
 
     pub fn has_dflash_drafter(&self) -> bool {
@@ -1085,7 +1047,7 @@ impl ModelRunner {
         let logits = if let Some(drafter) = self.dflash_drafter.as_ref() {
             let target_layer_ids = drafter.target_layer_ids();
             let (logits, hidden_states) = match &self.model {
-                Model::Qwen3_5(model) => model.forward_with_hidden_states(
+                Model::Qwen3_5(model) => model.forward_collecting_layers(
                     &input_ids,
                     &positions,
                     kv_pairs,
@@ -1109,7 +1071,9 @@ impl ModelRunner {
                     false,
                     target_layer_ids,
                 )?,
-                _ => candle_core::bail!("DFlash currently supports Qwen3.5 target models"),
+                _ => {
+                    candle_core::bail!("DFlash2 supports Qwen3.5 / Qwen3.5 MoE / Qwen3-VL targets")
+                }
             };
             let projected = drafter.extract_and_concat_hidden(&hidden_states)?;
             let mut offset = 0usize;
@@ -1975,7 +1939,7 @@ impl ModelRunner {
             // self.decode_capturer.model.sync()?;
             if let Some(mtp_cap) = &mut self.mtp_capturer {
                 let label = if self.dflash_drafter.is_some() {
-                    "DFlash"
+                    "DFlash2"
                 } else {
                     "MTP"
                 };

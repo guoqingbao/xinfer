@@ -308,8 +308,8 @@ impl EngineConfig {
         pd_server_prefix_cache_ratio=None, pd_client_prefix_cache_ratio=None, yarn_scaling_factor=None,
         disable_reasoning=false, disable_cuda_graph=false, prefill_chunk_size=Some(8192),
         num_nodes=1, node_rank=0, master_addr=None, master_port=29500,
-        enable_tool_grammar=false, mtp_num_speculative_tokens=None,
-        draft_model_id=None, draft_model_path=None, num_speculative_tokens=None,))]
+        enable_tool_grammar=false, num_speculative_tokens=None,
+        draft_model=None,))]
     pub fn new(
         model_id: Option<String>,
         weight_path: Option<String>,
@@ -349,10 +349,8 @@ impl EngineConfig {
         master_addr: Option<String>,
         master_port: u16,
         enable_tool_grammar: bool,
-        mtp_num_speculative_tokens: Option<usize>,
-        draft_model_id: Option<String>,
-        draft_model_path: Option<String>,
         num_speculative_tokens: Option<usize>,
+        draft_model: Option<String>,
     ) -> Self {
         let mut device_ids = device_ids.unwrap_or_default();
         if device_ids.is_empty() {
@@ -413,10 +411,8 @@ impl EngineConfig {
             node_rank,
             master_addr,
             master_port,
-            mtp_num_speculative_tokens,
-            draft_model_id,
-            draft_model_path,
             num_speculative_tokens,
+            draft_model,
             enable_tool_grammar,
         }
     }

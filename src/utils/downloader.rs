@@ -473,7 +473,7 @@ impl Downloader {
             }
             _ => {
                 candle_core::bail!(
-                    "Draft model requires either --draft-model-path or --draft-model-id"
+                    "Draft model requires --draft-model (HuggingFace id or local directory)"
                 );
             }
         }

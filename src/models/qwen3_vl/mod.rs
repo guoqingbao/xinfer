@@ -791,7 +791,7 @@ impl Qwen3VLForConditionalGeneration {
         target_layer_ids: &[usize],
     ) -> Result<(Tensor, Vec<Tensor>)> {
         match &self.text_model {
-            Qwen3TextModel::Dense35(model) => model.forward_with_hidden_states(
+            Qwen3TextModel::Dense35(model) => model.forward_collecting_layers(
                 input_ids,
                 positions,
                 kv_caches,
@@ -811,6 +811,26 @@ impl Qwen3VLForConditionalGeneration {
                 "forward_with_hidden_states only supported for Qwen3.5 text models"
             ),
         }
+    }
+
+    /// Alias kept for newer call sites.
+    pub fn forward_collecting_layers(
+        &self,
+        input_ids: &Tensor,
+        positions: &Tensor,
+        kv_caches: Option<&Vec<(Tensor, Tensor)>>,
+        input_metadata: &InputMetadata,
+        embeded_inputs: bool,
+        target_layer_ids: &[usize],
+    ) -> Result<(Tensor, Vec<Tensor>)> {
+        self.forward_with_hidden_states(
+            input_ids,
+            positions,
+            kv_caches,
+            input_metadata,
+            embeded_inputs,
+            target_layer_ids,
+        )
     }
 
     /// Apply lm_head to hidden states (for MTP drafting).
