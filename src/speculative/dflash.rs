@@ -156,6 +156,11 @@ impl DFlashDrafter {
         self.cached_target_hidden.lock().unwrap().remove(&seq_id);
     }
 
+    /// The bounded projected-context window size (0 = unbounded).
+    pub fn context_window(&self) -> usize {
+        self.context_window
+    }
+
     pub fn build_draft_context(&self, seq_id: usize) -> Result<Option<Tensor>> {
         let cached = self.cached_target_hidden.lock().unwrap();
         Ok(cached.get(&seq_id).cloned())

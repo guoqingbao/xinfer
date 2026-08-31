@@ -13,6 +13,7 @@ pub struct GuidedDecodingRequest<'a> {
     pub reasoning_end_ids: &'a [u32],
 }
 
+#[derive(Clone)]
 pub struct GuidedDecodingStep {
     guided_seq_ids: Option<HashSet<usize>>,
 }

@@ -58,6 +58,20 @@ pub struct CachedSamplingParams {
     pub presence_penalty: Option<f32>,
 }
 
+/// Per-sequence speculative decoding stats (captured at sequence end).
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct SpecSeqStatsData {
+    pub mechanism: String,
+    pub steps: usize,
+    pub proposed: usize,
+    pub accepted: usize,
+    pub k_moves: usize,
+    pub k_min: usize,
+    pub k_max: usize,
+    pub target_bound: usize,
+    pub grammar_bound: usize,
+}
+
 #[derive(Clone, Copy)]
 pub enum Seqs<'a> {
     SeqRefs(&'a [&'a Sequence]),
@@ -1110,9 +1124,9 @@ impl ModelRunner {
                         // Prefill position check: only seed DFlash context when within
                         // context_window tokens of the prefill end. Prevents accumulating
                         // truncated early-prefill context (which degrades draft quality).
-                        let should_seed = if is_prefill && context_window > 0 {
+                        let should_seed = if is_prefill && drafter.context_window() > 0 {
                             sequence.len().saturating_sub(sequence.num_cached_tokens)
-                                <= context_window
+                                <= drafter.context_window()
                         } else {
                             true
                         };
@@ -1911,7 +1925,7 @@ impl ModelRunner {
                         vob_words.as_ref(),
                     )?;
                     self.guided_decoding.apply_fast_forward(&seq_ids, &mut tokens);
-                    self.guided_decoding.commit(&seq_ids, &tokens, guided_step);
+                    self.guided_decoding.commit(&seq_ids, &tokens, guided_step.clone());
                     tokens
                 } else {
                     let mask = self
@@ -1923,15 +1937,16 @@ impl ModelRunner {
                         mask.as_ref(),
                     )?;
                     self.guided_decoding.apply_fast_forward(&seq_ids, &mut tokens);
-                    self.guided_decoding.commit(&seq_ids, &tokens, guided_step);
+                    self.guided_decoding.commit(&seq_ids, &tokens, guided_step.clone());
                     tokens
                 }
             } else {
                 let guided_delta = (&guided_logits - &original_guided_logits)?;
-                logits.index_add(&guided_indices, &guided_delta, 0)?
+                let modified_logits = logits.index_add(&guided_indices, &guided_delta, 0)?;
+                self.sample_processed_logits(&modified_logits, &cached_params.sampling)?
             };
             let mut tokens =
-                self.sample_processed_logits(&sample_logits, &cached_params.sampling)?;
+                self.sample_processed_logits(&logits, &cached_params.sampling)?;
             self.guided_decoding
                 .apply_fast_forward(&seq_ids, &mut tokens);
             self.guided_decoding.commit(&seq_ids, &tokens, guided_step);
@@ -2024,22 +2039,7 @@ impl ModelRunner {
                     label,
                     self.mtp_num_speculative
                 );
-mtp_cap.capture_mtp(&self.device, kv_pairs, &verify_lens, label)?;
-            }
-        }
-
-        // Opt-in DFlash draft graph (XINFER_SPEC_GRAPH): capture the draft transformer.
-        if let Some(graph) = self.dflash_draft_graph.as_mut() {
-            if let Some(drafter) = self.dflash_drafter.as_ref() {
-                let dm = &drafter.draft_model;
-                crate::log_info!("Capturing DFlash draft graph...");
-                graph.capture(|th, ne, pos| dm.forward(th, ne, pos))?;
-                crate::log_warn!(
-                    "Captured DFlash draft graph cap={} block={} hidden={}",
-                    graph.cap(),
-                    graph.block(),
-                    graph.hidden()
-                );
+mtp_cap.capture_mtp(&self.device, kv_pairs, self.mtp_num_speculative)?;
             }
         }
 

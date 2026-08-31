@@ -373,6 +373,8 @@ impl GuidanceState {
             llm_tokens: self.llm_tokens.clone(),
             reasoning_end_ids: self.reasoning_end_ids.clone(),
             reasoning_ended: self.reasoning_ended,
+            dfa: self.dfa.clone(),
+            dfa_state: self.dfa_state,
         }
     }
 
