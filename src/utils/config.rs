@@ -1726,7 +1726,7 @@ mod tests {
             "quantization_status": "compressed",
             "sparsity_config": {},
             "transform_config": {},
-            "version": "0.14.4.dev54+g704d57b"
+            "version": "0.14.5.dev54+g704d57b"
         }"#;
         let mut cfg: QuantConfig = serde_json::from_str(json).unwrap();
         cfg.normalize_compressed_tensors();
@@ -1834,7 +1834,7 @@ mod tests {
             "quantization_status": "compressed",
             "sparsity_config": {},
             "transform_config": {},
-            "version": "0.14.4.a20260310"
+            "version": "0.14.5.a20260310"
         }"#;
         let mut cfg: QuantConfig = serde_json::from_str(json).unwrap();
         cfg.normalize_compressed_tensors();
