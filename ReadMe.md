@@ -61,10 +61,22 @@ xinfer --m /home/Qwen3.6-35B-A3B --d 0,1 --ui-server
 python3 -m xinfer.server --m Qwen/Qwen3.6-27B-FP8 --kvcache-dtype turbo4 --ui-server
 ```
 
-**MTP**
+**Speculative decoding (MTP & DFlash2)**
+
+Built-in MTP (model must include MTP heads):
+
 ```bash
-xinfer --w /home/Qwen3.6-35B-A3B --d 0,1 --ui-server --mtp 2
+xinfer --m Qwen/Qwen3.5-35B-A3B --d 0,1 --ui-server --num-speculative-tokens 3
 ```
+
+External DFlash2 draft model:
+
+```bash
+xinfer --m Qwen/Qwen3.8-... --d 0,1 --ui-server \
+  --draft-model <dflash2-draft-id-or-path> --num-speculative-tokens 7
+```
+
+See [docs/speculative_decoding.md](docs/speculative_decoding.md) for details.
 
 > **Tip:** Open `http://IP:8001` for the built-in chat UI, or use `http://IP:8000/v1/` as your API `Base URL`.
 
@@ -529,7 +541,8 @@ xinfer --m Qwen/Qwen3.6-27B-FP8 --ui-server --enable-tool-grammar
 | `--frequency-penalty` | Penalize frequent tokens (−2 to 2) |
 | `--mcp-config` | MCP servers JSON config |
 | `--mcp-command` / `--mcp-args` | Single MCP server command + args |
-| `--mtp`| Multi-token prediction, usage `--mtp 2` for two-token prediction per forward pass |
+| `--num-speculative-tokens` | Speculative draft tokens per decode step. Enables **built-in MTP** on models with MTP heads (e.g. Qwen3.5). Example: `--num-speculative-tokens 3` |
+| `--draft-model` | External **DFlash2** draft model (HuggingFace id or local directory). When set, uses DFlash2 instead of built-in MTP. |
 
 ### Environment Variables
 
@@ -591,7 +604,7 @@ SM90_LOWER_PRECISION_GDN_PREFILL=1 xinfer --m Qwen/Qwen3.5-35B-A3B-FP8 --ui-serv
 * [x] **MXFP4/NVFP4 Model Support**
 * [x] **Support Turboquant (4-bit, 3-bit) KvCache**
 * [ ] TentorRT-LLM
-* [x] **Multi-token Prediciton (MTP)**
+* [x] **Multi-token Prediction (MTP) & DFlash2 speculative decoding**
 
 ---
 

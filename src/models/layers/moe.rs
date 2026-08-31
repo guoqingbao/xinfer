@@ -3383,7 +3383,7 @@ impl FusedMoeNvfp4 {
                 is_prefill,
                 None,
                 projection.scales_swizzled.as_ref(),
-                projection.half_scales.as_ref(),
+                None,
             )?,
             Nvfp4GateUpWeights::Separate { gate, up } => {
                 let gate_output = moe::moe_gemm_nvfp4(

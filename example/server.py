@@ -51,10 +51,16 @@ def parse_args():
     parser.add_argument("--disable-cuda-graph", action="store_true")
     parser.add_argument("--prefill-chunk-size", type=int, default=8192)
     parser.add_argument(
-        "--mtp",
+        "--num-speculative-tokens",
         type=int,
         default=None,
-        help="number of speculative draft tokens per MTP step",
+        help="speculative draft tokens per decode step (built-in MTP when draft model is unset)",
+    )
+    parser.add_argument(
+        "--draft-model",
+        type=str,
+        default=None,
+        help="external DFlash/DFlash2 draft model (HuggingFace id or local path)",
     )
 
     args = parser.parse_args()
@@ -138,7 +144,8 @@ def run_server(args):
         disable_reasoning=args.disable_reasoning,
         disable_cuda_graph=args.disable_cuda_graph,
         prefill_chunk_size=args.prefill_chunk_size,
-        mtp_num_speculative_tokens=args.mtp,
+        num_speculative_tokens=args.num_speculative_tokens,
+        draft_model=args.draft_model,
     )
 
     engine = Engine(cfg, args.dtype)

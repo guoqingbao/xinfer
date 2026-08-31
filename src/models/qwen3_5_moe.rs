@@ -346,6 +346,8 @@ pub struct Qwen3_5MoEForCausalLM {
     is_qvar_builder: bool,
     /// Pre-allocated hidden state buffer for MTP speculative decoding (graph-safe).
     pub mtp_hidden_buffer: std::sync::Mutex<Option<Tensor>>,
+    pub dflash_verify_hidden_buffers: std::sync::Mutex<Option<Vec<Tensor>>>,
+    pub dflash_target_layer_ids: std::sync::Mutex<Vec<usize>>,
 }
 
 impl Qwen3_5MoEForCausalLM {
@@ -634,6 +636,8 @@ impl Qwen3_5MoEForCausalLM {
             vocab_size,
             is_qvar_builder,
             mtp_hidden_buffer: std::sync::Mutex::new(None),
+            dflash_verify_hidden_buffers: std::sync::Mutex::new(None),
+            dflash_target_layer_ids: std::sync::Mutex::new(Vec::new()),
         })
     }
 
@@ -656,6 +660,55 @@ impl Qwen3_5MoEForCausalLM {
         buf.get(0).ok()
     }
 
+    pub fn preallocate_dflash_verify_buffers(
+        &self,
+        target_layer_ids: &[usize],
+        max_verify_len: usize,
+    ) -> Result<()> {
+        // Match residual-stream dtype: GGUF / ISQ / higher-precision promote to F32;
+        // FP8 safetensors keep model dtype (BF16/F16) in the residual stream.
+        let buf_dtype = if self.is_qvar_builder
+            || self.config.quant.is_some()
+            || self.config.higher_precision_required()
+        {
+            DType::F32
+        } else {
+            self.dtype
+        };
+        let mut buffers = Vec::with_capacity(target_layer_ids.len());
+        for _ in target_layer_ids {
+            buffers.push(Tensor::zeros(
+                (max_verify_len, self.config.hidden_size),
+                buf_dtype,
+                &self.device,
+            )?);
+        }
+        if let Ok(mut guard) = self.dflash_verify_hidden_buffers.lock() {
+            *guard = Some(buffers);
+        }
+        if let Ok(mut guard) = self.dflash_target_layer_ids.lock() {
+            *guard = target_layer_ids.to_vec();
+        }
+        Ok(())
+    }
+
+    pub fn take_dflash_verify_hiddens(&self, num_tokens: usize) -> Option<Vec<Tensor>> {
+        let ids = self.dflash_target_layer_ids.lock().ok()?;
+        let guard = self.dflash_verify_hidden_buffers.lock().ok()?;
+        let buffers = guard.as_ref()?;
+        if buffers.len() != ids.len() || num_tokens == 0 {
+            return None;
+        }
+        let mut out = Vec::with_capacity(buffers.len());
+        for buf in buffers {
+            if num_tokens > buf.dim(0).ok()? {
+                return None;
+            }
+            out.push(buf.narrow(0, 0, num_tokens).ok()?.contiguous().ok()?);
+        }
+        Some(out)
+    }
+
     pub fn preallocate_mtp_hidden_buffer(&self, max_batch_size: usize) -> Result<()> {
         let buf = Tensor::zeros(
             (max_batch_size, self.config.hidden_size),
@@ -676,6 +729,7 @@ impl Qwen3_5MoEForCausalLM {
         input_metadata: &InputMetadata,
         embeded_inputs: bool,
     ) -> Result<(Tensor, Tensor)> {
+        let mut none_layers = None;
         let hidden = self.forward_inner(
             input_ids,
             positions,
@@ -685,6 +739,8 @@ impl Qwen3_5MoEForCausalLM {
             &None,
             &None,
             true,
+            None,
+            &mut none_layers,
         )?;
         let logits = if self.is_qvar_builder {
             self.lm_head.forward(&hidden)?
@@ -716,6 +772,8 @@ impl Qwen3_5MoEForCausalLM {
         visual_pos_masks: &Option<Tensor>,
         deepstack_visual_embeds: &Option<Vec<Tensor>>,
         return_hidden: bool,
+        collect_layer_ids: Option<&[usize]>,
+        collected_layers: &mut Option<Vec<Tensor>>,
     ) -> Result<Tensor> {
         let seqlens = input_metadata.seqlens.clone().unwrap_or_default();
         let attention_mask = get_attention_causal_mask(
@@ -732,6 +790,10 @@ impl Qwen3_5MoEForCausalLM {
         } else {
             self.embed_forward(input_ids)?
         };
+
+        if collect_layer_ids.is_some() {
+            *collected_layers = Some(vec![xs.clone()]);
+        }
 
         let mut kv_cache_idx = 0usize;
         let seq_slots = self.resolve_seq_slots(input_metadata, xs.dim(0)?)?;
@@ -760,6 +822,38 @@ impl Qwen3_5MoEForCausalLM {
                 &seq_slots,
             )?;
 
+            if let (Some(layer_ids), Some(layers)) = (collect_layer_ids, collected_layers.as_mut())
+            {
+                if layer_ids.contains(&i) {
+                    layers.push(xs.clone());
+                }
+            }
+
+            if input_metadata.is_mtp_verify {
+                if let (Ok(ids), Ok(bufs)) = (
+                    self.dflash_target_layer_ids.lock(),
+                    self.dflash_verify_hidden_buffers.lock(),
+                ) {
+                    if let Some(buffers) = bufs.as_ref() {
+                        for (buf_idx, &layer_id) in ids.iter().enumerate() {
+                            if layer_id == i {
+                                if let Some(buf) = buffers.get(buf_idx) {
+                                    let n = xs.dim(0)?;
+                                    if n <= buf.dim(0).unwrap_or(0) {
+                                        if xs.dtype() != buf.dtype() {
+                                            buf.narrow(0, 0, n)?
+                                                .copy_(&xs.to_dtype(buf.dtype())?, 0)?;
+                                        } else {
+                                            buf.narrow(0, 0, n)?.copy_(&xs, 0)?;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             if let (Some(pos_mask), Some(deepstacks)) = (visual_pos_masks, deepstack_visual_embeds)
             {
                 use crate::models::layers::deepstack::ApplyDeepStack;
@@ -767,6 +861,24 @@ impl Qwen3_5MoEForCausalLM {
                     xs = xs.apply_deep_stack(pos_mask, &deepstacks[i])?;
                 }
             }
+        }
+
+        if collect_layer_ids.is_some() {
+            let logits_xs = if !seqlens.is_empty() {
+                let indices: Vec<_> = seqlens.iter().map(|x| x - 1).collect();
+                let batch = indices.len();
+                xs.index_select(&Tensor::from_vec(indices, (batch,), xs.device())?, 0)?
+            } else {
+                xs
+            };
+            let logits_xs = self.norm.forward(&logits_xs)?;
+            return if self.is_qvar_builder {
+                self.lm_head.forward(&logits_xs)
+            } else {
+                self.lm_head
+                    .forward(&logits_xs.to_dtype(self.dtype)?)?
+                    .to_dtype(DType::F32)
+            };
         }
 
         if !seqlens.is_empty() && !return_hidden {
@@ -803,6 +915,7 @@ impl Qwen3_5MoEForCausalLM {
         input_metadata: &InputMetadata,
         embeded_inputs: bool,
     ) -> Result<Tensor> {
+        let mut none_layers = None;
         self.forward_inner(
             input_ids,
             positions,
@@ -812,6 +925,8 @@ impl Qwen3_5MoEForCausalLM {
             &None,
             &None,
             false,
+            None,
+            &mut none_layers,
         )
     }
 
@@ -823,6 +938,7 @@ impl Qwen3_5MoEForCausalLM {
         input_metadata: &InputMetadata,
         embeded_inputs: bool,
     ) -> Result<Tensor> {
+        let mut none_layers = None;
         self.forward_inner(
             input_ids,
             positions,
@@ -832,7 +948,35 @@ impl Qwen3_5MoEForCausalLM {
             &None,
             &None,
             true,
+            None,
+            &mut none_layers,
         )
+    }
+
+    /// Forward pass returning logits plus intermediate layer hidden states for DFlash.
+    pub fn forward_collecting_layers(
+        &self,
+        input_ids: &Tensor,
+        positions: &Tensor,
+        kv_caches: Option<&Vec<(Tensor, Tensor)>>,
+        input_metadata: &InputMetadata,
+        embeded_inputs: bool,
+        target_layer_ids: &[usize],
+    ) -> Result<(Tensor, Vec<Tensor>)> {
+        let mut collected_layers = None;
+        let logits = self.forward_inner(
+            input_ids,
+            positions,
+            kv_caches,
+            input_metadata,
+            embeded_inputs,
+            &None,
+            &None,
+            false,
+            Some(target_layer_ids),
+            &mut collected_layers,
+        )?;
+        Ok((logits, collected_layers.unwrap_or_default()))
     }
 
     pub fn forward_with_deepstack(
@@ -845,6 +989,7 @@ impl Qwen3_5MoEForCausalLM {
         visual_pos_masks: &Option<Tensor>,
         deepstack_visual_embeds: &Option<Vec<Tensor>>,
     ) -> Result<Tensor> {
+        let mut none_layers = None;
         self.forward_inner(
             input_ids,
             positions,
@@ -854,7 +999,19 @@ impl Qwen3_5MoEForCausalLM {
             visual_pos_masks,
             deepstack_visual_embeds,
             false,
+            None,
+            &mut none_layers,
         )
+    }
+
+    pub fn lm_head_forward(&self, hidden: &Tensor) -> Result<Tensor> {
+        if self.is_qvar_builder {
+            self.lm_head.forward(hidden)
+        } else {
+            self.lm_head
+                .forward(&hidden.to_dtype(self.dtype)?)?
+                .to_dtype(DType::F32)
+        }
     }
 
     pub fn get_vocab_size(&self) -> usize {
@@ -916,6 +1073,15 @@ impl Qwen3_5MoEForCausalLM {
     }
 
     pub fn mtp_rollback_mamba(&self, seq_id: usize, keep_tokens: usize) -> Result<bool> {
+        self.mtp_rollback_mamba_at(seq_id, keep_tokens, 0)
+    }
+
+    pub fn mtp_rollback_mamba_at(
+        &self,
+        seq_id: usize,
+        keep_tokens: usize,
+        snapshot_offset: usize,
+    ) -> Result<bool> {
         let mut mamba_cache = self.mamba_cache.write();
 
         let slots = mamba_cache
@@ -926,7 +1092,12 @@ impl Qwen3_5MoEForCausalLM {
         let seq_slots = Tensor::from_vec(slots, (1,), &self.device)?;
         for layer in &self.layers {
             if let Qwen3_5MoEAttnType::LinearAttention(gdn) = &layer.attn {
-                gdn.rollback_mtp_verify(&mut mamba_cache, &seq_slots, keep_tokens)?;
+                gdn.rollback_mtp_verify_at(
+                    &mut mamba_cache,
+                    &seq_slots,
+                    keep_tokens,
+                    snapshot_offset,
+                )?;
             }
         }
         Ok(true)

@@ -885,11 +885,14 @@ pub struct Args {
     #[arg(long, default_value_t = 29500)]
     pub master_port: u16,
 
-    /// Enable MTP (Multi-Token Prediction) speculative decoding.
-    /// Specifies the number of speculative draft tokens per step (e.g. 3-7).
-    /// The model must have MTP heads (e.g. Qwen3.5, DeepSeek-V3).
+    /// Number of speculative draft tokens per decode step (built-in MTP or DFlash2 verify width).
     #[arg(long, default_value = None)]
-    pub mtp: Option<usize>,
+    pub num_speculative_tokens: Option<usize>,
+
+    /// External DFlash2 draft model (HuggingFace id or local directory).
+    /// When set, enables DFlash2 speculative decoding instead of built-in MTP.
+    #[arg(long, default_value = None)]
+    pub draft_model: Option<String>,
 
     /// Enable grammar-based generation: tool grammar, structured outputs, and client constraints
     #[arg(long, default_value = "false")]

@@ -110,6 +110,49 @@ pub enum Model {
     MiniMax(Arc<MiniMaxForCausalLM>),
 }
 
+impl Model {
+    /// Collect intermediate layer hiddens for DFlash2 prefill/decode context.
+    pub fn forward_collecting_layers(
+        &self,
+        input_ids: &Tensor,
+        positions: &Tensor,
+        kv_caches: Option<&Vec<(Tensor, Tensor)>>,
+        input_metadata: &InputMetadata,
+        embeded_inputs: bool,
+        target_layer_ids: &[usize],
+    ) -> Result<(Tensor, Vec<Tensor>)> {
+        match self {
+            Model::Qwen3_5(m) => m.forward_collecting_layers(
+                input_ids,
+                positions,
+                kv_caches,
+                input_metadata,
+                embeded_inputs,
+                target_layer_ids,
+            ),
+            Model::Qwen3_5MoE(m) => m.forward_collecting_layers(
+                input_ids,
+                positions,
+                kv_caches,
+                input_metadata,
+                embeded_inputs,
+                target_layer_ids,
+            ),
+            Model::Qwen3VL(m) => m.forward_collecting_layers(
+                input_ids,
+                positions,
+                kv_caches,
+                input_metadata,
+                embeded_inputs,
+                target_layer_ids,
+            ),
+            _ => candle_core::bail!(
+                "forward_collecting_layers only supported for Qwen3.5 / Qwen3.5 MoE / Qwen3-VL"
+            ),
+        }
+    }
+}
+
 pub enum RunnerType {
     Thread(ModelRunner),
     Process(Vec<LocalStream>),
@@ -152,6 +195,8 @@ pub struct ModelRunner {
     pub(crate) mtp_head: Option<Arc<Qwen3_5MtpHead>>,
     /// Number of speculative tokens to draft per step
     pub(crate) mtp_num_speculative: usize,
+    /// Optional external DFlash2 drafter.
+    pub(crate) dflash_drafter: Option<crate::speculative::DFlashDrafter>,
 }
 
 impl ModelRunner {
@@ -283,14 +328,29 @@ impl ModelRunner {
         stream: Option<LocalStream>,
     ) -> Result<Self> {
         attention_rs::reset_paged_attention_layer_counter();
-        let requested_mtp_num_speculative = econfig.mtp_num_speculative_tokens.unwrap_or(0);
+        let requested_num_speculative = econfig.num_speculative_tokens.unwrap_or(0);
+        let uses_dflash = crate::speculative::uses_dflash(econfig);
+        let uses_builtin_mtp = crate::speculative::uses_builtin_mtp(econfig) && !uses_dflash;
         let is_mtp_model_type = Self::is_mtp_model_type(&model_type);
         let has_mtp_config = config.mtp_num_hidden_layers.unwrap_or(0) > 0;
         let has_mtp_weights = Self::has_mtp_weights(vb, config);
-        config.mtp_enabled = requested_mtp_num_speculative > 0
+        let mut builtin_mtp_enabled = uses_builtin_mtp
+            && requested_num_speculative > 0
             && is_mtp_model_type
             && (has_mtp_config || has_mtp_weights)
             && has_mtp_weights;
+        if uses_dflash {
+            config.mtp_enabled = true;
+        } else {
+            config.mtp_enabled = builtin_mtp_enabled;
+        }
+        // Size GDN MTP snapshot buffers for worst-case packed verify:
+        // max_num_seqs * (speculative_tokens + 1).
+        if config.mtp_enabled {
+            let spec_tokens = requested_num_speculative.max(1);
+            let max_seqs = econfig.max_num_parallel_reqs.max(1);
+            config.mtp_max_verify_tokens = max_seqs.saturating_mul(spec_tokens.saturating_add(1));
+        }
 
         let model = crate::build_model!(
             model_type,
@@ -350,7 +410,7 @@ impl ModelRunner {
         );
 
         #[cfg(all(feature = "cuda", feature = "graph"))]
-        let mtp_wrapper = if econfig.mtp_num_speculative_tokens.unwrap_or(0) > 0 {
+        let mtp_wrapper = if uses_dflash || (uses_builtin_mtp && requested_num_speculative > 0) {
             Some(crate::graph_wrapper!(
                 &model,
                 device,
@@ -653,53 +713,82 @@ impl ModelRunner {
             );
         }
 
-        let (mtp_head, mtp_num_speculative) = if let Some(num_spec) =
-            econfig.mtp_num_speculative_tokens
-        {
-            if requested_mtp_num_speculative == 0 {
-                (None, 0)
-            } else if config.mtp_enabled {
-                match crate::models::qwen3_5_mtp::Qwen3_5MtpHead::new(
-                    vb,
-                    comm.clone(),
-                    config,
-                    dtype,
-                    is_rope_i,
-                    &device,
-                ) {
-                    Ok(head) => {
-                        crate::log_info!(
-                            "MTP head loaded: {} speculative tokens per step",
-                            num_spec
-                        );
-                        (Some(Arc::new(head)), num_spec)
+        let (mtp_head, mut mtp_num_speculative) = if uses_builtin_mtp {
+            if let Some(num_spec) = econfig.num_speculative_tokens {
+                if requested_num_speculative == 0 {
+                    (None, 0)
+                } else if builtin_mtp_enabled {
+                    match crate::models::qwen3_5_mtp::Qwen3_5MtpHead::new(
+                        vb,
+                        comm.clone(),
+                        config,
+                        dtype,
+                        is_rope_i,
+                        &device,
+                    ) {
+                        Ok(head) => {
+                            crate::log_info!(
+                                "MTP head loaded: {} speculative tokens per step",
+                                num_spec
+                            );
+                            (Some(Arc::new(head)), num_spec)
+                        }
+                        Err(e) => {
+                            crate::log_warn!("Failed to load MTP head: {}. MTP disabled.", e);
+                            (None, 0)
+                        }
                     }
-                    Err(e) => {
-                        crate::log_warn!("Failed to load MTP head: {}. MTP disabled.", e);
-                        (None, 0)
-                    }
-                }
-            } else if !is_mtp_model_type {
-                crate::log_info!(
-                    "MTP requested but model type {:?} does not support MTP. MTP disabled.",
-                    model_type
-                );
-                (None, 0)
-            } else if !has_mtp_weights {
-                crate::log_info!(
-                    "MTP requested but model weights do not contain MTP layers. MTP disabled."
-                );
-                (None, 0)
-            } else {
-                crate::log_info!(
+                } else if !is_mtp_model_type {
+                    crate::log_info!(
+                        "MTP requested but model type {:?} does not support MTP. MTP disabled.",
+                        model_type
+                    );
+                    (None, 0)
+                } else if !has_mtp_weights {
+                    crate::log_info!(
+                        "MTP requested but model weights do not contain MTP layers. MTP disabled."
+                    );
+                    (None, 0)
+                } else {
+                    crate::log_info!(
                         "MTP requested but model config has no MTP layers (mtp_num_hidden_layers={}). MTP disabled.",
                         config.mtp_num_hidden_layers.unwrap_or(0)
                     );
+                    (None, 0)
+                }
+            } else {
                 (None, 0)
             }
         } else {
             (None, 0)
         };
+        let dflash_drafter =
+            crate::speculative::dflash::init_dflash_drafter(econfig, comm.clone(), &device)?;
+        // DFlash2 reuses the MTP verify CUDA-graph capturer. When only DFlash2 is
+        // enabled, borrow num_speculative for capture/replay sizing.
+        if mtp_num_speculative == 0 {
+            if let Some(drafter) = dflash_drafter.as_ref() {
+                mtp_num_speculative = drafter.num_speculative_tokens;
+                if econfig.num_speculative_tokens.is_none() {
+                    econfig.num_speculative_tokens = Some(drafter.num_speculative_tokens);
+                }
+                let max_seqs = econfig.max_num_parallel_reqs.max(1);
+                config.mtp_max_verify_tokens =
+                    max_seqs.saturating_mul(drafter.num_speculative_tokens.saturating_add(1));
+            }
+        }
+        if let Some(drafter) = dflash_drafter.as_ref() {
+            let verify_len = drafter.num_speculative_tokens + 1;
+            let layer_ids = drafter.target_layer_ids();
+            match &model {
+                Model::Qwen3_5(m) => m.preallocate_dflash_verify_buffers(layer_ids, verify_len)?,
+                Model::Qwen3_5MoE(m) => {
+                    m.preallocate_dflash_verify_buffers(layer_ids, verify_len)?
+                }
+                Model::Qwen3VL(m) => m.preallocate_dflash_verify_buffers(layer_ids, verify_len)?,
+                _ => {}
+            }
+        }
 
         Ok(Self {
             model,
@@ -750,7 +839,12 @@ impl ModelRunner {
             model_type,
             mtp_head,
             mtp_num_speculative,
+            dflash_drafter,
         })
+    }
+
+    pub fn has_dflash_drafter(&self) -> bool {
+        self.dflash_drafter.is_some()
     }
 
     /// Initialize MTP head for speculative decoding.
@@ -993,31 +1087,66 @@ impl ModelRunner {
         let _prefill_guard = set_linear_is_prefill(is_prefill);
         let kv_guard = self.get_kv_cache();
         let kv_pairs = kv_guard.as_pairs();
-        let logits = crate::model_call!(
-            &self.model,
-            forward,
-            (&input_ids, &positions, kv_pairs, &input_metadata),
-            {
-                Qwen3 => false,
-                Qwen3MoE => false,
-                Qwen3_5 => false,
-                Qwen3_5MoE => false,
-                LLaMa => false,
-                LLaMa4 => images,
-                Phi4 => false,
-                GLM4 => false,
-                GLM4MoE => false,
-                GLM4MoeLite => false,
-                DeepSeek => false,
-                DeepSeekV4 => false,
-                GLM5 => false,
-                Mistral3VL => images,
-                Gemma3 => images,
-                Gemma4 => false,
-                Qwen3VL => images,
-                MiniMax => false,
+        let logits = if let Some(drafter) = self.dflash_drafter.as_ref() {
+            let target_layer_ids = drafter.target_layer_ids();
+            let (logits, hidden_states) = self.model.forward_collecting_layers(
+                &input_ids,
+                &positions,
+                kv_pairs,
+                &input_metadata,
+                false,
+                target_layer_ids,
+            )?;
+            let projected = drafter.extract_and_concat_hidden(&hidden_states)?;
+            let mut offset = 0usize;
+            match &seqs {
+                Seqs::SeqRefs(sequences) => {
+                    for sequence in *sequences {
+                        let count = sequence
+                            .prefill_chunk_tokens(self.config.effective_prefill_chunk_size());
+                        drafter.store_decode_hidden(
+                            &projected.narrow(0, offset, count)?,
+                            sequence.id,
+                        )?;
+                        offset += count;
+                    }
+                }
+                Seqs::DecodeVec(sequences) => {
+                    for sequence in *sequences {
+                        drafter
+                            .store_decode_hidden(&projected.narrow(0, offset, 1)?, sequence.id)?;
+                        offset += 1;
+                    }
+                }
             }
-        )?;
+            logits
+        } else {
+            crate::model_call!(
+                &self.model,
+                forward,
+                (&input_ids, &positions, kv_pairs, &input_metadata),
+                {
+                    Qwen3 => false,
+                    Qwen3MoE => false,
+                    Qwen3_5 => false,
+                    Qwen3_5MoE => false,
+                    LLaMa => false,
+                    LLaMa4 => images,
+                    Phi4 => false,
+                    GLM4 => false,
+                    GLM4MoE => false,
+                    GLM4MoeLite => false,
+                    DeepSeek => false,
+                    DeepSeekV4 => false,
+                    GLM5 => false,
+                    Mistral3VL => images,
+                    Gemma3 => images,
+                    Gemma4 => false,
+                    Qwen3VL => images,
+                    MiniMax => false,
+                }
+            )?
+        };
         drop(kv_guard);
         let output_ids = self.sample(&logits, seqs, is_prefill)?;
         #[cfg(feature = "nvtx")]
@@ -1780,6 +1909,9 @@ impl ModelRunner {
         let mut restored = self.restored_prefix_sequences.write();
         let _ = restored.remove(&id);
         self.guided_decoding.finish(id);
+        if let Some(drafter) = self.dflash_drafter.as_ref() {
+            drafter.clear_seq_hidden(id);
+        }
         match &self.model {
             Model::Qwen3_5(model) => model.release_sequence_state(id),
             Model::Qwen3_5MoE(model) => model.release_sequence_state(id),
@@ -1828,8 +1960,14 @@ impl ModelRunner {
         if self.mtp_num_speculative > 0 {
             // self.decode_capturer.model.sync()?;
             if let Some(mtp_cap) = &mut self.mtp_capturer {
+                let label = if self.dflash_drafter.is_some() {
+                    "DFlash2"
+                } else {
+                    "MTP"
+                };
                 crate::log_info!(
-                    "Capturing MTP verify graphs for up to {} draft tokens...",
+                    "Capturing {} verify graphs for up to {} draft tokens...",
+                    label,
                     self.mtp_num_speculative
                 );
                 mtp_cap.capture_mtp(&self.device, kv_pairs, self.mtp_num_speculative)?;

@@ -319,6 +319,10 @@ pub struct Config {
     pub mtp_use_dedicated_embeddings: Option<bool>,
     #[serde(skip)]
     pub mtp_enabled: bool,
+    /// Max packed verify tokens for GDN MTP/DFlash snapshot buffers
+    /// (`max_num_seqs * (num_speculative_tokens + 1)`).
+    #[serde(skip)]
+    pub mtp_max_verify_tokens: usize,
     #[serde(default)]
     pub expert_dtype: Option<String>,
 }
@@ -345,6 +349,7 @@ impl fmt::Debug for Config {
             .field("is_multi_model", &self.is_multi_model)
             .field("is_f16_mode", &self.is_f16_mode)
             .field("mtp_enabled", &self.mtp_enabled)
+            .field("mtp_max_verify_tokens", &self.mtp_max_verify_tokens)
             .finish()
     }
 }
@@ -473,10 +478,14 @@ pub struct EngineConfig {
     pub master_addr: Option<String>,
     #[serde(default = "default_master_port")]
     pub master_port: u16,
-    /// MTP (Multi-Token Prediction) speculative decoding: number of draft tokens per step.
-    /// None means MTP is disabled.
+    /// Number of speculative draft tokens per decode step.
+    /// With built-in MTP heads (e.g. Qwen3.5), enables MTP decoding.
+    /// With `--draft-model`, enables external DFlash2 decoding.
     #[serde(default)]
-    pub mtp_num_speculative_tokens: Option<usize>,
+    pub num_speculative_tokens: Option<usize>,
+    /// External DFlash2 draft model (HuggingFace id or local directory).
+    #[serde(default)]
+    pub draft_model: Option<String>,
     pub enable_tool_grammar: bool,
 }
 
@@ -590,7 +599,10 @@ pub struct EngineConfig {
     pub master_port: u16,
     #[pyo3(get, set)]
     #[serde(default)]
-    pub mtp_num_speculative_tokens: Option<usize>,
+    pub num_speculative_tokens: Option<usize>,
+    #[pyo3(get, set)]
+    #[serde(default)]
+    pub draft_model: Option<String>,
     #[pyo3(get, set)]
     pub enable_tool_grammar: bool,
 }
@@ -607,8 +619,8 @@ impl EngineConfig {
         }
     }
 
-    pub fn with_mtp(mut self, mtp_tokens: Option<usize>) -> Self {
-        self.mtp_num_speculative_tokens = mtp_tokens;
+    pub fn with_num_speculative_tokens(mut self, tokens: Option<usize>) -> Self {
+        self.num_speculative_tokens = tokens;
         self
     }
 }
@@ -654,7 +666,7 @@ impl EngineConfig {
         master_addr: Option<String>,
         master_port: u16,
         enable_tool_grammar: bool,
-        mtp_num_speculative_tokens: Option<usize>,
+        num_speculative_tokens: Option<usize>,
     ) -> Self {
         let mut device_ids = device_ids.unwrap_or_default();
         if device_ids.is_empty() {
@@ -714,7 +726,8 @@ impl EngineConfig {
             node_rank,
             master_addr,
             master_port,
-            mtp_num_speculative_tokens,
+            num_speculative_tokens,
+            draft_model: None,
             enable_tool_grammar,
         }
     }
@@ -1713,7 +1726,7 @@ mod tests {
             "quantization_status": "compressed",
             "sparsity_config": {},
             "transform_config": {},
-            "version": "0.14.4.dev54+g704d57b"
+            "version": "0.14.5.dev54+g704d57b"
         }"#;
         let mut cfg: QuantConfig = serde_json::from_str(json).unwrap();
         cfg.normalize_compressed_tensors();
@@ -1821,7 +1834,7 @@ mod tests {
             "quantization_status": "compressed",
             "sparsity_config": {},
             "transform_config": {},
-            "version": "0.14.4.a20260310"
+            "version": "0.14.5.a20260310"
         }"#;
         let mut cfg: QuantConfig = serde_json::from_str(json).unwrap();
         cfg.normalize_compressed_tensors();

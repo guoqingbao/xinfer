@@ -195,6 +195,10 @@ pub enum MessageType {
 
     /// Sent by runner in response to `RunDecodeMTP` with multiple tokens per sequence.
     RunResponseMTP(Vec<Vec<u32>>),
+    /// Sent by the main process to request external DFlash speculative decode.
+    RunDecodeDFlash(Vec<DecodeSequence>),
+    /// Sent by a runner in response to `RunDecodeDFlash`.
+    RunResponseDFlash(Vec<Vec<u32>>),
 
     /// Sent by main process to request embedding on sequences.
     RunEmbed((Vec<Sequence>, EmbeddingStrategy)),
@@ -229,6 +233,11 @@ pub enum MessageType {
     // Client: Check PD prefill status
     CheckPrefillStatus(usize),
     CheckPrefillStatusResponse(bool),
+
+    RunSpecDecode(Vec<Sequence>),
+    RunDraftAndVerify((Vec<Sequence>, Vec<u32>)),
+
+    RunSpecDecodeResponse(Vec<Vec<u32>>),
 
     KVCacheSwap((HashMap<usize, usize>, bool)),
 
@@ -750,6 +759,17 @@ pub fn run_runner_process(args: Vec<String>) -> anyhow::Result<()> {
                 send_local(
                     &mut vec![stream.try_clone()?],
                     &MessageType::RunResponse(outputs.unwrap_or(vec![])),
+                    false,
+                )?;
+            }
+            Ok(MessageType::RunDecodeDFlash(sequences)) => {
+                let outputs = runner.run_dflash_decode(Seqs::DecodeVec(&sequences));
+                if outputs.is_err() {
+                    crate::log_error!("Runner DFlash decode error: {:?}", outputs);
+                }
+                send_local(
+                    &mut vec![stream.try_clone()?],
+                    &MessageType::RunResponseDFlash(outputs.unwrap_or_default()),
                     false,
                 )?;
             }

@@ -1047,13 +1047,15 @@ impl LLMEngine {
             }
         }
 
-        // Pre-allocate blocks for MTP speculative positions before cloning sequences
+        // Pre-allocate blocks for speculative verify positions before cloning sequences
         if !is_prefill {
-            if let Some(mtp_tokens) = self.econfig.mtp_num_speculative_tokens {
-                if mtp_tokens > 0 {
-                    self.scheduler
-                        .pre_allocate_mtp_blocks(&scheduled_ids, mtp_tokens + 1);
-                }
+            if self.econfig.num_speculative_tokens.unwrap_or(0) > 0
+                && (crate::speculative::uses_builtin_mtp(&self.econfig)
+                    || crate::speculative::uses_dflash(&self.econfig))
+            {
+                let spec_tokens = self.econfig.num_speculative_tokens.unwrap_or(0);
+                self.scheduler
+                    .pre_allocate_mtp_blocks(&scheduled_ids, spec_tokens + 1);
             }
         }
 
@@ -1275,6 +1277,74 @@ impl LLMEngine {
                     let _ = crate::utils::multi_node::recv_tcp(tcp_stream);
                 }
 
+                result
+            }
+        }
+    }
+
+    fn run_dflash_on_local_streams(
+        runner_streams: &mut Vec<LocalStream>,
+        request: &MessageType,
+    ) -> Result<Vec<Vec<u32>>> {
+        let cloned_streams: Vec<LocalStream> = runner_streams
+            .iter_mut()
+            .map(|stream| stream.try_clone().expect("clone failed"))
+            .collect();
+        let all_outputs: Result<Vec<Vec<Vec<u32>>>> = cloned_streams
+            .into_par_iter()
+            .map(|mut stream| {
+                send_local(&mut vec![stream.try_clone()?], request, false)?;
+                match receive_local(&mut stream, false)? {
+                    MessageType::RunResponseDFlash(tokens) if !tokens.is_empty() => Ok(tokens),
+                    MessageType::RunResponseDFlash(_) => {
+                        candle_core::bail!("DFlash runner returned empty response")
+                    }
+                    other => candle_core::bail!("Unexpected DFlash response type: {:?}", other),
+                }
+            })
+            .collect();
+        all_outputs
+            .map_err(candle_core::Error::wrap)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| candle_core::Error::Msg("No response from local DFlash runners".into()))
+    }
+
+    fn run_forward_dflash(
+        runners: &Arc<RwLock<RunnerType>>,
+        owned_seqs: &[Sequence],
+    ) -> Result<Vec<Vec<u32>>> {
+        match &mut *runners.write() {
+            RunnerType::Thread(model_runner) => {
+                let seq_refs: Vec<&Sequence> = owned_seqs.iter().collect();
+                model_runner.run_dflash_decode(Seqs::SeqRefs(&seq_refs))
+            }
+            RunnerType::Process(runner_streams) => {
+                let sequences = owned_seqs
+                    .iter()
+                    .map(|sequence| DecodeSequence::new(sequence))
+                    .collect::<Vec<_>>();
+                let request = MessageType::RunDecodeDFlash(sequences);
+                Self::run_dflash_on_local_streams(runner_streams, &request)
+            }
+            RunnerType::MultiNodeMaster {
+                local_streams,
+                remote_streams,
+            } => {
+                let sequences = owned_seqs
+                    .iter()
+                    .map(|sequence| DecodeSequence::new(sequence))
+                    .collect::<Vec<_>>();
+                let request = MessageType::RunDecodeDFlash(sequences);
+                let serialized =
+                    bincode::serialize(&request).expect("Bincode serialization failed");
+                for stream in remote_streams.iter_mut() {
+                    crate::utils::multi_node::send_tcp(stream, &serialized)?;
+                }
+                let result = Self::run_dflash_on_local_streams(local_streams, &request);
+                for stream in remote_streams.iter_mut() {
+                    let _ = crate::utils::multi_node::recv_tcp(stream);
+                }
                 result
             }
         }
@@ -2257,13 +2327,15 @@ impl LLMEngine {
     pub fn start_engine(engine: Arc<RwLock<Self>>) {
         GLOBAL_RT.spawn(async move {
             let engine = engine.clone();
-            let (is_pd_server, runners, mtp_enabled) = {
+            let (is_pd_server, runners, mtp_enabled, dflash_enabled) = {
                 let guard = engine.read();
-                let has_mtp = guard.econfig.mtp_num_speculative_tokens.is_some();
+                let has_mtp = crate::speculative::uses_builtin_mtp(&guard.econfig);
+                let has_dflash = crate::speculative::uses_dflash(&guard.econfig);
                 (
                     guard.is_pd_mode() && guard.is_pd_server(),
                     guard.runners.clone(),
                     has_mtp,
+                    has_dflash,
                 )
             };
             loop {
@@ -2296,10 +2368,14 @@ impl LLMEngine {
                 // Engine lock released -- server can accept new requests during forward pass
 
                 if let Some((scheduled_ids, is_prefill, owned_seqs)) = prep {
-                    let use_mtp = mtp_enabled && !is_prefill && owned_seqs.len() == 1;
+                    let use_dflash = dflash_enabled && !is_prefill && owned_seqs.len() == 1;
+                    let use_mtp =
+                        !use_dflash && mtp_enabled && !is_prefill && owned_seqs.len() == 1;
 
                     let forward_result: Result<Vec<Vec<u32>>> = if use_mtp {
                         Self::run_forward_mtp(&runners, &owned_seqs)
+                    } else if use_dflash {
+                        Self::run_forward_dflash(&runners, &owned_seqs)
                     } else {
                         Self::run_forward(&runners, &owned_seqs, is_prefill)
                             .map(|ids| ids.into_iter().map(|t| vec![t]).collect())

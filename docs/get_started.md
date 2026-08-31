@@ -67,9 +67,26 @@ cargo build --release --features metal
   target/release/xinfer --m Qwen/Qwen3-VL-8B-Instruct --ui-server
   ```
 
-Common runtime knobs: `--max-model-len`, `--max-num-seqs`, `--kv-fraction` (CUDA KV share), `--cpu-mem-fold` (CPU swap ratio), `--port`, `--kvcache-dtype` (fp8/turbo8/turbo4/turbo3), `--prefix-cache`, `--prefix-cache-max-tokens`, `--ui-server`, `--batch` (perf test).
+Common runtime knobs: `--max-model-len`, `--max-num-seqs`, `--kv-fraction` (CUDA KV share), `--cpu-mem-fold` (CPU swap ratio), `--port`, `--kvcache-dtype` (fp8/turbo8/turbo4/turbo3), `--prefix-cache`, `--prefix-cache-max-tokens`, `--ui-server`, `--batch` (perf test), `--num-speculative-tokens` (built-in MTP), `--draft-model` (DFlash2).
 
 Reasoning defaults to enabled when a request omits `thinking` / `enable_thinking`. Use `--disable-reasoning` on the Rust CLI to make the default be disabled instead; explicit request values still override the server default.
+
+### Speculative decoding (MTP & DFlash2)
+
+Speed up decode with speculative token drafting + target verification. See [speculative_decoding.md](./speculative_decoding.md) for full details.
+
+- **Built-in MTP** (Qwen3.5 / Qwen3.6 with MTP weights): `--num-speculative-tokens N`
+  ```bash
+  target/release/xinfer --m Qwen/Qwen3.5-35B-A3B --d 0,1 \
+    --num-speculative-tokens 3 --ui-server
+  ```
+- **DFlash2** (external draft checkpoint): `--draft-model <hf_id_or_local_path>` plus optional `--num-speculative-tokens`
+  ```bash
+  target/release/xinfer --m Qwen/Qwen3.8-... --d 0,1 \
+    --draft-model <dflash2-draft> --num-speculative-tokens 7 --ui-server
+  ```
+
+If `--draft-model` is set, DFlash2 is used instead of built-in MTP. Build with `cuda,nccl,flashinfer,cutlass` for best performance.
 
 ## 4) Multi-rank (single node)
 - **NCCL multi-GPU**  

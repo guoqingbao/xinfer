@@ -8,6 +8,7 @@ pub mod models;
 pub mod py;
 pub mod runner;
 pub mod server;
+pub mod speculative;
 pub mod tools;
 pub mod transfer;
 pub mod utils;

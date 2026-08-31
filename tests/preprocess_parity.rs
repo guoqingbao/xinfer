@@ -74,7 +74,7 @@ fn build_econfig() -> EngineConfig {
         None,                                // master_addr
         29500,                               // master_port
         false,                               // enable_tool_grammar
-        None,                                // mtp_num_speculative_tokens
+        None,                                // num_speculative_tokens
     )
 }
 

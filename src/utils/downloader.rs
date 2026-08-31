@@ -430,6 +430,127 @@ impl Downloader {
         Ok((paths, gguf))
     }
 
+    /// Load draft model weights - only requires config.json + safetensors files.
+    /// Draft models (e.g. DFlash) don't ship tokenizer.json or other tokenizer files.
+    pub fn prepare_draft_model_weights(
+        &self,
+        hf_token: Option<String>,
+        hf_token_path: Option<String>,
+    ) -> Result<(ModelPaths, bool)> {
+        match (&self.model_id, &self.weight_path) {
+            (_, Some(path)) => {
+                if !Path::new(path).is_dir() {
+                    candle_core::bail!("Draft model weight path must be a directory: {}", path);
+                }
+                let config_path = Path::new(path).join("config.json");
+                if !config_path.exists() {
+                    candle_core::bail!("Draft model directory missing config.json: {}", path);
+                }
+                let filenames = if Path::new(path)
+                    .join("model.safetensors.index.json")
+                    .exists()
+                {
+                    super::hub_load_local_safetensors(path, "model.safetensors.index.json")?
+                } else {
+                    vec![Path::new(path).join("model.safetensors")]
+                };
+                Ok((
+                    ModelPaths {
+                        tokenizer_filename: PathBuf::new(),
+                        tokenizer_config_filename: PathBuf::new(),
+                        config_filename: config_path,
+                        generation_config_filename: PathBuf::new(),
+                        filenames,
+                        auxiliary_filenames: Vec::new(),
+                        chat_template_filename: None,
+                    },
+                    false,
+                ))
+            }
+            (Some(_model_id), None) => {
+                let paths = self.download_draft_model(None, hf_token, hf_token_path)?;
+                Ok((paths, false))
+            }
+            _ => {
+                candle_core::bail!(
+                    "Draft model requires --draft-model (HuggingFace id or local directory)"
+                );
+            }
+        }
+    }
+
+    /// Download a draft model from HuggingFace - only fetches config.json + safetensors.
+    fn download_draft_model(
+        &self,
+        revision: Option<String>,
+        hf_token: Option<String>,
+        hf_token_path: Option<String>,
+    ) -> Result<ModelPaths> {
+        assert!(self.model_id.is_some(), "No draft model id provided!");
+        let mut filenames = vec![];
+
+        if let Some(cache_path) = self.check_cache() {
+            let config_filename = cache_path.join("config.json");
+            if config_filename.exists() {
+                for entry in std::fs::read_dir(&cache_path)? {
+                    let path = entry?.path();
+                    if path.extension() == Some("safetensors".as_ref()) {
+                        crate::log_warn!("Found draft model cache: {}", path.display());
+                        filenames.push(path);
+                    }
+                }
+                if !filenames.is_empty() {
+                    return Ok(ModelPaths {
+                        tokenizer_filename: PathBuf::new(),
+                        tokenizer_config_filename: PathBuf::new(),
+                        config_filename,
+                        generation_config_filename: PathBuf::new(),
+                        filenames,
+                        auxiliary_filenames: Vec::new(),
+                        chat_template_filename: None,
+                    });
+                }
+            }
+        }
+
+        let api = ApiBuilder::new()
+            .with_progress(true)
+            .with_token(Some(get_token(hf_token.clone(), hf_token_path.clone())?))
+            .build()
+            .map_err(candle_core::Error::wrap)?;
+        let revision = revision.unwrap_or("main".to_string());
+        let api = api.repo(Repo::with_revision(
+            self.model_id.clone().unwrap(),
+            RepoType::Model,
+            revision,
+        ));
+
+        let config_filename = api.get("config.json").map_err(candle_core::Error::wrap)?;
+
+        for rfilename in api
+            .info()
+            .map_err(candle_core::Error::wrap)?
+            .siblings
+            .iter()
+            .map(|x| x.rfilename.clone())
+            .filter(|x| x.ends_with(".safetensors"))
+        {
+            let filename =
+                self.hf_get_with_retry(&api, &rfilename, 5, std::time::Duration::from_secs(5))?;
+            filenames.push(filename);
+        }
+
+        Ok(ModelPaths {
+            tokenizer_filename: PathBuf::new(),
+            tokenizer_config_filename: PathBuf::new(),
+            config_filename,
+            generation_config_filename: PathBuf::new(),
+            filenames,
+            auxiliary_filenames: Vec::new(),
+            chat_template_filename: None,
+        })
+    }
+
     pub fn check_cache(&self) -> Option<PathBuf> {
         use crate::utils::{contains_gguf, has_complete_safetensors};
         let sanitized_id = std::path::Path::new(self.model_id.as_ref().unwrap())

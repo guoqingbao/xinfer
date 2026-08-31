@@ -1,5 +1,6 @@
 pub mod deepseek3;
 pub mod deepseek4;
+pub mod dflash;
 pub mod gemma3;
 pub mod gemma4;
 pub mod glm4;
