@@ -17,7 +17,7 @@ pub struct DFlashDrafter {
     pub mask_token_id: u32,
     context_window: usize,
     device: Device,
-    _dtype: DType,
+    dtype: DType,
     cached_target_hidden: Mutex<HashMap<usize, Tensor>>,
 }
 
@@ -40,7 +40,7 @@ impl DFlashDrafter {
         let draft_vb = unsafe {
             candle_nn::var_builder::ShardedSafeTensors::var_builder(
                 draft_weight_files,
-                DType::BF16,
+                dtype,
                 device,
             )?
         };
@@ -52,8 +52,7 @@ impl DFlashDrafter {
             Some(draft_weight_files.to_vec()),
         );
 
-        let draft_model =
-            DFlashDraftModel::new(&draft_vb, comm, draft_config, DType::BF16, device)?;
+        let draft_model = DFlashDraftModel::new(&draft_vb, comm, draft_config, dtype, device)?;
 
         let target_layer_ids = draft_config.target_layer_ids();
         // block_size = [anchor] + N mask slots; user-facing count is N.
@@ -81,7 +80,7 @@ impl DFlashDrafter {
             mask_token_id,
             context_window,
             device: device.clone(),
-            _dtype: dtype,
+            dtype,
             cached_target_hidden: Mutex::new(HashMap::new()),
         })
     }
@@ -113,7 +112,7 @@ impl DFlashDrafter {
             &self.device,
         )?;
 
-        let noise_embedding = embed_fn(&block_tensor)?.to_dtype(DType::BF16)?;
+        let noise_embedding = embed_fn(&block_tensor)?.to_dtype(self.dtype)?;
 
         let target_hidden_2d = if target_hidden.rank() == 3 {
             let (_, ctx, h) = target_hidden.dims3()?;
@@ -121,9 +120,9 @@ impl DFlashDrafter {
         } else {
             target_hidden.clone()
         };
-        let target_hidden_bf16 = target_hidden_2d.to_dtype(DType::BF16)?;
+        let target_hidden_typed = target_hidden_2d.to_dtype(self.dtype)?;
 
-        let ctx_len = target_hidden_bf16.dim(0)?;
+        let ctx_len = target_hidden_typed.dim(0)?;
         let noise_2d = if noise_embedding.rank() == 3 {
             let (_, s, h) = noise_embedding.dims3()?;
             noise_embedding.reshape((s, h))?
@@ -137,7 +136,7 @@ impl DFlashDrafter {
 
         let draft_hidden =
             self.draft_model
-                .forward(&target_hidden_bf16, &noise_2d, &positions_tensor)?;
+                .forward(&target_hidden_typed, &noise_2d, &positions_tensor)?;
         let total_out = draft_hidden.dim(0)?;
         let draft_hidden = draft_hidden.narrow(0, total_out - n, n)?;
         let draft_logits = lm_head_fn(&draft_hidden)?;
@@ -677,11 +676,12 @@ pub fn init_dflash_drafter(
         .map_err(|e| candle_core::Error::Msg(format!("Failed to read DFlash2 config: {e}")))?;
     let draft_config: DFlashModelConfig = serde_json::from_slice(&config_data)
         .map_err(|e| candle_core::Error::Msg(format!("Failed to parse DFlash2 config: {e}")))?;
+    let draft_dtype = crate::utils::get_dtype(None);
     let drafter = DFlashDrafter::new(
         &draft_config,
         &draft_paths.get_weight_filenames(),
         comm,
-        DType::BF16,
+        draft_dtype,
         device,
         econfig.num_speculative_tokens,
     )?;

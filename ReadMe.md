@@ -610,7 +610,6 @@ SM90_LOWER_PRECISION_GDN_PREFILL=1 xinfer --m Qwen/Qwen3.5-35B-A3B-FP8 --ui-serv
 
 ## 📚 References
 
-- [Speculative decoding (MTP & DFlash2)](docs/speculative_decoding.md)
 - [Candle-vLLM](https://github.com/EricLBuehler/candle-vllm)
 - Python nano-vllm
 

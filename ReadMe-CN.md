@@ -75,7 +75,7 @@ xinfer --m Qwen/Qwen3.8-... --d 0,1 --ui-server \
   --draft-model <dflash2-草稿-id或路径> --num-speculative-tokens 7
 ```
 
-详见 [docs/speculative_decoding-CN.md](docs/speculative_decoding-CN.md)（英文：[speculative_decoding.md](docs/speculative_decoding.md)）。
+详见 [docs/speculative_decoding.md](docs/speculative_decoding.md)。
 
 > **提示：** 浏览器打开 `http://IP:8001` 即可使用内置对话界面，或使用 `http://IP:8000/v1/` 作为 API 服务 `Base URL`。
 
@@ -607,7 +607,6 @@ SM90_LOWER_PRECISION_GDN_PREFILL=1 xinfer --m Qwen/Qwen3.5-35B-A3B-FP8 --ui-serv
 
 ## 📚 参考项目
 
-- [推测解码（MTP 与 DFlash2）](docs/speculative_decoding-CN.md)
 - [Candle-vLLM](https://github.com/EricLBuehler/candle-vllm)
 - Python nano-vllm
 
