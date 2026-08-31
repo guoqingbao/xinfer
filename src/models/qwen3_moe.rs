@@ -590,63 +590,6 @@ impl Qwen3MoEForCausalLM {
         )
     }
 
-    pub fn forward_with_hidden_states(
-        &self,
-        input_ids: &Tensor,
-        positions: &Tensor,
-        kv_caches: Option<&Vec<(Tensor, Tensor)>>,
-        input_metadata: &InputMetadata,
-        embeded_inputs: bool,
-        target_layer_ids: &[usize],
-    ) -> Result<(Tensor, Vec<Tensor>)> {
-        let seqlens = input_metadata.seqlens.clone().unwrap_or_default();
-        let attention_mask = get_attention_causal_mask(
-            &self.device,
-            self.dtype,
-            positions,
-            seqlens.clone(),
-            self.config.sliding_window,
-            input_metadata.is_prefill,
-        );
-        let mut xs = if embeded_inputs {
-            input_ids.to_owned()
-        } else {
-            self.embed_forward(input_ids)?
-        };
-        let mut hidden_states_collector: Vec<Tensor> = Vec::new();
-        hidden_states_collector.push(xs.clone());
-        if let Some(kv_caches) = kv_caches {
-            for ((k_cache, v_cache), (i, layer)) in
-                zip(kv_caches.iter(), self.layers.iter().enumerate())
-            {
-                xs = layer.forward(
-                    &xs,
-                    attention_mask.as_ref(),
-                    positions,
-                    Some((k_cache, v_cache)),
-                    input_metadata,
-                )?;
-                if target_layer_ids.contains(&i) {
-                    hidden_states_collector.push(xs.clone());
-                }
-            }
-        }
-        if !seqlens.is_empty() {
-            let indices: Vec<_> = seqlens.iter().map(|x| x - 1 as u32).collect();
-            let batch = indices.len();
-            xs = xs.index_select(&Tensor::from_vec(indices, (batch,), xs.device())?, 0)?;
-        }
-        let xs = self.norm.forward(&xs)?;
-        let logits = if self.is_qvar_builder {
-            self.lm_head.forward(&xs)?
-        } else {
-            self.lm_head
-                .forward(&xs.to_dtype(self.dtype)?)?
-                .to_dtype(DType::F32)?
-        };
-        Ok((logits, hidden_states_collector))
-    }
-
     pub fn forward_with_deepstack(
         &self,
         input_ids: &Tensor,
@@ -667,16 +610,6 @@ impl Qwen3MoEForCausalLM {
             deepstack_visual_embeds,
             false,
         )
-    }
-
-    pub fn lm_head_forward(&self, hidden: &Tensor) -> Result<Tensor> {
-        if self.is_qvar_builder {
-            self.lm_head.forward(hidden)
-        } else {
-            self.lm_head
-                .forward(&hidden.to_dtype(self.dtype)?)?
-                .to_dtype(DType::F32)
-        }
     }
 
     pub fn get_vocab_size(&self) -> usize {
