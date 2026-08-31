@@ -964,7 +964,6 @@ impl<M: CudaGraphModule> GraphCapturer<M> {
         };
 
         let mut outputs = BTreeMap::<usize, Tensor>::new();
-        let mut stable_logits: Option<Tensor> = None;
         let _guard = candle_core::cuda_backend::cuda_param_cache_scope(true);
 
         for phase in CapturePhase::ALL {
@@ -974,19 +973,13 @@ impl<M: CudaGraphModule> GraphCapturer<M> {
                 self.model.start_capture(verify_len)?;
             }
             if phase.is_warmup() {
-                let out = self.model.forward(
+                let _ = self.model.forward(
                     &input_ids,
                     &positions,
                     kv_caches,
                     &input_metadata,
                     false,
                 )?;
-                // Allocate the stable logits buffer on the default pool during
-                // uncaptured cache-prewarm so AUTO_FREE_ON_LAUNCH does not
-                // invalidate the address read after graph replay.
-                if phase.is_cache_prewarm() {
-                    stable_logits = Some(Tensor::zeros(out.shape(), out.dtype(), device)?);
-                }
                 #[cfg(feature = "cuda")]
                 if !should_capture {
                     device.synchronize()?;
@@ -999,14 +992,7 @@ impl<M: CudaGraphModule> GraphCapturer<M> {
                     &input_metadata,
                     false,
                 )?;
-                let stable = stable_logits.as_ref().ok_or_else(|| {
-                    candle_core::Error::msg(
-                        "MTP graph capture missing stable logits buffer (cache prewarm failed)",
-                    )
-                })?;
-                // D2D into non-pool storage; this copy is part of the captured graph.
-                stable.copy_(&out, 0)?;
-                outputs.insert(verify_len, stable.clone());
+                outputs.insert(verify_len, out);
             }
             if should_capture {
                 self.model.end_capture(!phase.is_warmup())?;

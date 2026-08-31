@@ -110,6 +110,49 @@ pub enum Model {
     MiniMax(Arc<MiniMaxForCausalLM>),
 }
 
+impl Model {
+    /// Collect intermediate layer hiddens for DFlash2 prefill/decode context.
+    pub fn forward_collecting_layers(
+        &self,
+        input_ids: &Tensor,
+        positions: &Tensor,
+        kv_caches: Option<&Vec<(Tensor, Tensor)>>,
+        input_metadata: &InputMetadata,
+        embeded_inputs: bool,
+        target_layer_ids: &[usize],
+    ) -> Result<(Tensor, Vec<Tensor>)> {
+        match self {
+            Model::Qwen3_5(m) => m.forward_collecting_layers(
+                input_ids,
+                positions,
+                kv_caches,
+                input_metadata,
+                embeded_inputs,
+                target_layer_ids,
+            ),
+            Model::Qwen3_5MoE(m) => m.forward_collecting_layers(
+                input_ids,
+                positions,
+                kv_caches,
+                input_metadata,
+                embeded_inputs,
+                target_layer_ids,
+            ),
+            Model::Qwen3VL(m) => m.forward_collecting_layers(
+                input_ids,
+                positions,
+                kv_caches,
+                input_metadata,
+                embeded_inputs,
+                target_layer_ids,
+            ),
+            _ => candle_core::bail!(
+                "forward_collecting_layers only supported for Qwen3.5 / Qwen3.5 MoE / Qwen3-VL"
+            ),
+        }
+    }
+}
+
 pub enum RunnerType {
     Thread(ModelRunner),
     Process(Vec<LocalStream>),
@@ -1046,35 +1089,14 @@ impl ModelRunner {
         let kv_pairs = kv_guard.as_pairs();
         let logits = if let Some(drafter) = self.dflash_drafter.as_ref() {
             let target_layer_ids = drafter.target_layer_ids();
-            let (logits, hidden_states) = match &self.model {
-                Model::Qwen3_5(model) => model.forward_collecting_layers(
-                    &input_ids,
-                    &positions,
-                    kv_pairs,
-                    &input_metadata,
-                    false,
-                    target_layer_ids,
-                )?,
-                Model::Qwen3_5MoE(model) => model.forward_with_hidden_states(
-                    &input_ids,
-                    &positions,
-                    kv_pairs,
-                    &input_metadata,
-                    false,
-                    target_layer_ids,
-                )?,
-                Model::Qwen3VL(model) => model.forward_with_hidden_states(
-                    &input_ids,
-                    &positions,
-                    kv_pairs,
-                    &input_metadata,
-                    false,
-                    target_layer_ids,
-                )?,
-                _ => {
-                    candle_core::bail!("DFlash2 supports Qwen3.5 / Qwen3.5 MoE / Qwen3-VL targets")
-                }
-            };
+            let (logits, hidden_states) = self.model.forward_collecting_layers(
+                &input_ids,
+                &positions,
+                kv_pairs,
+                &input_metadata,
+                false,
+                target_layer_ids,
+            )?;
             let projected = drafter.extract_and_concat_hidden(&hidden_states)?;
             let mut offset = 0usize;
             match &seqs {

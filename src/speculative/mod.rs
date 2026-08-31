@@ -9,8 +9,9 @@ pub mod verify;
 pub use dflash::DFlashDrafter;
 pub use metadata::SpecSeqInfo;
 pub use verify::{
-    mtp_stats_acceptance_rate, mtp_stats_avg_tokens_per_step, mtp_stats_reset, mtp_stats_summary,
-    mtp_stats_update, verify_draft_greedy, MtpVerifyResult,
+    dflash_stats_reset, dflash_stats_summary, mtp_stats_acceptance_rate,
+    mtp_stats_avg_tokens_per_step, mtp_stats_reset, mtp_stats_summary, mtp_stats_update,
+    verify_draft_greedy, MtpVerifyResult, SPEC_STATS_WINDOW_STEPS,
 };
 
 use std::path::Path;

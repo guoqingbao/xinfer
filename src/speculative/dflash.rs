@@ -5,36 +5,10 @@ use candle_core::{DType, Device, Result, Tensor};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 /// DFlash2 drafts attend to a bounded projected-context window (matches reference training).
 const DEFAULT_CONTEXT_WINDOW: usize = 512;
-
-static DFLASH_TOTAL_PROPOSED: AtomicUsize = AtomicUsize::new(0);
-static DFLASH_TOTAL_ACCEPTED: AtomicUsize = AtomicUsize::new(0);
-static DFLASH_TOTAL_STEPS: AtomicUsize = AtomicUsize::new(0);
-
-fn dflash_stats_update(proposed: usize, accepted: usize) {
-    DFLASH_TOTAL_PROPOSED.fetch_add(proposed, Ordering::Relaxed);
-    DFLASH_TOTAL_ACCEPTED.fetch_add(accepted, Ordering::Relaxed);
-    let steps = DFLASH_TOTAL_STEPS.fetch_add(1, Ordering::Relaxed) + 1;
-    if steps % 64 == 0 {
-        let total_proposed = DFLASH_TOTAL_PROPOSED.load(Ordering::Relaxed);
-        let total_accepted = DFLASH_TOTAL_ACCEPTED.load(Ordering::Relaxed);
-        crate::log_info!(
-            "DFlash2 Stats: steps={}, proposed={}, accepted={}, average_acceptance_rate={:.2}%",
-            steps,
-            total_proposed,
-            total_accepted,
-            if total_proposed == 0 {
-                0.0
-            } else {
-                total_accepted as f64 / total_proposed as f64 * 100.0
-            }
-        );
-    }
-}
 
 pub struct DFlashDrafter {
     pub draft_model: DFlashDraftModel,
@@ -226,7 +200,7 @@ impl DFlashDrafter {
 use crate::core::runner::{Model, ModelRunner, Seqs};
 use crate::models::layers::linear::set_linear_is_prefill;
 use crate::speculative::metadata::SpecSeqInfo;
-use crate::speculative::verify::verify_draft_greedy;
+use crate::speculative::verify::{dflash_stats_summary, dflash_stats_update, verify_draft_greedy};
 use crate::utils::config::EngineConfig;
 use attention_rs::InputMetadata;
 
@@ -239,33 +213,14 @@ fn forward_collecting_target(
     input_metadata: &InputMetadata,
     target_layer_ids: &[usize],
 ) -> Result<(Tensor, Vec<Tensor>)> {
-    match model {
-        Model::Qwen3_5(m) => m.forward_collecting_layers(
-            input_ids,
-            positions,
-            kv_pairs,
-            input_metadata,
-            false,
-            target_layer_ids,
-        ),
-        Model::Qwen3_5MoE(m) => m.forward_with_hidden_states(
-            input_ids,
-            positions,
-            kv_pairs,
-            input_metadata,
-            false,
-            target_layer_ids,
-        ),
-        Model::Qwen3VL(m) => m.forward_with_hidden_states(
-            input_ids,
-            positions,
-            kv_pairs,
-            input_metadata,
-            false,
-            target_layer_ids,
-        ),
-        _ => candle_core::bail!("DFlash2 supports Qwen3.5 / Qwen3.5 MoE / Qwen3-VL targets"),
-    }
+    model.forward_collecting_layers(
+        input_ids,
+        positions,
+        kv_pairs,
+        input_metadata,
+        false,
+        target_layer_ids,
+    )
 }
 
 impl ModelRunner {
@@ -498,7 +453,9 @@ impl ModelRunner {
         result_tokens.push(anchor_token);
         result_tokens.extend_from_slice(&verify_result.accepted_tokens);
         result_tokens.push(verify_result.continuation_token);
-        dflash_stats_update(verify_result.num_proposed, verify_result.num_accepted);
+        if dflash_stats_update(verify_result.num_proposed, verify_result.num_accepted) {
+            crate::log_info!("{}", dflash_stats_summary());
+        }
         Ok(vec![result_tokens])
     }
 
@@ -686,7 +643,9 @@ impl ModelRunner {
             output.push(anchor_token);
             output.extend_from_slice(&verify_result.accepted_tokens);
             output.push(verify_result.continuation_token);
-            dflash_stats_update(verify_result.num_proposed, verify_result.num_accepted);
+            if dflash_stats_update(verify_result.num_proposed, verify_result.num_accepted) {
+                crate::log_info!("{}", dflash_stats_summary());
+            }
             result.push(output);
         }
         Ok(result)

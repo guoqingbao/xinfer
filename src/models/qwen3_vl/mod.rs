@@ -780,8 +780,8 @@ impl Qwen3VLForConditionalGeneration {
         }
     }
 
-    /// Forward pass returning intermediate text-backbone states for DFlash.
-    pub fn forward_with_hidden_states(
+    /// Forward pass returning logits plus intermediate text-backbone layer hiddens for DFlash2.
+    pub fn forward_collecting_layers(
         &self,
         input_ids: &Tensor,
         positions: &Tensor,
@@ -799,7 +799,7 @@ impl Qwen3VLForConditionalGeneration {
                 embeded_inputs,
                 target_layer_ids,
             ),
-            Qwen3TextModel::MoE35(model) => model.forward_with_hidden_states(
+            Qwen3TextModel::MoE35(model) => model.forward_collecting_layers(
                 input_ids,
                 positions,
                 kv_caches,
@@ -808,29 +808,9 @@ impl Qwen3VLForConditionalGeneration {
                 target_layer_ids,
             ),
             _ => candle_core::bail!(
-                "forward_with_hidden_states only supported for Qwen3.5 text models"
+                "forward_collecting_layers only supported for Qwen3.5 text models"
             ),
         }
-    }
-
-    /// Alias kept for newer call sites.
-    pub fn forward_collecting_layers(
-        &self,
-        input_ids: &Tensor,
-        positions: &Tensor,
-        kv_caches: Option<&Vec<(Tensor, Tensor)>>,
-        input_metadata: &InputMetadata,
-        embeded_inputs: bool,
-        target_layer_ids: &[usize],
-    ) -> Result<(Tensor, Vec<Tensor>)> {
-        self.forward_with_hidden_states(
-            input_ids,
-            positions,
-            kv_caches,
-            input_metadata,
-            embeded_inputs,
-            target_layer_ids,
-        )
     }
 
     /// Apply lm_head to hidden states (for MTP drafting).

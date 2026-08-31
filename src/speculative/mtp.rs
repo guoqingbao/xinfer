@@ -2,11 +2,8 @@ use crate::core::runner::{Model, ModelRunner, Seqs};
 use crate::models::layers::linear::set_linear_is_prefill;
 use crate::models::qwen3_5_mtp::Qwen3_5MtpHead;
 use crate::speculative::metadata::SpecSeqInfo;
-use crate::speculative::verify::{
-    mtp_stats_summary, mtp_stats_update, verify_draft_greedy, MTP_TOTAL_STEPS,
-};
+use crate::speculative::verify::{mtp_stats_summary, mtp_stats_update, verify_draft_greedy};
 use candle_core::{Result, Tensor};
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 impl ModelRunner {
@@ -387,8 +384,7 @@ impl ModelRunner {
         result_tokens.extend_from_slice(&verify_result.accepted_tokens);
         result_tokens.push(verify_result.continuation_token);
 
-        mtp_stats_update(verify_result.num_proposed, verify_result.num_accepted);
-        if MTP_TOTAL_STEPS.load(Ordering::Relaxed) % 256 == 0 {
+        if mtp_stats_update(verify_result.num_proposed, verify_result.num_accepted) {
             crate::log_info!("{}", mtp_stats_summary());
         }
 
