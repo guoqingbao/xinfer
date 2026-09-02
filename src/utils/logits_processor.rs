@@ -271,6 +271,94 @@ impl LogitsProcessor {
         Ok(next_tokens)
     }
 
+    /// Sample `sample_with_strategy`, but with an optional per-row grammar allow-mask
+    /// (`[batch, vocab]` u8, 1 = legal) offloaded into the fused CUDA sampler's top-k
+    /// stage, so disallowed vocab is dropped without a separate CPU biasing pass.
+    pub fn sample_with_strategy_masked(
+        &self,
+        logits: &Tensor,
+        sampling: &Sampling,
+        mask: Option<&Tensor>,
+    ) -> Result<Vec<u32>> {
+        #[cfg(feature = "cuda")]
+        {
+            let (k, p, t) = match sampling {
+                Sampling::TopKThenTopP { k, p, temperature } => (*k, *p, *temperature),
+                Sampling::TopK { k, temperature } => (*k, 1.0, *temperature),
+                Sampling::TopP { p, temperature } => (256, *p, *temperature),
+                _ => (0, 0.0, 0.0),
+            };
+            let should_run = matches!(
+                sampling,
+                Sampling::TopKThenTopP { .. } | Sampling::TopK { .. } | Sampling::TopP { .. }
+            );
+            if should_run && k > 0 {
+                let seed = {
+                    use rand::RngCore;
+                    self.rng.lock().next_u64()
+                };
+                let sampler = self.fast_sampler.lock().unwrap();
+                return match mask {
+                    Some(m) => sampler.sample_cuda_masked(logits, k, p as f32, t, seed, Some(m)),
+                    None => sampler.sample_cuda(logits, k, p as f32, t, seed),
+                };
+            }
+        }
+        // Non-CUDA build or unsupported strategy: fall back to the plain sampler. On this
+        // path the caller has already folded the mask into the logits (CPU where_cond).
+        self.sample_with_strategy(logits, sampling)
+    }
+
+    /// Sample with a VOB bitset mask (`[b, v/32]` U32). 8x less data than the
+    /// F32 mask path. Uses the fused `sample_cuda_vob` kernel (bitwise AND).
+    pub fn sample_with_vob(
+        &self,
+        logits: &Tensor,
+        sampling: &Sampling,
+        vob: Option<&Tensor>,
+    ) -> Result<Vec<u32>> {
+        #[cfg(feature = "cuda")]
+        {
+            let (k, p, t) = match sampling {
+                Sampling::TopKThenTopP { k, p, temperature } => (*k, *p, *temperature),
+                Sampling::TopK { k, temperature } => (*k, 1.0, *temperature),
+                Sampling::TopP { p, temperature } => (256, *p, *temperature),
+                _ => (0, 0.0, 0.0),
+            };
+            let should_run = matches!(
+                sampling,
+                Sampling::TopKThenTopP { .. } | Sampling::TopK { .. } | Sampling::TopP { .. }
+            );
+            if should_run && k > 0 {
+                let seed = {
+                    use rand::RngCore;
+                    self.rng.lock().next_u64()
+                };
+                let sampler = self.fast_sampler.lock().unwrap();
+                return sampler.sample_cuda_vob(logits, k, p as f32, t, seed, vob);
+            }
+        }
+        // Fallback: convert VOB to F32 mask and use the existing path.
+        let mask = vob.map(|vob_tensor| {
+            let words = vob_tensor.flatten_all()?.to_vec1::<u32>()?;
+            let (b, vw) = vob_tensor.dims2()?;
+            let vocab = vw * 32;
+            let mut allow = vec![1u8; b * vocab];
+            for (bi, word) in words.iter().enumerate() {
+                let row = bi / vw;
+                let col = bi % vw;
+                for bit in 0..32 {
+                    let idx = col * 32 + bit;
+                    if idx < vocab && (word >> bit) & 1 == 0 {
+                        allow[row * vocab + idx] = 0;
+                    }
+                }
+            }
+            Tensor::from_vec(allow, (b, vocab), vob_tensor.device())
+        }).transpose()?;
+        self.sample_with_strategy_masked(logits, sampling, mask.as_ref())
+    }
+
     pub fn sample(
         &self,
         logits: &Tensor,

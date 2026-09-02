@@ -1,5 +1,6 @@
 // src/utils/config.rs
 use crate::transfer::PdConfig;
+use crate::core::qos::QosConfig;
 use llguidance::api::TopLevelGrammar;
 #[cfg(feature = "python")]
 use pyo3::pyclass;
@@ -471,6 +472,17 @@ pub struct EngineConfig {
     pub disable_cuda_graph: bool,
     #[serde(default = "default_prefill_chunk_size")]
     pub prefill_chunk_size: usize,
+    /// Hard ceiling for the adaptive prefill chunk (default: `prefill_chunk_size`).
+    /// Under decode pressure the scheduler shrinks the chunk toward this cap.
+    #[serde(default)]
+    pub max_prefill_chunk_tokens: Option<usize>,
+    /// Floor for the adaptive prefill chunk (default: 256). The chunk never
+    /// shrinks below this even under heavy decode pressure.
+    #[serde(default)]
+    pub min_prefill_chunk_tokens: Option<usize>,
+    /// QoS scheduling (class-aware adaptive prefill/decode).
+    #[serde(default)]
+    pub qos: QosConfig,
     #[serde(default = "default_num_nodes")]
     pub num_nodes: usize,
     #[serde(default)]
@@ -586,6 +598,17 @@ pub struct EngineConfig {
     #[pyo3(get, set)]
     #[serde(default = "default_prefill_chunk_size")]
     pub prefill_chunk_size: usize,
+    /// Hard ceiling for the adaptive prefill chunk (default: `prefill_chunk_size`).
+    #[pyo3(get, set)]
+    #[serde(default)]
+    pub max_prefill_chunk_tokens: Option<usize>,
+    /// Floor for the adaptive prefill chunk (default: 256).
+    #[pyo3(get, set)]
+    #[serde(default)]
+    pub min_prefill_chunk_tokens: Option<usize>,
+    /// QoS scheduling (class-aware adaptive prefill/decode).
+    #[serde(default)]
+    pub qos: QosConfig,
     #[pyo3(get, set)]
     #[serde(default = "default_num_nodes")]
     pub num_nodes: usize,
@@ -667,6 +690,9 @@ impl EngineConfig {
         master_port: u16,
         enable_tool_grammar: bool,
         num_speculative_tokens: Option<usize>,
+        draft_model: Option<String>,
+        max_prefill_chunk_tokens: Option<usize>,
+        min_prefill_chunk_tokens: Option<usize>,
     ) -> Self {
         let mut device_ids = device_ids.unwrap_or_default();
         if device_ids.is_empty() {
@@ -722,12 +748,15 @@ impl EngineConfig {
             prefill_chunk_size: normalize_prefill_chunk_size(
                 prefill_chunk_size.unwrap_or(DEFAULT_PREFILL_CHUNK_SIZE),
             ),
+            max_prefill_chunk_tokens,
+            min_prefill_chunk_tokens,
+            qos: QosConfig::default(),
             num_nodes,
             node_rank,
             master_addr,
             master_port,
             num_speculative_tokens,
-            draft_model: None,
+            draft_model,
             enable_tool_grammar,
         }
     }
@@ -1420,17 +1449,16 @@ impl Default for ReasoningEffort {
 impl ReasoningEffort {
     /// Parse a string to ReasoningEffort
     pub fn from_str(s: String) -> Self {
-        match s.to_lowercase().as_str() {
+        match s.to_lowercase().replace("-", "_").as_str() {
             "none" => Self::None,
-            "model_default" | "default" => Self::ModelDefault,
             "low" => Self::Low,
             "normal" | "medium" => Self::Medium,
             "high" => Self::High,
-            "xhigh" | "x_high" | "very_high" | "maximum" | "max" => Self::High,
-            "chain_of_thought" | "cot" | "cove" => Self::ChainOfThought,
+            // Maximum reasoning levels
+            "xhigh" | "x_high" | "very_high" | "maximum" | "max" | "chain_of_thought" | "cot" | "cove" => Self::ChainOfThought,
             #[cfg(all(not(feature = "python"), not(feature = "pyo3")))]
             s if s.starts_with("custom:") => Self::Custom(s[7..].to_string()),
-            _ => Self::None,
+            _ => Self::ModelDefault,
         }
     }
 
@@ -2087,7 +2115,7 @@ mod tests {
         );
         assert_eq!(
             ReasoningEffort::from_str("xhigh".to_string()),
-            ReasoningEffort::High
+            ReasoningEffort::ChainOfThought
         );
         assert_eq!(
             ReasoningEffort::from_str("chain_of_thought".to_string()),

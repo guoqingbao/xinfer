@@ -21,7 +21,7 @@ use crate::transfer::Transfer;
 use crate::utils::chat_template::Message;
 use crate::utils::config::{EngineConfig, EosTokenId, ModelType, SamplingParams};
 use crate::utils::guidance::{build_llg_factory, extract_guidance_tokens, GuidanceTokens};
-use crate::utils::guidance_grammar::{get_reasoning_token_strings, is_reasoning_grammar};
+use crate::utils::guidance_grammar::{get_lark_from_top_level_grammar, is_reasoning_grammar};
 use crate::utils::heartbeat::heartbeat_worker;
 use crate::utils::image::{get_image_config, ImageData, ImageProcessConfig};
 use crate::utils::kvcache_allocator::KVCacheAllocator;
@@ -113,6 +113,9 @@ pub struct LLMEngine {
     pub tool_config: ToolConfig,
     pub img_cfg: Option<ImageProcessConfig>,
     pub guidance_tokens: GuidanceTokens,
+    seq_spec_stats: HashMap<usize, crate::runner::SpecSeqStatsData>,
+    /// Per-sequence QoS/scheduling stats, captured at sequence end (conditional display).
+    seq_sched_stats: HashMap<usize, crate::core::qos::SchedSeqStats>,
 }
 
 impl LLMEngine {
@@ -590,6 +593,8 @@ impl LLMEngine {
             img_cfg,
             model_name,
             guidance_tokens,
+            seq_spec_stats: HashMap::new(),
+            seq_sched_stats: HashMap::new(),
         }));
 
         Self::start_engine(engine.clone());
@@ -711,13 +716,17 @@ impl LLMEngine {
                 params.stop_sequences = Some(resolved_stop_sequences);
             }
         }
-        let seq = Sequence::new(
+        let mut seq = Sequence::new(
             token_ids,
             self.econfig.block_size,
             params,
             images,
             image_idx,
         );
+        // QoS: infer the class from the request's max output tokens (short output
+        // => latency-sensitive agentic; large => throughput). Explicit hints can
+        // override this later.
+        seq.qos_class = self.econfig.qos.infer_class(seq.sampling_params.max_tokens);
 
         let prompt_required_blocks = self.scheduler.block_manager.required_blocks(&seq);
         let requested_decode_blocks = max_tokens.div_ceil(self.econfig.block_size);
@@ -975,6 +984,15 @@ impl LLMEngine {
     }
 
     pub fn notify_runner_finished(&mut self, id: usize) -> Result<()> {
+        // Fetch the per-seq spec stats before FinishDecode (which drops them runner-side).
+        let spec_stats = self.fetch_spec_seq_stats(id);
+        if !spec_stats.mechanism.is_empty() {
+            self.seq_spec_stats.insert(id, spec_stats);
+        }
+        // Capture the per-seq QoS/scheduling stats (scheduler-side, same process).).
+        if let Some(sched_stats) = self.scheduler.sched_stats_for(id) {
+            self.seq_sched_stats.insert(id, sched_stats);
+        }
         match &mut *self.runners.write() {
             RunnerType::Thread(model_runner) => Ok(model_runner.finished(id)),
             RunnerType::Process(ref mut runner_streams) => {
@@ -995,12 +1013,45 @@ impl LLMEngine {
                 for stream in local_streams.iter_mut() {
                     send_local(&mut vec![stream.try_clone()?], &msg, false)?;
                 }
-                let serialized = bincode::serialize(&msg).expect("Bincode serialization failed");
+                let serialized = rmp_serde::to_vec(&msg).expect("MsgPack serialization failed");
                 for tcp_stream in remote_streams.iter_mut() {
                     crate::utils::multi_node::send_tcp(tcp_stream, &serialized)?;
                 }
                 Ok(())
             }
+        }
+    }
+
+    /// The cached per-seq spec stats (for the server's end-of-sequence report).
+    pub fn get_seq_spec_stats(&self, seq_id: usize) -> Option<crate::runner::SpecSeqStatsData> {
+        self.seq_spec_stats.get(&seq_id).cloned()
+    }
+
+    /// The cached per-seq QoS/scheduling stats (for the server's end-of-sequence report).
+    pub fn get_seq_sched_stats(&self, seq_id: usize) -> Option<crate::core::qos::SchedSeqStats> {
+        self.seq_sched_stats.get(&seq_id).cloned()
+    }
+
+    /// Fetch a sequence's speculative-decode stats from rank 0 (Process mode only).
+    fn fetch_spec_seq_stats(&self, id: usize) -> crate::runner::SpecSeqStatsData {
+        use crate::runner::SpecSeqStatsData;
+        match &mut *self.runners.write() {
+            RunnerType::Process(ref mut runner_streams) => {
+                if runner_streams.is_empty() {
+                    return SpecSeqStatsData::default();
+                }
+                let stream = &mut runner_streams[0];
+                let _ = send_local(
+                    &mut vec![stream.try_clone().expect("clone failed")],
+                    &MessageType::GetSpecSeqStats(id),
+                    false,
+                );
+                match receive_local(stream, false) {
+                    Ok(MessageType::SpecSeqStatsResponse(_, data)) => data,
+                    _ => SpecSeqStatsData::default(),
+                }
+            }
+            _ => SpecSeqStatsData::default(),
         }
     }
 
@@ -1101,7 +1152,7 @@ impl LLMEngine {
                     MessageType::RunDecode((sequences, false))
                 };
                 let serialized =
-                    bincode::serialize(&request).expect("Bincode serialization failed");
+                    rmp_serde::to_vec(&request).expect("MsgPack serialization failed");
 
                 // Send to remote worker nodes via TCP (fire-and-forget the responses;
                 // NCCL all-reduce synchronizes the actual computation)
@@ -1119,7 +1170,7 @@ impl LLMEngine {
                 for tcp_stream in remote_streams.iter_mut() {
                     match crate::utils::multi_node::recv_tcp(tcp_stream) {
                         Ok(data) => {
-                            let resp: MessageType = bincode::deserialize(&data)
+                            let resp: MessageType = rmp_serde::from_slice(&data)
                                 .expect("Failed to deserialize remote worker response");
                             match resp {
                                 MessageType::RunResponse(ref ids) if ids.is_empty() => {
@@ -1171,8 +1222,15 @@ impl LLMEngine {
 
                 match response {
                     MessageType::RunResponse(output_ids) => {
-                        if output_ids.len() == 0 {
-                            candle_core::bail!("Runner step error, no response!")
+                        if output_ids.is_empty() {
+                            // Runner hit a transient error (e.g. drafter mask
+                            // mismatch). Log and signal retry; do NOT kill the
+                            // entire engine. The sequence stays in the running
+                            // list and will be retried on the next tick.
+                            crate::log_warn!(
+                                "Runner returned empty response (transient error, will retry next tick)"
+                            );
+                            Ok(vec![]) // empty = "no progress this tick"
                         } else {
                             Ok(output_ids)
                         }
@@ -1214,7 +1272,9 @@ impl LLMEngine {
                         Ok(multi_tokens)
                     }
                     MessageType::RunResponseMTP(_) => {
-                        candle_core::bail!("MTP runner returned empty response")
+                        // Transient error: log and retry next tick.
+                        crate::log_warn!("MTP runner returned empty (transient error, retrying)");
+                        Ok(vec![])
                     }
                     other => {
                         candle_core::bail!("Unexpected MTP response type: {:?}", other)
@@ -1263,7 +1323,7 @@ impl LLMEngine {
                     .collect::<Vec<_>>();
                 let request = MessageType::RunDecodeMTP(sequences);
                 let serialized =
-                    bincode::serialize(&request).expect("Bincode serialization failed");
+                    rmp_serde::to_vec(&request).expect("MsgPack serialization failed");
 
                 for tcp_stream in remote_streams.iter_mut() {
                     if let Err(e) = crate::utils::multi_node::send_tcp(tcp_stream, &serialized) {
@@ -1297,7 +1357,8 @@ impl LLMEngine {
                 match receive_local(&mut stream, false)? {
                     MessageType::RunResponseDFlash(tokens) if !tokens.is_empty() => Ok(tokens),
                     MessageType::RunResponseDFlash(_) => {
-                        candle_core::bail!("DFlash runner returned empty response")
+                        crate::log_warn!("DFlash runner returned empty (transient error, retrying)");
+                        Ok(vec![])
                     }
                     other => candle_core::bail!("Unexpected DFlash response type: {:?}", other),
                 }
@@ -1337,7 +1398,7 @@ impl LLMEngine {
                     .collect::<Vec<_>>();
                 let request = MessageType::RunDecodeDFlash(sequences);
                 let serialized =
-                    bincode::serialize(&request).expect("Bincode serialization failed");
+                    rmp_serde::to_vec(&request).expect("MsgPack serialization failed");
                 for stream in remote_streams.iter_mut() {
                     crate::utils::multi_node::send_tcp(stream, &serialized)?;
                 }
@@ -1732,13 +1793,21 @@ impl LLMEngine {
         let default_enable_thinking = self.template.enable_thinking();
         if let Some(grammar) = &params.grammar {
             if is_reasoning_grammar(&grammar) {
+                // Implies full-envelope generation
                 prompt_template.set_enable_thinking(true);
             } else {
-                // Grammar without reasoning rules: thinking is handled at the mask
-                // level (GuidanceState defers grammar until after </think>), so use
-                // the default thinking setting — same as the no-grammar path.
-                prompt_template
-                    .set_enable_thinking(params.thinking.unwrap_or(default_enable_thinking));
+                if crate::utils::env::llg_full_enabled() {
+                    // Without reasoning grammar in full-envelope generation, the model cannot emit </think>
+                    prompt_template.set_enable_thinking(false);
+                } else {
+                    // Normal 2-phase generation.
+                    // Grammar without reasoning rules: thinking is handled at the mask
+                    // level (GuidanceState defers grammar until after </think>), so use
+                    // the default thinking setting — same as the no-grammar path.
+                    prompt_template.set_enable_thinking(
+                        params.thinking.unwrap_or(default_enable_thinking),
+                    );
+                }
             }
         } else {
             prompt_template.set_enable_thinking(params.thinking.unwrap_or(default_enable_thinking));
@@ -1782,7 +1851,8 @@ impl LLMEngine {
         }
         // Generation alignment and open/close parity enforcement
         if let Some(grammar) = &params.grammar {
-            if self.guidance_tokens.add_bos_token {
+            let lark = get_lark_from_top_level_grammar(grammar);
+            if lark.contains("start: bos ") {
                 // BOS-based trimming: trim the last BOS token from the prompt tail.
                 // Only trim if the prompt actually ends with the BOS string to avoid
                 // splitting in the middle of a multi-turn conversation.
@@ -1790,42 +1860,20 @@ impl LLMEngine {
                     .tokenizer
                     .decode(&self.guidance_tokens.bos_token_ids, false)
                 {
-                    if prompt.trim_end().ends_with(&bos_string) {
-                        if let Some((prefix, _)) = prompt.rsplit_once(&bos_string) {
-                            return (prefix.to_string(), image_idx);
+                    if let Some((prefix, trimmed)) = prompt.rsplit_once(&bos_string) {
+                        if crate::utils::env::debug_llg() {
+                            log_info!("[llg] Prompt suffix trimmed: {}{}", &bos_string, trimmed);
                         }
+                        return (prefix.to_string(), image_idx);
                     }
                 }
                 for bos_token in self.guidance_tokens.bos_token_ids.iter() {
                     if let Ok(bos_string) = self.tokenizer.decode(&[*bos_token], false) {
-                        if prompt.trim_end().ends_with(&bos_string) {
-                            if let Some((prefix, _)) = prompt.rsplit_once(&bos_string) {
-                                return (prefix.to_string(), image_idx);
+                        if let Some((prefix, trimmed)) = prompt.rsplit_once(&bos_string) {
+                            if crate::utils::env::debug_llg() {
+                                log_info!("[llg] Prompt suffix trimmed: {}{}", &bos_string, trimmed);
                             }
-                        }
-                    }
-                }
-            } else {
-                // Reasoning tag-based trimming: check for reasoning start/end tokens
-                if let Some((start_str, end_str)) =
-                    get_reasoning_token_strings(&self.guidance_tokens, &self.tokenizer)
-                {
-                    if is_reasoning_grammar(&grammar) {
-                        // Control entire reasoning block via guidance
-                        if prompt.trim().ends_with(&start_str) || prompt.trim().ends_with(&end_str)
-                        {
-                            if let Some((prompt, _trimmed)) = prompt.rsplit_once(&start_str) {
-                                return (prompt.to_string(), image_idx);
-                            }
-                        }
-                    } else if params.guidance_reasoning_end_ids.is_empty() {
-                        // Only trim <think> when NOT using two-phase reasoning.
-                        // With two-phase reasoning, the model needs the <think> prefix
-                        // to generate reasoning freely before grammar constraints kick in.
-                        if prompt.trim().ends_with(&start_str) {
-                            if let Some((prompt, _trimmed)) = prompt.rsplit_once(&start_str) {
-                                return (prompt.to_string(), image_idx);
-                            }
+                            return (prefix.to_string(), image_idx);
                         }
                     }
                 }
@@ -2190,7 +2238,7 @@ impl LLMEngine {
                     } => {
                         let request = MessageType::RunEmbed((vec![seq.clone()], strategy.clone()));
                         let serialized =
-                            bincode::serialize(&request).expect("Bincode serialization failed");
+                            rmp_serde::to_vec(&request).expect("MsgPack serialization failed");
 
                         for tcp_stream in remote_streams.iter_mut() {
                             crate::utils::multi_node::send_tcp(tcp_stream, &serialized)?;
@@ -2226,7 +2274,7 @@ impl LLMEngine {
 
                         for tcp_stream in remote_streams.iter_mut() {
                             let data = crate::utils::multi_node::recv_tcp(tcp_stream)?;
-                            let response: MessageType = bincode::deserialize(&data)
+                            let response: MessageType = rmp_serde::from_slice(&data)
                                 .expect("Failed to deserialize remote worker response");
                             match response {
                                 MessageType::RunResponseEmbed(output_embed) => {
@@ -2383,6 +2431,16 @@ impl LLMEngine {
 
                     match forward_result {
                         Ok(multi_output_ids) => {
+                            // If all outputs are empty, the runner hit a transient
+                            // error (e.g. drafter mask mismatch). Skip finish_step
+                            // and retry on the next tick. Sequences stay in the
+                            // running list; no data is lost.
+                            if multi_output_ids.iter().all(|ids| ids.is_empty()) {
+                                crate::log_warn!(
+                                    "[Engine Loop] All runners returned empty (transient error), retrying next tick"
+                                );
+                                continue;
+                            }
                             let mut guard = engine.write();
                             match guard.finish_step(scheduled_ids, is_prefill, multi_output_ids) {
                                 Ok(n) => task_processed = n,
@@ -2450,6 +2508,7 @@ mod tests {
             tool_call_start_ids: Vec::new(),
             tool_call_end_ids: Vec::new(),
             add_bos_token: false,
+            add_eos_token: true,
         };
 
         assert_eq!(
@@ -2468,6 +2527,7 @@ mod tests {
             tool_call_start_ids: Vec::new(),
             tool_call_end_ids: Vec::new(),
             add_bos_token: false,
+            add_eos_token: true,
         };
 
         assert_eq!(
@@ -2486,6 +2546,7 @@ mod tests {
             tool_call_start_ids: Vec::new(),
             tool_call_end_ids: Vec::new(),
             add_bos_token: false,
+            add_eos_token: true,
         };
 
         assert_eq!(
@@ -2504,6 +2565,7 @@ mod tests {
             tool_call_start_ids: Vec::new(),
             tool_call_end_ids: Vec::new(),
             add_bos_token: false,
+            add_eos_token: true,
         };
 
         assert_eq!(
@@ -2522,6 +2584,7 @@ mod tests {
             tool_call_start_ids: Vec::new(),
             tool_call_end_ids: Vec::new(),
             add_bos_token: false,
+            add_eos_token: true,
         };
 
         assert_eq!(

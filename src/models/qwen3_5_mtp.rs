@@ -557,6 +557,7 @@ impl Qwen3_5MtpHead {
         embed_fn: impl Fn(u32) -> Result<Tensor>,
         lm_head_fn: impl Fn(&Tensor) -> Result<Tensor>,
         positions_base: usize,
+        grammar_masks: Option<&[Vec<u32>]>,
     ) -> Result<(Vec<u32>, Tensor)> {
         let mut draft_tokens = Vec::with_capacity(num_tokens);
         let mut current_hidden = initial_hidden.clone();
@@ -566,7 +567,7 @@ impl Qwen3_5MtpHead {
             let token_embed = embed_fn(current_token)?;
             let token_embed = match token_embed.dims().len() {
                 1 => token_embed.unsqueeze(0)?,
-                _ => token_embed,
+                _ => token_embed.clone(),
             };
 
             let current_hidden_2d = match current_hidden.dims().len() {
@@ -586,6 +587,37 @@ impl Qwen3_5MtpHead {
             } else {
                 logits
             };
+
+            // Apply grammar mask at this draft position (if provided).
+            let logits_last = if let Some(masks) = grammar_masks {
+                if step < masks.len() {
+                    let mask = &masks[step];
+                    let vocab_size = logits_last.dim(1)? as usize;
+                    let num_words = (vocab_size + 31) / 32;
+                    let apply_len = mask.len().min(num_words);
+                    // Build a u8 allow vector from the VOB words (1=allowed, 0=disallowed)
+                    let mut allow = vec![1u8; vocab_size];
+                    for (w, &word) in mask.iter().take(apply_len).enumerate() {
+                        for b in 0..32 {
+                            let idx = w * 32 + b;
+                            if idx >= vocab_size { break; }
+                            allow[idx] = ((word >> b) & 1) as u8;
+                        }
+                    }
+                    // Set disallowed logits to -inf
+                    let neg_inf = Tensor::full(f32::NEG_INFINITY, logits_last.shape(), logits_last.device())?;
+                    let allow_tensor = Tensor::from_vec(allow, (vocab_size,), logits_last.device())?;
+                    let allow_f32 = allow_tensor.to_dtype(DType::F32)?;
+                    let ones = Tensor::full(1.0f32, allow_f32.shape(), allow_f32.device())?;
+                    let mask_bool = allow_f32.eq(&ones)?;
+                    mask_bool.where_cond(&logits_last, &neg_inf)?
+                } else {
+                    logits_last
+                }
+            } else {
+                logits_last
+            };
+
             let next_token = logits_last.argmax(D::Minus1)?.to_scalar::<u32>()?;
 
             draft_tokens.push(next_token);

@@ -1,15 +1,17 @@
 //! Speculative decoding: built-in MTP heads and external DFlash2 draft models.
 
+pub mod adaptive_k;
 pub mod dflash;
 pub mod mamba;
 pub mod metadata;
 pub mod mtp;
+pub mod spec_stats;
 pub mod verify;
 
 pub use dflash::DFlashDrafter;
 pub use metadata::SpecSeqInfo;
 pub use verify::{
-    dflash_stats_reset, dflash_stats_summary, mtp_stats_acceptance_rate,
+    dfa_validate_draft, dflash_stats_reset, dflash_stats_summary, mtp_stats_acceptance_rate,
     mtp_stats_avg_tokens_per_step, mtp_stats_reset, mtp_stats_summary, mtp_stats_update,
     verify_draft_greedy, MtpVerifyResult, SPEC_STATS_WINDOW_STEPS,
 };

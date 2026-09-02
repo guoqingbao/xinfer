@@ -309,7 +309,7 @@ impl EngineConfig {
         disable_reasoning=false, disable_cuda_graph=false, prefill_chunk_size=Some(8192),
         num_nodes=1, node_rank=0, master_addr=None, master_port=29500,
         enable_tool_grammar=false, num_speculative_tokens=None,
-        draft_model=None,))]
+        draft_model=None, max_prefill_chunk_tokens=None, min_prefill_chunk_tokens=None))]
     pub fn new(
         model_id: Option<String>,
         weight_path: Option<String>,
@@ -351,6 +351,8 @@ impl EngineConfig {
         enable_tool_grammar: bool,
         num_speculative_tokens: Option<usize>,
         draft_model: Option<String>,
+        max_prefill_chunk_tokens: Option<usize>,
+        min_prefill_chunk_tokens: Option<usize>,
     ) -> Self {
         let mut device_ids = device_ids.unwrap_or_default();
         if device_ids.is_empty() {
@@ -414,6 +416,9 @@ impl EngineConfig {
             num_speculative_tokens,
             draft_model,
             enable_tool_grammar,
+            max_prefill_chunk_tokens,
+            min_prefill_chunk_tokens,
+            qos: crate::core::qos::QosConfig::default(),
         }
     }
 }
@@ -553,5 +558,13 @@ impl PdConfig {
             panic!("Non-CUDA platform does not support LocalIPC, please provide pd-url (e.g., server: 0.0.0.0:8100, client: server_id:8100)!");
         }
         Self { role, method, url }
+    }
+}
+
+// QosConfig is configured via env vars (XINFER_QOS), not Python.
+// Return default when extracted from Python.
+impl<'source> pyo3::FromPyObject<'source> for crate::core::qos::QosConfig {
+    fn extract_bound(_: &pyo3::Bound<'source, pyo3::PyAny>) -> pyo3::PyResult<Self> {
+        Ok(crate::core::qos::QosConfig::default())
     }
 }
