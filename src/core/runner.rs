@@ -12,7 +12,7 @@ use crate::utils::graph::{
     planned_graph_capture_batches, CudaGraphFn, CudaGraphWrapper, GraphCapturer, ModelFn,
 };
 use crate::utils::guidance::ParserFactory;
-use crate::utils::guided_decoding::{GuidedDecoding, GuidedDecodingRequest};
+use crate::utils::guided_decoding::{GuidedDecoding, GuidedDecodingRequest, GuidedDecodingStep};
 use crate::utils::image::compute_image_slice;
 use crate::utils::logits_processor::{LogitsProcessor, Sampling};
 use crate::utils::progress::ProgressLike;
@@ -1884,14 +1884,17 @@ impl ModelRunner {
                 .iter()
                 .map(|&index| all_requests[index])
                 .collect();
-            let (guided_logits, guided_step) = self
-                .guided_decoding
-                .apply(&original_guided_logits, &guided_requests)?;
             let guided_tokens: Vec<u32> = if crate::utils::env::spec_mask_offload() {
-                // GPU offload: pass the allow-mask to the fused sampler instead of biasing the
-                // logits; sample the original (unbiased) logits. The mask must cover the FULL
-                // batch (one row per sequence) so its row count matches `logits`; non-guided
-                // rows are all-1 (allow-all).
+                // GPU offload: build mask directly (single compute_mask_or_eos call).
+                // Do NOT call apply() here - it consumes ff_tokens_cache as a side effect,
+                // causing the second compute_mask_or_eos in build_allow_mask to see a
+                // different parser state.
+                let guided_step = GuidedDecodingStep::new(
+                    all_requests.iter()
+                        .filter(|r| r.grammar.is_some())
+                        .map(|r| r.seq_id)
+                        .collect()
+                );
                 if crate::utils::env::vob_sampling() {
                     // VOB bitset path: 8x less data than F32 mask.
                     let vob_words = self
@@ -1911,7 +1914,7 @@ impl ModelRunner {
                         vob_words.as_ref(),
                     )?;
                     self.guided_decoding.apply_fast_forward(&seq_ids, &mut tokens);
-                    self.guided_decoding.commit(&seq_ids, &tokens, guided_step.clone());
+                    self.guided_decoding.commit(&seq_ids, &tokens, guided_step);
                     tokens
                 } else {
                     let mask = self
@@ -1923,20 +1926,27 @@ impl ModelRunner {
                         mask.as_ref(),
                     )?;
                     self.guided_decoding.apply_fast_forward(&seq_ids, &mut tokens);
-                    self.guided_decoding.commit(&seq_ids, &tokens, guided_step.clone());
+                    self.guided_decoding.commit(&seq_ids, &tokens, guided_step);
                     tokens
                 }
             } else {
-                let guided_delta = (&guided_logits - &original_guided_logits)?;
-                let modified_logits = logits.index_add(&guided_indices, &guided_delta, 0)?;
-                self.sample_processed_logits(&modified_logits, &cached_params.sampling)?
+                // Original path: apply() computes masked logits via index_add.
+                let (guided_logits, guided_step) = self
+                    .guided_decoding
+                    .apply(&original_guided_logits, &guided_requests)?;
+                let sample_logits = if guided_positions.len() == seq_ids.len() {
+                    guided_logits
+                } else {
+                    let guided_delta = (&guided_logits - &original_guided_logits)?;
+                    logits.index_add(&guided_indices, &guided_delta, 0)?
+                };
+                let mut tokens =
+                    self.sample_processed_logits(&sample_logits, &cached_params.sampling)?;
+                self.guided_decoding.apply_fast_forward(&seq_ids, &mut tokens);
+                self.guided_decoding.commit(&seq_ids, &tokens, guided_step);
+                tokens
             };
-            let mut tokens =
-                self.sample_processed_logits(&logits, &cached_params.sampling)?;
-            self.guided_decoding
-                .apply_fast_forward(&seq_ids, &mut tokens);
-            self.guided_decoding.commit(&seq_ids, &tokens, guided_step);
-            tokens
+            guided_tokens
         };
 
         // Track tokens for sequences when penalties are enabled

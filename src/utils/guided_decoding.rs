@@ -26,7 +26,7 @@ impl GuidedDecodingStep {
         }
     }
 
-    fn new(guided_seq_ids: HashSet<usize>) -> Self {
+    pub fn new(guided_seq_ids: HashSet<usize>) -> Self {
         Self {
             guided_seq_ids: Some(guided_seq_ids),
         }
