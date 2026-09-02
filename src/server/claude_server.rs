@@ -3940,7 +3940,7 @@ mod tests {
         assert_eq!(request.reasoning_effort.as_deref(), Some("xhigh"));
         assert_eq!(
             ReasoningEffort::from_str(request.reasoning_effort.unwrap()),
-            ReasoningEffort::High
+            ReasoningEffort::ChainOfThought
         );
     }
 

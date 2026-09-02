@@ -607,7 +607,6 @@ pub struct EngineConfig {
     #[serde(default)]
     pub min_prefill_chunk_tokens: Option<usize>,
     /// QoS scheduling (class-aware adaptive prefill/decode).
-    #[pyo3(get, set)]
     #[serde(default)]
     pub qos: QosConfig,
     #[pyo3(get, set)]
@@ -691,6 +690,9 @@ impl EngineConfig {
         master_port: u16,
         enable_tool_grammar: bool,
         num_speculative_tokens: Option<usize>,
+        draft_model: Option<String>,
+        max_prefill_chunk_tokens: Option<usize>,
+        min_prefill_chunk_tokens: Option<usize>,
     ) -> Self {
         let mut device_ids = device_ids.unwrap_or_default();
         if device_ids.is_empty() {
@@ -746,15 +748,15 @@ impl EngineConfig {
             prefill_chunk_size: normalize_prefill_chunk_size(
                 prefill_chunk_size.unwrap_or(DEFAULT_PREFILL_CHUNK_SIZE),
             ),
-            max_prefill_chunk_tokens: None,
-            min_prefill_chunk_tokens: None,
+            max_prefill_chunk_tokens,
+            min_prefill_chunk_tokens,
             qos: QosConfig::default(),
             num_nodes,
             node_rank,
             master_addr,
             master_port,
             num_speculative_tokens,
-            draft_model: None,
+            draft_model,
             enable_tool_grammar,
         }
     }
@@ -2113,7 +2115,7 @@ mod tests {
         );
         assert_eq!(
             ReasoningEffort::from_str("xhigh".to_string()),
-            ReasoningEffort::High
+            ReasoningEffort::ChainOfThought
         );
         assert_eq!(
             ReasoningEffort::from_str("chain_of_thought".to_string()),

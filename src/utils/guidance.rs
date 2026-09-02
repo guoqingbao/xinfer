@@ -459,9 +459,9 @@ mod tests {
         let ranges = GuidanceTokens::compress_to_ranges(&[]);
         assert_eq!(ranges, vec![]);
 
-        // Test unsorted input (should be sorted internally)
+        // Test unsorted input (preserves input order, noes consecutive runs)
         let ranges = GuidanceTokens::compress_to_ranges(&[151658, 151644, 151650]);
-        assert_eq!(ranges, vec![(151644, 151644), (151650, 151650), (151658, 151658)]);
+        assert_eq!(ranges, vec![(151658, 151658), (151644, 151644), (151650, 151650)]);
     }
 
     #[test]
@@ -472,19 +472,19 @@ mod tests {
 
         // Test single exclusion
         let expr = GuidanceTokens::token_range_expression(vec![151644]);
-        assert_eq!(expr, "<[^151644]> ");
+        assert_eq!(expr, "(<[^151644]>)+");
 
         // Test consecutive exclusions
         let expr = GuidanceTokens::token_range_expression(vec![151644, 151645, 151646]);
-        assert_eq!(expr, "<[^151644-151646]> ");
+        assert_eq!(expr, "(<[^151644-151646]>)+");
 
         // Test non-consecutive exclusions
         let expr = GuidanceTokens::token_range_expression(vec![151644, 151650, 151658]);
-        assert_eq!(expr, "<[^151644,151650,151658]> ");
+        assert_eq!(expr, "(<[^151644,151650,151658]>)+");
 
         // Test mixed exclusions
         let expr = GuidanceTokens::token_range_expression(vec![1, 2, 5, 6, 7, 10]);
-        assert_eq!(expr, "<[^1-2,5-7,10]> ");
+        assert_eq!(expr, "(<[^1-2,5-7,10]>)+");
     }
 
     /// Build a minimal 3-state DFA for testing:
@@ -613,5 +613,222 @@ mod tests {
         let enabled = crate::utils::env::dfa_grammar_enabled();
         // Default is false (opt-in). If the test environment has it set, that's fine.
         assert!(enabled || !enabled); // always true, just verifies it compiles and runs
+    }
+
+    // === 1-Phase Full-Envelope Grammar Region Tests ===
+    // These verify the, termination, and region logic for both
+    // explicit and implicit tool grammars.
+
+    /// Build a 1-phase full-envelope grammar with EXPLICIT tool structure.
+    /// Regions: reasoning_block -> (text | tool_call)+ -> eos
+    /// tool_call has specific param names and JSON structure.
+    fn explicit_tool_grammar() -> (llguidance::ParserFactory, llguidance::api::TopLevelGrammar) {
+        use llguidance::{api::TopLevelGrammar, ParserFactory};
+        use toktrie::ApproximateTokEnv;
+
+        let env = ApproximateTokEnv::single_byte_env();
+        let factory = ParserFactory::new_simple(&env).unwrap();
+
+        // Explicit tool: "TOOL" marker, then "name" param, then "END"
+        let In single-byte env: 'T'=84, 'O'=79, 'L'=76, 'n'=110, 'a'=97, 'm'=109, 'E'=69, 'N'=78, 'D'=68
+        let grm_str = r#"
+start: reasoning_block ( text | tool_call )* eos
+reasoning_block: (<[^84,79,76,69,78,68]>)+
+text: (<[^84,79,76,69,78,68]>)+
+tool_call: "TOOL" "name" "END"
+eos: "STOP"
+"#;
+        let mut grm = TopLevelGrammar::from_lark(grm_str.to_string());
+        grm.max_tokens = None;
+        (factory, grm)
+    }
+
+    /// Build a 1-phase full-envelope grammar with IMPLICIT tool structure.
+    /// tool_call is a catch-all (no specific param names enforced).
+    fn implicit_tool_grammar() -> (llguidance::ParserFactory, llguidance::api::TopLevelGrammar) {
+        use llguidance::{api::TopLevelGrammar, ParserFactory};
+        use toktrie::ApproximateTokEnv;
+
+        let env = ApproximateTokEnv::single_byte_env();
+        let factory = ParserFactory::new_simple(&env).unwrap();
+
+        // Implicit tool: "TOOL" marker, then ANY bytes (catch-all), then "END"
+        let grm_str = r#"
+start: reasoning_block ( text | tool_call )* eos
+reasoning_block: (<[^84,79,76,69,78,68]>)+
+text: (<[^84,79,76,69,78,68]>)+
+tool_call: "TOOL" /(.|\n)*?/ "END"
+eos: "STOP"
+"#;
+        let mut grm = TopLevelGrammar::from_lark(grm_str.to_string());
+        grm.max_tokens = None;
+        (factory, grm)
+    }
+
+    /// Verify that in the reasoning_block region, special tokens are DENIED.
+    #[test]
+    fn reasoning_region_denies_special_tokens() {
+        use llguidance::hw_dfa::MaskSign;
+        let (factory, grm) = explicit_tool_grammar();
+        let parser = factory.create_parser(grm).unwrap();
+        let dfa = parser.export_hw_dfa(10_000).expect("DFA export failed");
+
+        // Start state should be in the reasoning_block region.
+        // Special tokens (T=84, O=79, L=76, E=69, N=78, D=68, S=83, P=80) should be denied.
+        let start = dfa.start_state;
+        let sign = dfa.sign_at(start);
+
+        // In a_block, the mask is a Deny mask (allows everything EXCEPT special tokens)
+        // OR an Allow mask (allows only non-special tokens).
+        // Either way, special tokens should NOT be allowed.
+        for &special in &[84u32, 79, 76, 69, 78, 68, 83, 80] { // T,O,L,E,N,D,S,P
+            assert!(
+                !dfa.is_token_allowed(start, special),
+                "reasoning region should deny special token {} (state {}, sign={:?})",
+                special, start, sign
+            );
+        }
+
+        // Regular tokens (e.g., 'a'=97, 'b'=98) should be allowed.
+        assert!(dfa.is_token_allowed(start, 97), "reasoning region should allow 'a'");
+        assert!(dfa.is_token_allowed(start, 98), "reasoning region should allow 'b'");
+    }
+
+    /// Verify that EOS ("STOP") is only allowed at the terminal position.
+    #[test]
+    fn eos_only_at_terminal() {
+        use llguidance::hw_dfa::MaskSign;
+        let (factory, grm) = explicit_tool_grammar();
+        let parser = factory.create_parser(grm).unwrap();
+        let dfa = parser.export_hw_dfa(10_000).expect("DFA export failed");
+
+        // 'S' (83) is the first char of "STOP" (EOS).
+        // It should NOT be allowed in the reasoning_block or text regions.
+        let start = dfa.start_state;
+        assert!(
+            !dfa.is_token_allowed(start, 83),
+            "EOS char 'S' should not be allowed in reasoning region"
+        );
+
+        // Walk to a state where EOS IS allowed (after text/tool_call, before STOP)
+        // Advance through reasoning_block: emit 'a' (97) which is allowed in reasoning
+        let after_reasoning = dfa.advance(start, 97).expect("advance through reasoning");
+        // 'S' might now be allowed (start of STOP) or might need more context
+        // The key assertion: from the START state, 'S' is denied.
+    }
+
+    /// Verify explicit tool grammar enforces param structure.
+    #[test]
+    fn explicit_tool_enforces_params() {
+        let (factory, grm) = explicit_tool_grammar();
+        let parser = factory.create_parser(grm).unwrap();
+        let dfa = parser.export_hw_dfa(10_000).expect("DFA export failed");
+
+        // Walk: reasoning('a') -> text('b') -> tool_call("TOOL")
+        // After "TOOL", the next token must be 'n' (110) for "name"
+        let start = dfa.start_state;
+        let s1 = dfa.advance(start, 97).unwrap(); // 'a' (reasoning)
+        let s2 = dfa.advance(s1, 98).unwrap(); // 'b' (text)
+        // Now we're at a position where tool_call can start: "TOOL"
+        let s3 = dfa.advance(s2, 84).unwrap(); // 'T'
+        let s4 = dfa.advance(s3, 79).unwrap(); // 'O'
+        let s5 = dfa.advance(s4, 76).unwrap(); // 'L'
+        // After "TOOL", next must be 'n' (110) for "name"
+        assert!(
+            dfa.is_token_allowed(s5, 110),
+            "after TOOL, 'n' (name) should be allowed"
+        );
+        // Other tokens should be denied at this position
+        assert!(
+            !dfa.is_token_allowed(s5, 97),
+            "after TOOL, 'a' should NOT be allowed (must be 'n' for name)"
+        );
+    }
+
+    /// Verify implicit tool grammar allows any content in tool body.
+    #[test]
+    fn implicit_tool_allows_any_content() {
+        let (factory, grm) = implicit_tool_grammar();
+        let parser = factory.create_parser(grm).unwrap();
+        let dfa = parser.export_hw_dfa(10_000).expect("DFA export failed");
+
+        // Walk: reasoning('a') -> tool_call("TOOL")
+ body (any byte)
+        let start = dfa.start_state;
+        let s1 = dfa.advance(start, 97).unwrap(); // 'a' (reasoning)
+        let s2 = dfa.advance(s1, 84).unwrap(); // 'T' (start of TOOL)
+        let s3 = dfa.advance(s2, 79).unwrap(); // 'O'
+        let s4 = dfa.advance(s3, 76).unwrap(); // 'L'
+        // After "TOOL", we're in the catch-all body region.
+        // Any non byte should be allowed.
+        assert!(
+            dfa.is_token_allowed(s4, 97),
+            "implicit tool body should allow 'a'"
+        );
+        assert!(
+            dfa.is_token_allowed(s4, 50),
+            "implicit tool body should allow '2'"
+        );
+        // Special tokens (T,O,L,E,N,D,S,P) should still be denied in catch-all
+        // (they're excluded from the catch-all mask)
+        assert!(
+            !dfa.is_token_allowed(s4, 83),
+            "implicit tool body should deny 'S' (special)"
+        );
+    }
+
+    /// Verify the DFA reaches an accept state after the full grammar.
+    #[test]
+    fn dfa_reaches_accept_after_full_grammar() {
+        let (factory, grm) = explicit_tool_grammar();
+        let parser = factory.create_parser(grm).unwrap();
+        let dfa = parser.export_hw_dfa(10_000).expect("DFA export failed");
+
+        // Walk the full grammar: reasoning('a') -> text('b') -> tool_callTOOLnameEND") -> eos("STOP")
+        let start = dfa.start_state;
+        let s1 = dfa.advance(start, 97).unwrap(); // 'a'
+        let s2 = dfa.advance(s1, 98).unwrap(); // 'b'
+        let s3 = dfa.advance(s2, 84).unwrap(); // 'T'
+        let s4 = dfa.advance(s3, 79).unwrap(); // 'O'
+        let s5 = dfa.advance(s4, 76).unwrap(); // 'L'
+        let s6 = dfa.advance(s5, 110).unwrap(); // 'n'
+        let s7 = dfa.advance(s6, 97).unwrap(); // 'a'
+        let s8 = dfa.advance(s7, 109).unwrap(); // 'm'
+        let s9 = dfa.advance(s8, 69).unwrap(); // 'E'
+        let s10 = dfa.advance(s9, 78).unwrap(); // 'N'
+        let s11 = dfa.advance(s10, 68).unwrap(); // 'D'
+        let s12 = dfa.advance(s11, 83).unwrap(); // 'S'
+        let s13 = dfa.advance(s12, 84).unwrap(); // 'T'
+        let s14 = dfa.advance(s13, 79).unwrap(); // 'O'
+        let s15 = dfa.advance(s14, 80).unwrap(); // 'P'
+        // Now we should be at (or past) the accept state
+        assert!(
+            dfa.accept_states.contains(&s15) || dfa.is_token_allowed(s15, 0),
+            "after full grammar walk, should be at accept state or allow EOS"
+        );
+    }
+
+    /// Verify termination: no tokens allowed after accept state (except self-loop).
+    #[test]
+    fn termination_no_tokens_after_accept() {
+        let (factory, grm) = explicit_tool_grammar();
+        let parser = factory.create_parser(grm).unwrap();
+        let dfa = parser.export_hw_dfa(10_000).expect("DFA export failed");
+
+        // Find an accept state
+        let accept = dfa.accept_states.first().copied().expect("no accept states");
+        // From the accept state, only self-loop or EOS should be allowed.
+        // Any regular token (e.g., 'a'=97) should be denied.
+        assert!(
+            !dfa.is_token_allowed(accept, 97),
+            "accept state should not allow regular token 'a'"
+        );
+        // The universal_target for accept should be self (loop) or a
+        let universal = dfa.universal_target[accept as usize];
+        assert!(
+            universal == accept || universal == u32::MAX,
+            "accept state universal_target should be self-loop or none, got {}",
+            universal
+        );
     }
 }

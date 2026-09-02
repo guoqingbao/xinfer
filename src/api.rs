@@ -170,6 +170,9 @@ impl EngineBuilder {
             29500, // master_port
             false,
             None, // num_speculative_tokens
+            None, // draft_model
+            None, // max_prefill_chunk_tokens
+            None, // min_prefill_chunk_tokens
         );
 
         if let Some(kv_dtype) = self.kvcache_dtype {

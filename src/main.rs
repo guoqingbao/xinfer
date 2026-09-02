@@ -249,8 +249,10 @@ async fn main() -> Result<()> {
         args.master_port,
         args.enable_tool_grammar,
         args.num_speculative_tokens,
+        args.draft_model.clone(),
+        None, // max_prefill_chunk_tokens
+        None, // min_prefill_chunk_tokens
     );
-    econfig.draft_model = args.draft_model.clone();
 
     // Multi-node worker nodes run a daemon loop instead of the full engine
     if econfig.num_nodes > 1 && econfig.node_rank > 0 {
