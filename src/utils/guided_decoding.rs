@@ -58,6 +58,9 @@ pub struct GuidedDecoding {
     failed: RwLock<HashSet<usize>>,
     mismatch: RwLock<HashSet<usize>>,
     soft_mask: SoftMaskConfig,
+    /// GPU-resident DFA table (uploaded once when XINFER_DFA_GRAMMAR=1).
+    #[cfg(feature = "cuda")]
+    dfa_table: Option<attention_rs::dfa::DfaGpuTable>,
 }
 
 impl GuidedDecoding {
@@ -68,7 +71,35 @@ impl GuidedDecoding {
             failed: RwLock::new(HashSet::new()),
             mismatch: RwLock::new(HashSet::new()),
             soft_mask: SoftMaskConfig::default(),
+            #[cfg(feature = "cuda")]
+            dfa_table: None,
         }
+    }
+
+    /// Upload the DFA table to GPU (called once at model load when XINFER_DFA_GRAMMAR=1).
+    #[cfg(feature = "cuda")]
+    pub fn upload_dfa_table(&mut self, dfa: &llguidance::hw_dfa::HwDfa, device: &candle_core::Device) -> Result<()> {
+        let mask_sign: Vec<u8> = dfa.mask_sign.clone();
+        let edge_offsets: Vec<u32> = dfa.edge_offsets.clone();
+        let edge_counts: Vec<u32> = dfa.edge_counts.clone();
+        let edge_tokens: Vec<u32> = dfa.edges.iter().map(|e| e.token).collect();
+        let edge_next: Vec<u32> = dfa.edges.iter().map(|e| e.next_state).collect();
+        let mask_words: Vec<u32> = dfa.mask_words.clone();
+        let universal_target: Vec<u32> = dfa.universal_target.clone();
+        let table = attention_rs::dfa::DfaGpuTable::upload(
+            mask_sign,
+            edge_offsets,
+            edge_counts,
+            edge_tokens,
+            edge_next,
+            mask_words,
+            universal_target,
+            dfa.num_states,
+            dfa.words_per_vob,
+            device,
+        )?;
+        self.dfa_table = Some(table);
+        Ok(())
     }
 
     pub fn apply(
@@ -870,5 +901,76 @@ mod tests {
             "DFA speedup {speedup:.0}x is below 100x threshold. \
              The table lookup should be orders of magnitude faster than the CPU parser walk."
         );
+    }
+
+    /// GPU DFA accuracy: verifies GPU kernel output matches CPU DFA reference.
+    /// Uses a real llguidance grammar export. Benchmark is in examples/bench_dfa_xinfer.rs.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn gpu_dfa_accuracy_vs_cpu() {
+        use llguidance::{api::TopLevelGrammar, ParserFactory};
+        use toktrie::ApproximateTokEnv;
+
+        let env = ApproximateTokEnv::single_byte_env();
+        let factory = ParserFactory::new_simple(&env).unwrap();
+
+        // Real grammar: "abc" then "END" (6 tokens, 7 states)
+        let grm_str = r#"start: "abc" "END""#;
+        let mut grm = TopLevelGrammar::from_lark(grm_str.to_string());
+        grm.max_tokens = None;
+
+        // CPU parser (for timing + accuracy reference)
+        let cpu_parser = factory.create_parser(grm.clone()).unwrap();
+        let mut cpu = cpu_parser.clone();
+        cpu.start_without_prompt();
+
+        // Export DFA
+        let dfa = cpu_parser.export_hw_dfa(10_000).expect("DFA export failed for test grammar");
+        assert!(dfa.num_states > 1, "DFA should have multiple states");
+
+        // Upload to GPU
+        let dev = candle_core::Device::new_cuda(0).unwrap();
+        let mask_sign: Vec<u8> = dfa.mask_sign.clone();
+        let edge_offsets: Vec<u32> = dfa.edge_offsets.clone();
+        let edge_counts: Vec<u32> = dfa.edge_counts.clone();
+        let edge_tokens: Vec<u32> = dfa.edges.iter().map(|e| e.token).collect();
+        let edge_next: Vec<u32> = dfa.edges.iter().map(|e| e.next_state).collect();
+        let mask_words: Vec<u32> = dfa.mask_words.clone();
+        let universal_target: Vec<u32> = dfa.universal_target.clone();
+        let gpu_table = attention_rs::dfa::DfaGpuTable::upload(
+            mask_sign, edge_offsets, edge_counts,
+            edge_tokens, edge_next, mask_words, universal_target,
+            dfa.num_states, dfa.words_per_vob, &dev,
+        ).unwrap();
+
+        // Build a valid token sequence to walk through the grammar
+        let sequence: Vec<u32> = vec![97, 98, 99, 69, 78, 68]; // "abcEND"
+        let vocab = env.tok_trie().vocab_size();
+        let batch = 1;
+
+        // Setup GPU tensors
+        let logits = candle_core::Tensor::zeros((batch, vocab), candle_core::DType::F32, &dev).unwrap();
+        let states = candle_core::Tensor::from_vec(vec![dfa.start_state], (batch,), &dev).unwrap();
+
+        // Accuracy: verify GPU validate_draft matches CPU advance
+        let draft_t = candle_core::Tensor::from_vec(sequence.clone(), (batch, sequence.len()), &dev).unwrap();
+        let s_start = candle_core::Tensor::from_vec(vec![dfa.start_state], (batch,), &dev).unwrap();
+        let gpu_reject = gpu_table.validate_draft(&s_start, &draft_t).unwrap();
+        let gpu_reject_val = gpu_reject.flatten_all().unwrap().to_vec1::<u32>().unwrap()[0] as usize;
+
+        // CPU reference: advance through the sequence
+        let mut cpu_state = dfa.start_state;
+        let mut cpu_reject = sequence.len();
+        for (i, &tok) in sequence.iter().enumerate() {
+            match dfa.advance(cpu_state, tok) {
+                Some(next) => cpu_state = next,
+                None => { cpu_reject = i; break; }
+            }
+        }
+        assert_eq!(
+            gpu_reject_val, cpu_reject,
+            "GPU validate_draft reject={gpu_reject_val} != CPU reject={cpu_reject}"
+        );
+        println!("GPU DFA accuracy: validate_draft matches CPU (reject={cpu_reject}, all legal={})", cpu_reject == sequence.len());
     }
 }
