@@ -412,8 +412,8 @@ mod tests {
         let mut seq = test_sequence(10_000);
         seq.mamba_prefix_warmup_tokens = Some(5_824);
 
-        let encoded = bincode::serialize(&seq).unwrap();
-        let decoded: Sequence = bincode::deserialize(&encoded).unwrap();
+        let encoded = rmp_serde::to_vec(&seq).unwrap();
+        let decoded: Sequence = rmp_serde::from_slice(&encoded).unwrap();
 
         assert_eq!(decoded.len(), seq.len());
         assert_eq!(decoded.mamba_prefix_warmup_tokens, None);

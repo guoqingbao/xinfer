@@ -58,20 +58,6 @@ pub struct CachedSamplingParams {
     pub presence_penalty: Option<f32>,
 }
 
-/// Per-sequence speculative decoding stats (captured at sequence end).
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
-pub struct SpecSeqStatsData {
-    pub mechanism: String,
-    pub steps: usize,
-    pub proposed: usize,
-    pub accepted: usize,
-    pub k_moves: usize,
-    pub k_min: usize,
-    pub k_max: usize,
-    pub target_bound: usize,
-    pub grammar_bound: usize,
-}
-
 #[derive(Clone, Copy)]
 pub enum Seqs<'a> {
     SeqRefs(&'a [&'a Sequence]),
