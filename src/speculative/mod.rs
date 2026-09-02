@@ -1,9 +1,11 @@
 //! Speculative decoding: built-in MTP heads and external DFlash2 draft models.
 
+pub mod adaptive_k;
 pub mod dflash;
 pub mod mamba;
 pub mod metadata;
 pub mod mtp;
+pub mod spec_stats;
 pub mod verify;
 
 pub use dflash::DFlashDrafter;

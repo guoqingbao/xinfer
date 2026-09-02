@@ -1013,7 +1013,7 @@ impl LLMEngine {
                 for stream in local_streams.iter_mut() {
                     send_local(&mut vec![stream.try_clone()?], &msg, false)?;
                 }
-                let serialized = bincode::serialize(&msg).expect("Bincode serialization failed");
+                let serialized = rmp_serde::to_vec(&msg).expect("MsgPack serialization failed");
                 for tcp_stream in remote_streams.iter_mut() {
                     crate::utils::multi_node::send_tcp(tcp_stream, &serialized)?;
                 }
@@ -1152,7 +1152,7 @@ impl LLMEngine {
                     MessageType::RunDecode((sequences, false))
                 };
                 let serialized =
-                    bincode::serialize(&request).expect("Bincode serialization failed");
+                    rmp_serde::to_vec(&request).expect("MsgPack serialization failed");
 
                 // Send to remote worker nodes via TCP (fire-and-forget the responses;
                 // NCCL all-reduce synchronizes the actual computation)
@@ -1170,7 +1170,7 @@ impl LLMEngine {
                 for tcp_stream in remote_streams.iter_mut() {
                     match crate::utils::multi_node::recv_tcp(tcp_stream) {
                         Ok(data) => {
-                            let resp: MessageType = bincode::deserialize(&data)
+                            let resp: MessageType = rmp_serde::from_slice(&data)
                                 .expect("Failed to deserialize remote worker response");
                             match resp {
                                 MessageType::RunResponse(ref ids) if ids.is_empty() => {
@@ -1323,7 +1323,7 @@ impl LLMEngine {
                     .collect::<Vec<_>>();
                 let request = MessageType::RunDecodeMTP(sequences);
                 let serialized =
-                    bincode::serialize(&request).expect("Bincode serialization failed");
+                    rmp_serde::to_vec(&request).expect("MsgPack serialization failed");
 
                 for tcp_stream in remote_streams.iter_mut() {
                     if let Err(e) = crate::utils::multi_node::send_tcp(tcp_stream, &serialized) {
@@ -1398,7 +1398,7 @@ impl LLMEngine {
                     .collect::<Vec<_>>();
                 let request = MessageType::RunDecodeDFlash(sequences);
                 let serialized =
-                    bincode::serialize(&request).expect("Bincode serialization failed");
+                    rmp_serde::to_vec(&request).expect("MsgPack serialization failed");
                 for stream in remote_streams.iter_mut() {
                     crate::utils::multi_node::send_tcp(stream, &serialized)?;
                 }
@@ -2251,7 +2251,7 @@ impl LLMEngine {
                     } => {
                         let request = MessageType::RunEmbed((vec![seq.clone()], strategy.clone()));
                         let serialized =
-                            bincode::serialize(&request).expect("Bincode serialization failed");
+                            rmp_serde::to_vec(&request).expect("MsgPack serialization failed");
 
                         for tcp_stream in remote_streams.iter_mut() {
                             crate::utils::multi_node::send_tcp(tcp_stream, &serialized)?;
@@ -2287,7 +2287,7 @@ impl LLMEngine {
 
                         for tcp_stream in remote_streams.iter_mut() {
                             let data = crate::utils::multi_node::recv_tcp(tcp_stream)?;
-                            let response: MessageType = bincode::deserialize(&data)
+                            let response: MessageType = rmp_serde::from_slice(&data)
                                 .expect("Failed to deserialize remote worker response");
                             match response {
                                 MessageType::RunResponseEmbed(output_embed) => {

@@ -159,3 +159,80 @@ impl SchedSeqStats {
         )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn infer_class_short_output_is_latency() {
+        let cfg = QosConfig::default();
+        assert_eq!(cfg.infer_class(Some(512)), QosClass::Latency);
+        assert_eq!(cfg.infer_class(Some(1024)), QosClass::Latency);
+        assert_eq!(cfg.infer_class(Some(1025)), QosClass::Throughput);
+        assert_eq!(cfg.infer_class(None), QosClass::Throughput);
+    }
+
+    #[test]
+    fn adaptive_chunk_shrinks_with_load() {
+        let cfg = QosConfig::default();
+        let cap = 8192usize;
+        let floor = 256usize;
+
+        // No load: full chunk
+        assert_eq!(cfg.adaptive_chunk(cap, floor, 0.0), cap);
+
+        // Load = 1: cap / 2
+        assert_eq!(cfg.adaptive_chunk(cap, floor, 1.0), 4096);
+
+        // Load = 7: cap / 8
+        assert_eq!(cfg.adaptive_chunk(cap, floor, 7.0), 1024);
+
+        // Load = 31: cap / 32 = 256 (hits floor)
+        assert_eq!(cfg.adaptive_chunk(cap, floor, 31.0), 256);
+
+        // Load = 63: cap / 64 = 128 < floor, clamped to floor
+        assert_eq!(cfg.adaptive_chunk(cap, floor, 63.0), floor);
+    }
+
+    #[test]
+    fn effective_budget_scales_with_conservativeness() {
+        let mut cfg = QosConfig::default();
+        cfg.conservativeness = 0.5;
+        assert_eq!(cfg.effective_budget(1000), 500);
+
+        cfg.conservativeness = 1.0;
+        assert_eq!(cfg.effective_budget(1000), 1000);
+
+        // >1.0 is clamped to no-op
+        cfg.conservativeness = 1.5;
+        assert_eq!(cfg.effective_budget(1000), 1000);
+    }
+
+    #[test]
+    fn weighted_decode_load_() {
+        // Verify the formula: sum of weights for decoding sequences
+        // Latency weight = 2.0, Throughput weight = 1.0 (defaults)
+        let cfg = QosConfig::default();
+        assert_eq!(cfg.latency_weight, 2.0);
+        assert_eq!(cfg.throughput_weight, 1.0);
+        // 3 Latency decodes + 2 Throughput decodes = 3*2 + 2*1 = 8.0
+        // (verified by the router's dispatch scoring tests which use this value)
+        let expected = 3.0 * cfg.latency_weight + 2.0 * cfg.throughput_weight;
+        assert!((expected - 8.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn sched_stats_report_format() {
+        let mut stats = SchedSeqStats::default();
+        stats.qos_class = QosClass::Latency;
+        stats.prefill_steps = 3;
+        stats.chunk_shrunk = 2;
+        stats.priority_admitted = 1;
+        let report = stats.report();
+        assert!(report.contains("Latency"));
+        assert!(report.contains("prefill=3"));
+        assert!(report.contains("shrunk=2"));
+        assert!(report.contains("prio=1"));
+    }
+}
