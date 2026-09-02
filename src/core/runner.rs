@@ -36,6 +36,7 @@ use crate::{
     models::qwen3_5_moe::Qwen3_5MoEForCausalLM,
     models::qwen3_moe::Qwen3MoEForCausalLM,
     models::qwen3_vl::Qwen3VLForConditionalGeneration,
+    models::qwen4::Qwen4ForCausalLM,
     utils::config::{Config, EngineConfig, ModelType, SamplingParams},
     utils::kvcache_allocator::{hybrid_mamba_graph_capture_max_batch, KVCacheAllocator},
 };
@@ -94,6 +95,7 @@ pub enum Model {
     Qwen3MoE(Arc<Qwen3MoEForCausalLM>),
     Qwen3_5(Arc<Qwen3_5ForCausalLM>),
     Qwen3_5MoE(Arc<Qwen3_5MoEForCausalLM>),
+    Qwen4(Arc<Qwen4ForCausalLM>),
     LLaMa(Arc<LLaMaForCausalLM>),
     LLaMa4(Arc<LLama4ForConditionalGeneration>),
     Phi4(Arc<Phi4ForCausalLM>),
@@ -131,6 +133,14 @@ impl Model {
                 target_layer_ids,
             ),
             Model::Qwen3_5MoE(m) => m.forward_collecting_layers(
+                input_ids,
+                positions,
+                kv_caches,
+                input_metadata,
+                embeded_inputs,
+                target_layer_ids,
+            ),
+            Model::Qwen4(m) => m.forward_collecting_layers(
                 input_ids,
                 positions,
                 kv_caches,
@@ -255,6 +265,11 @@ impl ModelRunner {
             } else {
                 model.get_mamba_slots_for_sequences(sequence_ids)?
             }),
+            Model::Qwen4(model) => Some(if is_prefill {
+                model.ensure_mamba_slots_for_sequences(sequence_ids)?
+            } else {
+                model.get_mamba_slots_for_sequences(sequence_ids)?
+            }),
             Model::Qwen3VL(model) => {
                 if is_prefill {
                     model.ensure_mamba_slots_for_sequences(sequence_ids)?
@@ -288,7 +303,7 @@ impl ModelRunner {
     fn is_mtp_model_type(model_type: &ModelType) -> bool {
         matches!(
             model_type,
-            ModelType::Qwen3_5 | ModelType::Qwen3_5MoE | ModelType::Qwen3VL
+            ModelType::Qwen3_5 | ModelType::Qwen3_5MoE | ModelType::Qwen4 | ModelType::Qwen3VL
         )
     }
 
@@ -366,6 +381,7 @@ impl ModelRunner {
                 Qwen3MoE => Qwen3MoEForCausalLM,
                 Qwen3_5 => Qwen3_5ForCausalLM,
                 Qwen3_5MoE => Qwen3_5MoEForCausalLM,
+                Qwen4 => Qwen4ForCausalLM,
                 LLaMa => LLaMaForCausalLM,
                 LLaMa4 => LLama4ForConditionalGeneration,
                 Phi4 => Phi4ForCausalLM,
@@ -392,6 +408,7 @@ impl ModelRunner {
                 Qwen3MoE => EmbedInputs,
                 Qwen3_5 => EmbedInputs,
                 Qwen3_5MoE => EmbedInputs,
+                Qwen4 => EmbedInputs,
                 LLaMa => EmbedInputs,
                 LLaMa4 => NoneArg,
                 Phi4 => EmbedInputs,
@@ -419,6 +436,7 @@ impl ModelRunner {
                     Qwen3MoE => EmbedInputs,
                     Qwen3_5 => EmbedInputs,
                     Qwen3_5MoE => EmbedInputs,
+                Qwen4 => EmbedInputs,
                     LLaMa => EmbedInputs,
                     LLaMa4 => NoneArg,
                     Phi4 => EmbedInputs,
@@ -486,7 +504,7 @@ impl ModelRunner {
         };
 
         let is_hybrid_mamba_model = match &model {
-            Model::Qwen3_5(_) | Model::Qwen3_5MoE(_) => true,
+            Model::Qwen3_5(_) | Model::Qwen3_5MoE(_) | Model::Qwen4(_) => true,
             Model::Qwen3VL(m) => m.uses_hybrid_mamba_text_model(),
             _ => false,
         };
@@ -560,6 +578,13 @@ impl ModelRunner {
                 }
             }
             Model::Qwen3_5MoE(model) => {
+                model.preallocate_mamba_cache(mamba_cache_capacity)?;
+                model.set_mamba_prefix_cache_capacity(mamba_prefix_capacity);
+                if config.mtp_enabled {
+                    model.preallocate_mtp_hidden_buffer(econfig.max_num_parallel_reqs.max(8))?;
+                }
+            }
+            Model::Qwen4(model) => {
                 model.preallocate_mamba_cache(mamba_cache_capacity)?;
                 model.set_mamba_prefix_cache_capacity(mamba_prefix_capacity);
                 if config.mtp_enabled {
@@ -705,7 +730,10 @@ impl ModelRunner {
 
         if mamba_prefix_capacity > 0
             && comm.rank() == 0
-            && matches!(model, Model::Qwen3_5(_) | Model::Qwen3_5MoE(_))
+            && matches!(
+                model,
+                Model::Qwen3_5(_) | Model::Qwen3_5MoE(_) | Model::Qwen4(_)
+            )
         {
             crate::log_info!(
                 "Hybrid mamba prefix-state cache enabled: {} entries",
@@ -785,6 +813,7 @@ impl ModelRunner {
                 Model::Qwen3_5MoE(m) => {
                     m.preallocate_dflash_verify_buffers(layer_ids, verify_len)?
                 }
+                Model::Qwen4(m) => m.preallocate_dflash_verify_buffers(layer_ids, verify_len)?,
                 Model::Qwen3VL(m) => m.preallocate_dflash_verify_buffers(layer_ids, verify_len)?,
                 _ => {}
             }
@@ -885,7 +914,7 @@ impl ModelRunner {
 
     fn restore_mamba_prefix_states_for_prefill(&self, seqs: &[&Sequence]) -> Result<()> {
         match &self.model {
-            Model::Qwen3_5(_) | Model::Qwen3_5MoE(_) | Model::Qwen3VL(_) => {
+            Model::Qwen3_5(_) | Model::Qwen3_5MoE(_) | Model::Qwen4(_) | Model::Qwen3VL(_) => {
                 for seq in seqs {
                     if seq.num_cached_tokens == 0 {
                         continue;
@@ -921,6 +950,7 @@ impl ModelRunner {
         match &self.model {
             Model::Qwen3_5(model) => model.restore_mamba_prefix_state(seq_id, hash),
             Model::Qwen3_5MoE(model) => model.restore_mamba_prefix_state(seq_id, hash),
+            Model::Qwen4(model) => model.restore_mamba_prefix_state(seq_id, hash),
             Model::Qwen3VL(model) => model.restore_mamba_prefix_state(seq_id, hash),
             _ => Ok(true),
         }
@@ -935,6 +965,7 @@ impl ModelRunner {
         match &self.model {
             Model::Qwen3_5(model) => model.capture_mamba_prefix_state(seq_id, hash, preserve),
             Model::Qwen3_5MoE(model) => model.capture_mamba_prefix_state(seq_id, hash, preserve),
+            Model::Qwen4(model) => model.capture_mamba_prefix_state(seq_id, hash, preserve),
             Model::Qwen3VL(model) => model.capture_mamba_prefix_state(seq_id, hash, preserve),
             _ => return Ok(true),
         }
@@ -944,6 +975,7 @@ impl ModelRunner {
         match &self.model {
             Model::Qwen3_5(model) => Ok(model.has_mamba_prefix_state(hash)),
             Model::Qwen3_5MoE(model) => Ok(model.has_mamba_prefix_state(hash)),
+            Model::Qwen4(model) => Ok(model.has_mamba_prefix_state(hash)),
             Model::Qwen3VL(model) => Ok(model.has_mamba_prefix_state(hash)),
             _ => Ok(true),
         }
@@ -953,6 +985,7 @@ impl ModelRunner {
         match &self.model {
             Model::Qwen3_5(model) => Ok(model.remove_mamba_prefix_state(hash)),
             Model::Qwen3_5MoE(model) => Ok(model.remove_mamba_prefix_state(hash)),
+            Model::Qwen4(model) => Ok(model.remove_mamba_prefix_state(hash)),
             Model::Qwen3VL(model) => Ok(model.remove_mamba_prefix_state(hash)),
             _ => Ok(true),
         }
@@ -1001,6 +1034,11 @@ impl ModelRunner {
                             .replay(&input_ids, &positions, &input_metadata)?
                     }
                     Model::Qwen3_5MoE(model) => {
+                        let _guard = model.lock_mamba_cache_for_graph();
+                        self.decode_capturer
+                            .replay(&input_ids, &positions, &input_metadata)?
+                    }
+                    Model::Qwen4(model) => {
                         let _guard = model.lock_mamba_cache_for_graph();
                         self.decode_capturer
                             .replay(&input_ids, &positions, &input_metadata)?
@@ -1130,6 +1168,7 @@ impl ModelRunner {
                     Qwen3MoE => false,
                     Qwen3_5 => false,
                     Qwen3_5MoE => false,
+                    Qwen4 => false,
                     LLaMa => false,
                     LLaMa4 => images,
                     Phi4 => false,
@@ -1169,6 +1208,7 @@ impl ModelRunner {
                 Qwen3MoE => false,
                 Qwen3_5 => false,
                 Qwen3_5MoE => false,
+                Qwen4 => false,
                 LLaMa => false,
                 LLaMa4 => None,
                 Phi4 => false,
@@ -1574,7 +1614,7 @@ impl ModelRunner {
             #[cfg(all(feature = "cuda", feature = "graph"))]
             let use_cuda_graph = {
                 let require_exact_graph = match &self.model {
-                    Model::Qwen3_5(_) | Model::Qwen3_5MoE(_) => true,
+                    Model::Qwen3_5(_) | Model::Qwen3_5MoE(_) | Model::Qwen4(_) => true,
                     Model::Qwen3VL(model) => model.uses_hybrid_mamba_text_model(),
                     _ => false,
                 };
@@ -1915,6 +1955,7 @@ impl ModelRunner {
         match &self.model {
             Model::Qwen3_5(model) => model.release_sequence_state(id),
             Model::Qwen3_5MoE(model) => model.release_sequence_state(id),
+            Model::Qwen4(model) => model.release_sequence_state(id),
             Model::Qwen3VL(model) => model.release_sequence_state(id),
             Model::DeepSeekV4(model) => model.clear_seq_state(id),
             _ => {}
@@ -1927,6 +1968,7 @@ impl ModelRunner {
             Model::Qwen3MoE(model) => model.get_vocab_size(),
             Model::Qwen3_5(model) => model.get_vocab_size(),
             Model::Qwen3_5MoE(model) => model.get_vocab_size(),
+            Model::Qwen4(model) => model.get_vocab_size(),
             Model::LLaMa(model) => model.get_vocab_size(),
             Model::LLaMa4(model) => model.get_vocab_size(),
             Model::Phi4(model) => model.get_vocab_size(),
@@ -1977,6 +2019,7 @@ impl ModelRunner {
         match &self.model {
             Model::Qwen3_5(model) => model.reset_mamba_cache()?,
             Model::Qwen3_5MoE(model) => model.reset_mamba_cache()?,
+            Model::Qwen4(model) => model.reset_mamba_cache()?,
             Model::Qwen3VL(model) => model.reset_mamba_cache()?,
             _ => {}
         }

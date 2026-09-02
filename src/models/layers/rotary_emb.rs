@@ -121,7 +121,7 @@ fn calculate_default_inv_freq(base: f64, dim: usize) -> Vec<f32> {
 }
 
 #[derive(Debug, Clone)]
-pub struct ScalingRotaryEmbedding(RotaryEmbedding);
+pub struct ScalingRotaryEmbedding(pub RotaryEmbedding);
 
 impl ScalingRotaryEmbedding {
     pub fn new(
