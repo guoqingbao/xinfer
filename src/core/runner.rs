@@ -12,7 +12,7 @@ use crate::utils::graph::{
     planned_graph_capture_batches, CudaGraphFn, CudaGraphWrapper, GraphCapturer, ModelFn,
 };
 use crate::utils::guidance::ParserFactory;
-use crate::utils::guided_decoding::{GuidedDecoding, GuidedDecodingRequest};
+use crate::utils::guided_decoding::{GuidedDecoding, GuidedDecodingRequest, GuidedDecodingStep};
 use crate::utils::image::compute_image_slice;
 use crate::utils::logits_processor::{LogitsProcessor, Sampling};
 use crate::utils::progress::ProgressLike;
@@ -1102,12 +1102,26 @@ impl ModelRunner {
             match &seqs {
                 Seqs::SeqRefs(sequences) => {
                     for sequence in *sequences {
-                        let count = sequence
-                            .prefill_chunk_tokens(self.config.effective_prefill_chunk_size());
-                        drafter.store_decode_hidden(
-                            &projected.narrow(0, offset, count)?,
-                            sequence.id,
-                        )?;
+                        let count = sequence.prefill_chunk_tokens(
+                            sequence
+                                .active_prefill_chunk
+                                .unwrap_or(self.config.effective_prefill_chunk_size()),
+                        );
+                        // Prefill position check: only seed DFlash context when within
+                        // context_window tokens of the prefill end. Prevents accumulating
+                        // truncated early-prefill context (which degrades draft quality).
+                        let should_seed = if is_prefill && drafter.context_window() > 0 {
+                            sequence.len().saturating_sub(sequence.num_cached_tokens)
+                                <= drafter.context_window()
+                        } else {
+                            true
+                        };
+                        if should_seed {
+                            drafter.store_decode_hidden(
+                                &projected.narrow(0, offset, count)?,
+                                sequence.id,
+                            )?;
+                        }
                         offset += count;
                     }
                 }
@@ -1248,9 +1262,12 @@ impl ModelRunner {
         let mut max_seqlen_q = 0;
         let mut max_seqlen_k = 0;
         let mut slot_mapping = Vec::new();
-        let chunk_size = self.config.effective_prefill_chunk_size();
         let mut max_context_len = 0;
         for (seq_idx, seq) in seqs.iter().enumerate() {
+            // Adaptive chunk size stamped by the scheduler (fallback: static config).
+            let chunk_size = seq
+                .active_prefill_chunk
+                .unwrap_or(self.config.effective_prefill_chunk_size());
             let num_tokens = seq.prefill_chunk_tokens(chunk_size);
             input_ids
                 .extend(&seq.token_ids[seq.num_cached_tokens..seq.num_cached_tokens + num_tokens]);
@@ -1848,8 +1865,8 @@ impl ModelRunner {
             logits.to_owned()
         };
 
-        let guided_requests = guided_decoding_requests(&seqs, &seq_ids);
-        let guided_positions: Vec<usize> = guided_requests
+        let all_requests = guided_decoding_requests(&seqs, &seq_ids);
+        let guided_positions: Vec<usize> = all_requests
             .iter()
             .enumerate()
             .filter_map(|(index, request)| request.grammar.is_some().then_some(index))
@@ -1865,23 +1882,71 @@ impl ModelRunner {
             let original_guided_logits = logits.index_select(&guided_indices, 0)?;
             let guided_requests: Vec<_> = guided_positions
                 .iter()
-                .map(|&index| guided_requests[index])
+                .map(|&index| all_requests[index])
                 .collect();
-            let (guided_logits, guided_step) = self
-                .guided_decoding
-                .apply(&original_guided_logits, &guided_requests)?;
-            let sample_logits = if guided_positions.len() == seq_ids.len() {
-                guided_logits
+            let guided_tokens: Vec<u32> = if crate::utils::env::spec_mask_offload() {
+                // GPU offload: build mask directly (single compute_mask_or_eos call).
+                // Do NOT call apply() here - it consumes ff_tokens_cache as a side effect,
+                // causing the second compute_mask_or_eos in build_allow_mask to see a
+                // different parser state.
+                let guided_step = GuidedDecodingStep::new(
+                    all_requests.iter()
+                        .filter(|r| r.grammar.is_some())
+                        .map(|r| r.seq_id)
+                        .collect()
+                );
+                if crate::utils::env::vob_sampling() {
+                    // VOB bitset path: 8x less data than F32 mask.
+                    let vob_words = self
+                        .guided_decoding
+                        .build_vob_words(&all_requests, logits.dim(1)?)
+                        .map(|words| {
+                            candle_core::Tensor::from_vec(
+                                words,
+                                (all_requests.len(), logits.dim(1)? / 32),
+                                logits.device(),
+                            )
+                        })
+                        .transpose()?;
+                    let mut tokens = self.logit_processor.sample_with_vob(
+                        &logits,
+                        &cached_params.sampling,
+                        vob_words.as_ref(),
+                    )?;
+                    self.guided_decoding.apply_fast_forward(&seq_ids, &mut tokens);
+                    self.guided_decoding.commit(&seq_ids, &tokens, guided_step);
+                    tokens
+                } else {
+                    let mask = self
+                        .guided_decoding
+                        .build_allow_mask(&all_requests, logits.dim(1)?, logits.device())?;
+                    let mut tokens = self.logit_processor.sample_with_strategy_masked(
+                        &logits,
+                        &cached_params.sampling,
+                        mask.as_ref(),
+                    )?;
+                    self.guided_decoding.apply_fast_forward(&seq_ids, &mut tokens);
+                    self.guided_decoding.commit(&seq_ids, &tokens, guided_step);
+                    tokens
+                }
             } else {
-                let guided_delta = (&guided_logits - &original_guided_logits)?;
-                logits.index_add(&guided_indices, &guided_delta, 0)?
+                // Original path: apply() computes masked logits via index_add.
+                let (guided_logits, guided_step) = self
+                    .guided_decoding
+                    .apply(&original_guided_logits, &guided_requests)?;
+                let sample_logits = if guided_positions.len() == seq_ids.len() {
+                    guided_logits
+                } else {
+                    let guided_delta = (&guided_logits - &original_guided_logits)?;
+                    logits.index_add(&guided_indices, &guided_delta, 0)?
+                };
+                let mut tokens =
+                    self.sample_processed_logits(&sample_logits, &cached_params.sampling)?;
+                self.guided_decoding.apply_fast_forward(&seq_ids, &mut tokens);
+                self.guided_decoding.commit(&seq_ids, &tokens, guided_step);
+                tokens
             };
-            let mut tokens =
-                self.sample_processed_logits(&sample_logits, &cached_params.sampling)?;
-            self.guided_decoding
-                .apply_fast_forward(&seq_ids, &mut tokens);
-            self.guided_decoding.commit(&seq_ids, &tokens, guided_step);
-            tokens
+            guided_tokens
         };
 
         // Track tokens for sequences when penalties are enabled
@@ -1970,7 +2035,7 @@ impl ModelRunner {
                     label,
                     self.mtp_num_speculative
                 );
-                mtp_cap.capture_mtp(&self.device, kv_pairs, self.mtp_num_speculative)?;
+mtp_cap.capture_mtp(&self.device, kv_pairs, self.mtp_num_speculative)?;
             }
         }
 

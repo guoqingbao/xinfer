@@ -19,9 +19,10 @@ non-empty prefill step for correct sampling.
 - `--prefix-cache-max-tokens <N>`: cap cache size in tokens (rounded down to block size).
 
 If `--prefix-cache-max-tokens` is not set, defaults are:
-- Normal mode: ~50% of GPU KV blocks
-- PD server: ~75% of GPU KV blocks
-- PD client: ~35% of GPU KV blocks
+- Normal mode: `max_num_seqs × max_model_len / block_size` (workload-aware;
+  sized to hold all concurrent sequences at full context, capped at total KV blocks)
+- PD server: 80% of GPU KV blocks
+- PD client: 50% of GPU KV blocks
 
 ## Hybrid Mamba Snapshot Stride
 For hybrid Mamba models (for example Qwen3.5), prefix reuse also needs a

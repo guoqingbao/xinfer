@@ -1,4 +1,5 @@
 // src/core/sequence.rs
+use crate::core::qos::QosClass;
 use crate::utils::config::SamplingParams;
 use crate::utils::image::ImageData;
 use serde::{Deserialize, Serialize};
@@ -38,6 +39,21 @@ pub struct Sequence {
     pub output_ids: Vec<u32>,
     pub block_table: Vec<u32>,
     pub num_cached_tokens: usize,
+    /// The adaptive prefill chunk size stamped by the scheduler for this step
+    /// (`None` = use the static `effective_prefill_chunk_size`). Travels with the
+    /// sequence clone across the process boundary so the runner's `prepare_prefill`
+    /// and the scheduler's `filter_prefill_finished` agree on how many tokens were
+    /// processed this step.
+    #[serde(default)]
+    pub active_prefill_chunk: Option<usize>,
+    /// QoS class (Latency vs Throughput), set at request arrival; drives
+    /// priority admission, class-weighted chunk sizing, and reservations.
+    #[serde(default)]
+    pub qos_class: QosClass,
+    /// Per-sequence scheduling/contention stats, accumulated by the scheduler and
+    /// reported at sequence end (conditional). Owned on the sequence (no locks).
+    #[serde(default)]
+    pub sched_stats: crate::core::qos::SchedSeqStats,
     pub mamba_prefix_hash: Option<u64>,
     #[serde(skip)]
     pub mamba_prefix_warmup_tokens: Option<usize>,
@@ -175,6 +191,9 @@ impl Sequence {
             output_ids: Vec::new(),
             block_table: Vec::new(),
             num_cached_tokens: 0,
+            active_prefill_chunk: None,
+            qos_class: QosClass::default(),
+            sched_stats: Default::default(),
             mamba_prefix_hash: None,
             mamba_prefix_warmup_tokens: None,
             // DeepSeek V4: non-final prefill chunks end on native-token boundaries.
@@ -393,8 +412,8 @@ mod tests {
         let mut seq = test_sequence(10_000);
         seq.mamba_prefix_warmup_tokens = Some(5_824);
 
-        let encoded = bincode::serialize(&seq).unwrap();
-        let decoded: Sequence = bincode::deserialize(&encoded).unwrap();
+        let encoded = rmp_serde::to_vec(&seq).unwrap();
+        let decoded: Sequence = rmp_serde::from_slice(&encoded).unwrap();
 
         assert_eq!(decoded.len(), seq.len());
         assert_eq!(decoded.mamba_prefix_warmup_tokens, None);
