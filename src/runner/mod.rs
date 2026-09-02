@@ -276,7 +276,7 @@ pub fn send_local(
     let serialized = if use_json {
         serde_json::to_vec(message).expect("JSON serialization failed")
     } else {
-        bincode::serialize(message).expect("Bincode serialization failed")
+        rmp_serde::to_vec(message).expect("Serialization failed")
     };
 
     for stream in streams.iter_mut() {
@@ -313,10 +313,10 @@ pub fn receive_local(stream: &mut LocalStream, use_json: bool) -> std::io::Resul
             )
         })?
     } else {
-        bincode::deserialize(&serialized).map_err(|err| {
+        rmp_serde::from_slice(&serialized).map_err(|err| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("Bincode deserialization failed: {err}"),
+                format!("MsgPack deserialization failed: {err}"),
             )
         })?
     };
@@ -452,7 +452,7 @@ macro_rules! def_broadcast_message_to_runners {
                         .collect();
 
                     let mut values = local_results?;
-                    let serialized = bincode::serialize(&request).expect("Bincode serialization failed");
+                    let serialized = rmp_serde::to_vec(&request).expect("Serialization failed");
 
                     for tcp_stream in remote_streams.iter_mut() {
                         crate::utils::multi_node::send_tcp(tcp_stream, &serialized)?;
@@ -460,8 +460,8 @@ macro_rules! def_broadcast_message_to_runners {
 
                     for tcp_stream in remote_streams.iter_mut() {
                         let data = crate::utils::multi_node::recv_tcp(tcp_stream)?;
-                        let response: MessageType = bincode::deserialize(&data)
-                            .expect("Bincode deserialization failed");
+                        let response: MessageType = rmp_serde::from_slice(&data)
+                            .expect("MsgPack deserialization failed");
                         match response {
                             $resp_variant(value) => values.push(value),
                             MessageType::Error(err) => {
