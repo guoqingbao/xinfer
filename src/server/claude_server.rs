@@ -3938,9 +3938,10 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(request.reasoning_effort.as_deref(), Some("xhigh"));
+        // "xhigh" (extra-high) is above "high", so it maps to the top level.
         assert_eq!(
             ReasoningEffort::from_str(request.reasoning_effort.unwrap()),
-            ReasoningEffort::High
+            ReasoningEffort::ChainOfThought
         );
     }
 
