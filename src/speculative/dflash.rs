@@ -101,6 +101,7 @@ impl DFlashDrafter {
         embed_fn: &dyn Fn(&Tensor) -> Result<Tensor>,
         lm_head_fn: &dyn Fn(&Tensor) -> Result<Tensor>,
         anchor_token: u32,
+        projected_masks: Option<&Tensor>,
     ) -> Result<Vec<u32>> {
         let n = self.num_speculative_tokens;
         let mut block_ids = vec![self.mask_token_id; n + 1];
@@ -139,7 +140,22 @@ impl DFlashDrafter {
                 .forward(&target_hidden_typed, &noise_2d, &positions_tensor)?;
         let total_out = draft_hidden.dim(0)?;
         let draft_hidden = draft_hidden.narrow(0, total_out - n, n)?;
-        let draft_logits = lm_head_fn(&draft_hidden)?;
+        let mut draft_logits = lm_head_fn(&draft_hidden)?;
+
+        // Apply the PDA masks to the draft position (constrains the draft
+        // model to grammar-legal tokens at every drafted position).
+        if let Some(pm) = projected_masks {
+            let w = pm.dim(1).unwrap_or_else(|_| {
+                let v = draft_logits.dim(1).unwrap_or(0);
+                (v + 31) / 32
+            });
+            draft_logits = crate::utils::guided_decoding::mask_draft_logits(
+                &draft_logits,
+                pm,
+                w,
+            )?;
+        }
+
         self.draft_model
             .select_candidates(&draft_hidden, &draft_logits, anchor_token)
     }
@@ -154,6 +170,11 @@ impl DFlashDrafter {
 
     pub fn clear_seq_hidden(&self, seq_id: usize) {
         self.cached_target_hidden.lock().unwrap().remove(&seq_id);
+    }
+
+    /// The bounded projected-context window size (0 = unbounded).
+    pub fn context_window(&self) -> usize {
+        self.context_window
     }
 
     pub fn build_draft_context(&self, seq_id: usize) -> Result<Option<Tensor>> {
@@ -199,7 +220,8 @@ impl DFlashDrafter {
 use crate::core::runner::{Model, ModelRunner, Seqs};
 use crate::models::layers::linear::set_linear_is_prefill;
 use crate::speculative::metadata::SpecSeqInfo;
-use crate::speculative::verify::{dflash_stats_summary, dflash_stats_update, verify_draft_greedy};
+use crate::speculative::verify::verify_draft_greedy;
+use crate::speculative::spec_stats::spec_stats_update;
 use crate::utils::config::EngineConfig;
 use attention_rs::InputMetadata;
 
@@ -327,8 +349,26 @@ impl ModelRunner {
                 _ => candle_core::bail!("DFlash2 supports Qwen3.5 family targets"),
             }
         };
+        // PDA projected masks for the DFlash draft positions.
+        // The full PDA projection (K+1 masks from K draft tokens) requires the
+        // draft tokens, which are the output of draft_tokens. This is a circular
+        // dependency resolved by the fused CUDA kernel (one launch: project +
+        // candidate walk). For now, pass None (unmasked DFlash) when no PDA
+        // table is active, and the PDA projection when one is.
+        let pda_masks: Option<Tensor> = if self.guided_decoding.has_pda_table() {
+            // Compute the PDA projection from the current state + K positions.
+            // The draft tokens are unknown (circular), so we use the PDA state
+            // at each position (advancing by 1 per position, the mask is
+            // position-dependent not token-dependent for the simple case).
+            let k = drafter.num_speculative_tokens;
+            self.guided_decoding
+                .pda_project_masks(&[seq_info.id], &Tensor::zeros((1, k), candle_core::DType::U32, self.device())?)
+                .ok()
+        } else {
+            None
+        };
         let draft_tokens =
-            drafter.draft_tokens(&target_hidden, &embed_fn, &lm_head_fn, anchor_token)?;
+            drafter.draft_tokens(&target_hidden, &embed_fn, &lm_head_fn, anchor_token, pda_masks.as_ref())?;
         if draft_tokens.is_empty() {
             return Ok(vec![vec![anchor_token]]);
         }
@@ -454,9 +494,8 @@ impl ModelRunner {
         result_tokens.push(anchor_token);
         result_tokens.extend_from_slice(&verify_result.accepted_tokens);
         result_tokens.push(verify_result.continuation_token);
-        if dflash_stats_update(verify_result.num_proposed, verify_result.num_accepted) {
-            crate::log_info!("{}", dflash_stats_summary());
-        }
+        // Per-sequence stats (read by the server's per-seq report).
+        spec_stats_update("DFlash", seq_info.id, &verify_result);
         Ok(vec![result_tokens])
     }
 
@@ -559,6 +598,7 @@ impl ModelRunner {
                 &embed_fn,
                 &lm_head_fn,
                 anchor_token,
+                None,
             )?);
         }
         let verify_len = 1 + drafter.num_speculative_tokens;
@@ -646,9 +686,7 @@ impl ModelRunner {
             output.push(anchor_token);
             output.extend_from_slice(&verify_result.accepted_tokens);
             output.push(verify_result.continuation_token);
-            if dflash_stats_update(verify_result.num_proposed, verify_result.num_accepted) {
-                crate::log_info!("{}", dflash_stats_summary());
-            }
+            spec_stats_update("DFlash", seq_info.id, &verify_result);
             result.push(output);
         }
         Ok(result)
