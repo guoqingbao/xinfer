@@ -88,19 +88,107 @@ cfg = EngineConfig(
     num_speculative_tokens=7,
 )
 
+engine = Engine(cfg, "bf16")
+```
+
+### Speculative-decoding env vars
+
 | Var | Default | Effect |
 |---|---|---|
 | `XINFER_SPEC_REJECTION_SAMPLING` | off | distribution-correct verify for non-greedy targets |
-| `XINFER_SPEC_ADAPTIVE_K` | off | scale K with acceptance (per-tier verify graphs - no graph/eager flip) |
+| `XINFER_SPEC_ADAPTIVE_K` | off | scale K with acceptance (per-tier verify graphs, no graph/eager flip) |
 | `XINFER_SPEC_ADAPTIVE_TIERS` | `[1, 3, max_k]` | adaptive-K tier/capture set (comma list, max_k always included) |
 | `XINFER_SPEC_CONTEXT_WINDOW` | 4096 | DFlash context cap (0 = unbounded) |
 | `XINFER_SPEC_GRAPH` | on | DFlash draft CUDA graph (0 = eager draft) |
 | `XINFER_SPEC_MASK_OFFLOAD` | on (CUDA) | grammar mask in the fused CUDA sampler |
 | `XINFER_SPEC_GRANULAR_MASK` | off | exact per-position FSM draft mask |
 | `XINFER_VOB_SAMPLING` | off | VOB bitset grammar sampling (8x less data than F32 mask; fused bitwise-AND kernel) |
+| `XINFER_PDA_GRAMMAR` | off | GPU-resident PDA grammar masking (fused mask+sample+advance; drafting projection) |
 
-engine = Engine(cfg, "bf16")
+---
+
+## Modality permutations
+
+The grammar mask can run on five substrates, each with a different trade-off.
+The diagram shows the full decision tree from "is a grammar active?" down to
+the specific kernel/function that runs.
+
+```mermaid
+flowchart TD
+    A{grammar active?} -->|no| B["Plain sampling<br/>greedy / top-k / top-p<br/>(no mask)"]
+    A -->|yes| C{XINFER_PDA_GRAMMAR<br/>+ PDA table uploaded?}
+
+    C -->|yes| D{drafting?}
+    C -->|no| E{XINFER_SPEC_MASK_OFFLOAD?}
+
+    %% PDA GPU path
+    D -->|per-token| F["GPU fused_sample<br/>mask + sample + advance<br/>(1 kernel launch)"]
+    D -->|MTP / DFlash draft| G["GPU fused_project<br/>K+1 VOB masks<br/>(1 kernel launch)"]
+    F --> H["sample: greedy<br/>(top-k/top-p plumbed)"]
+    G --> I["vob_to_allow -> draft allow-matrix"]
+
+    %% CPU fallback paths
+    E -->|yes, VOB| J["build_vob_words (CPU)<br/>-> sample_with_vob (GPU)"]
+    E -->|yes, F32| K["build_allow_mask (CPU)<br/>-> sample_with_strategy_masked (GPU)"]
+    E -->|no| L["apply() (CPU index_add)<br/>-> sample_processed_logits"]
+
+    J --> M["CPU Earley parser<br/>(reactive mask)"]
+    K --> M
+    L --> M
+
+    subgraph Substrates["5 execution substrates"]
+        S1["CPU scalar<br/>(reference / oracle)"]
+        S2["CPU SIMD inline<br/>(rten-simd dispatch)"]
+        S3["CPU SIMD service<br/>(PdaService packet-in/out)"]
+        S4["GPU ungraphed<br/>(individual kernel launches)"]
+        S5["GPU graphed<br/>(CUDA graph capture + replay)"]
+    end
+
+    F -.-> S4
+    G -.-> S4
+    M -.-> S1
+    S2 -.-> S1
+    S3 -.-> S1
+    S5 -.-> S4
 ```
+
+### Substrate selection
+
+| Substrate | When used | Notes |
+|---|---|---|
+| **CPU scalar** | always available | the reference / oracle; correctness ground truth |
+| **CPU SIMD inline** | `simd` feature, no GPU | rten-simd `load/add/store`; bit-exact vs scalar |
+| **CPU SIMD service** | `PdaService` (device model) | packet-in/packet-out; emulates the GPU batch model on CPU |
+| **GPU ungraphed** | `XINFER_PDA_GRAMMAR=1` | individual `fused_sample` / `fused_project` launches |
+| **GPU graphed** | CUDA graph capture | the model-forward graph; PDA kernels launch individually (dynamic K) |
+
+### Sampling-mode permutations
+
+| Mode | PDA fused_sample | VOB sampler | CPU apply |
+|---|---|---|---|
+| greedy | implemented | implemented | implemented |
+| top-k | plumbed (FFI param) | implemented | implemented |
+| top-p | plumbed (FFI param) | implemented | implemented |
+
+The PDA `fused_sample` kernel currently implements greedy; top-k/top-p are
+plumbed through the FFI signature for a future fused implementation (the VOB
+and CPU paths already support all three).
+
+### Drafting permutations
+
+| Drafter | PDA projection | Mask application |
+|---|---|---|
+| MTP (built-in) | `fused_project` (K+1 VOB) | `mask_draft_logits` on verify logits |
+| DFlash (external) | `fused_project` (K+1 VOB) | `vob_to_allow` -> `draft_tokens` allow-matrix |
+| none | n/a | n/a |
+
+K is dynamic (adaptive-K), so the projection kernel is launched individually
+(not captured in a CUDA graph).
+
+See also:
+- [guided_decoding.md](./guided_decoding.md) - the grammar/mask workflow
+- [anti_loop_design.md](./anti_loop_design.md) - the in-flight repetition detector
+- [qos_scheduling.md](./qos_scheduling.md) - the QoS scheduling interaction
 
 ---
 
