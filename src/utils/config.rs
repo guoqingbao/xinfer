@@ -300,6 +300,8 @@ pub struct Config {
     pub sliding_window: Option<usize>,
     pub max_window_layers: Option<usize>,
     pub partial_rotary_factor: Option<f32>,
+    #[serde(default)]
+    pub output_gate_type: Option<String>,
     #[serde(alias = "hidden_activation")]
     pub hidden_act: candle_nn::Activation,
     #[serde(alias = "rope_parameters")]
@@ -974,6 +976,7 @@ pub enum ModelType {
     DeepSeek,
     DeepSeekV4,
     GLM5,
+    Qwen4,
     Mistral3VL,
     Qwen3VL,
     LLaMa4,
@@ -988,6 +991,7 @@ impl ModelType {
             "Qwen3_5ForCausalLM" => Some(ModelType::Qwen3_5),
             "Qwen3_5MoEForCausalLM" => Some(ModelType::Qwen3_5MoE),
             "Qwen3NextForCausalLM" => Some(ModelType::Qwen3_5MoE),
+            "Qwen4ExpForConditionalGeneration" | "Qwen4ExpForCausalLM" => Some(ModelType::Qwen4),
             "LlamaForCausalLM" => Some(ModelType::LLaMa),
             "GemmaForCausalLM" => Some(ModelType::Gemma),
             "Gemma3ForConditionalGeneration" => Some(ModelType::Gemma3),

@@ -702,6 +702,10 @@ pub fn run_runner_process(args: Vec<String>) -> anyhow::Result<()> {
                     crate::log_info!("CUDA graph capture disabled by --disable-cuda-graph");
                 } else if crate::utils::is_no_cuda_graph_supprt(arch.clone()) {
                     crate::log_info!("{arch} does not supprt CUDA graph");
+                } else if crate::utils::qwen4_has_ple(&init_req.config) {
+                    crate::log_info!(
+                        "CUDA graph disabled: Qwen4 PLE n-gram embedding gathers on host memory"
+                    );
                 } else {
                     match runner.warmup_capture() {
                         Ok(_) => {

@@ -146,6 +146,7 @@ Add `--kvcache-dtype` to compress KV cache and extend context length:
 * ✅ Qwen2/Qwen3 MoE
 * ✅ Qwen3 Next
 * ✅ Qwen3.5/3.6/3.8 Dense/MoE (27B, 35B, 122B, 397B, Multimodal model)
+* ✅ Qwen3.8-Next/Qwen4
 * ✅ Mistral v1, v2
 * ✅ Mistral-3-VL Reasoning (3B, 8B, 14B, Multimodal model)
 * ✅ GLM4 (0414)

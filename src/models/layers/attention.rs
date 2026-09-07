@@ -409,6 +409,8 @@ impl Attention {
                 | "Qwen3_5MoeForConditionalGeneration"
                 | "Qwen3NextForCausalLM"
                 | "Qwen3NextForConditionalGeneration"
+                | "Qwen4ExpForConditionalGeneration"
+                | "Qwen4ExpForCausalLM"
         );
         let attention_bias = if is_qwen35_or_next {
             config.qkv_bias.or(config.attention_bias).unwrap_or(false)

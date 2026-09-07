@@ -271,6 +271,10 @@ impl LLMEngine {
                     log_info!("CUDA graph capture disabled by --disable-cuda-graph");
                 } else if crate::utils::is_no_cuda_graph_supprt(arch.clone()) {
                     log_info!("{arch} does not supprt CUDA graph");
+                } else if crate::utils::qwen4_has_ple(&config) {
+                    log_info!(
+                        "CUDA graph disabled: Qwen4 PLE n-gram embedding gathers on host memory"
+                    );
                 } else {
                     match model_runner.warmup_capture() {
                         Ok(_) => {

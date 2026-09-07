@@ -671,6 +671,7 @@ mod tests {
             sliding_window: None,
             max_window_layers: None,
             partial_rotary_factor: None,
+            output_gate_type: None,
             hidden_act: candle_nn::Activation::Silu,
             rope_scaling: None,
             quant: None,

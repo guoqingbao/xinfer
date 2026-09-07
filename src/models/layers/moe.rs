@@ -282,6 +282,8 @@ fn resolve_packed_gate_up_layout(cfg: &Config) -> Result<PackedGateUpLayout> {
             | "Qwen3_5MoeForConditionalGeneration"
             | "Qwen3NextForCausalLM"
             | "Qwen3NextForConditionalGeneration"
+            | "Qwen4ExpForCausalLM"
+            | "Qwen4ExpForConditionalGeneration"
             | "Gemma4ForConditionalGeneration"
             | "Gemma4ForCausalLM"
     ) {
@@ -317,6 +319,8 @@ fn resolve_packed_down_layout(cfg: &Config) -> PackedDownLayout {
             | "Qwen3_5MoeForConditionalGeneration"
             | "Qwen3NextForCausalLM"
             | "Qwen3NextForConditionalGeneration"
+            | "Qwen4ExpForCausalLM"
+            | "Qwen4ExpForConditionalGeneration"
             | "Gemma4ForConditionalGeneration"
             | "Gemma4ForCausalLM"
     ) {

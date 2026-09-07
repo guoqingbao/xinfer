@@ -334,6 +334,7 @@ impl ToolConfig {
             | ModelType::Qwen3MoE
             | ModelType::Qwen3_5
             | ModelType::Qwen3_5MoE
+            | ModelType::Qwen4
             | ModelType::Qwen3VL => {
                 // Qwen 2.5 / 3
                 start_ids.insert(151657); // <tool_call>
@@ -1679,7 +1680,7 @@ impl StreamToolParser {
         match model_type {
             ModelType::LLaMa => "llama",
             ModelType::Mistral | ModelType::Mistral3VL => "mistral",
-            ModelType::Qwen3_5 | ModelType::Qwen3_5MoE => "qwen_coder",
+            ModelType::Qwen3_5 | ModelType::Qwen3_5MoE | ModelType::Qwen4 => "qwen_coder",
             ModelType::Qwen3 | ModelType::Qwen3MoE | ModelType::Qwen3VL => {
                 if model_lower.contains("coder") || model_lower.contains("qwen3.") {
                     "qwen_coder"
