@@ -364,6 +364,14 @@ pub fn run_runner() -> anyhow::Result<()> {
             Ok(MessageType::FinishDecode(id)) => {
                 runner.finished(id);
             }
+            Ok(MessageType::GetSpecSeqStats(id)) => {
+                let data = xinfer::speculative::spec_stats::spec_seq_stats_data(id);
+                send_local(
+                    &mut vec![stream.try_clone()?],
+                    &MessageType::SpecSeqStatsResponse(id, data),
+                    false,
+                )?;
+            }
             Ok(MessageType::CaptureMambaPrefixState((seq_id, hash, preserve))) => {
                 let ret = runner.capture_mamba_prefix_state(seq_id, hash, preserve);
                 if ret.is_err() {
@@ -483,14 +491,32 @@ pub fn run_runner() -> anyhow::Result<()> {
                     false,
                 )?;
             }
+            Ok(MessageType::RunSpecDecode(sequences)) => {
+                // External DFlash drafter path (not yet implemented in this branch).
+                // Log and respond with empty to avoid blocking the engine.
+                xinfer::log_warn!("RunSpecDecode received but not implemented ({} seqs)", sequences.len());
+                send_local(
+                    &mut vec![stream.try_clone()?],
+                    &MessageType::RunSpecDecodeResponse(vec![]),
+                    false,
+                )?;
+            }
+            Ok(MessageType::RunDraftAndVerify((sequences, draft_tokens))) => {
+                xinfer::log_warn!("RunDraftAndVerify received but not implemented ({} seqs, {} draft tokens)", sequences.len(), draft_tokens.len());
+                send_local(
+                    &mut vec![stream.try_clone()?],
+                    &MessageType::RunSpecDecodeResponse(vec![]),
+                    false,
+                )?;
+            }
             Err(e) => {
                 if e.kind() != std::io::ErrorKind::UnexpectedEof {
                     xinfer::log_error!("Runner exit with error: {:?}", e);
                 }
                 break;
             }
-            _ => {
-                xinfer::log_error!("Unexpected message type");
+            Ok(msg) => {
+                xinfer::log_error!("Unexpected message type: {:?}", msg);
             }
         }
     }
