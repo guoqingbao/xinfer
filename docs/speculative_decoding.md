@@ -88,6 +88,17 @@ cfg = EngineConfig(
     num_speculative_tokens=7,
 )
 
+| Var | Default | Effect |
+|---|---|---|
+| `XINFER_SPEC_REJECTION_SAMPLING` | off | distribution-correct verify for non-greedy targets |
+| `XINFER_SPEC_ADAPTIVE_K` | off | scale K with acceptance (per-tier verify graphs - no graph/eager flip) |
+| `XINFER_SPEC_ADAPTIVE_TIERS` | `[1, 3, max_k]` | adaptive-K tier/capture set (comma list, max_k always included) |
+| `XINFER_SPEC_CONTEXT_WINDOW` | 4096 | DFlash context cap (0 = unbounded) |
+| `XINFER_SPEC_GRAPH` | on | DFlash draft CUDA graph (0 = eager draft) |
+| `XINFER_SPEC_MASK_OFFLOAD` | on (CUDA) | grammar mask in the fused CUDA sampler |
+| `XINFER_SPEC_GRANULAR_MASK` | off | exact per-position FSM draft mask |
+| `XINFER_VOB_SAMPLING` | off | VOB bitset grammar sampling (8x less data than F32 mask; fused bitwise-AND kernel) |
+
 engine = Engine(cfg, "bf16")
 ```
 
