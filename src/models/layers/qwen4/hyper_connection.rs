@@ -34,18 +34,24 @@ impl Qwen4HyperConnection {
         use_combine: bool,
         prefix: &str,
     ) -> Result<Self> {
+        let _ = comm;
         let hc_hidden = hc_count * hidden_size;
+        // HC weights are replicated on every TP rank. The HF tp_plan shards
+        // input_mix_weight_down row-wise (split input), which would require an
+        // all-reduce of the low-rank mix output; these matrices are tiny
+        // (e.g. 320x10240), so replication is cheap and exact.
+        let rep = shard(0, 0, 1);
         let hc_norm_weight = vb.get_with_hints_dtype(
             (hc_hidden,),
             &format!("{prefix}.hc_norm.weight"),
-            shard(0, comm.rank(), comm.world_size()),
+            rep,
             dtype,
         )?;
         let input_mix_weight_down = Linear::new(
             vb.get_with_hints_dtype(
                 (hc_lowrank, hc_hidden),
                 &format!("{prefix}.input_mix_weight_down.weight"),
-                shard(1, comm.rank(), comm.world_size()),
+                rep,
                 dtype,
             )?,
             None,
@@ -55,7 +61,7 @@ impl Qwen4HyperConnection {
             vb.get_with_hints_dtype(
                 (hc_hidden, hc_lowrank),
                 &format!("{prefix}.input_mix_weight_up.weight"),
-                shard(0, comm.rank(), comm.world_size()),
+                rep,
                 dtype,
             )?,
             None,
@@ -66,7 +72,7 @@ impl Qwen4HyperConnection {
                 vb.get_with_hints_dtype(
                     (hc_count, hc_hidden),
                     &format!("{prefix}.block_inject_weight.weight"),
-                    shard(0, comm.rank(), comm.world_size()),
+                    rep,
                     dtype,
                 )?,
                 None,
@@ -88,56 +94,41 @@ impl Qwen4HyperConnection {
 
     /// Read: collapse hc branches to block input.
     pub fn read(&self, hyper_input: &Tensor) -> Result<(Tensor, Qwen4HyperConnectionState)> {
-        #[cfg(feature = "cuda")]
-        {
-            if hyper_input.device().is_cuda() {
-                let inject_w = self
-                    .block_inject_weight
-                    .as_ref()
-                    .map(|l| l.dense_weight())
-                    .transpose()?;
-                let (mixed, inject, _scratch) = attention_rs::qwen4::hc_read(
-                    hyper_input,
-                    &self.hc_norm_weight,
-                    self.input_mix_weight_down.dense_weight()?,
-                    self.input_mix_weight_up.dense_weight()?,
-                    inject_w.as_ref().map(|w| *w),
-                    self.hc_count,
-                    self.hidden_size,
-                    self.input_mix_weight_down.dense_weight()?.dim(0)?,
-                    self.rms_norm_eps as f32,
-                )?;
-                return Ok((
-                    mixed,
-                    Qwen4HyperConnectionState {
-                        hyper_input: hyper_input.clone(),
-                        injection_weights: inject,
-                    },
-                ));
-            }
-        }
+        // NOTE: the fused CUDA kernel (attention_rs::qwen4::hc_read) launches
+        // one block per token, so at decode batch=1 the two low-rank GEMVs
+        // (~13MB of weights) are pulled through a single SM — measured
+        // ~1.86ms/call vs ~0.1ms for the candle-op path below (cuBLAS uses
+        // the whole GPU). Use the candle path until the kernel is
+        // restructured with multi-block GEMV parallelism.
         self.read_candle(hyper_input)
     }
 
     fn read_candle(&self, hyper_input: &Tensor) -> Result<(Tensor, Qwen4HyperConnectionState)> {
-        let (seq_len, hc_hidden) = hyper_input.dims2()?;
+        let (seq_len, _hc_hidden) = hyper_input.dims2()?;
         let hc = self.hc_count;
         let hidden = self.hidden_size;
-        let x = hyper_input.reshape((seq_len, hc, hidden))?;
+        let in_dtype = hyper_input.dtype();
+        // Reference computes the grouped RMSNorm in float32 with (1 + w) scale.
+        let x = hyper_input
+            .to_dtype(DType::F32)?
+            .reshape((seq_len, hc, hidden))?;
         let variance = x.sqr()?.mean_keepdim(candle_core::D::Minus1)?;
         let normed = x.broadcast_div(&(variance + self.rms_norm_eps)?.sqrt()?)?;
-        let weight =
-            (self.hc_norm_weight.to_dtype(normed.dtype())? + 1.0)?.reshape((1, hc, hidden))?;
-        let normed = normed.broadcast_mul(&weight)?;
+        let weight = (self.hc_norm_weight.to_dtype(DType::F32)? + 1.0)?.reshape((1, hc, hidden))?;
+        let normed = normed
+            .broadcast_mul(&weight)?
+            .to_dtype(in_dtype)?
+            .reshape((seq_len, hc, hidden))?;
         let flat = normed.flatten_from(1)?;
         let mix_down = self.input_mix_weight_down.forward(&flat)?;
         let mix_down = candle_nn::ops::silu(&(mix_down / (hc as f64))?)?;
         let mix_up = candle_nn::ops::sigmoid(&self.input_mix_weight_up.forward(&mix_down)?)?;
         let mix_up = mix_up.reshape((seq_len, hc, hidden))?;
         let mixed = (mix_up * &normed)?.mean_keepdim(1)?.squeeze(1)?;
+        // Reference: injection = 2 * sigmoid(W_inject @ normed / hc)
         let injection_weights = if let Some(w) = &self.block_inject_weight {
-            let inj = candle_nn::ops::sigmoid(&w.forward(&flat)?)?;
-            Some(((inj * 2.0)? / (hc as f64))?)
+            let inj = candle_nn::ops::sigmoid(&(w.forward(&flat)? / (hc as f64))?)?;
+            Some((inj * 2.0)?)
         } else {
             None
         };

@@ -67,6 +67,9 @@ pub struct GatedDeltaNet {
     /// The model's native dtype (BF16/F16). Used for projection input and weight loading.
     /// Quantized projections (FP8/NVFP4/QLinear) handle dtype internally.
     model_dtype: DType,
+    /// Output gate activation for the gated RMSNorm: false = silu (Qwen3.5),
+    /// true = sigmoid (Qwen4 `output_gate_type = "sigmoid"`).
+    gate_sigmoid: bool,
     conv_mtp_state: Option<Tensor>,
     recurrent_mtp_state: Option<Tensor>,
 }
@@ -773,6 +776,10 @@ impl GatedDeltaNet {
             } else {
                 dtype
             },
+            gate_sigmoid: config
+                .output_gate_type
+                .as_deref()
+                .is_some_and(|a| a.eq_ignore_ascii_case("sigmoid")),
             conv_mtp_state,
             recurrent_mtp_state,
         })
@@ -982,15 +989,27 @@ impl GatedDeltaNet {
         // output: [seq_len, num_v_heads, head_v_dim] -> [seq_len, value_dim]
         let output = output.reshape((token_count, self.value_dim))?;
 
-        // Gated RMSNorm: norm(output) * silu(z) via fused kernel
-        let gated_output = gdn::gated_rmsnorm_silu_mul(
-            &output,
-            &z,
-            &self.gdn_norm_weight,
-            self.gdn_norm_bias.as_ref(),
-            self.rms_norm_eps,
-            self.head_v_dim,
-        )?;
+        // Gated RMSNorm: norm(output) * act(z) via fused kernel.
+        // Qwen3.5 uses silu; Qwen4 uses sigmoid (`output_gate_type`).
+        let gated_output = if self.gate_sigmoid {
+            gdn::gated_rmsnorm_sigmoid_mul(
+                &output,
+                &z,
+                &self.gdn_norm_weight,
+                self.gdn_norm_bias.as_ref(),
+                self.rms_norm_eps,
+                self.head_v_dim,
+            )?
+        } else {
+            gdn::gated_rmsnorm_silu_mul(
+                &output,
+                &z,
+                &self.gdn_norm_weight,
+                self.gdn_norm_bias.as_ref(),
+                self.rms_norm_eps,
+                self.head_v_dim,
+            )?
+        };
 
         let out = self
             .out_proj

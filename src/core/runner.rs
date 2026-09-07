@@ -656,10 +656,29 @@ impl ModelRunner {
         let has_heterogeneous_head_dim =
             matches!(model_type, ModelType::Gemma3) || matches!(model_type, ModelType::Gemma4);
 
+        // FlashInfer prefill/decode kernels only support specific GQA group
+        // sizes (see attention-rs flashinfer.rs); e.g. Qwen3.8-Flash-Next has
+        // 24 Q heads / 2 KV heads (group 12) which is unsupported — fall back
+        // to the native flash paged-attention path instead of failing at
+        // decode-plan time.
+        #[cfg(feature = "flashinfer")]
+        let flashinfer_gqa_supported = {
+            let world = comm.world_size();
+            let qo_heads = config.num_attention_heads / world;
+            let kv_heads = if config.num_key_value_heads >= world {
+                config.num_key_value_heads / world
+            } else {
+                1 // replicated KV mode
+            };
+            let group = qo_heads / kv_heads.max(1);
+            matches!(group, 1 | 2 | 3 | 4 | 5 | 6 | 8 | 16 | 32 | 64)
+        };
+
         #[cfg(feature = "flashinfer")]
         let skip_flashinfer_init = config.kvcache_dtype.is_turboquant()
             || (config.kvcache_dtype.is_fp8_keys() && !attention_rs::has_flashinfer_fp8_e4m3())
             || has_heterogeneous_head_dim
+            || !flashinfer_gqa_supported
             // V4 never consumes FlashInfer attention; skip its MLA workspace.
             || matches!(model_type, ModelType::DeepSeekV4);
         #[cfg(feature = "flashinfer")]

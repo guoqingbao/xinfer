@@ -75,9 +75,11 @@ pub struct Qwen4DecoderLayer {
     shared_expert: Option<MLP>,
     attn_hyper_connection: Qwen4HyperConnection,
     mlp_hyper_connection: Qwen4HyperConnection,
+    ple: Option<crate::models::layers::qwen4::Qwen4Ple>,
 }
 
 impl Qwen4DecoderLayer {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         vb: VarBuilderX,
         comm: Rc<Comm>,
@@ -85,6 +87,7 @@ impl Qwen4DecoderLayer {
         config: &Config,
         qwen4: &crate::utils::Qwen4Config,
         layer_type: &str,
+        layer_idx: usize,
         gdn_layer_idx: usize,
         dtype: DType,
     ) -> Result<Self> {
@@ -249,6 +252,35 @@ impl Qwen4DecoderLayer {
             (None, None)
         };
 
+        // PLE (Engram N-gram Embedding): injected at 1-based `ple_layer_ids`.
+        let ple = qwen4.ple.as_ref().and_then(|ple_cfg| {
+            let mut sorted_ids = ple_cfg.layer_ids.clone();
+            sorted_ids.sort_unstable();
+            sorted_ids.dedup();
+            sorted_ids
+                .iter()
+                .position(|&id| id == layer_idx + 1)
+                .map(|dense_id| (ple_cfg, dense_id))
+        });
+        let ple = match ple {
+            Some((ple_cfg, dense_id)) => {
+                let m = crate::models::layers::qwen4::Qwen4Ple::new(
+                    vb.clone(),
+                    config,
+                    ple_cfg,
+                    dense_id,
+                    hc_count,
+                    dtype,
+                )?;
+                crate::log_info!(
+                    "Qwen4 PLE (n-gram embedding) enabled at layer {} (dense id {dense_id})",
+                    layer_idx + 1
+                );
+                Some(m)
+            }
+            None => None,
+        };
+
         Ok(Self {
             attn,
             mlp,
@@ -256,20 +288,32 @@ impl Qwen4DecoderLayer {
             shared_expert,
             attn_hyper_connection,
             mlp_hyper_connection,
+            ple,
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn forward(
         &self,
         xs: &Tensor,
         attention_mask: Option<&Vec<Tensor>>,
         positions: &Tensor,
+        input_ids: &Tensor,
         cache: Option<(&Tensor, &Tensor)>,
         input_metadata: &InputMetadata,
         mamba_cache: &mut MambaCache,
         seq_slots: &Tensor,
         rotary_emb: &Arc<dyn ApplyRotaryEmbedding>,
     ) -> Result<Tensor> {
+        // PLE adds its n-gram delta directly to the multi-stream HC state
+        // before the attention hyper-connection read (reference ordering).
+        let ple_xs;
+        let xs = if let Some(ple) = &self.ple {
+            ple_xs = (xs + ple.forward(xs, input_ids, positions, input_metadata, seq_slots)?)?;
+            &ple_xs
+        } else {
+            xs
+        };
         let (attn_input, attn_hc_state) = self.attn_hyper_connection.read(xs)?;
         let attn_output = match &self.attn {
             Qwen4AttnType::QSAAttention(qsa) => qsa.forward(
@@ -448,6 +492,16 @@ impl Qwen4ForCausalLM {
     ) -> Result<Self> {
         let has_prefix = prefix.is_some();
         let mut prefix = prefix.unwrap_or("model.".to_string());
+        let is_qvar_builder = vb.is_qvar_builder();
+        // Multimodal checkpoints (Qwen4ExpForConditionalGeneration) nest text
+        // weights under `model.language_model.` — auto-detect that layout.
+        if !is_qvar_builder
+            && prefix == "model."
+            && !vb.has_key("model.embed_tokens.weight")
+            && vb.has_key("model.language_model.embed_tokens.weight")
+        {
+            prefix = "model.language_model.".to_string();
+        }
         let gguf_prefix = if has_prefix {
             prefix.clone()
         } else {
@@ -461,7 +515,6 @@ impl Qwen4ForCausalLM {
         .iter()
         .cloned()
         .collect();
-        let is_qvar_builder = vb.is_qvar_builder();
         let reporter = progress_reporter.clone();
         let tie_word_embeddings = if !is_qvar_builder
             && vb.has_key("embed_tokens.weight")
@@ -541,6 +594,7 @@ impl Qwen4ForCausalLM {
                 &model_config,
                 &qwen4,
                 layer_type,
+                i,
                 current_gdn_idx,
                 dtype,
             )?;
@@ -835,6 +889,7 @@ impl Qwen4ForCausalLM {
                 &xs,
                 attention_mask.as_ref(),
                 positions,
+                input_ids,
                 cache,
                 input_metadata,
                 &mut mamba_cache,

@@ -1,19 +1,25 @@
 use crate::models::layers::attention::Attention;
-use crate::models::layers::distributed::{shard, Comm, TensorParallelColumnLinear};
-use crate::models::layers::others::rms_norm;
+use crate::models::layers::distributed::Comm;
 use crate::models::layers::rotary_emb::ApplyRotaryEmbedding;
 use crate::models::layers::VarBuilderX;
 use crate::utils::config::Config;
 use crate::utils::Qwen4Config;
 use attention_rs::InputMetadata;
 use candle_core::{DType, Result, Tensor};
+use candle_nn::{Linear, Module};
 use std::rc::Rc;
 use std::sync::Arc;
 
 /// Qwen4 QSA attention: gated full attention + block-level sparse indexer mask.
+///
+/// Reference: `Qwen4ExpTextQSAIndexer` + `Qwen4ExpTextAttention` in HF
+/// transformers `models/qwen4_exp/modeling_qwen4_exp.py`.
 pub struct Qwen4QSAAttention {
     attention: Attention,
-    index_qk_proj: TensorParallelColumnLinear,
+    // Replicated (not TP-sharded): the projection packs 4 q heads + 1 shared k
+    // head, so column sharding would strand the k head on a single rank. The
+    // indexer is tiny (640 x hidden) and every rank needs the full mask anyway.
+    index_qk_proj: Linear,
     q_index_norm_weight: Tensor,
     k_index_norm_weight: Tensor,
     index_n_heads: usize,
@@ -45,24 +51,19 @@ impl Qwen4QSAAttention {
             .unwrap_or(config.hidden_size / config.num_attention_heads);
         let partial = config.partial_rotary_factor.unwrap_or(1.0) as f64;
         let rotary_dim = (head_dim as f64 * partial) as usize;
+        if rotary_dim > index_head_dim {
+            candle_core::bail!(
+                "Qwen4 QSA: rotary_dim ({rotary_dim}) exceeds indexer head_dim ({index_head_dim}); check partial_rotary_factor"
+            );
+        }
 
-        let index_qk_proj = TensorParallelColumnLinear::load_with_hints(
-            config.hidden_size,
-            index_qk_out,
-            false,
-            vb.pp("indexer.index_qk_proj"),
-            comm.clone(),
-            &config.quantization_config,
-            &config.quant,
-            dtype,
-        )?;
-        let _q_index_norm = rms_norm(
-            index_head_dim,
-            config.rms_norm_eps,
-            vb.pp("indexer.q_layernorm"),
-            dtype,
-            false,
-        )?;
+        let index_qk_weight = vb
+            .get(
+                (index_qk_out, config.hidden_size),
+                "indexer.index_qk_proj.weight",
+            )?
+            .to_dtype(dtype)?;
+        let index_qk_proj = Linear::new(index_qk_weight, None);
         let q_index_norm_weight = vb
             .get((index_head_dim,), "indexer.q_layernorm.weight")?
             .to_dtype(dtype)?;
@@ -107,33 +108,27 @@ impl Qwen4QSAAttention {
         input_metadata: &InputMetadata,
     ) -> Result<Tensor> {
         let (seq_len, _) = xs.dims2()?;
+        // Per the HF reference, the indexer q is RMS-normed then RoPE'd at the
+        // current positions, while keys are pooled RAW (no norm, no rope),
+        // then normed and RoPE'd at block-start positions. The CUDA kernel
+        // performs all of these steps, so pass raw q/k here.
         let index_qk = self.index_qk_proj.forward(xs)?;
         let q_index_size = self.index_n_heads * self.index_head_dim;
-        let q_index = index_qk.narrow(1, 0, q_index_size)?;
-        let k_index = index_qk.narrow(1, q_index_size, self.index_head_dim)?;
+        let q_index = index_qk.narrow(1, 0, q_index_size)?.contiguous()?;
+        let k_index = index_qk
+            .narrow(1, q_index_size, self.index_head_dim)?
+            .contiguous()?;
 
-        let q_index = q_index.reshape((seq_len, self.index_n_heads, self.index_head_dim))?;
-        let q_index_flat = q_index.reshape((seq_len * self.index_n_heads, self.index_head_dim))?;
-        let q_index_normed = self.rms_norm(&q_index_flat, &self.q_index_norm_weight)?;
-        let q_index = q_index_normed.reshape((seq_len, self.index_n_heads, self.index_head_dim))?;
-
-        let q_for_rope = q_index.clone();
-        let k_for_rope = k_index.reshape((seq_len, 1, self.index_head_dim))?;
-        let q_index_rope =
-            match rotary_emb.apply_rotary_emb_qkv(&q_for_rope, &k_for_rope, positions)? {
-                Some((q_rope, _)) => q_rope,
-                None => q_for_rope,
-            };
-
-        let k_index_flat = k_for_rope.reshape((seq_len, self.index_head_dim))?;
+        // TODO: the indexer needs its own raw-key cache to score against the
+        // full history during decode; for now it scores within the current
+        // forward pass (exact for prefill from position 0).
         let kv_len = seq_len;
         let cos = self.cos_table.narrow(0, 0, kv_len)?;
         let sin = self.sin_table.narrow(0, 0, kv_len)?;
 
-        let q_flat = q_index_rope.reshape((seq_len, self.index_n_heads * self.index_head_dim))?;
         let _qsa_mask = attention_rs::qwen4::qsa_indexer_mask(
-            &q_flat,
-            &k_index_flat,
+            &q_index,
+            &k_index,
             &self.q_index_norm_weight,
             &self.k_index_norm_weight,
             &cos,
@@ -146,6 +141,9 @@ impl Qwen4QSAAttention {
             self.rms_norm_eps as f32,
         )?;
 
+        // TODO: apply the sparse mask to the attention computation. For
+        // sequences within the indexer budget (2048 tokens) QSA selects all
+        // visible tokens, i.e. exact full attention — which is what we run.
         self.attention.forward(
             xs,
             &Some(rotary_emb.clone()),
@@ -154,12 +152,5 @@ impl Qwen4QSAAttention {
             cache,
             input_metadata,
         )
-    }
-
-    fn rms_norm(&self, x: &Tensor, weight: &Tensor) -> Result<Tensor> {
-        let variance = x.sqr()?.mean_keepdim(candle_core::D::Minus1)?;
-        let x = x.broadcast_div(&(variance + self.rms_norm_eps)?.sqrt()?)?;
-        let w = (weight.to_dtype(x.dtype())? + 1.0)?;
-        x.broadcast_mul(&w)
     }
 }

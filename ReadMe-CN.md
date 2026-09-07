@@ -145,6 +145,7 @@ xinfer --m Qwen/Qwen3.8-... --d 0,1 --ui-server \
 * ✅ Qwen2/Qwen3 MoE 系列
 * ✅ Qwen3-Next 系列
 * ✅ Qwen3.5/3.6/3.8 Dense/MoE 系列（27B、35B、122B、397B、多模态）
+* ✅ Qwen3.8-Next/Qwen4 系列
 * ✅ Mistral v1、v2
 * ✅ Mistral-3-VL Reasoning（3B、8B、14B、多模态）
 * ✅ GLM4（0414 版本）

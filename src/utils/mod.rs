@@ -732,6 +732,7 @@ pub fn config_from_gguf<R: std::io::Seek + std::io::Read>(
         attention_bias: None,
         qkv_bias: None,
         attn_output_gate: None,
+        output_gate_type: None,
         attn_logit_softcapping: None,
         final_logit_softcapping: None,
         tie_word_embeddings: Some(!has_output_weight),
@@ -1064,6 +1065,23 @@ pub struct Qwen4Config {
     pub indexer_head_dim: usize,
     pub indexer_budget: usize,
     pub indexer_compress_ratio: usize,
+    pub ple: Option<Qwen4PleConfig>,
+}
+
+/// PLE (Engram N-gram Embedding) configuration for Qwen4-Exp.
+/// Reference: vLLM `Qwen4ExpNGramEmbedding` / `Qwen4ExpPLELayer`.
+#[derive(Debug, Clone)]
+pub struct Qwen4PleConfig {
+    /// 1-based decoder layer ids that inject PLE deltas (e.g. [2]).
+    pub layer_ids: Vec<usize>,
+    pub ngram_size: usize,
+    pub heads_per_ngram: usize,
+    pub ngram_vocab_size_base: usize,
+    pub make_vocab_size_divisible_by: usize,
+    pub split_ngram_parts: usize,
+    pub ple_embed_dim: usize,
+    pub ple_conv_kernel_size: usize,
+    pub seed: u64,
 }
 
 #[derive(Debug, Clone, Default, serde::Deserialize)]
@@ -1075,9 +1093,21 @@ struct Qwen4RawConfig {
     indexer_head_dim: Option<usize>,
     indexer_budget: Option<usize>,
     indexer_compress_ratio: Option<usize>,
+    ple_layer_ids: Option<Vec<usize>>,
+    ngram_size: Option<usize>,
+    heads_per_ngram: Option<usize>,
+    ngram_vocab_size_base: Option<usize>,
+    make_ngram_vocab_size_divisible_by: Option<usize>,
+    split_ngram_parts: Option<usize>,
+    ple_embed_dim: Option<usize>,
+    ple_conv_kernel_size: Option<usize>,
+    seed: Option<u64>,
     #[serde(alias = "layer_types")]
     layers_block_type: Option<Vec<String>>,
+    // Absorbs the hybrid (linear-attention) sub-config keys during parsing;
+    // Qwen4 resolves those values from the main Config instead.
     #[serde(flatten)]
+    #[allow(dead_code)]
     hybrid: Qwen3HybridRawConfig,
 }
 
@@ -1097,6 +1127,22 @@ pub fn resolve_qwen4_config(config: &Config) -> Result<Qwen4Config> {
     } else {
         Qwen4RawConfig::default()
     };
+    let ple = raw.ple_layer_ids.as_ref().and_then(|ids| {
+        if ids.is_empty() {
+            return None;
+        }
+        Some(Qwen4PleConfig {
+            layer_ids: ids.clone(),
+            ngram_size: raw.ngram_size.unwrap_or(3),
+            heads_per_ngram: raw.heads_per_ngram.unwrap_or(8),
+            ngram_vocab_size_base: raw.ngram_vocab_size_base.unwrap_or(20_000_000),
+            make_vocab_size_divisible_by: raw.make_ngram_vocab_size_divisible_by.unwrap_or(128),
+            split_ngram_parts: raw.split_ngram_parts.unwrap_or(128),
+            ple_embed_dim: raw.ple_embed_dim.unwrap_or(2560),
+            ple_conv_kernel_size: raw.ple_conv_kernel_size.unwrap_or(4),
+            seed: raw.seed.unwrap_or(1234),
+        })
+    });
     Ok(Qwen4Config {
         hc_count: raw.hc_count.unwrap_or(4),
         hc_lowrank: raw.hc_lowrank.unwrap_or(320),
@@ -1105,7 +1151,24 @@ pub fn resolve_qwen4_config(config: &Config) -> Result<Qwen4Config> {
         indexer_head_dim: raw.indexer_head_dim.unwrap_or(128),
         indexer_budget: raw.indexer_budget.unwrap_or(2048),
         indexer_compress_ratio: raw.indexer_compress_ratio.unwrap_or(4),
+        ple,
     })
+}
+
+/// Whether the Qwen4 model has PLE (N-gram Embedding) layers. PLE gathers
+/// embedding rows from host-memory/disk-mapped tables inside the forward
+/// pass, which cannot be captured into CUDA graphs.
+pub fn qwen4_has_ple(config: &Config) -> bool {
+    let is_qwen4 = config
+        .architectures
+        .as_ref()
+        .is_some_and(|archs| archs.iter().any(|a| is_qwen4_arch_name(a)));
+    if !is_qwen4 {
+        return false;
+    }
+    resolve_qwen4_config(config)
+        .map(|c| c.ple.is_some())
+        .unwrap_or(false)
 }
 
 pub fn resolve_qwen4_layer_types(config: &Config) -> Vec<String> {
@@ -1405,6 +1468,8 @@ fn apply_qwen35_next_moe_norm_topk_default(config: &mut Config) {
             | "Qwen3_5MoeForConditionalGeneration"
             | "Qwen3NextForCausalLM"
             | "Qwen3NextForConditionalGeneration"
+            | "Qwen4ExpForCausalLM"
+            | "Qwen4ExpForConditionalGeneration"
     ) {
         return;
     }
@@ -1581,12 +1646,23 @@ pub fn init_config_tokenizer(
         }
 
         // Extract rope_theta from rope_parameters for models that use that format (e.g. GlmMoeDsa)
-        if config.rope_theta.is_none() {
+        if config.rope_theta.is_none() || config.partial_rotary_factor.is_none() {
             if let Some(ref extra) = config.extra_config_json {
                 if let Ok(root) = serde_json::from_str::<serde_json::Value>(extra) {
-                    if let Some(rp) = root.get("rope_parameters") {
-                        if let Some(theta) = rp.get("rope_theta").and_then(|v| v.as_f64()) {
-                            config.rope_theta = Some(theta);
+                    // Multimodal checkpoints nest these under text_config.
+                    let cfg = root.get("text_config").cloned().unwrap_or(root);
+                    if let Some(rp) = cfg.get("rope_parameters") {
+                        if config.rope_theta.is_none() {
+                            if let Some(theta) = rp.get("rope_theta").and_then(|v| v.as_f64()) {
+                                config.rope_theta = Some(theta);
+                            }
+                        }
+                        if config.partial_rotary_factor.is_none() {
+                            if let Some(prf) =
+                                rp.get("partial_rotary_factor").and_then(|v| v.as_f64())
+                            {
+                                config.partial_rotary_factor = Some(prf as f32);
+                            }
                         }
                     }
                 }
@@ -2746,6 +2822,7 @@ mod tests {
             sliding_window: Some(4096),
             max_window_layers: None,
             partial_rotary_factor: None,
+            output_gate_type: None,
             hidden_act: Activation::GeluPytorchTanh,
             rope_scaling: None,
             quant: None,
