@@ -1743,7 +1743,7 @@ impl LnNvfp4 {
                     vb.get_with_hints_dtype((), "weight_global_scale", no_shard, DType::F32)?
                 }
             };
-            let raw = t.flatten_all()?.to_vec1::<f32>()?[0];
+            let raw = t.flatten_all()?.max(0)?.to_scalar::<f32>()?;
             if raw != 0.0 {
                 1.0 / raw
             } else {
@@ -1755,7 +1755,7 @@ impl LnNvfp4 {
                 Ok(t) => t,
                 Err(_) => vb.get_with_hints_dtype((), "weight_scale_2", no_shard, DType::F32)?,
             };
-            t.flatten_all()?.to_vec1::<f32>()?[0]
+            t.flatten_all()?.max(0)?.to_scalar::<f32>()?
         } else {
             1.0f32
         };
@@ -1768,7 +1768,7 @@ impl LnNvfp4 {
                 Ok(t) => t,
                 Err(_) => vb.get_with_hints_dtype((), "input_scale", no_shard, DType::F32)?,
             };
-            t.flatten_all()?.to_vec1::<f32>()?[0]
+            t.flatten_all()?.max(0)?.to_scalar::<f32>()?
         } else if vb.contains_tensor("input_global_scale") {
             // compressed-tensors format: input_global_scale is a divisor, invert it
             let t = match vb.get_with_hints_dtype((1,), "input_global_scale", no_shard, DType::F32)
@@ -1778,7 +1778,7 @@ impl LnNvfp4 {
                     vb.get_with_hints_dtype((), "input_global_scale", no_shard, DType::F32)?
                 }
             };
-            let raw = t.flatten_all()?.to_vec1::<f32>()?[0];
+            let raw = t.flatten_all()?.max(0)?.to_scalar::<f32>()?;
             if raw != 0.0 {
                 1.0 / raw
             } else {
