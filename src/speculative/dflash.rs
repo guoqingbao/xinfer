@@ -30,13 +30,9 @@ impl DFlashDrafter {
         device: &Device,
         num_speculative_tokens: Option<usize>,
     ) -> Result<Self> {
-        if !draft_config.is_dflash2() {
-            candle_core::bail!(
-                "Only DFlash2 draft models are supported (architecture DFlash2* or dflash_config.selector_top_k). \
-                 For Qwen3.5 built-in speculative decoding, use --num-speculative-tokens without --draft-model."
-            );
-        }
-
+        // DFlash1 and DFlash2 are both supported. DFlash2 checkpoints carry the
+        // candidate selector + grouped conv; DFlash1 has neither and uses the
+        // plain-argmax draft path (see DFlashDraftModel::select_from_logits).
         let draft_vb = unsafe {
             candle_nn::var_builder::ShardedSafeTensors::var_builder(
                 draft_weight_files,

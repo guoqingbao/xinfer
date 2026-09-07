@@ -64,6 +64,17 @@ impl DFlashModelConfig {
                 .is_some_and(|config| config.selector_top_k.is_some())
     }
 
+    /// True when the checkpoint carries DFlash2 components (the grouped dynamic
+    /// conv and/or the candidate selector). DFlash1 checkpoints have neither, so
+    /// this is the auto-detection signal for the v1 (plain argmax) drafter path.
+    pub fn has_v2_components(&self) -> bool {
+        self.dflash_config.as_ref().is_some_and(|dc| {
+            dc.selector_rank.is_some()
+                || dc.selector_top_k.is_some()
+                || (dc.conv_kernel_size.is_some() && dc.conv_group_size.is_some())
+        })
+    }
+
     pub fn head_dim(&self) -> usize {
         self.head_dim
             .unwrap_or(self.hidden_size / self.num_attention_heads)
@@ -522,8 +533,9 @@ pub struct DFlashDecoderLayer {
     mlp: MLP,
     input_layernorm: NormX,
     post_attention_layernorm: NormX,
-    attention_conv: DFlashGroupedConv,
-    mlp_conv: DFlashGroupedConv,
+    /// DFlash2 grouped: the grouped dynamic conv. DFlash1 has no conv (None).
+    attention_conv: Option<DFlashGroupedConv>,
+    mlp_conv: Option<DFlashGroupedConv>,
 }
 
 impl DFlashDecoderLayer {
@@ -560,35 +572,36 @@ impl DFlashDecoderLayer {
             DType::F32,
             false,
         )?;
-        let (attention_conv, mlp_conv) = {
-            let dflash_config = config.dflash_config.as_ref().ok_or_else(|| {
-                candle_core::Error::Msg("DFlash2 config is missing dflash_config".into())
-            })?;
-            let group_size = dflash_config.conv_group_size.ok_or_else(|| {
-                candle_core::Error::Msg("DFlash2 config is missing conv_group_size".into())
-            })?;
-            let taps = dflash_config.conv_kernel_size.ok_or_else(|| {
-                candle_core::Error::Msg("DFlash2 config is missing conv_kernel_size".into())
-            })?;
-            let block_size = config.block_size();
-            (
-                DFlashGroupedConv::new(
-                    vb.pp("attention_conv"),
-                    config.hidden_size,
-                    group_size,
-                    taps,
-                    block_size,
-                    dtype,
-                )?,
-                DFlashGroupedConv::new(
-                    vb.pp("mlp_conv"),
-                    config.hidden_size,
-                    group_size,
-                    taps,
-                    block_size,
-                    dtype,
-                )?,
-            )
+        // DFlash2 only: the grouped dynamic conv. DFlash1 has no conv params, so
+        // both are None and the forward skips the conv.
+        let conv_params = config.dflash_config.as_ref().and_then(|dc| {
+            dc.conv_group_size
+                .zip(dc.conv_kernel_size)
+                .map(|(group_size, taps)| (group_size, taps))
+        });
+        let (attention_conv, mlp_conv) = match conv_params {
+            Some((group_size, taps)) => {
+                let block_size = config.block_size();
+                (
+                    Some(DFlashGroupedConv::new(
+                        vb.pp("attention_conv"),
+                        config.hidden_size,
+                        group_size,
+                        taps,
+                        block_size,
+                        dtype,
+                    )?),
+                    Some(DFlashGroupedConv::new(
+                        vb.pp("mlp_conv"),
+                        config.hidden_size,
+                        group_size,
+                        taps,
+                        block_size,
+                        dtype,
+                    )?),
+                )
+            }
+            None => (None, None),
         };
 
         Ok(Self {
@@ -610,20 +623,37 @@ impl DFlashDecoderLayer {
     ) -> Result<Tensor> {
         let residual = hidden_states;
         let hidden_states = self.input_layernorm.forward(hidden_states)?;
-        let (hidden_states, attention_coefficients) =
-            self.attention_conv.prepare(&hidden_states)?;
+        // DFlash2: apply the attention conv (prepare/finish). DFlash1: skip (no conv).
+        let (hidden_states, attention_coefficients) = match &self.attention_conv {
+            Some(conv) => {
+                let (h, coeffs) = conv.prepare(&hidden_states)?;
+                (h, Some(coeffs))
+            }
+            None => (hidden_states, None),
+        };
         let attn_output = self
             .self_attn
             .forward(&hidden_states, target_hidden, cos, sin)?;
-        let attn_output = self
-            .attention_conv
-            .finish(&attn_output, &attention_coefficients)?;
+        let attn_output = match (&self.attention_conv, attention_coefficients) {
+            (Some(conv), Some(coefficients)) => conv.finish(&attn_output, &coefficients)?,
+            _ => attn_output,
+        };
         let hidden_states = (attn_output + residual)?;
         let residual = &hidden_states;
         let hidden_states = self.post_attention_layernorm.forward(&hidden_states)?;
-        let (hidden_states, mlp_coefficients) = self.mlp_conv.prepare(&hidden_states)?;
+        // DFlash2: apply the mlp conv. DFlash1: skip.
+        let (hidden_states, mlp_coefficients) = match &self.mlp_conv {
+            Some(conv) => {
+                let (h, coeffs) = conv.prepare(&hidden_states)?;
+                (h, Some(coeffs))
+            }
+            None => (hidden_states, None),
+        };
         let mlp_output = self.mlp.forward(&hidden_states)?;
-        let mlp_output = self.mlp_conv.finish(&mlp_output, &mlp_coefficients)?;
+        let mlp_output = match (&self.mlp_conv, mlp_coefficients) {
+            (Some(conv), Some(coefficients)) => conv.finish(&mlp_output, &coefficients)?,
+            _ => mlp_output,
+        };
         residual + mlp_output
     }
 }
@@ -675,7 +705,8 @@ pub struct DFlashDraftModel {
     pub mask_token_id: Option<u32>,
     device: Device,
     dtype: DType,
-    candidate_selector: DFlashCandidateSelector,
+    /// DFlash2 only: the candidate selector lattice. DFlash1 has none (argmax).
+    candidate_selector: Option<DFlashCandidateSelector>,
 }
 
 impl DFlashDraftModel {
@@ -686,11 +717,6 @@ impl DFlashDraftModel {
         dtype: DType,
         device: &Device,
     ) -> Result<Self> {
-        if !config.is_dflash2() {
-            candle_core::bail!(
-                "DFlashDraftModel requires a DFlash2 checkpoint (selector_top_k / DFlash2 architecture)"
-            );
-        }
         let target_layer_ids = config.target_layer_ids();
         let fc_in_dim = target_layer_ids.len() * config.hidden_size;
 
@@ -731,21 +757,28 @@ impl DFlashDraftModel {
         )?;
 
         let rotary_emb = DFlashRotaryEmbedding::new(config, dtype, device)?;
-        let dflash_config = config.dflash_config.as_ref().ok_or_else(|| {
-            candle_core::Error::Msg("DFlash2 config is missing dflash_config".into())
-        })?;
-        let candidate_selector = DFlashCandidateSelector::new(
-            vb.pp("candidate_selector"),
-            config.hidden_size,
-            config.vocab_size,
-            dflash_config.selector_rank.ok_or_else(|| {
-                candle_core::Error::Msg("DFlash2 config is missing selector_rank".into())
-            })?,
-            dflash_config.selector_top_k.ok_or_else(|| {
-                candle_core::Error::Msg("DFlash2 config is missing selector_top_k".into())
-            })?,
-            dtype,
-        )?;
+        // DFlash2 only: the candidate selector lattice. DFlash1 has no selector
+        // (it uses plain argmax), so this is None when the checkpoint lacks the
+        // v2 selector components.
+        let candidate_selector = if config.has_v2_components() {
+            let dflash_config = config.dflash_config.as_ref().ok_or_else(|| {
+                candle_core::Error::Msg("DFlash2 config is missing dflash_config".into())
+            })?;
+            Some(DFlashCandidateSelector::new(
+                vb.pp("candidate_selector"),
+                config.hidden_size,
+                config.vocab_size,
+                dflash_config.selector_rank.ok_or_else(|| {
+                    candle_core::Error::Msg("DFlash2 config is missing selector_rank".into())
+                })?,
+                dflash_config.selector_top_k.ok_or_else(|| {
+                    candle_core::Error::Msg("DFlash2 config is missing selector_top_k".into())
+                })?,
+                dtype,
+            )?)
+        } else {
+            None
+        };
 
         Ok(Self {
             fc,
@@ -813,7 +846,7 @@ impl DFlashDraftModel {
     }
 
     pub fn is_dflash2(&self) -> bool {
-        true
+        self.config.has_v2_components()
     }
 
     pub fn select_candidates(
@@ -822,8 +855,59 @@ impl DFlashDraftModel {
         logits: &Tensor,
         anchor_token: u32,
     ) -> Result<Vec<u32>> {
-        self.candidate_selector
-            .select(hidden_states, logits, anchor_token)
+        // DFlash2: the candidate-selector lattice walk. DFlash1 (no selector):
+        // plain argmax over the draft logits.
+        match &self.candidate_selector {
+            Some(selector) => selector.select(hidden_states, logits, anchor_token),
+            None => Ok(logits
+                .to_dtype(DType::F32)?
+                .argmax(D::Minus1)?
+                .to_vec1::<u32>()?),
+        }
+    }
+
+    /// Select draft tokens from pre-computed logits (no grammar gate): DFlash2
+    /// candidate-selector walk when available, else plain argmax (DFlash1).
+    pub fn select_from_logits(
+        &self,
+        logits: &Tensor,
+        hidden_n: &Tensor,
+        anchor: u32,
+    ) -> Result<Vec<u32>> {
+        match &self.candidate_selector {
+            Some(selector) => selector.select(hidden_n, logits, anchor),
+            None => Ok(logits
+                .to_dtype(DType::F32)?
+                .argmax(D::Minus1)?
+                .to_vec1::<u32>()?),
+        }
+    }
+
+    /// Grammar-gated draft-token selection. `allow` is an optional per-position
+    /// allow matrix `[n, vocab]` u8 (1 = legal, 0 = illegal); `None` = unguided.
+    /// DFlash2 uses the selector walk; DFlash1 (no selector) pre-masks the logits
+    /// (disallowed -> -inf) and argmaxes.
+    pub fn select_tokens_masked(
+        &self,
+        logits: &Tensor,
+        hidden_n: &Tensor,
+        anchor: u32,
+        allow: Option<&Tensor>,
+    ) -> Result<Vec<u32>> {
+        if allow.is_none() {
+            return self.select_from_logits(logits, hidden_n, anchor);
+        }
+        let allow = allow.unwrap();
+        // Pre-mask the logits: disallowed positions -> -inf, then argmax. Works for
+        // both DFlash1 (no selector) and DFlash2 (a portable fallback; the fused
+        // in-kernel selector walk is a future optimization).
+        let neg_inf = Tensor::full(f32::NEG_INFINITY, logits.shape().clone(), logits.device())?
+            .to_dtype(logits.dtype())?;
+        let masked = allow.where_cond(logits, &neg_inf)?;
+        masked
+            .to_dtype(DType::F32)?
+            .argmax(D::Minus1)?
+            .to_vec1::<u32>()
     }
 
     pub fn dtype(&self) -> DType {
