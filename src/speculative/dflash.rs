@@ -8,9 +8,6 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Mutex;
 
-/// DFlash2 drafts attend to a bounded projected-context window (matches reference training).
-const DEFAULT_CONTEXT_WINDOW: usize = 512;
-
 pub struct DFlashDrafter {
     pub draft_model: DFlashDraftModel,
     pub target_layer_ids: Vec<usize>,
@@ -56,10 +53,11 @@ impl DFlashDrafter {
         let block_size =
             num_speculative_tokens.unwrap_or_else(|| draft_config.block_size().saturating_sub(1));
         let mask_token_id = draft_config.mask_token_id().unwrap_or(0);
-        let context_window = std::cmp::min(
-            DEFAULT_CONTEXT_WINDOW,
-            draft_config.max_position_embeddings.max(1),
-        );
+        let context_window = match crate::utils::env::spec_context_window() {
+            // 0 = unbounded full history (the original DFlash behavior).
+            0 => draft_config.max_position_embeddings.max(1),
+            n => std::cmp::min(n, draft_config.max_position_embeddings.max(1)),
+        };
 
         crate::log_info!(
             "DFlash2 drafter initialized: {} layers, num_speculative_tokens={}, target_layer_ids={:?}, mask_token_id={}, context_window={}",
@@ -387,10 +385,11 @@ impl ModelRunner {
         let _verify_guard = set_linear_is_prefill(true);
 
         #[cfg(all(feature = "cuda", feature = "graph"))]
-        let use_verify_graph = self
-            .mtp_capturer
-            .as_ref()
-            .map_or(false, |c| c.is_mtp_captured(verify_len));
+        let use_verify_graph = crate::utils::env::spec_graph()
+            && self
+                .mtp_capturer
+                .as_ref()
+                .map_or(false, |c| c.is_mtp_captured(verify_len));
         #[cfg(not(all(feature = "cuda", feature = "graph")))]
         let use_verify_graph = false;
 

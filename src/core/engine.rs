@@ -2433,9 +2433,14 @@ impl LLMEngine {
                 // Engine lock released -- server can accept new requests during forward pass
 
                 if let Some((scheduled_ids, is_prefill, owned_seqs)) = prep {
-                    let use_dflash = dflash_enabled && !is_prefill && owned_seqs.len() == 1;
-                    let use_mtp =
-                        !use_dflash && mtp_enabled && !is_prefill && owned_seqs.len() == 1;
+                    let parallel_ok = owned_seqs.len() == 1 || crate::utils::env::spec_parallel_draft();
+                    // dflash_parallel_slots caps how many concurrent sequences get a DFlash
+                    // drafter slot (MTP is a single shared drafter, no slots). Sequences
+                    // beyond the cap fall back to plain decode.
+                    let dflash_ok = parallel_ok
+                        && owned_seqs.len() <= crate::utils::env::dflash_parallel_slots().max(1);
+                    let use_dflash = dflash_enabled && !is_prefill && dflash_ok;
+                    let use_mtp = !use_dflash && mtp_enabled && !is_prefill && parallel_ok;
 
                     let forward_result: Result<Vec<Vec<u32>>> = if use_mtp {
                         Self::run_forward_mtp(&runners, &owned_seqs)
