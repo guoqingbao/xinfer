@@ -1,6 +1,7 @@
 use crate::models::dflash::{DFlashDraftModel, DFlashModelConfig};
 use crate::models::layers::distributed::Comm;
 use crate::models::layers::VarBuilderX;
+use crate::utils::apply_static_rope_scaling;
 use candle_core::{DType, Device, Result, Tensor};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -712,8 +713,15 @@ pub fn init_dflash_drafter(
 
     let config_data = std::fs::read(draft_paths.get_config_filename())
         .map_err(|e| candle_core::Error::Msg(format!("Failed to read DFlash2 config: {e}")))?;
-    let draft_config: DFlashModelConfig = serde_json::from_slice(&config_data)
+    let mut draft_config: DFlashModelConfig = serde_json::from_slice(&config_data)
         .map_err(|e| candle_core::Error::Msg(format!("Failed to parse DFlash2 config: {e}")))?;
+    // Reuse the CLI-driven dynamic YARN machinery so the drafter's rope matches
+    // the base model (same derive_yarn_parameters theta adjustment + mscale).
+    if let Some(map) =
+        apply_static_rope_scaling(econfig.yarn_scaling_factor, draft_config.max_position_embeddings)
+    {
+        draft_config.rope_scaling = Some(map);
+    }
     let draft_dtype = crate::utils::get_dtype(None);
     let drafter = DFlashDrafter::new(
         &draft_config,
