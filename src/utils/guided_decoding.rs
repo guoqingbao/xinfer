@@ -130,7 +130,7 @@ impl GuidedDecoding {
         let ctrl = Tensor::cat(&ctrl_rows, 0)?;
         let stack = Tensor::cat(&stack_rows, 0)?;
         let sp = Tensor::cat(&sp_rows, 0)?;
-        table.fused_project(&ctrl, &stack, &sp, draft)
+        table.fused_project(&ctrl, &stack, &sp, draft, None)
     }
 
     /// Current-position on-GPU PDA masking: for each guided sequence, compute the
@@ -180,7 +180,8 @@ impl GuidedDecoding {
         let sp = sp.squeeze(1)?;
 
         // One batched PDA step: fused mask + sample + advance (one kernel launch).
-        let (out_ctrl, out_sp, out_tok) = table.fused_sample(&logits, &ctrl, &stack, &sp, sampling)?;
+        let (out_ctrl, out_sp, out_tok) =
+            table.fused_sample(&logits, &ctrl, &stack, &sp, sampling, None, 0)?;
 
         // Scatter the new (ctrl, sp) back to per-seq state (stack is updated in-place
         // on the GPU buffer owned by each seq's tensor; re-read it).
