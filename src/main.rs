@@ -209,7 +209,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    let mut econfig = EngineConfig::new(
+    let econfig = EngineConfig::new(
         args.model_id,
         args.weight_path,
         args.weight_file,
@@ -249,8 +249,8 @@ async fn main() -> Result<()> {
         args.master_port,
         args.enable_tool_grammar,
         args.num_speculative_tokens,
+        args.draft_model.clone(),
     );
-    econfig.draft_model = args.draft_model.clone();
 
     // Multi-node worker nodes run a daemon loop instead of the full engine
     if econfig.num_nodes > 1 && econfig.node_rank > 0 {

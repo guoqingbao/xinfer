@@ -254,10 +254,12 @@ impl ModelRunner {
             }
         };
 
-        let (input_ids, positions, mut input_metadata) = match seqs {
+        let (input_ids, positions, input_metadata) = match seqs {
             Seqs::SeqRefs(ref refs) => self.prepare_decode(refs.iter())?,
             Seqs::DecodeVec(ref decoded) => self.prepare_decode(decoded.iter())?,
         };
+        #[cfg(feature = "flashinfer")]
+        let mut input_metadata = input_metadata;
         #[cfg(feature = "flashinfer")]
         if let Some(flashinfer_metadata) = input_metadata.flashinfer_metadata.as_mut() {
             if flashinfer_metadata.decode_plan_info.is_none() {
@@ -481,10 +483,12 @@ impl ModelRunner {
                 })
                 .collect::<Vec<_>>(),
         };
-        let (input_ids, positions, mut input_metadata) = match seqs {
+        let (input_ids, positions, input_metadata) = match seqs {
             Seqs::SeqRefs(ref refs) => self.prepare_decode(refs.iter())?,
             Seqs::DecodeVec(ref decoded) => self.prepare_decode(decoded.iter())?,
         };
+        #[cfg(feature = "flashinfer")]
+        let mut input_metadata = input_metadata;
         #[cfg(feature = "flashinfer")]
         if let Some(flashinfer_metadata) = input_metadata.flashinfer_metadata.as_mut() {
             if flashinfer_metadata.decode_plan_info.is_none() {

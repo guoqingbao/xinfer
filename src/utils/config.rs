@@ -669,6 +669,7 @@ impl EngineConfig {
         master_port: u16,
         enable_tool_grammar: bool,
         num_speculative_tokens: Option<usize>,
+        draft_model: Option<String>,
     ) -> Self {
         let mut device_ids = device_ids.unwrap_or_default();
         if device_ids.is_empty() {
@@ -729,7 +730,7 @@ impl EngineConfig {
             master_addr,
             master_port,
             num_speculative_tokens,
-            draft_model: None,
+            draft_model,
             enable_tool_grammar,
         }
     }
