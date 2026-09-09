@@ -88,6 +88,23 @@ pub fn spec_stats_update(name: &str, seq_id: usize, res: &MtpVerifyResult) {
     c.add(res);
 }
 
+/// Record a speculative fast-forward continuation (the grammar-forced ff run) into the
+/// per-seq window. Unlike MTP/DFlash (which propose + verify drafts), the spec-ff path
+/// appends deterministic grammar-forced tokens, so it increments `steps` and
+/// `ff_continuations` (the number of ff tokens appended this step).
+pub fn spec_stats_update_ff(name: &str, seq_id: usize, ff_count: usize) {
+    if ff_count == 0 {
+        return;
+    }
+    let mut map = SPEC_SEQ_STATS.lock().expect("spec seq stats mutex poisoned");
+    let c = map.entry(seq_id).or_default();
+    if c.mechanism.is_empty() {
+        c.mechanism = name.to_string();
+    }
+    c.steps += 1;
+    c.ff_continuations += ff_count;
+}
+
 /// Report + drop the per-sequence window (at the sequence's end). None if empty.
 pub fn spec_seq_report(seq_id: usize) -> Option<String> {
     let mut map = SPEC_SEQ_STATS.lock().expect("spec seq stats mutex poisoned");

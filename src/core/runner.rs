@@ -2129,6 +2129,9 @@ impl ModelRunner {
             let remaining_ff = self.guided_decoding.ff_tokens(*seq_id);
             if !remaining_ff.is_empty() {
                 self.guided_decoding.commit_ff_sequence(*seq_id);
+                // Report the ff continuation in the per-seq speculative stats (the same
+                // optional end-of-sequence report as MTP/DFlash).
+                crate::speculative::spec_stats::spec_stats_update_ff("SpecFF", *seq_id, remaining_ff.len());
                 out.extend(remaining_ff);
             }
             outputs.push(out);
