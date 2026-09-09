@@ -261,6 +261,23 @@ pub fn spec_parallel_draft() -> bool {
     })
 }
 
+/// Speculative fast-forward decode: after the sampled base token, append the full
+/// grammar-forced (ff) run (the deterministic tokens the grammar forces) instead of
+/// sampling them one at a time. The next draft anchors on the last ff token.
+/// Set `XINFER_SPEC_FF=1` to enable (default off).
+pub const SPEC_FF_ENV: &str = "XINFER_SPEC_FF";
+
+static SPEC_FF: OnceLock<bool> = OnceLock::new();
+
+pub fn spec_ff() -> bool {
+    *SPEC_FF.get_or_init(|| {
+        env::var(SPEC_FF_ENV)
+            .ok()
+            .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false)
+    })
+}
+
 /// Cap on how many concurrent sequences get a DFlash drafter slot when parallel
 /// drafting is enabled (`XINFER_SPEC_PARALLEL_DRAFT`). Sequences beyond the cap
 /// fall back to plain decode. Default 2.

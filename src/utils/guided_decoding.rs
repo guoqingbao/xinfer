@@ -438,6 +438,21 @@ impl GuidedDecoding {
         states.get_mut(&seq_id).map(|s| s.compute_ff_tokens()).unwrap_or_default()
     }
 
+    /// Commit the full grammar-forced (ff) sequence for a seq, one token at a time.
+    /// The ff tokens are deterministic (forced by the grammar), so they are appended
+    /// directly without model sampling. Returns the number of tokens committed.
+    pub fn commit_ff_sequence(&self, seq_id: usize) -> usize {
+        let ff = self.ff_tokens(seq_id);
+        if ff.is_empty() {
+            return 0;
+        }
+        let step = GuidedDecodingStep::new(std::collections::HashSet::from([seq_id]));
+        for &token in &ff {
+            let _ = self.commit(&[seq_id], &[token], step.clone());
+        }
+        ff.len()
+    }
+
     /// Apply the seq's current grammar VOB to a single logit row; returns the masked row.
     /// No-op (returns the row) if the seq is not guided.
     pub fn mask_row(&self, seq_id: usize, row: &Tensor) -> Result<Tensor> {

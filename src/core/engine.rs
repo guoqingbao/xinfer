@@ -1415,6 +1415,75 @@ impl LLMEngine {
         }
     }
 
+    fn run_spec_ff_on_local_streams(
+        runner_streams: &mut Vec<LocalStream>,
+        request: &MessageType,
+    ) -> Result<Vec<Vec<u32>>> {
+        let cloned_streams: Vec<LocalStream> = runner_streams
+            .iter_mut()
+            .map(|stream| stream.try_clone().expect("clone failed"))
+            .collect();
+        let all_outputs: Result<Vec<Vec<Vec<u32>>>> = cloned_streams
+            .into_par_iter()
+            .map(|mut stream| {
+                send_local(&mut vec![stream.try_clone()?], request, false)?;
+                match receive_local(&mut stream, false)? {
+                    MessageType::RunResponseSpecFF(tokens) if !tokens.is_empty() => Ok(tokens),
+                    MessageType::RunResponseSpecFF(_) => {
+                        crate::log_warn!("Spec-FF runner returned empty (transient error, retrying)");
+                        Ok(vec![])
+                    }
+                    other => candle_core::bail!("Unexpected spec-ff response type: {:?}", other),
+                }
+            })
+            .collect();
+        all_outputs
+            .map_err(candle_core::Error::wrap)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| candle_core::Error::Msg("No response from local spec-ff runners".into()))
+    }
+
+    fn run_forward_spec_ff(
+        runners: &Arc<RwLock<RunnerType>>,
+        owned_seqs: &[Sequence],
+    ) -> Result<Vec<Vec<u32>>> {
+        match &mut *runners.write() {
+            RunnerType::Thread(model_runner) => {
+                let seq_refs: Vec<&Sequence> = owned_seqs.iter().collect();
+                model_runner.run_speculative_ff(Seqs::SeqRefs(&seq_refs))
+            }
+            RunnerType::Process(runner_streams) => {
+                let sequences = owned_seqs
+                    .iter()
+                    .map(|sequence| DecodeSequence::new(sequence))
+                    .collect::<Vec<_>>();
+                let request = MessageType::RunDecodeSpecFF(sequences);
+                Self::run_spec_ff_on_local_streams(runner_streams, &request)
+            }
+            RunnerType::MultiNodeMaster {
+                local_streams,
+                remote_streams,
+            } => {
+                let sequences = owned_seqs
+                    .iter()
+                    .map(|sequence| DecodeSequence::new(sequence))
+                    .collect::<Vec<_>>();
+                let request = MessageType::RunDecodeSpecFF(sequences);
+                let serialized =
+                    rmp_serde::to_vec(&request).expect("MsgPack serialization failed");
+                for stream in remote_streams.iter_mut() {
+                    crate::utils::multi_node::send_tcp(stream, &serialized)?;
+                }
+                let result = Self::run_spec_ff_on_local_streams(local_streams, &request);
+                for stream in remote_streams.iter_mut() {
+                    let _ = crate::utils::multi_node::recv_tcp(stream);
+                }
+                result
+            }
+        }
+    }
+
     /// Phase 3: Postprocess forward pass results, deliver tokens, and do maintenance.
     /// Handles both single-token (normal decode/prefill) and multi-token (MTP) outputs.
     pub fn finish_step(
@@ -2441,11 +2510,16 @@ impl LLMEngine {
                         && owned_seqs.len() <= crate::utils::env::dflash_parallel_slots().max(1);
                     let use_dflash = dflash_enabled && !is_prefill && dflash_ok;
                     let use_mtp = !use_dflash && mtp_enabled && !is_prefill && parallel_ok;
+                    // Speculative fast-forward: append the full grammar-forced (ff) run after
+                    // the sampled base token (the lowest-priority decode path, the fallback).
+                    let use_spec_ff = !use_mtp && !use_dflash && crate::utils::env::spec_ff() && !is_prefill;
 
                     let forward_result: Result<Vec<Vec<u32>>> = if use_mtp {
                         Self::run_forward_mtp(&runners, &owned_seqs)
                     } else if use_dflash {
                         Self::run_forward_dflash(&runners, &owned_seqs)
+                    } else if use_spec_ff {
+                        Self::run_forward_spec_ff(&runners, &owned_seqs)
                     } else {
                         Self::run_forward(&runners, &owned_seqs, is_prefill)
                             .map(|ids| ids.into_iter().map(|t| vec![t]).collect())

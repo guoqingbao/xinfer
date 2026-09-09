@@ -219,6 +219,12 @@ pub enum MessageType {
     /// Sent by a runner in response to `RunDecodeDFlash`.
     RunResponseDFlash(Vec<Vec<u32>>),
 
+    /// Sent by the main process to request speculative fast-forward decode (the grammar-forced
+    /// ff run appended after the sampled base token).
+    RunDecodeSpecFF(Vec<DecodeSequence>),
+    /// Sent by a runner in response to `RunDecodeSpecFF`.
+    RunResponseSpecFF(Vec<Vec<u32>>),
+
     /// Sent by main process to request embedding on sequences.
     RunEmbed((Vec<Sequence>, EmbeddingStrategy)),
 
@@ -798,6 +804,17 @@ pub fn run_runner_process(args: Vec<String>) -> anyhow::Result<()> {
                 send_local(
                     &mut vec![stream.try_clone()?],
                     &MessageType::RunResponseDFlash(outputs.unwrap_or_default()),
+                    false,
+                )?;
+            }
+            Ok(MessageType::RunDecodeSpecFF(sequences)) => {
+                let outputs = runner.run_speculative_ff(Seqs::DecodeVec(&sequences));
+                if outputs.is_err() {
+                    crate::log_error!("Runner spec-ff decode error: {:?}", outputs);
+                }
+                send_local(
+                    &mut vec![stream.try_clone()?],
+                    &MessageType::RunResponseSpecFF(outputs.unwrap_or_default()),
                     false,
                 )?;
             }

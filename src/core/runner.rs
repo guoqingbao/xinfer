@@ -2111,6 +2111,31 @@ impl ModelRunner {
         Ok(tokens)
     }
 
+    /// Speculative fast-forward decode: sample the base token (the current `run`, which
+    /// commits it to the FSM), then append the full grammar-forced (ff) run that follows.
+    /// The ff tokens are deterministic (forced by the grammar), so they are committed
+    /// directly without model sampling. Returns `[base_token, ff_run...]` per sequence;
+    /// the next draft anchors on the last ff token (the `instead of the base token" case).
+    pub fn run_speculative_ff(&self, seqs: Seqs) -> Result<Vec<Vec<u32>>> {
+        let base_tokens = self.run(seqs, false)?;
+        let seq_ids: Vec<usize> = match &seqs {
+            Seqs::SeqRefs(seqs) => seqs.iter().map(|s| s.id()).collect(),
+            Seqs::DecodeVec(v) => v.iter().map(|s| s.id()).collect(),
+        };
+        let mut outputs: Vec<Vec<u32>> = Vec::with_capacity(seq_ids.len());
+        for (i, seq_id) in seq_ids.iter().enumerate() {
+            let mut out = vec![base_tokens[i]];
+            // The remaining grammar run (from the FSM state after the base token is committed).
+            let remaining_ff = self.guided_decoding.ff_tokens(*seq_id);
+            if !remaining_ff.is_empty() {
+                self.guided_decoding.commit_ff_sequence(*seq_id);
+                out.extend(remaining_ff);
+            }
+            outputs.push(out);
+        }
+        Ok(outputs)
+    }
+
     pub fn finished(&self, id: usize) {
         let mut seq_tokens = self.seq_tokens.write();
         let _ = seq_tokens.remove(&id);

@@ -328,6 +328,26 @@ pub fn run_runner() -> anyhow::Result<()> {
                     }
                 }
             }
+            Ok(MessageType::RunDecodeSpecFF(sequences)) => {
+                let outputs = runner.run_speculative_ff(Seqs::DecodeVec(&sequences));
+                match outputs {
+                    Ok(multi_tokens) => {
+                        send_local(
+                            &mut vec![stream.try_clone()?],
+                            &MessageType::RunResponseSpecFF(multi_tokens),
+                            false,
+                        )?;
+                    }
+                    Err(e) => {
+                        xinfer::log_error!("Runner spec-ff decode error: {:?}", e);
+                        send_local(
+                            &mut vec![stream.try_clone()?],
+                            &MessageType::RunResponseSpecFF(vec![]),
+                            false,
+                        )?;
+                    }
+                }
+            }
             Ok(MessageType::RunEmbed((sequences, strategy))) => {
                 use xinfer::core::sequence::Sequence;
                 let refs: Vec<&Sequence> = sequences.iter().collect();
