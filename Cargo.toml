@@ -23,9 +23,9 @@ akin = "0.4.0"
 indicatif = "0.17.11"
 serde_json = "1.0.108"
 serde_yaml = "0.9"
-llguidance = { git = "https://github.com/guidance-ai/llguidance", rev = "a8d6cc850", default-features = false, features = ["lark", "referencing", "jsonschema_validation", "dpda"] }
-toktrie_hf_tokenizers = { git = "https://github.com/guidance-ai/llguidance", rev = "a8d6cc850" }
-toktrie = { git = "https://github.com/guidance-ai/llguidance", rev = "a8d6cc850" }
+llguidance = { git = "https://github.com/sempervictus/llguidance", rev = "7d537c34", default-features = false, features = ["lark", "referencing", "jsonschema_validation", "dpda"] }
+toktrie_hf_tokenizers = { git = "https://github.com/sempervictus/llguidance", rev = "7d537c34" }
+toktrie = { git = "https://github.com/sempervictus/llguidance", rev = "7d537c34" }
 half = { version = "2.5.0", features = ["num-traits", "use-intrinsics", "rand_distr"] }
 tokio = { version = "1.38.0", features = ["sync"] }
 tracing = "0.1.40"
