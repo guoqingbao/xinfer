@@ -271,6 +271,25 @@ impl LogitsProcessor {
         Ok(next_tokens)
     }
 
+    /// Per-sequence sampling (the additive path, the QoS-gated): the temperature / top_p /
+    /// top_k are per-batch-row tensors (the [B]), so each sequence samples with its own
+    /// strategy. The existing `sample_with_strategy` (the single shared strategy) is unchanged.
+    #[cfg(feature = "cuda")]
+    pub fn sample_with_strategy_perseq(
+        &self,
+        logits: &Tensor,
+        temperature_d: &Tensor, // [B]
+        top_p_d: &Tensor,       // [B]
+        top_k_d: &Tensor,       // [B]
+    ) -> Result<Vec<u32>> {
+        let seed = {
+            use rand::RngCore;
+            self.rng.lock().next_u64()
+        };
+        let sampler = self.fast_sampler.lock().unwrap();
+        sampler.sample_cuda_perseq(logits, temperature_d, top_p_d, top_k_d, seed)
+    }
+
     /// Sample `sample_with_strategy`, but with an optional per-row grammar allow-mask
     /// (`[batch, vocab]` u8, 1 = legal) offloaded into the fused CUDA sampler's top-k
     /// stage, so disallowed vocab is dropped without a separate CPU biasing pass.

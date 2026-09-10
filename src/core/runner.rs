@@ -245,6 +245,45 @@ pub struct ModelRunner {
 impl ModelRunner {
     // Mamba slots track concurrent sequence states (not KV token blocks).
 
+    /// Resolve the per-sequence sampling strategy (each seq.sampling_params) into the
+    /// per-batch tensors (the temperature_d, the top_p_d, the top_k_d) for the QoS-gated
+    /// per-sequence sampling path.
+    fn resolve_perseq_sampling(
+        seqs: &Seqs,
+        logits: &Tensor,
+    ) -> Result<(Tensor, Tensor, Tensor)> {
+        let b = match seqs {
+            Seqs::SeqRefs(s) => s.len(),
+            Seqs::DecodeVec(v) => v.len(),
+        };
+        let device = logits.device();
+        let mut temps = Vec::with_capacity(b);
+        let mut top_ps = Vec::with_capacity(b);
+        let mut top_ks = Vec::with_capacity(b);
+        match seqs {
+            Seqs::SeqRefs(s) => {
+                for seq in *s {
+                    let sp = &seq.sampling_params;
+                    temps.push(sp.temperature.unwrap_or(0.7));
+                    top_ps.push(sp.top_p.unwrap_or(0.95));
+                    top_ks.push(sp.top_k.unwrap_or(32) as u32);
+                }
+            }
+            Seqs::DecodeVec(v) => {
+                for seq in v.iter() {
+                    let sp = &seq.sampling_params;
+                    temps.push(sp.temperature.unwrap_or(0.7));
+                    top_ps.push(sp.top_p.unwrap_or(0.95));
+                    top_ks.push(sp.top_k.unwrap_or(32) as u32);
+                }
+            }
+        }
+        let temperature_d = Tensor::from_vec(temps, (b,), device)?;
+        let top_p_d = Tensor::from_vec(top_ps, (b,), device)?;
+        let top_k_d = Tensor::from_vec(top_ks, (b,), device)?;
+        Ok((temperature_d, top_p_d, top_k_d))
+    }
+
     /// Set the PDA projected masks for the next MTP verify step.
     /// Called by the engine before `run_mtp_decode` when a grammar is active.
     #[cfg(feature = "cuda")]
@@ -1973,7 +2012,17 @@ impl ModelRunner {
             .filter_map(|(index, request)| request.grammar.is_some().then_some(index))
             .collect();
         let tokens = if guided_positions.is_empty() {
-            self.sample_processed_logits(&logits, &cached_params.sampling)?
+            if crate::utils::env::qos_enabled() && !is_prefill {
+                // the QoS-gated per-sequence sampling (the additive path): each sequence
+                // samples with its own strategy (the per-batch temperature / top_p / top_k),
+                // instead of the single shared cached_params strategy.
+                let (temperature_d, top_p_d, top_k_d) =
+                    Self::resolve_perseq_sampling(&seqs, &logits)?;
+                self.logit_processor
+                    .sample_with_strategy_perseq(&logits, &temperature_d, &top_p_d, &top_k_d)?
+            } else {
+                self.sample_processed_logits(&logits, &cached_params.sampling)?
+            }
         } else {
             let guided_indices = Tensor::from_vec(
                 guided_positions.iter().map(|&index| index as u32).collect(),
@@ -2470,5 +2519,46 @@ mod tests {
         assert_eq!(requests[3].seq_id, 13);
         assert!(requests[3].grammar.is_some());
         assert_eq!(requests[3].reasoning_end_ids, &[7, 8]);
+    }
+
+    /// The QoS-gated per-sequence path: two sequences with distinct sampling params
+    /// must resolve to distinct per-batch strategy tensors (the temperature / top_p /
+    /// top_k), not a single shared strategy.
+    #[test]
+    fn test_resolve_perseq_sampling_distinct_strategies() {
+        use candle_core::{DType, Device, Tensor};
+        use super::ModelRunner;
+
+        let seqs = vec![
+            decode_sequence_with_sampling(10, Some(0.5), Some(16), Some(0.9)),
+            decode_sequence_with_sampling(11, Some(1.0), Some(64), Some(0.5)),
+        ];
+        let logits = Tensor::zeros((2, 8), DType::F32, &Device::Cpu).unwrap();
+        let (temperature_d, top_p_d, top_k_d) =
+            ModelRunner::resolve_perseq_sampling(&Seqs::DecodeVec(&seqs), &logits).unwrap();
+        assert_eq!(temperature_d.to_vec1::<f32>().unwrap(), vec![0.5, 1.0]);
+        assert_eq!(top_p_d.to_vec1::<f32>().unwrap(), vec![0.9, 0.5]);
+        assert_eq!(top_k_d.to_vec1::<u32>().unwrap(), vec![16, 64]);
+    }
+
+    fn decode_sequence_with_sampling(
+        id: usize,
+        temperature: Option<f32>,
+        top_k: Option<isize>,
+        top_p: Option<f32>,
+    ) -> DecodeSequence {
+        let mut sampling_params = SamplingParams::new_with_max_tokens(16);
+        sampling_params.temperature = temperature;
+        sampling_params.top_k = top_k;
+        sampling_params.top_p = top_p;
+        DecodeSequence {
+            id,
+            last_token: 0,
+            len: 1,
+            last_block_tokens: 1,
+            block_table_last: 0,
+            block_tables: vec![0],
+            sampling_params,
+        }
     }
 }
