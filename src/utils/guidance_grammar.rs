@@ -75,6 +75,12 @@ trait GrammarBuilder: Clone + std::fmt::Debug + Sized {
         other.clone()
     }
 
+    /// Compose two grammars with sequence (AND) - defaults to cloning 'other'
+    /// Override when specific sequence logic is needed
+    fn compose_sequence(&mut self, other: &mut Self) -> Self {
+        other.clone()
+    }
+
     /// Convert to TopLevelGrammar - defaults to parsing build_lark() output
     fn format(&mut self) -> TopLevelGrammar {
         TopLevelGrammar::from_lark_ascii(&self.build_lark())
@@ -463,8 +469,95 @@ impl GrammarBuilder for StructuredOutputsGrammar {
         }
     }
 
+    fn compose_sequence(&mut self, other: &mut Self) -> Self {
+        let this_lark = self.build_lark();
+        let other_lark = other.build_lark();
+
+        // Parse both grammars and combine rules, deduplicating
+        let this_lines: Vec<&str> = this_lark.lines().collect();
+        let other_lines: Vec<&str> = other_lark.lines().collect();
+
+        // Extract start rules and other rules from both
+        let this_start = this_lines
+            .first()
+            .and_then(|l| l.strip_prefix("start: "))
+            .unwrap_or("");
+        let other_start = other_lines
+            .first()
+            .and_then(|l| l.strip_prefix("start: "))
+            .unwrap_or("");
+
+        // Combine start rules (sequence: this then other)
+        let combined_start = format!("{} {}", this_start, other_start).trim().to_string();
+
+        // Collect all non-start rules from both, deduplicating
+        let mut seen = std::collections::HashSet::new();
+        let mut all_rules: Vec<String> = Vec::new();
+
+        for line in this_lines.iter().skip(1) {
+            let trimmed = line.trim();
+            if !trimmed.is_empty() && !seen.contains(trimmed) {
+                seen.insert(trimmed.to_string());
+                all_rules.push(trimmed.to_string());
+            }
+        }
+
+        for line in other_lines.iter().skip(1) {
+            let trimmed = line.trim();
+            if !trimmed.is_empty() && !seen.contains(trimmed) {
+                seen.insert(trimmed.to_string());
+                all_rules.push(trimmed.to_string());
+            }
+        }
+
+        let combined_rules = all_rules.join("\n");
+
+        Self {
+            constraint: StructuredConstraint::Lark(format!(
+                "start: {}\n{}",
+                combined_start, combined_rules
+            )),
+        }
+    }
+
     fn format(&mut self) -> TopLevelGrammar {
         TopLevelGrammar::from_lark_ascii(&self.build_lark())
+    }
+}
+
+// SIMPLE REASONING GRAMMAR
+
+/// Simple reasoning grammar wrapper for llg_full_enabled() mode
+/// Generates: start: reasoning_block
+///            reasoning_block: <[start_id]> text <[end_id]>
+///            text: <token_range_expression>
+#[derive(Clone, Debug)]
+pub struct SimpleReasoningGrammar {
+    pub start_token_id: u32,
+    pub end_token_id: u32,
+}
+
+impl SimpleReasoningGrammar {
+    pub fn new(start_id: u32, end_id: u32) -> Self {
+        Self {
+            start_token_id: start_id,
+            end_token_id: end_id,
+        }
+    }
+
+    /// Build reasoning grammar that wraps text with reasoning block tokens
+    pub fn build_lark(&self, text_rule: &str) -> String {
+        if self.start_token_id == 0 || self.end_token_id == 0 {
+            // Fallback to text-only if token IDs not set
+            return format!("start: {}\n", text_rule);
+        }
+        format!(
+            r#"start: reasoning_block
+reasoning_block: <[{}]> text <[{}]>
+{}
+"#,
+            self.start_token_id, self.end_token_id, text_rule
+        )
     }
 }
 
@@ -487,6 +580,8 @@ pub struct ToolCallGrammar {
     pub format: ToolFormat,
     marker_token_ids: HashMap<String, u32>,
     value_rules: HashMap<String, String>,
+    /// Excluded token IDs for text generation (BOS, EOS, reasoning, tool markers)
+    excluded_token_ids: Vec<u32>,
 }
 
 impl Default for ToolCallGrammar {
@@ -498,12 +593,13 @@ impl Default for ToolCallGrammar {
             format: ToolFormat::Json,
             marker_token_ids: HashMap::new(),
             value_rules: HashMap::new(),
+            excluded_token_ids: Vec::new(),
         }
     }
 }
 
 impl ToolCallGrammar {
-    pub fn new_generic(tools: Vec<Tool>, start_token_id: u32, end_token_id: u32) -> Self {
+    pub fn new_generic(tools: Vec<Tool>, start_token_id: u32, end_token_id: u32, excluded_token_ids: Vec<u32>) -> Self {
         Self {
             tools,
             start_token_id,
@@ -511,9 +607,10 @@ impl ToolCallGrammar {
             format: ToolFormat::Generic,
             marker_token_ids: HashMap::new(),
             value_rules: HashMap::new(),
+            excluded_token_ids,
         }
     }
-    pub fn new_qwen_coder(tools: Vec<Tool>, start_token_id: u32, end_token_id: u32) -> Self {
+    pub fn new_qwen_coder(tools: Vec<Tool>, start_token_id: u32, end_token_id: u32, excluded_token_ids: Vec<u32>) -> Self {
         Self {
             tools,
             start_token_id,
@@ -521,9 +618,10 @@ impl ToolCallGrammar {
             format: ToolFormat::QwenCoder,
             marker_token_ids: HashMap::new(),
             value_rules: HashMap::new(),
+            excluded_token_ids,
         }
     }
-    pub fn new_minimax(tools: Vec<Tool>, start_token_id: u32, end_token_id: u32) -> Self {
+    pub fn new_minimax(tools: Vec<Tool>, start_token_id: u32, end_token_id: u32, excluded_token_ids: Vec<u32>) -> Self {
         Self {
             tools,
             start_token_id,
@@ -531,6 +629,7 @@ impl ToolCallGrammar {
             format: ToolFormat::MiniMax,
             marker_token_ids: HashMap::new(),
             value_rules: HashMap::new(),
+            excluded_token_ids,
         }
     }
     pub fn new_glm47_moe(
@@ -538,6 +637,7 @@ impl ToolCallGrammar {
         start_token_id: u32,
         end_token_id: u32,
         marker_token_ids: HashMap<String, u32>,
+        excluded_token_ids: Vec<u32>,
     ) -> Self {
         Self {
             tools,
@@ -546,9 +646,10 @@ impl ToolCallGrammar {
             format: ToolFormat::Glm47Moe,
             marker_token_ids,
             value_rules: HashMap::new(),
+            excluded_token_ids,
         }
     }
-    pub fn new_json(tools: Vec<Tool>, start_token_id: u32, end_token_id: u32) -> Self {
+    pub fn new_json(tools: Vec<Tool>, start_token_id: u32, end_token_id: u32, excluded_token_ids: Vec<u32>) -> Self {
         Self {
             tools,
             start_token_id,
@@ -556,6 +657,7 @@ impl ToolCallGrammar {
             format: ToolFormat::Json,
             marker_token_ids: HashMap::new(),
             value_rules: HashMap::new(),
+            excluded_token_ids,
         }
     }
 }
@@ -580,18 +682,21 @@ impl GrammarBuilder for ToolCallGrammar {
 
 impl ToolCallGrammar {
     pub fn build_generic_lark(&mut self) -> String {
+        let text_expr = GuidanceTokens::token_range_expression(self.excluded_token_ids.clone());
         if self.tools.is_empty() {
-            r#"start: text
- text: /(?s:.+?)/
-"#
-            .to_string()
+            format!(
+                r#"start: text
+ text: {}
+ "#,
+                text_expr
+            )
         } else {
             format!(
                 r#"start: tool_call
-tool_call: <[{}]> text <[{}]>
-text: /(?s:.+?)/
+tool_call: <[{}]> tool_text <[{}]>
+tool_text: {}
 "#,
-                self.start_token_id, self.end_token_id
+                self.start_token_id, self.end_token_id, text_expr
             )
         }
     }
@@ -1005,7 +1110,7 @@ pub fn request_has_tool_grammar(
     request: &ChatCompletionRequest,
     enable_tool_grammar: bool,
 ) -> bool {
-    enable_tool_grammar
+    (enable_tool_grammar || crate::utils::env::llg_full_enabled())
         && !matches!(
             request.tool_choice.as_ref(),
             Some(crate::tools::ToolChoice::Mode(
@@ -1084,30 +1189,47 @@ impl<'a> GrammarRequestDispatcher<'a> {
         // masks until after the </think> token). The grammar only constrains the
         // structured output — tool call JSON, JSON schema, regex, etc.
         // Reasoning effort is used only for non-grammar reasoning control.
+        let enable_reasoning = crate::utils::env::llg_full_enabled() && !self.disable_reasoning;
 
-        // Only activate LLG when the request actually specifies something to constrain.
-        if constraint_grammar.is_none() && tool_grammar.is_none() {
+        // Determine if we should activate llguidance at all.
+        // This is independent of reasoning - we build a grammar whenever:
+        // 1. XINFER_LLG_FULL is set (full-envelope mode), OR
+        // 2. There are user constraints (structured outputs, response format, etc.), OR
+        // 3. There are tools to constrain
+        let should_activate_llg = crate::utils::env::llg_full_enabled()
+            || constraint_grammar.is_some()
+            || tool_grammar.is_some();
+
+        if !should_activate_llg {
             return None;
         }
 
         let max_tokens = self.request.max_tokens.unwrap_or(0);
 
         let force_tool_call = request_requires_tool_call(self.request);
+
+        // Build free text expression using token range notation
+        let free_text_expr = self.guidance_tokens.text_grammar_mask_outer();
+
         let grammar = match (constraint_grammar, tool_grammar) {
             (None, Some(mut tool_grammar)) if force_tool_call => {
                 StructuredOutputsGrammar::new(StructuredConstraint::Lark(tool_grammar.build_lark()))
             }
             (None, Some(tool_grammar)) => {
                 let text_grammar = StructuredOutputsGrammar::new(StructuredConstraint::Lark(
-                    "start: text\ntext[stop=\"\"]: /(?s:.+?)/".to_string(),
+                    format!(r#"start: text
+text: {}
+"#, free_text_expr),
                 ));
                 GrammarComposer::compose_constraint_with_tools(text_grammar, Some(tool_grammar))
             }
             (constraint_grammar, tool_grammar) => {
-                // Build only the structured output constraint grammar — NO reasoning wrapping.
+                // Build only the structured output constraint grammar - NO reasoning wrapping.
                 let constraint_grammar = constraint_grammar.unwrap_or_else(|| {
                     StructuredOutputsGrammar::new(StructuredConstraint::Lark(
-                        "start: text\ntext[stop=\"\"]: /(?s:.+?)/".to_string(),
+                        format!(r#"start: text
+text: {}
+"#, free_text_expr),
                     ))
                 });
 
@@ -1122,6 +1244,7 @@ impl<'a> GrammarRequestDispatcher<'a> {
             max_tokens,
             self.chat_template,
             self.tokenizer,
+            enable_reasoning,
         );
         grammar_cache_insert(cache_key, grammar.clone());
         Some(grammar)
@@ -1304,33 +1427,50 @@ impl<'a> GrammarRequestDispatcher<'a> {
             &self.guidance_tokens.tool_call_end_ids,
         );
 
+        // Get excluded token IDs for proper text rule generation
+        let excluded_token_ids = self.guidance_tokens.get_text_excluded_ids();
+
+        if !self.enable_tool_grammar {
+            return Some(ToolCallGrammar::new_generic(
+                tools,
+                start_token_id,
+                end_token_id,
+                excluded_token_ids.clone(),
+            ));
+        }
+
         // TODO align 1:1 with parser selection
         match self.parser_name.as_str() {
             "qwen_coder" => Some(ToolCallGrammar::new_qwen_coder(
                 tools,
                 start_token_id,
                 end_token_id,
+                excluded_token_ids.clone(),
             )),
             "minimax_m2" => Some(ToolCallGrammar::new_minimax(
                 tools,
                 start_token_id,
                 end_token_id,
+                excluded_token_ids.clone(),
             )),
             "glm47_moe" => Some(ToolCallGrammar::new_glm47_moe(
                 tools,
                 start_token_id,
                 end_token_id,
                 self.resolve_glm_marker_token_ids(),
+                excluded_token_ids.clone(),
             )),
             "gemma4" => Some(ToolCallGrammar::new_json(
                 tools,
                 start_token_id,
                 end_token_id,
+                excluded_token_ids.clone(),
             )),
             "qwen" | "json" | _ => Some(ToolCallGrammar::new_json(
                 tools,
                 start_token_id,
                 end_token_id,
+                excluded_token_ids.clone(),
             )),
         }
     }
@@ -1348,11 +1488,17 @@ impl GrammarComposer {
         max_tokens: usize,
         chat_template: Option<crate::utils::chat_template::ChatTemplate>,
         tokenizer: &Tokenizer,
+        enable_reasoning: bool,
     ) -> TopLevelGrammar {
         let merged_constraints = Self::merge_constraints(constraint_grammars);
         let composed_with_tools =
             Self::compose_constraint_with_tools(merged_constraints, tool_grammar);
-        let mut grammar = Self::finalize_with_eos(composed_with_tools, guidance_tokens);
+        let wrapped = Self::wrap_with_simple_reasoning(
+            composed_with_tools,
+            guidance_tokens,
+            enable_reasoning,
+        );
+        let mut grammar = Self::finalize_with_eos(wrapped, guidance_tokens);
 
         // Derive role from chat template: MiniMax uses "ai", most others use "assistant"
         let role = chat_template
@@ -1413,6 +1559,38 @@ impl GrammarComposer {
             }
             None => base,
         }
+    }
+
+    /// Wrap base grammar with simple reasoning block when llg_full_enabled() is true.
+    /// Uses sequence composition to properly chain reasoning_block BEFORE base grammar.
+    fn wrap_with_simple_reasoning(
+        base: StructuredOutputsGrammar,
+        guidance_tokens: &GuidanceTokens,
+        enable_reasoning: bool,
+    ) -> StructuredOutputsGrammar {
+        if !enable_reasoning {
+            return base;
+        }
+        // Check if we have reasoning token IDs
+        if guidance_tokens.reasoning_start_ids.is_empty()
+            || guidance_tokens.reasoning_end_ids.is_empty()
+        {
+            return base;
+        }
+        // Build reasoning grammar that wraps text with reasoning block tokens.
+        // The key fix: use compose_sequence to chain reasoning_block + base, so the
+        // base grammar (with tools/constraints) is NOT lost.
+        let reasoning_lark = format!(
+            r#"start: reasoning_block
+reasoning_block: {}
+"#,
+            guidance_tokens.reasoning_grammar_mask()
+        );
+        let reasoning_grammar =
+            StructuredOutputsGrammar::new(StructuredConstraint::Lark(reasoning_lark));
+        let mut reasoning_mut = reasoning_grammar;
+        let mut base_mut = base;
+        reasoning_mut.compose_sequence(&mut base_mut)
     }
 
     fn prefix_with_bos(

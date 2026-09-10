@@ -241,6 +241,7 @@ impl GuidedDecoding {
                     factory.clone(),
                     grammar,
                     request.reasoning_end_ids.to_vec(),
+                    false, // full_envelope: false for default two-phase mode
                 ) {
                     Ok(state) => entry.insert(state),
                     Err(err) => {
@@ -526,6 +527,7 @@ impl GuidedDecoding {
                     factory.clone(),
                     grammar,
                     request.reasoning_end_ids.to_vec(),
+                    false, // full_envelope: false for default two-phase mode
                 ) {
                     Ok(state) => entry.insert(state),
                     Err(err) => {
@@ -615,6 +617,7 @@ impl GuidedDecoding {
                         factory,
                         grammar,
                         request.reasoning_end_ids.to_vec(),
+                        false, // full_envelope: false for default two-phase mode
                     ) {
                         Ok(state) => entry.insert(state),
                         Err(err) => {

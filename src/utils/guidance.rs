@@ -31,6 +31,109 @@ pub struct GuidanceTokens {
     pub add_bos_token: bool,
 }
 
+impl GuidanceTokens {
+    /// Compress a sorted list of token IDs into ranges.
+    /// E.g., [1, 2, 3, 5, 7, 8] -> [(1, 3), (5, 5), (7, 8)]
+    fn compress_to_ranges(ids: &[u32]) -> Vec<(u32, u32)> {
+        if ids.is_empty() {
+            return Vec::new();
+        }
+        let mut ranges = Vec::new();
+        let mut start = ids[0];
+        let mut prev = ids[0];
+        for &id in &ids[1..] {
+            if id == prev + 1 {
+                prev = id;
+            } else {
+                ranges.push((start, prev));
+                start = id;
+                prev = id;
+            }
+        }
+        ranges.push((start, prev));
+        ranges
+    }
+
+    /// Generate a token-range expression for free text generation.
+    /// Returns the RHS expression usable directly after `text: ` in Lark grammar.
+    /// Uses llguidance's negated token range syntax to allow all tokens EXCEPT the
+    /// excluded set (the ~20 control tokens), a 12,000x smaller mask than the
+    /// allowed set. Empty exclusions fall back to the full regex regex.
+    pub fn token_range_expression(excluded_ids: Vec<u32>) -> String {
+        if excluded_ids.is_empty() {
+            return r#"/(?s:.*)/"#.to_string();
+        }
+        let mut sorted_ids: Vec<u32> = excluded_ids;
+        sorted_ids.sort();
+        sorted_ids.dedup();
+        let ranges = Self::compress_to_ranges(&sorted_ids);
+        format!(
+            "(<[^{}]>)+ ",
+            ranges
+                .iter()
+                .map(|(start, end)| {
+                    if start == end {
+                        start.to_string()
+                    } else {
+                        format!("{}-{}", start, end)
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(",")
+        )
+    }
+
+    // Disallow all control tokens, used in the middle of grammars
+    pub fn text_grammar_mask_inner(&self) -> String {
+        let mut ids = Vec::new();
+        ids.extend_from_slice(&self.bos_token_ids);
+        ids.extend_from_slice(&self.eos_token_ids);
+        ids.extend_from_slice(&self.reasoning_start_ids);
+        ids.extend_from_slice(&self.reasoning_end_ids);
+        ids.extend_from_slice(&self.tool_call_start_ids);
+        ids.extend_from_slice(&self.tool_call_end_ids);
+        Self::token_range_expression(ids)
+    }
+
+    // Allow EOS tokens to "naturally" finish output
+    pub fn text_grammar_mask_outer(&self) -> String {
+        let mut ids = Vec::new();
+        ids.extend_from_slice(&self.bos_token_ids);
+        ids.extend_from_slice(&self.reasoning_start_ids);
+        ids.extend_from_slice(&self.reasoning_end_ids);
+        ids.extend_from_slice(&self.tool_call_start_ids);
+        ids.extend_from_slice(&self.tool_call_end_ids);
+        Self::token_range_expression(ids)
+    }
+
+    // Allow end-of-reasoning token to "naturally" finish thinking; allow BOS and
+    // start-of-reasoning for models which need it
+    pub fn reasoning_grammar_mask(&self) -> String {
+        let mut ids = Vec::new();
+        ids.extend_from_slice(&self.eos_token_ids);
+        if !self.add_bos_token {
+            ids.extend_from_slice(&self.bos_token_ids);
+            ids.extend_from_slice(&self.reasoning_start_ids);
+        }
+        ids.extend_from_slice(&self.tool_call_start_ids);
+        ids.extend_from_slice(&self.tool_call_end_ids);
+        Self::token_range_expression(ids)
+    }
+
+    /// Get the excluded token IDs for the free-text rule (the BOS + the reasoning + the
+    /// tool-call IDs, NOT the EOS). Used by the ToolCallGrammar to build the text rule
+    /// via token_range_expression (the token-number masking).
+    pub fn get_text_excluded_ids(&self) -> Vec<u32> {
+        let mut ids = Vec::new();
+        ids.extend_from_slice(&self.bos_token_ids);
+        ids.extend_from_slice(&self.reasoning_start_ids);
+        ids.extend_from_slice(&self.reasoning_end_ids);
+        ids.extend_from_slice(&self.tool_call_start_ids);
+        ids.extend_from_slice(&self.tool_call_end_ids);
+        ids
+    }
+}
+
 pub fn extract_guidance_tokens(
     tokenizer: &Tokenizer,
     eos_token_ids: Vec<u32>,
@@ -119,6 +222,9 @@ pub struct GuidanceState {
     /// Whether reasoning has ended (the </think> token was observed).
     /// Once true, grammar masks are applied normally.
 reasoning_ended: bool,
+    /// Full-envelope mode: grammar constrains from BOS to EOS including reasoning.
+    /// When true, the `reasoning_ended` logic is bypassed and masks are always applied.
+    full_envelope: bool,
     /// GPU-resident PDA (pushdown-rs transition table).
     pub(crate) pda: Option<pushdown_rs::machine::PdaMachine>,
     /// The PDA control-state stack (top = last element). Mirrors the LR state stack.
@@ -132,6 +238,7 @@ impl GuidanceState {
         factory: Arc<ParserFactory>,
         grammar: &TopLevelGrammar,
         reasoning_end_ids: Vec<u32>,
+        full_envelope: bool,
     ) -> Result<Self> {
         use crate::utils::guidance_grammar::get_lark_from_top_level_grammar;
 
@@ -144,9 +251,10 @@ impl GuidanceState {
             );
             tracing::trace!("[llg] Guidance parser grammar:\n{}\n", lark);
         }
-        // In full-envelope mode, reasoning is constrained by grammar from the start
-        let reasoning_ended = if crate::utils::env::llg_full_enabled() {
-            true  // Bypass two-phase logic; always apply grammar masks
+        // In full-envelope mode OR llg_full_enabled, reasoning is constrained from the start
+        let llg_full_enabled = crate::utils::env::llg_full_enabled();
+        let reasoning_ended = if full_envelope || llg_full_enabled {
+            true  // Single-phase: grammar always applies
         } else {
             reasoning_end_ids.is_empty()
         };
@@ -178,6 +286,7 @@ impl GuidanceState {
             llm_tokens: Vec::new(),
             reasoning_end_ids,
             reasoning_ended,
+            full_envelope,
             pda: None,
             pda_stack: Vec::new(),
             pda_ctrl: 0,
@@ -312,8 +421,13 @@ impl GuidanceState {
     /// Compute mask or return EOS token set if stopped.
     /// In full-envelope mode, always apply grammar mask (no all-ones during reasoning).
     pub fn compute_mask_or_eos(&mut self) -> Result<SimpleVob> {
+        // Full-envelope mode (the per-state) OR llg_full_enabled (the global): always
+        // apply the grammar mask (the no all-ones during reasoning).
+        if self.full_envelope || crate::utils::env::llg_full_enabled() {
+            return self.matcher.compute_mask_immut().map_err(Into::into);
+        }
         // Two-phase mode: allow everything during reasoning
-        if !crate::utils::env::llg_full_enabled() && !self.reasoning_ended {
+        if !self.reasoning_ended {
             return self
                 .matcher
                 .compute_mask_immut()
@@ -323,11 +437,7 @@ impl GuidanceState {
                 })
                 .map_err(Into::into);
         }
-
         // Two-phase mode: apply grammar mask after reasoning
-        if self.llm_tokens.is_empty() {
-            return self.matcher.compute_mask_immut().map_err(Into::into)
-        }
         self.matcher.compute_mask_immut().map_err(Into::into)
     }
 
@@ -571,10 +681,69 @@ start: <[97]> <[98]>
         let cgrm2 = f2.create_parser(g2).unwrap().parser.grammar().clone();
         let pda1 = llguidance::dpda_adapter::compile_pda(&cgrm1).expect("explicit PDA");
         let pda2 = llguidance::dpda_adapter::compile_pda(&cgrm2).expect("implicit PDA");
-        assert!(
+assert!(
             pda1.num_states > pda2.num_states,
             "explicit ({}) should have more states than implicit ({})",
-pda1.num_states, pda2.num_states
+            pda1.num_states, pda2.num_states
+        );
+    }
+
+    #[test]
+    fn test_compress_to_ranges() {
+        use super::GuidanceTokens;
+        // single ID
+        assert_eq!(GuidanceTokens::compress_to_ranges(&[151644]), vec![(151644, 151644)]);
+        // consecutive IDs collapse to one range
+        assert_eq!(
+            GuidanceTokens::compress_to_ranges(&[151644, 151645, 151646]),
+            vec![(151644, 151646)]
+        );
+        // non-consecutive stay separate
+        assert_eq!(
+            GuidanceTokens::compress_to_ranges(&[151644, 151650, 151658]),
+            vec![(151644, 151644), (151650, 151650), (151658, 151658)]
+        );
+        // mixed
+        assert_eq!(
+            GuidanceTokens::compress_to_ranges(&[1, 2, 5, 6, 7, 10]),
+            vec![(1, 2), (5, 7), (10, 10)]
+        );
+        // empty
+        assert_eq!(GuidanceTokens::compress_to_ranges(&[]), Vec::<(u32, u32)>::new());
+        // unsorted input preserves input order (sorting happens in token_range_expression)
+        assert_eq!(
+            GuidanceTokens::compress_to_ranges(&[151658, 151644, 151650]),
+            vec![(151658, 151658), (151644, 151644), (151650, 151650)]
+        );
+    }
+
+    #[test]
+    fn test_token_range_expression() {
+        use super::GuidanceTokens;
+        // empty exclusions -> full regex
+        assert_eq!(
+            GuidanceTokens::token_range_expression(vec![]),
+            r#"/(?s:.*)/"#
+        );
+        // single exclusion -> negated range, one-or-more, trailing space (the e7897bab form)
+        assert_eq!(
+            GuidanceTokens::token_range_expression(vec![151644]),
+            "(<[^151644]>)+ "
+        );
+        // consecutive exclusions collapse into a range
+        assert_eq!(
+            GuidanceTokens::token_range_expression(vec![151644, 151645, 151646]),
+            "(<[^151644-151646]>)+ "
+        );
+        // non-consecutive exclusions are sorted + comma-joined
+        assert_eq!(
+            GuidanceTokens::token_range_expression(vec![151644, 151650, 151658]),
+            "(<[^151644,151650,151658]>)+ "
+        );
+        // mixed
+        assert_eq!(
+            GuidanceTokens::token_range_expression(vec![1, 2, 5, 6, 7, 10]),
+            "(<[^1-2,5-7,10]>)+ "
         );
     }
 }
