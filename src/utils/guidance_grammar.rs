@@ -71,13 +71,6 @@ pub fn get_user_reasoning_grammar(level: &str) -> Option<String> {
     guard.as_ref()?.reasoning.get(level).cloned()
 }
 
-/// Legacy: load reasoning grammars from a flat YAML (level -> lark).
-/// Deprecated: use load_grammar_file instead.
-#[deprecated(note = "use load_grammar_file")]
-pub fn load_reasoning_grammars(path: &str) -> Result<(), String> {
-    load_grammar_file(path)
-}
-
 #[derive(Default)]
 struct GrammarCache {
     entries: HashMap<String, TopLevelGrammar>,
@@ -1563,17 +1556,7 @@ impl GrammarComposer {
         let mut grammar = Self::suffix_with_eos(wrapped, guidance_tokens);
 
         // Derive role from chat template: MiniMax uses "ai", most others use "assistant"
-        let role = chat_template
-            .as_ref()
-            .and_then(|t| t.get_template_string())
-            .and_then(|tmpl| {
-                if tmpl.contains("\"ai\"") || tmpl.contains("'ai'") {
-                    Some("ai".to_string())
-                } else {
-                    None
-                }
-            })
-            .unwrap_or_else(|| "assistant".to_string());
+        let role = extract_llm_role_from_template(chat_template.clone(), guidance_tokens, tokenizer);
 
         if guidance_tokens.add_bos_token {
             grammar = Self::prefix_with_bos(grammar, guidance_tokens, role);
@@ -2041,8 +2024,91 @@ pub fn is_reasoning_grammar(grammar: &TopLevelGrammar) -> bool {
     let lark_str = get_lark_from_top_level_grammar(grammar);
     lark_str.lines().any(|l| {
         let trimmed = l.trim();
-        trimmed.starts_with("reasoning_block:") && trimmed.contains("<[") && trimmed.contains("]>")
+        trimmed.starts_with("reasoning_block: ") && trimmed.contains("<[") && trimmed.contains("]>")
     })
+}
+
+/// Extract all role names from chat template by finding strings between BOS pattern and colon.
+/// Returns a Vec of all role candidates found in the template.
+fn extract_all_role_names_from_template(template: &str, bos_pattern: &str) -> Vec<String> {
+    let mut role_names: Vec<String> = vec![];
+
+    // Find all occurrences of BOS pattern in the template
+    let mut start = 0;
+    while let Some(pos) = template[start..].find(bos_pattern) {
+        let absolute_pos = start + pos;
+        let after_bos = &template[absolute_pos + bos_pattern.len()..];
+
+        // Find the colon that marks the end of the role name
+        if let Some(colon_pos) = after_bos.find(':') {
+            // Extract the role name (trim whitespace)
+            let role_candidate = after_bos[..colon_pos].trim();
+
+            // Validate role name - should be alphanumeric with possible underscores/hyphens
+            if !role_candidate.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-') {
+                // Skip invalid role names
+                start = absolute_pos + 1;
+                continue;
+            }
+
+            if !role_names.contains(&role_candidate.to_string()) {
+                role_names.push(role_candidate.to_string());
+            }
+        }
+
+        start = absolute_pos + 1;
+    }
+
+    role_names
+}
+
+/// Extract the LLM's role name from chat template.
+/// Finds all role names, filters out non-LLM roles, and returns the most likely LLM role.
+fn extract_llm_role_from_template(
+    chat_template: Option<ChatTemplate>,
+    guidance_tokens: &GuidanceTokens,
+    tokenizer: &Tokenizer,
+) -> String {
+    // Default fallback
+    let default_role = "assistant";
+
+    // Get BOS token string representation
+    let bos_string = guidance_tokens
+        .bos_token_ids
+        .first()
+        .and_then(|id| tokenizer.decode(&[*id], false).ok())
+        .unwrap_or_else(|| "<[bos]>".to_string());
+
+    // Get the template string - clone to avoid lifetime issues
+    let template = match chat_template {
+        Some(t) => match t.get_template_string() {
+            Some(s) => s.to_string(),
+            None => return default_role.to_string(),
+        },
+        None => return default_role.to_string(),
+    };
+
+    // Step 1: Find all role names between BOS pattern and colon
+    let all_roles = extract_all_role_names_from_template(&template, &bos_string);
+
+    // Step 2: Filter out non-LLM roles
+    let excluded_roles: std::collections::HashSet<&str> =
+        ["user", "system", "tool", "tool_response", "function", "observation", "query"]
+            .iter()
+            .cloned()
+            .collect();
+
+    let llm_roles: Vec<&String> = all_roles
+        .iter()
+        .filter(|r| !excluded_roles.contains(&r.to_lowercase().as_str()))
+        .collect();
+
+    // Step 3: Return the most likely LLM role with priority
+    if llm_roles.is_empty() {
+        return default_role.to_string();
+    }
+
+    llm_roles[0].clone()
 }
 
 /// Build TopLevelGrammar from a GrammarRequest

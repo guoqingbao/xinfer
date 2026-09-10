@@ -592,7 +592,10 @@ impl GuidedDecoding {
         }
         let batch_size = requests.len();
         let num_words = (vocab_size + 31) / 32;
-        let mut words = vec![0u32; batch_size * num_words];
+        // Initialize to all-ones (allow everything by default); gated rows are reset
+        // to zero below before their allowed bits are OR-ed in. Allow-all rows stay
+        // all-ones, so a mixed batch never masks out its free rows.
+        let mut words = vec![u32::MAX; batch_size * num_words];
         let mut any_gate = false;
 
         let mut states = self.states.write();
@@ -644,6 +647,11 @@ impl GuidedDecoding {
                     if !mask_allows_all(&mask, vocab_size) {
                         any_gate = true;
                         let row_base = row * num_words;
+                        // Reset this gated row to zero (the default all-ones would allow
+                        // everything); the allowed bits are OR-ed in below.
+                        for w in 0..num_words {
+                            words[row_base + w] = 0;
+                        }
                         let apply_len = std::cmp::min(vocab_size, mask.len());
                         mask.iter_set_entries(|idx| {
                             if idx < apply_len {

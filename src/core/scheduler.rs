@@ -233,6 +233,15 @@ impl Scheduler {
         seq.id = self.next_seq_id;
         let id = seq.id;
         self.next_seq_id += 1;
+        if crate::utils::env::debug_llg() {
+            if let Some(gram) = &seq.sampling_params.grammar {
+                crate::log_info!(
+                    "[llg] Seq {}: TopLevelGrammar:\n{}\n",
+                    &seq.id,
+                    crate::utils::guidance_grammar::get_lark_from_top_level_grammar(gram)
+                )
+            }
+        }
         self.waiting.push_back(seq);
         id
     }

@@ -257,7 +257,7 @@ async fn main() -> Result<()> {
 
     // Load user-defined reasoning grammars if provided
     if let Some(ref path) = econfig.reasoning_grammars {
-        match xinfer::utils::guidance_grammar::load_reasoning_grammars(path) {
+        match xinfer::utils::guidance_grammar::load_grammar_file(path) {
             Ok(()) => tracing::info!("Loaded user-defined reasoning grammars from {}", path),
             Err(e) => tracing::warn!("Failed to load reasoning grammars from {}: {}", path, e),
         }

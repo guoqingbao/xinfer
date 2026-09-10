@@ -21,7 +21,7 @@ use crate::transfer::Transfer;
 use crate::utils::chat_template::Message;
 use crate::utils::config::{EngineConfig, EosTokenId, ModelType, SamplingParams};
 use crate::utils::guidance::{build_llg_factory, extract_guidance_tokens, GuidanceTokens};
-use crate::utils::guidance_grammar::{get_reasoning_token_strings, is_reasoning_grammar};
+use crate::utils::guidance_grammar::is_reasoning_grammar;
 use crate::utils::heartbeat::heartbeat_worker;
 use crate::utils::image::{get_image_config, ImageData, ImageProcessConfig};
 use crate::utils::kvcache_allocator::KVCacheAllocator;
@@ -1935,7 +1935,8 @@ impl LLMEngine {
         }
         // Generation alignment and open/close parity enforcement
         if let Some(grammar) = &params.grammar {
-            if self.guidance_tokens.add_bos_token {
+            let lark = crate::utils::guidance_grammar::get_lark_from_top_level_grammar(grammar);
+            if lark.contains("start: bos ") {
                 // BOS-based trimming: trim the last BOS token from the prompt tail.
                 // Only trim if the prompt actually ends with the BOS string to avoid
                 // splitting in the middle of a multi-turn conversation.
@@ -1954,30 +1955,6 @@ impl LLMEngine {
                         if prompt.trim_end().ends_with(&bos_string) {
                             if let Some((prefix, _)) = prompt.rsplit_once(&bos_string) {
                                 return (prefix.to_string(), image_idx);
-                            }
-                        }
-                    }
-                }
-            } else {
-                // Reasoning tag-based trimming: check for reasoning start/end tokens
-                if let Some((start_str, end_str)) =
-                    get_reasoning_token_strings(&self.guidance_tokens, &self.tokenizer)
-                {
-                    if is_reasoning_grammar(&grammar) {
-                        // Control entire reasoning block via guidance
-                        if prompt.trim().ends_with(&start_str) || prompt.trim().ends_with(&end_str)
-                        {
-                            if let Some((prompt, _trimmed)) = prompt.rsplit_once(&start_str) {
-                                return (prompt.to_string(), image_idx);
-                            }
-                        }
-                    } else if params.guidance_reasoning_end_ids.is_empty() {
-                        // Only trim <think> when NOT using two-phase reasoning.
-                        // With two-phase reasoning, the model needs the <think> prefix
-                        // to generate reasoning freely before grammar constraints kick in.
-                        if prompt.trim().ends_with(&start_str) {
-                            if let Some((prompt, _trimmed)) = prompt.rsplit_once(&start_str) {
-                                return (prompt.to_string(), image_idx);
                             }
                         }
                     }
