@@ -2099,42 +2099,39 @@ impl ModelRunner {
     /// The ff tokens are deterministic (forced by the grammar), so they are committed
     /// directly without model sampling. Returns `[base_token, ff_run...]` per sequence;
     /// the next draft anchors on the last ff token (the `instead of the base token" case).
-    pub fn run_speculative_ff(&self, seqs: Seqs) -> Result<Vec<Vec<u32>>> {
-        let base_tokens = self.run(seqs, false)?;
-        let seq_ids: Vec<usize> = match &seqs {
-            Seqs::SeqRefs(seqs) => seqs.iter().map(|s| s.id()).collect(),
-            Seqs::DecodeVec(v) => v.iter().map(|s| s.id()).collect(),
-        };
-        let mut outputs: Vec<Vec<u32>> = Vec::with_capacity(seq_ids.len());
-        for (i, seq_id) in seq_ids.iter().enumerate() {
-            let mut out = vec![base_tokens[i]];
-            // spec-FF is mid-step committed (the ff read below needs the base in the FSM),
-            // so the terminal gate_commit skips this path. Commit the base token now.
-            self.guided_decoding.commit_run(*seq_id, &out);
-            // The remaining grammar run (from the FSM state after the base token is committed).
-            let remaining_ff = self.guided_decoding.ff_tokens(*seq_id);
-            if !remaining_ff.is_empty() {
-                self.guided_decoding.commit_ff_sequence(*seq_id);
-                // Report the ff continuation in the per-seq speculative stats (the same
-                // optional end-of-sequence report as MTP/DFlash).
-                crate::speculative::spec_stats::spec_stats_update_ff("SpecFF", *seq_id, remaining_ff.len());
-                out.extend(remaining_ff);
-            }
-            outputs.push(out);
-        }
-        Ok(outputs)
+    pub fn run_speculative_ff(&self, seqs: Seqs) -> Result<Vec<u32>> {
+        // The sampling only: the base token (the current run). The ordered-queue
+        // commit (the base + the grammar-forced continuation) is done by the
+        // single gate (the `gate_commit` with `ff = true`), so the spec-FF path
+        // no longer has its own mid-step writers.
+        self.run(seqs, false)
     }
 
     /// The single matcher-gated ingress: commit each sequence's produced run to the
     /// FSM and return only the FSM-passing prefix. Every token-production path
     /// (plain, spec-FF, MTP, DFlash) funnels through this one call just before the
     /// sequence append, so the sequence can never hold a token the FSM rejected.
-    pub fn gate_commit(&self, seq_ids: &[usize], runs: &[Vec<u32>]) -> Vec<Vec<u32>> {
+    ///
+    /// `ff` selects the ordered-queue writer: when true (the spec-FF path) the base
+    /// run is committed, the grammar-forced continuation is read from the settled
+    /// state, and the continuation is committed — all in acquisition order, so the
+    /// queue [base, ff…] is appended as one serialized stream. When false (the
+    /// plain/MTP/DFlash paths) the whole run is committed as-is.
+    pub fn gate_commit(&self, seq_ids: &[usize], runs: &[Vec<u32>], ff: bool) -> Vec<Vec<u32>> {
         runs.iter()
             .enumerate()
             .map(|(i, run)| {
-                let n = self.guided_decoding.commit_run(seq_ids[i], run);
-                run[..n].to_vec()
+                let sid = seq_ids[i];
+                let n_base = self.guided_decoding.commit_run(sid, run);
+                let mut queue = run[..n_base].to_vec();
+                if ff {
+                    let ff_run = self.guided_decoding.ff_tokens(sid);
+                    if !ff_run.is_empty() {
+                        let n_ff = self.guided_decoding.commit_run(sid, &ff_run);
+                        queue.extend(ff_run[..n_ff].to_vec());
+                    }
+                }
+                queue
             })
             .collect()
     }

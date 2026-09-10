@@ -452,21 +452,6 @@ impl GuidedDecoding {
         states.get_mut(&seq_id).map(|s| s.compute_ff_tokens()).unwrap_or_default()
     }
 
-    /// Commit the full grammar-forced (ff) sequence for a seq, one token at a time.
-    /// The ff tokens are deterministic (forced by the grammar), so they are appended
-    /// directly without model sampling. Returns the number of tokens committed.
-    pub fn commit_ff_sequence(&self, seq_id: usize) -> usize {
-        let ff = self.ff_tokens(seq_id);
-        if ff.is_empty() {
-            return 0;
-        }
-        let step = GuidedDecodingStep::new(std::collections::HashSet::from([seq_id]));
-        for &token in &ff {
-            let _ = self.commit(&[seq_id], &[token], step.clone());
-        }
-        ff.len()
-    }
-
     /// Apply the seq's current grammar VOB to a single logit row; returns the masked row.
     /// No-op (returns the row) if the seq is not guided.
     pub fn mask_row(&self, seq_id: usize, row: &Tensor) -> Result<Tensor> {
@@ -771,7 +756,7 @@ fn write_allow_row(row: &mut [u8], mask: &SimpleVob, vocab_size: usize) {
 
 #[cfg(test)]
 mod tests {
-    use super::{mask_allows_all, mask_draft_logits, write_allow_row};
+    use super::{mask_allows_all, mask_draft_logits, write_allow_row, GuidedDecoding, GuidedDecodingRequest};
     use toktrie::SimpleVob;
     use candle_core::Tensor;
 
@@ -934,5 +919,57 @@ mod tests {
         assert_eq!(m[1][97], f32::NEG_INFINITY, "pos1 token 97 must be masked");
         assert!((m[1][98] - 5.0).abs() < 1e-6, "pos1 token 98 kept");
         println!("mask_draft_logits: projected masks correctly mask draft positions");
+    }
+
+    /// PROOF of the sequential gating contract: the token stream is serialized
+    /// through the FSM in acquisition order. The base is committed, the ff-run is
+    /// read from the post-base settled state, and the ff-run is committed — so the
+    /// ordered queue [base, ff…] is appended in the the order the FSM accepted
+    /// it. A future ff-after-drafted path cannot desync because the ff-read is a
+    /// pure observation of the settled state that already contains the base.
+    #[test]
+    fn test_sequential_gating_ordered_queue() {
+        use llguidance::{api::TopLevelGrammar, ParserFactory};
+        use toktrie::ApproximateTokEnv;
+        use candle_core::Tensor;
+
+        let env = ApproximateTokEnv::single_byte_env();
+        let factory = ParserFactory::new_simple(&env).unwrap();
+        let grm_str = r#"start: "abc""#;
+        let mut grm = TopLevelGrammar::from_lark(grm_str.to_string());
+        grm.max_tokens = None;
+
+        let gd = GuidedDecoding::new(Some(std::sync::Arc::new(factory)));
+        let seq_id = 0;
+        let requests = vec![GuidedDecodingRequest {
+            seq_id,
+            grammar: Some(&grm),
+            reasoning_end_ids: &[],
+        }];
+        let vocab = env.tok_trie().vocab_size();
+        let logits = Tensor::zeros(
+            (1, vocab),
+            candle_core::DType::F32,
+            &candle_core::Device::Cpu,
+        )
+        .unwrap();
+        let _ = gd.apply(&logits, &requests).unwrap();
+
+        // the base token ('a' = 97) is committed first (the several-clicks + settle)
+        let base = vec![97u32];
+        let n_base = gd.commit_run(seq_id, &base);
+        assert_eq!(n_base, 1, "the base is committed");
+
+        // the ff-run is read from the post-base settled state (the pure read)
+        let ff = gd.ff_tokens(seq_id);
+        assert_eq!(ff, vec![98, 99], "the ff-run is 'b','c' (the post-base state)");
+
+        // the ff-run is committed (the several-clicks + settle)
+        let n_ff = gd.commit_run(seq_id, &ff);
+        assert_eq!(n_ff, 2, "the ff-run is committed");
+
+        // the ordered queue [base, ff…] is exactly what the FSM accepted, in order
+        let accepted: Vec<u32> = base.iter().chain(ff.iter()).copied().collect();
+        assert_eq!(accepted, vec![97, 98, 99], "the ordered queue is in acquisition order");
     }
 }

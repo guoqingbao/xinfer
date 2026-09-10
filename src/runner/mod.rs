@@ -798,7 +798,7 @@ pub fn run_runner_process(args: Vec<String>) -> anyhow::Result<()> {
                 let gated = match outputs {
                     Ok(toks) if !is_prefill => {
                         let runs: Vec<Vec<u32>> = toks.iter().map(|&t| vec![t]).collect();
-                        runner.gate_commit(&seq_ids, &runs)
+                        runner.gate_commit(&seq_ids, &runs, false)
                             .into_iter()
                             .map(|v| v.into_iter().next().unwrap_or(0))
                             .collect::<Vec<u32>>()
@@ -821,7 +821,7 @@ pub fn run_runner_process(args: Vec<String>) -> anyhow::Result<()> {
                 // runner's FSM and send back only the FSM-passing prefixes.
                 let seq_ids: Vec<usize> = sequences.iter().map(|s| s.id).collect();
                 let gated = match outputs {
-                    Ok(runs) => runner.gate_commit(&seq_ids, &runs),
+                    Ok(runs) => runner.gate_commit(&seq_ids, &runs, false),
                     Err(_) => vec![],
                 };
                 send_local(
@@ -831,13 +831,20 @@ pub fn run_runner_process(args: Vec<String>) -> anyhow::Result<()> {
                 )?;
             }
             Ok(MessageType::RunDecodeSpecFF(sequences)) => {
-                let outputs = runner.run_speculative_ff(Seqs::DecodeVec(&sequences));
-                if outputs.is_err() {
-                    crate::log_error!("Runner spec-ff decode error: {:?}", outputs);
+                let base_tokens = runner.run_speculative_ff(Seqs::DecodeVec(&sequences));
+                if base_tokens.is_err() {
+                    crate::log_error!("Runner spec-ff decode error: {:?}", base_tokens);
                 }
+                let seq_ids: Vec<usize> = sequences.iter().map(|s| s.id).collect();
+                let runs: Vec<Vec<u32>> = base_tokens
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|&t| vec![t])
+                    .collect();
+                let gated = runner.gate_commit(&seq_ids, &runs, true);
                 send_local(
                     &mut vec![stream.try_clone()?],
-                    &MessageType::RunResponseSpecFF(outputs.unwrap_or_default()),
+                    &MessageType::RunResponseSpecFF(gated),
                     false,
                 )?;
             }
@@ -996,7 +1003,7 @@ pub fn run_runner_process(args: Vec<String>) -> anyhow::Result<()> {
                 // runner's FSM and send back only the FSM-passing prefixes.
                 let seq_ids: Vec<usize> = sequences.iter().map(|s| s.id).collect();
                 let gated = match outputs {
-                    Ok(runs) => runner.gate_commit(&seq_ids, &runs),
+                    Ok(runs) => runner.gate_commit(&seq_ids, &runs, false),
                     Err(e) => {
                         crate::log_error!("Runner MTP decode error: {:?}", e);
                         vec![]

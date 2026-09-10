@@ -1205,10 +1205,11 @@ impl LLMEngine {
         runners: &Arc<RwLock<RunnerType>>,
         scheduled_ids: &[usize],
         runs: &[Vec<u32>],
+        ff: bool,
     ) -> Vec<Vec<u32>> {
         match &mut *runners.write() {
             RunnerType::Thread(model_runner) => {
-                model_runner.gate_commit(scheduled_ids, runs)
+                model_runner.gate_commit(scheduled_ids, runs, ff)
             }
             RunnerType::Process(_) | RunnerType::MultiNodeMaster { .. } => runs.to_vec(),
         }
@@ -1468,7 +1469,8 @@ impl LLMEngine {
         match &mut *runners.write() {
             RunnerType::Thread(model_runner) => {
                 let seq_refs: Vec<&Sequence> = owned_seqs.iter().collect();
-                model_runner.run_speculative_ff(Seqs::SeqRefs(&seq_refs))
+                let base_tokens = model_runner.run_speculative_ff(Seqs::SeqRefs(&seq_refs))?;
+                Ok(base_tokens.into_iter().map(|t| vec![t]).collect())
             }
             RunnerType::Process(runner_streams) => {
                 let sequences = owned_seqs
@@ -2556,13 +2558,11 @@ impl LLMEngine {
                             }
                             // Single matcher-gated ingress: commit each produced run to the
                             // FSM and keep only the FSM-passing prefix, just before the
-                            // sequence append. spec-FF is mid-step committed (its ff read
-                            // needs the base in the FSM), so it passes through ungated.
-                            let gated = if use_spec_ff {
-                                multi_output_ids
-                            } else {
-                                Self::gate_forward(&runners, &scheduled_ids, &multi_output_ids)
-                            };
+                            // sequence append. spec spec-FF path commits its ordered queue
+                            // (the base + the grammar-forced continuation) through the same
+                            // gate (the `ff = true`), so every path is serialized.
+                            let gated =
+                                Self::gate_forward(&runners, &scheduled_ids, &multi_output_ids, use_spec_ff);
                             let mut guard = engine.write();
                             match guard.finish_step(scheduled_ids, is_prefill, gated) {
                                 Ok(n) => task_processed = n,
