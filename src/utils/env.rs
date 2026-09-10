@@ -367,3 +367,89 @@ pub fn pda_grammar_enabled() -> bool {
             .unwrap_or(false)
     })
 }
+
+// ─── the anti-loop detector (the loop-defense) ────────────────────────────────
+// The master switch (default OFF = zero overhead, the detector is not even
+// constructed) + the probe-forward depth (the confirmation horizon for a stable
+// loop). The parsing is factored into pure helpers (the testable primitives);
+// the OnceLock getters are the process-wide caching wrappers.
+
+/// `XINFER_ANTI_LOOP=1` enables the in-flight closed-loop detector + the
+/// anti-loop kick. Default OFF (the overhead: the detector is not constructed,
+/// the OBSERVE/APPLY points are no-ops).
+pub const ANTI_LOOP_ENV: &str = "XINFER_ANTI_LOOP";
+
+/// `XINFER_REPETITION_PROBE_DEPTH` (default 512): the probe-forward horizon that
+/// confirms a candidate loop period is STABLE (a true closed loop keeps
+/// repeating across the depth; a one-off phrase repeat does not).
+pub const REPETITION_PROBE_DEPTH_ENV: &str = "XINFER_REPETITION_PROBE_DEPTH";
+pub const DEFAULT_REPETITION_PROBE_DEPTH: usize = 512;
+
+static ANTI_LOOP: OnceLock<bool> = OnceLock::new();
+static REPETITION_PROBE_DEPTH: OnceLock<usize> = OnceLock::new();
+
+/// Pure parsing primitive (the testable core): the anti-loop flag from the raw
+/// env string. Inclusive: "1"/"true"/"yes" (case-insensitive) are on. Exclusive:
+/// anything else (including unset) is off.
+fn parse_anti_loop_flag(raw: Option<String>) -> bool {
+    raw.map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false)
+}
+
+/// Pure parsing primitive: the probe depth from the raw env string. Inclusive: a
+/// positive integer is used. Exclusive: unset / non-numeric / zero all fall back
+/// to the default (512) (a zero depth would confirm nothing).
+fn parse_probe_depth(raw: Option<String>) -> usize {
+    raw.and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_REPETITION_PROBE_DEPTH)
+}
+
+pub fn anti_loop_enabled() -> bool {
+    *ANTI_LOOP.get_or_init(|| parse_anti_loop_flag(env::var(ANTI_LOOP_ENV).ok()))
+}
+
+pub fn repetition_probe_depth() -> usize {
+    *REPETITION_PROBE_DEPTH
+        .get_or_init(|| parse_probe_depth(env::var(REPETITION_PROBE_DEPTH_ENV).ok()))
+}
+
+#[cfg(test)]
+mod anti_loop_env_tests {
+    use super::*;
+
+    // The pure parsing primitives (the testable cores, the no OnceLock).
+    #[test]
+    fn anti_loop_flag_default_off() {
+        assert!(!parse_anti_loop_flag(None), "unset -> off (the zero-overhead default)");
+    }
+    #[test]
+    fn anti_loop_flag_on_variants() {
+        for v in ["1", "true", "yes", "TRUE", " Yes "] {
+            assert!(parse_anti_loop_flag(Some(v.to_string())), "on-variant {v:?}");
+        }
+    }
+    #[test]
+    fn anti_loop_flag_off_variants() {
+        for v in ["0", "false", "no", "", "maybe"] {
+            assert!(!parse_anti_loop_flag(Some(v.to_string())), "off-variant {v:?}");
+        }
+    }
+    #[test]
+    fn probe_depth_default() {
+        assert_eq!(parse_probe_depth(None), DEFAULT_REPETITION_PROBE_DEPTH);
+        assert_eq!(DEFAULT_REPETITION_PROBE_DEPTH, 512, "the documented default");
+    }
+    #[test]
+    fn probe_depth_override() {
+        assert_eq!(parse_probe_depth(Some("128".into())), 128);
+        assert_eq!(parse_probe_depth(Some(" 256 ".into())), 256, "trims whitespace");
+    }
+    #[test]
+    fn probe_depth_invalid_falls_back() {
+        // the exclusive: zero / non-numeric / negative all fall back to the default.
+        assert_eq!(parse_probe_depth(Some("0".into())), DEFAULT_REPETITION_PROBE_DEPTH);
+        assert_eq!(parse_probe_depth(Some("-5".into())), DEFAULT_REPETITION_PROBE_DEPTH);
+        assert_eq!(parse_probe_depth(Some("abc".into())), DEFAULT_REPETITION_PROBE_DEPTH);
+    }
+}

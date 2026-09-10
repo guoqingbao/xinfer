@@ -116,6 +116,15 @@ pub struct LLMEngine {
     seq_spec_stats: HashMap<usize, crate::runner::SpecSeqStatsData>,
     /// Per-sequence QoS/scheduling stats, captured at sequence end (conditional display).
     seq_sched_stats: HashMap<usize, crate::core::qos::SchedSeqStats>,
+    /// The anti-loop detector (the per-seq bounded tail). Only active when
+    /// XINFER_ANTI_LOOP is on (the zero-overhead default).
+    loop_detector: crate::utils::loop_detect::LoopDetector,
+    /// The per-seq anti-loop kicks (held until the periodicity clears).
+    kick_store: crate::utils::loop_detect::KickStore,
+    /// Per-sequence loop-defense stats (the guards + the durations, the admins' report).
+    seq_loop_stats: HashMap<usize, crate::utils::loop_detect::LoopSeqStats>,
+    /// The transient per-seq guard-held-step counter (the duration tracking, not serialized).
+    guard_step_counts: HashMap<usize, usize>,
 }
 
 impl LLMEngine {
@@ -599,6 +608,10 @@ impl LLMEngine {
             guidance_tokens,
             seq_spec_stats: HashMap::new(),
             seq_sched_stats: HashMap::new(),
+            loop_detector: crate::utils::loop_detect::LoopDetector::new(),
+            kick_store: crate::utils::loop_detect::KickStore::new(),
+            seq_loop_stats: HashMap::new(),
+            guard_step_counts: HashMap::new(),
         }));
 
         Self::start_engine(engine.clone());
@@ -1568,6 +1581,7 @@ impl LLMEngine {
         };
 
         let mut prefill_batch: Vec<(usize, usize, f32, bool)> = Vec::new();
+        let mut loop_observes: Vec<(usize, Vec<u32>)> = Vec::new();
         for &idx in &indices {
             let step_tokens = output_by_running_index.get(&idx).ok_or_else(|| {
                 candle_core::Error::msg(format!(
@@ -1576,6 +1590,7 @@ impl LLMEngine {
                 ))
             })?;
             let sq = self.scheduler.get_running(idx);
+            let seq_id_opt = sq.map(|s| s.id);
             if let Some(s) = sq {
                 let seq_id = s.id;
                 if s.is_finished() {
@@ -1723,6 +1738,19 @@ impl LLMEngine {
                         }
                     }
                 }
+                // collect the anti-loop OBSERVE (the seq_id + the step_tokens) for after the loop,
+                // so the scheduler borrow (sq) has ended before the &mut self call.
+                if let Some(seq_id) = seq_id_opt {
+                    loop_observes.push((seq_id, step_tokens.to_vec()));
+                }
+            }
+        }
+
+        // the anti-loop OBSERVE: after the scheduler borrow has ended.
+        // Zero-overhead when XINFER_ANTI_LOOP is off (the default).
+        if crate::utils::env::anti_loop_enabled() {
+            for (seq_id, step_tokens) in &loop_observes {
+                self.observe_loop(*seq_id, step_tokens);
             }
         }
 
@@ -1771,6 +1799,80 @@ impl LLMEngine {
             self.may_print_decoding_throughput(&indices);
         }
         Ok(indices.len())
+    }
+
+    /// The cached per-seq loop-defense stats (for the server's end-of-sequence report).
+    pub fn get_seq_loop_stats(&self, seq_id: usize) -> Option<crate::utils::loop_detect::LoopSeqStats> {
+        self.seq_loop_stats.get(&seq_id).cloned()
+    }
+
+    /// The anti-loop OBSERVE: after the accepted tokens are known, check for a closed
+    /// loop. On a hit, apply the kick (the mitigation) + record the per-seq stats + emit    /// emit the [llg] event log. On a miss (the loop cleared), remove the kick + log it.
+    fn observe_loop(&mut self, seq_id: usize, accepted: &[u32]) {
+        use crate::utils::loop_detect::LoopSeqStats;
+        let probe_depth = crate::utils::env::repetition_probe_depth();
+        let was_active = self.kick_store.is_active(seq_id);
+        // the guard duration tracking: while a kick is held, count the steps.
+        if was_active {
+            *self.guard_step_counts.entry(seq_id).or_insert(0) += 1;
+            if let Some(stats) = self.seq_loop_stats.get_mut(&seq_id) {
+                stats.guard_steps += 1;
+            }
+        }
+        match self.loop_detector.observe(seq_id, accepted, probe_depth) {
+            Some(span) => {
+                self.kick_store.apply(seq_id, &span);
+                let kick = self.kick_store.get(seq_id).expect("just applied");
+                let stats = self.seq_loop_stats.entry(seq_id).or_insert_with(LoopSeqStats::default);
+                stats.guards += 1;
+                if !stats.periods.contains(&span.period) {
+                    stats.periods.push(span.period);
+                }
+                crate::log_warn!(
+                    "[llg] [Seq {}] loop detected: period={} seed={:?} -> mitigation applied (forbid token {})",
+                    seq_id, span.period, span.seed, kick.forbid
+                );
+                if crate::utils::env::debug_llg() {
+                    crate::log_info!(
+                        "[llg] [Seq {}] anti-loop kick: forbid={} seed={:?} period={}",
+                        seq_id, kick.forbid, kick.seed, kick.period
+                    );
+                }
+                // bridge the kick to the runner's sampling (the APPLY): the kick is a
+                // sampling constraint (the forbid token -> -inf, the seed penalty), not
+                // a grammar-mask perturbation.
+                self.push_kick_to_runner(seq_id, kick.forbid, &kick.seed, kick.period);
+            }
+            None => {
+                if was_active {
+                    self.kick_store.remove(seq_id);
+                    let held = self.guard_step_counts.remove(&seq_id).unwrap_or(0);
+                    if let Some(stats) = self.seq_loop_stats.get_mut(&seq_id) {
+                        stats.max_guard_steps = stats.max_guard_steps.max(held);
+                    }
+                    crate::log_warn!(
+                        "[llg] [Seq {}] loop cleared -> mitigation removed (guard held {} steps)",
+                        seq_id, held
+                    );
+                    self.clear_kick_from_runner(seq_id);
+                }
+            }
+        }
+    }
+
+    /// Bridge the kick to the runner's sampling (the Thread mode, the in-process).
+    /// The Process / MultiNode modes keep the kick in the engine's kick_store (the
+    /// IPC runners don't sample; the mitigation is master-side).
+    fn push_kick_to_runner(&self, seq_id: usize, forbid: u32, seed: &[u32], period: u32) {
+        if let RunnerType::Thread(ref runner) = *self.runners.read() {
+            runner.set_loop_kick(seq_id, forbid, seed.to_vec(), period);
+        }
+    }
+
+    fn clear_kick_from_runner(&self, seq_id: usize) {
+        if let RunnerType::Thread(ref runner) = *self.runners.read() {
+            runner.clear_loop_kick(seq_id);
+        }
     }
 
     pub fn try_release_cache(&mut self, tokens_required: usize) -> bool {

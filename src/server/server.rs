@@ -1326,6 +1326,19 @@ if let Some(spec) = engine_clone.read().get_seq_spec_stats(current_seq_id) {
                             );
                         }
 
+                        // Loop-defense report: shown only when a guard fired (the no
+                        // noise for clean sequences). The [llg] prefix + the warn level
+                        // make it visible to the admins (the no grammar-digging).
+                        if let Some(loop_stats) = engine_clone.read().get_seq_loop_stats(current_seq_id) {
+                            if loop_stats.guards > 0 {
+                                crate::log_warn!(
+                                    "[llg] [Seq {}] {}",
+                                    current_seq_id,
+                                    loop_stats.report()
+                                );
+                            }
+                        }
+
                         break;
                     }
                     StreamItem::Error(e) => {

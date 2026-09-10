@@ -228,6 +228,8 @@ pub struct ModelRunner {
     seq_tokens: RwLock<HashMap<usize, Vec<u32>>>,
     restored_prefix_sequences: RwLock<HashSet<usize>>,
     pub(crate) guided_decoding: GuidedDecoding,
+    /// The per-seq anti-loop kicks (the sampling constraint, bridged from the engine).
+    kick_store: RwLock<crate::utils::loop_detect::KickStore>,
     transfer: Option<Arc<Transfer>>,
     is_first_rank: bool,
     pub(crate) model_type: ModelType,
@@ -961,6 +963,7 @@ impl ModelRunner {
             seq_tokens: RwLock::new(HashMap::new()),
             restored_prefix_sequences: RwLock::new(HashSet::new()),
             guided_decoding: GuidedDecoding::new(llg_factory),
+            kick_store: RwLock::new(crate::utils::loop_detect::KickStore::new()),
             transfer,
             is_first_rank: comm.rank() == 0,
             model_type,
@@ -1855,6 +1858,11 @@ impl ModelRunner {
             Seqs::DecodeVec(v) => v.iter().map(|s| s.id()).collect(),
         };
 
+        // the anti-loop kicks (the sampling constraint, the per-row penalty): the
+        // forbid token -> -inf + the seed tokens -> a penalty scaled by the period.
+        // No-op when no kick is active for the batch.
+        let logits = self.apply_loop_kicks(&logits, &seq_ids);
+
         // Get the batch size for deciding whether to use parallel sampling
         let batch_size = match seqs {
             Seqs::SeqRefs(seqs) => seqs.len(),
@@ -2198,6 +2206,65 @@ impl ModelRunner {
                 queue
             })
             .collect()
+    }
+
+    /// Bridge the anti-loop kick from the engine (the sampling constraint: the
+    /// forbid token + the seed + the period). The kick is applied at the next
+    /// sampling step (the LogitsProcessor consults the kick_store).
+    pub fn set_loop_kick(&self, seq_id: usize, forbid: u32, seed: Vec<u32>, period: u32) {
+        use crate::utils::loop_detect::LoopSpan;
+        self.kick_store.write().apply(
+            seq_id,
+            &LoopSpan {
+                period,
+                unit: vec![forbid],
+                seed,
+            },
+        );
+    }
+
+    /// Clear the anti-loop kick for a sequence (the loop cleared).
+    pub fn clear_loop_kick(&self, seq_id: usize) {
+        self.kick_store.write().remove(seq_id);
+    }
+
+    /// Apply the active anti-loop kicks as a sampling constraint (the per-row
+    /// penalty on the logits, before sampling). The forbid token (the loop
+    /// trigger) is set to -inf (the hard exclusion); the seed tokens (the first
+    /// ~20% of the loop unit) get a penalty scaled by the period (the longer the
+    /// loop, the harder the kick). This is a sampling intervention, not a grammar-
+    /// mask perturbation, so the mask stays a pure function of the settled FSM
+    /// state. No-op when no kick is active for the batch.
+    fn apply_loop_kicks(&self, logits: &Tensor, seq_ids: &[usize]) -> Tensor {
+        // When the 1-phase (full-envelope) grammar is active, the grammar itself
+        // constrains the generation and breaks the loop; the sampling kick is skipped.
+        if crate::utils::env::llg_full_enabled() {
+            return logits.clone();
+        }
+        let kicks = self.kick_store.read();
+        let any_kick = seq_ids.iter().any(|&sid| kicks.is_active(sid));
+        if !any_kick {
+            return logits.clone();
+        }
+        let (b, v) = logits.dims2().expect("logits is 2-D");
+        let device = logits.device();
+        let mut flat: Vec<f32> = vec![0.0f32; b * v];
+        for (i, &sid) in seq_ids.iter().enumerate() {
+            if let Some(kick) = kicks.get(sid) {
+                if (kick.forbid as usize) < v {
+                    flat[i * v + kick.forbid as usize] = f32::NEG_INFINITY;
+                }
+                let penalty = -(kick.period as f32) * 2.0;
+                for &seed_tok in &kick.seed {
+                    if (seed_tok as usize) < v {
+                        flat[i * v + seed_tok as usize] = penalty;
+                    }
+                }
+            }
+        }
+        drop(kicks);
+        let penalty_tensor = Tensor::from_vec(flat, (b, v), device).expect("penalty tensor");
+        logits.add(&penalty_tensor).expect("add penalty to logits")
     }
 
     pub fn finished(&self, id: usize) {
