@@ -106,6 +106,13 @@ one `CachedSamplingParams` (the prefill's, from `seqs[0]`) for every row, so a
 greedy first request drags every other request into greedy sampling and their
 output quality collapses.
 
+The same per-sequence strategy applies to the guided (grammar-masked) decode
+path: when QoS is on, `sample_with_strategy_perseq_masked` threads the per-row
+temperature / top_p / top_k together with the `[B,V]` grammar allow-mask (the
+attention-rs `sampling_perseq_masked_f32` kernel), so a batch that mixes
+grammar-constrained requests with different per-request sampling params no
+longer collapses onto the first request's strategy.
+
 With QoS off the existing single-strategy path is taken unchanged, so there is
 no behavior or performance impact for the default configuration.
 
