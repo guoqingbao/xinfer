@@ -1197,6 +1197,23 @@ impl LLMEngine {
         }
     }
 
+    /// The single matcher-gated ingress for the in-process (Thread) runner: commit each
+    /// produced run to the FSM and return only the FSM-passing prefix. For IPC runners the
+    /// gate runs on the remote runner (which owns the FSM) before the runs cross the wire,
+    /// so this passes through unchanged.
+    fn gate_forward(
+        runners: &Arc<RwLock<RunnerType>>,
+        scheduled_ids: &[usize],
+        runs: &[Vec<u32>],
+    ) -> Vec<Vec<u32>> {
+        match &mut *runners.write() {
+            RunnerType::Thread(model_runner) => {
+                model_runner.gate_commit(scheduled_ids, runs)
+            }
+            RunnerType::Process(_) | RunnerType::MultiNodeMaster { .. } => runs.to_vec(),
+        }
+    }
+
     fn run_forward_on_local_streams(
         runner_streams: &mut Vec<LocalStream>,
         owned_seqs: &[Sequence],
@@ -2537,8 +2554,17 @@ impl LLMEngine {
                                 );
                                 continue;
                             }
+                            // Single matcher-gated ingress: commit each produced run to the
+                            // FSM and keep only the FSM-passing prefix, just before the
+                            // sequence append. spec-FF is mid-step committed (its ff read
+                            // needs the base in the FSM), so it passes through ungated.
+                            let gated = if use_spec_ff {
+                                multi_output_ids
+                            } else {
+                                Self::gate_forward(&runners, &scheduled_ids, &multi_output_ids)
+                            };
                             let mut guard = engine.write();
-                            match guard.finish_step(scheduled_ids, is_prefill, multi_output_ids) {
+                            match guard.finish_step(scheduled_ids, is_prefill, gated) {
                                 Ok(n) => task_processed = n,
                                 Err(e) => {
                                     crate::log_error!("[Engine Loop] Finish error: {:?}", e);

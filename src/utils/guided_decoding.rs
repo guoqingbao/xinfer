@@ -36,7 +36,6 @@ pub struct GuidedDecoding {
     factory: Option<Arc<ParserFactory>>,
     states: RwLock<HashMap<usize, GuidanceState>>,
     failed: RwLock<HashSet<usize>>,
-    mismatch: RwLock<HashSet<usize>>,
     /// GPU-resident PDA table (uploaded once when XINFER_PDA_GRAMMAR=1).
     #[cfg(feature = "cuda")]
     pda_table: Option<attention_rs::pda::PdaPushdownTable>,
@@ -54,7 +53,6 @@ impl GuidedDecoding {
             factory,
             states: RwLock::new(HashMap::new()),
             failed: RwLock::new(HashSet::new()),
-            mismatch: RwLock::new(HashSet::new()),
             #[cfg(feature = "cuda")]
             pda_table: None,
             #[cfg(feature = "cuda")]
@@ -212,7 +210,6 @@ impl GuidedDecoding {
 
         let mut states = self.states.write();
         let mut failed = self.failed.write();
-        let mut mismatch = self.mismatch.write();
         let mut modified = false;
         let batch_size = logits.dim(0)?;
         let vocab_size = logits.dim(1)?;
@@ -225,7 +222,6 @@ impl GuidedDecoding {
             if request.grammar.is_none() {
                 let _ = states.remove(&request.seq_id);
                 let _ = failed.remove(&request.seq_id);
-                let _ = mismatch.remove(&request.seq_id);
             }
         }
 
@@ -271,15 +267,6 @@ impl GuidedDecoding {
                         }
                         failed_seq_ids.push(seq_id);
                         continue;
-                    }
-
-                    if mask_len != vocab_size && mismatch.insert(seq_id) {
-                        crate::log_warn!(
-                            "[Seq {}] Guidance mask size {} does not match vocab size {}. Clamping mask application.",
-                            seq_id,
-                            mask_len,
-                            vocab_size
-                        );
                     }
 
                     if !mask_allows_all(&mask, vocab_size) {
@@ -385,8 +372,6 @@ impl GuidedDecoding {
         let _ = states.remove(&seq_id);
         let mut failed = self.failed.write();
         let _ = failed.remove(&seq_id);
-        let mut mismatch = self.mismatch.write();
-        let _ = mismatch.remove(&seq_id);
     }
 
     /// True if `seq_id` has an active (non-failed) grammar FSM state.
@@ -429,6 +414,35 @@ impl GuidedDecoding {
                 }
                 let _ = states.remove(&seq_id);
             }
+        }
+    }
+
+    /// Single matcher-gated ingress: commit the seq's produced run to the FSM and
+    /// return the accepted count (the prefix that may be appended to the sequence).
+    /// Unguided or already-failed seqs pass the whole run (no constraint). This is
+    /// the one call every token-production path funnels through just before the
+    /// sequence append, so the sequence can never hold a token the FSM rejected.
+    pub fn commit_run(&self, seq_id: usize, run: &[u32]) -> usize {
+        if run.is_empty() {
+            return 0;
+        }
+        let mut states = self.states.write();
+        let mut failed = self.failed.write();
+        match states.get_mut(&seq_id) {
+            Some(s) => match s.commit_run(run) {
+                Some(n) => n,
+                None => {
+                    if failed.insert(seq_id) {
+                        crate::log_warn!(
+                            "[Seq {}] Guidance commit failed; disabling constraints.",
+                            seq_id
+                        );
+                    }
+                    let _ = states.remove(&seq_id);
+                    0
+                }
+            },
+            None => run.len(),
         }
     }
 
@@ -492,124 +506,6 @@ impl GuidedDecoding {
         let allow_2d = allow.expand((n, vocab_size))?;
         let disallowed = Tensor::full(f32::NEG_INFINITY, logits.shape().clone(), logits.device())?;
         Ok(allow_2d.where_cond(logits, &disallowed)?)
-    }
-
-    /// Sequentially mask `draft_logits` [n, vocab] with a CLONE of the seq's FSM (precise
-    /// per-position gating). Returns the n grammar-biased draft tokens. Live FSM untouched.
-    pub fn masked_drafts(&self, seq_id: usize, draft_logits: &Tensor) -> Result<Vec<u32>> {
-        let mut state = {
-            let states = self.states.read();
-            match states.get(&seq_id) {
-                Some(s) => s.deep_clone(),
-                None => {
-                    return draft_logits
-                        .to_dtype(candle_core::DType::F32)?
-                        .argmax(candle_core::D::Minus1)?
-                        .to_vec1::<u32>();
-                }
-            }
-        };
-        let n = draft_logits.dim(0)?;
-        let mut tokens = Vec::with_capacity(n);
-        for i in 0..n {
-            let row = draft_logits.get(i)?;
-            let mask = state
-                .compute_mask_or_eos()
-                .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
-            let masked = apply_vob_to_row(&row, &mask)?;
-            let tok = masked.argmax(candle_core::D::Minus1)?.to_scalar::<u32>()?;
-            state.commit_token(tok).map_err(|e| candle_core::Error::Msg(e.to_string()))?;
-            tokens.push(tok);
-        }
-        Ok(tokens)
-    }
-
-    /// Static grammar gate for the fused DFlash2 selector: repeat the sequence's *current*
-    /// VOB across all `n` draft positions -> `[n, vocab]` u8 allow matrix on `device`.
-    /// Returns `None` when the seq is unguided/finished or the VBO allows allows the whole vocab.
-    pub fn draft_allow_repeated(
-        &self,
-        seq_id: usize,
-        n: usize,
-        vocab: usize,
-        device: &candle_core::Device,
-    ) -> Result<Option<Tensor>> {
-        if n == 0 || vocab == 0 {
-            return Ok(None);
-        }
-        let mask = {
-            let mut states = self.states.write();
-            let state = match states.get_mut(&seq_id) {
-                Some(s) => s,
-                None => return Ok(None),
-            };
-            if state.is_finished() {
-                return Ok(None);
-            }
-            state
-                .compute_mask_or_eos()
-                .map_err(|e| candle_core::Error::Msg(e.to_string()))?
-        };
-        if mask_allows_all(&mask, vocab) {
-            return Ok(None);
-        }
-        let mut row = vec![0u8; vocab];
-        write_allow_row(&mut row, &mask, vocab);
-        let row = Tensor::from_vec(row, (vocab,), device)?;
-        Ok(Some(row.unsqueeze(0)?.expand((n, vocab))?))
-    }
-
-    /// Exact per-position grammar gate for the fused DFlash2 selector: walk a *clone* of the
-    /// sequence's FSM over the draft `logits`, recording each position's VOB into a
-    /// `[n, vocab]` u8 allow matrix. Returns `None` if unguided/finished or every position
-    /// allows the full vocab.
-    pub fn draft_allow_walk(
-        &self,
-        seq_id: usize,
-        logits: &Tensor,
-        vocab: usize,
-    ) -> Result<Option<Tensor>> {
-        let n = logits.dim(0)?;
-        if n == 0 || vocab == 0 {
-            return Ok(None);
-        }
-        let mut state = {
-            let states = self.states.read();
-            match states.get(&seq_id) {
-                Some(s) => s.deep_clone(),
-                None => return Ok(None),
-            }
-        };
-        if state.is_finished() {
-            return Ok(None);
-        }
-        let device = logits.device();
-        let mut flat = vec![0u8; n * vocab];
-        let mut any_gate = false;
-        for i in 0..n {
-            let mask = state
-                .compute_mask_or_eos()
-                .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
-            if mask_allows_all(&mask, vocab) {
-                flat[i * vocab..(i + 1) * vocab].fill(1);
-            } else {
-                any_gate = true;
-                write_allow_row(&mut flat[i * vocab..(i + 1) * vocab], &mask, vocab);
-            }
-            let row = logits.get(i)?;
-            let masked = apply_vob_to_row(&row, &mask)?;
-            let tok = masked
-                .to_dtype(candle_core::DType::F32)?
-                .argmax(candle_core::D::Minus1)?
-                .to_scalar::<u32>()?;
-            state
-                .commit_token(tok)
-                .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
-        }
-        if !any_gate {
-            return Ok(None);
-        }
-        Ok(Some(Tensor::from_vec(flat, (n, vocab), device)?))
     }
 
     /// Build the per-row grammar allow-mask `[requests.len(), vocab]` (u8, 1 = legal,
@@ -911,7 +807,7 @@ mod tests {
     fn gpu_pda_accuracy_vs_cpu() {
         use llguidance::{api::TopLevelGrammar, ParserFactory};
         use toktrie::ApproximateTokEnv;
-        use attention_rs::pda::{PdaPushdownTable, PdaSampling};
+        use attention_rs::pda::PdaPushdownTable;
         use pushdown_rs::pda::Dpda;
 
         let env = ApproximateTokEnv::single_byte_env();

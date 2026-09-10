@@ -790,9 +790,25 @@ pub fn run_runner_process(args: Vec<String>) -> anyhow::Result<()> {
                 if outputs.is_err() {
                     crate::log_error!("Runner decode error: {:?}", outputs);
                 }
+                // Single matcher-gated ingress: commit the produced tokens to this
+                // runner's FSM and send back only the FSM-passing prefixes. Plain
+                // tokens are legal by construction (sampled from the mask), so this
+                // commits rather than truncates.
+                let seq_ids: Vec<usize> = sequences.iter().map(|s| s.id).collect();
+                let gated = match outputs {
+                    Ok(toks) if !is_prefill => {
+                        let runs: Vec<Vec<u32>> = toks.iter().map(|&t| vec![t]).collect();
+                        runner.gate_commit(&seq_ids, &runs)
+                            .into_iter()
+                            .map(|v| v.into_iter().next().unwrap_or(0))
+                            .collect::<Vec<u32>>()
+                    }
+                    Ok(toks) => toks,
+                    Err(_) => vec![],
+                };
                 send_local(
                     &mut vec![stream.try_clone()?],
-                    &MessageType::RunResponse(outputs.unwrap_or(vec![])),
+                    &MessageType::RunResponse(gated),
                     false,
                 )?;
             }
@@ -801,9 +817,16 @@ pub fn run_runner_process(args: Vec<String>) -> anyhow::Result<()> {
                 if outputs.is_err() {
                     crate::log_error!("Runner DFlash decode error: {:?}", outputs);
                 }
+                // Single matcher-gated ingress: commit the produced runs to this
+                // runner's FSM and send back only the FSM-passing prefixes.
+                let seq_ids: Vec<usize> = sequences.iter().map(|s| s.id).collect();
+                let gated = match outputs {
+                    Ok(runs) => runner.gate_commit(&seq_ids, &runs),
+                    Err(_) => vec![],
+                };
                 send_local(
                     &mut vec![stream.try_clone()?],
-                    &MessageType::RunResponseDFlash(outputs.unwrap_or_default()),
+                    &MessageType::RunResponseDFlash(gated),
                     false,
                 )?;
             }
@@ -969,23 +992,21 @@ pub fn run_runner_process(args: Vec<String>) -> anyhow::Result<()> {
             }
             Ok(MessageType::RunDecodeMTP(sequences)) => {
                 let outputs = runner.run_mtp_decode(Seqs::DecodeVec(&sequences));
-                match outputs {
-                    Ok(multi_tokens) => {
-                        send_local(
-                            &mut vec![stream.try_clone()?],
-                            &MessageType::RunResponseMTP(multi_tokens),
-                            false,
-                        )?;
-                    }
+                // Single matcher-gated ingress: commit the accepted runs to this
+                // runner's FSM and send back only the FSM-passing prefixes.
+                let seq_ids: Vec<usize> = sequences.iter().map(|s| s.id).collect();
+                let gated = match outputs {
+                    Ok(runs) => runner.gate_commit(&seq_ids, &runs),
                     Err(e) => {
                         crate::log_error!("Runner MTP decode error: {:?}", e);
-                        send_local(
-                            &mut vec![stream.try_clone()?],
-                            &MessageType::RunResponseMTP(vec![]),
-                            false,
-                        )?;
+                        vec![]
                     }
-                }
+                };
+                send_local(
+                    &mut vec![stream.try_clone()?],
+                    &MessageType::RunResponseMTP(gated),
+                    false,
+                )?;
             }
             Ok(MessageType::ClearBlocks(block_ids)) => {
                 let ret = runner.clear_blocks(block_ids);

@@ -237,6 +237,46 @@ impl GuidanceState {
         Ok(())
     }
 
+    /// Commit a produced token run to the FSM (several clicks). Returns the count of
+    /// leading tokens that PASSED the matcher (the authority) — only these may be
+    /// appended to the sequence. `None` means the matcher entered an error state and
+    /// the sequence should be marked unguided. Handles the two-phase reasoning
+    /// transition within the run (free tokens until the reasoning-end, then the
+    /// grammar-gated tail).
+    pub fn commit_run(&mut self, run: &[u32]) -> Option<usize> {
+        if self.matcher.is_stopped() {
+            return Some(0);
+        }
+        if self.reasoning_ended {
+            match self.matcher.try_consume_tokens(run) {
+                Ok(n) => {
+                    self.llm_tokens.extend_from_slice(&run[..n]);
+                    Some(n)
+                }
+                Err(_) => None,
+            }
+        } else {
+            let mut accepted = 0;
+            for &tok in run {
+                self.llm_tokens.push(tok);
+                accepted += 1;
+                if self.reasoning_end_ids.contains(&tok) {
+                    self.reasoning_ended = true;
+                    let tail = &run[accepted..];
+                    match self.matcher.try_consume_tokens(tail) {
+                        Ok(n) => {
+                            self.llm_tokens.extend_from_slice(&tail[..n]);
+                            accepted += n;
+                        }
+                        Err(_) => return None,
+                    }
+                    break;
+                }
+            }
+            Some(accepted)
+        }
+    }
+
     /// Resync the PDA state from the CPU parser's current position.
     /// Called when the PDA and CPU disagree (PDA incomplete or desynced).
     fn resync_pda_from_cpu(&mut self) {
@@ -308,20 +348,6 @@ impl GuidanceState {
             return Ok(tokens.len());
         }
         self.matcher.validate_tokens(tokens)
-    }
-
-    /// Deep copy of this FSM state (independent matcher), for projecting drafts without
-    /// mutating the live state.
-    pub fn deep_clone(&self) -> Self {
-        Self {
-            matcher: self.matcher.deep_clone(),
-            llm_tokens: self.llm_tokens.clone(),
-            reasoning_end_ids: self.reasoning_end_ids.clone(),
-            reasoning_ended: self.reasoning_ended,
-            pda: self.pda.clone(),
-            pda_stack: self.pda_stack.clone(),
-            pda_ctrl: self.pda_ctrl,
-        }
     }
 
     // ─── PDA fast path (CPU table lookup, ~1000x faster than parser walk) ───
@@ -411,7 +437,6 @@ impl GuidanceState {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use pushdown_rs::pda::Dpda;
     // (the PDA is now pushdown_rs::machine::PdaMachine)
 
@@ -459,43 +484,6 @@ start: <[97]> <[98]>
         let mut grm = TopLevelGrammar::from_lark(grm_str.to_string());
         grm.max_tokens = None;
         (factory, grm)
-    }
-
-    /// Property-based PDA grammar tests.
-    /// Verifies: valid sequences accepted, invalid rejected, accept state terminal.
-    /// Uses the PdaMachine (pushdown-rs) CPU reference walk.
-
-    fn walk_pda(pda: &pushdown_rs::machine::PdaMachine, tokens: &[u32]) -> Result<(u32, u32), usize> {
-        let mut ctrl = pda.start_state;
-        let mut stack = vec![pda.start_stack];
-        for (i, &tok) in tokens.iter().enumerate() {
-            let top = stack.last().copied().unwrap_or(pda.start_stack);
-            match pda.lookup(ctrl, Some(tok), top).as_slice() {
-                [t] => {
-                    stack.pop();
-                    for &p in t.push.iter().rev() {
-                        stack.push(p);
-                    }
-                    ctrl = t.next_q;
-                }
-                _ => return Err(i),
-            }
-        }
-        Ok((ctrl, 0))
-    }
-
-    /// The PDA uses LOCAL terminal IDs (0..num_inputs), not global byte values.
-    // The local ID mapping depends on the CGrammar's terminal ordering.
-    // These tests verify PDA structure (not token walking - that's in llguidance).
-    fn valid_explicit_seq() -> Vec<u32> {
-        // A valid of local IDs that should be valid for the explicit grammar.
-        // The exact values depend on the terminal ordering; use 0, 1, 2 as
-        // the first three local terminal IDs.
-        vec![0, 1, 2]
-    }
-
-    fn valid_implicit_seq() -> Vec<u32> {
-        vec![0, 1]
     }
 
     #[test]
