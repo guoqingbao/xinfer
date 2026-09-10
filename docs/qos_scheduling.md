@@ -95,6 +95,20 @@ QoS is off by default (prior FIFO + static-chunk behavior). Enable it with the
 `XINFER_QOS=1` env var (or `qos.enabled` in the config). The tuning knobs
 below only take effect when QoS is on.
 
+## Per-sequence sampling (QoS-gated)
+
+When QoS is on and a plain (unguided) decode step batches multiple sequences,
+the sampling step resolves each sequence's own `sampling_params` (temperature /
+top_k / top_p) into per-batch-row tensors and samples through the per-sequence
+kernel path (`LogitsProcessor::sample_with_strategy_perseq`, backed by the
+attention-rs `sampling_perseq_f32` kernel). Without this, a batched step reuses
+one `CachedSamplingParams` (the prefill's, from `seqs[0]`) for every row, so a
+greedy first request drags every other request into greedy sampling and their
+output quality collapses.
+
+With QoS off the existing single-strategy path is taken unchanged, so there is
+no behavior or performance impact for the default configuration.
+
 ## Knobs (`EngineConfig.qos`)
 
 | Knob | Default | Effect |
