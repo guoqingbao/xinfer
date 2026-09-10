@@ -20,6 +20,64 @@ const GRAMMAR_CACHE_MAX_ENTRIES: usize = 128;
 
 static GRAMMAR_CACHE: Lazy<Mutex<GrammarCache>> = Lazy::new(|| Mutex::new(GrammarCache::default()));
 
+/// User-defined grammar definitions loaded from YAML.
+/// The YAML has top-level keys: text, tool, reasoning.
+/// The "reasoning" section maps level names to inner Lark expressions.
+#[derive(serde::Deserialize, Default)]
+struct GrammarFile {
+    #[serde(default)]
+    text: Option<serde_yaml::Value>,
+    #[serde(default)]
+    tool: Option<serde_yaml::Value>,
+    #[serde(default)]
+    reasoning: HashMap<String, String>,
+}
+
+static GRAMMAR_FILE: Lazy<Mutex<Option<GrammarFile>>> =
+    Lazy::new(|| Mutex::new(None));
+
+/// Load user-defined grammar definitions from a YAML file.
+/// The "reasoning" section maps level names to inner Lark expressions.
+/// The inner expression is used IN VERBATIM as the body of the reasoning_block
+/// rule. The system (Rust code) controls the framing (start:, reasoning_block
+/// header, reasoning_text rule with special token injection).
+pub fn load_grammar_file(path: &str) -> Result<(), String> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| format!("Failed to read grammar file '{}': {}", path, e))?;
+    let parsed: GrammarFile = serde_yaml::from_str(&content)
+        .map_err(|e| format!("Failed to parse grammar YAML: {}", e))?;
+    if parsed.reasoning.is_empty() {
+        return Err(format!("Grammar file '{}' has no reasoning definitions", path));
+    }
+    // Security check: reject any YAML that defines "start" or "reasoning_text"
+    // rules (the system controls these - user injection would break the framing).
+    for (level, expr) in &parsed.reasoning {
+        if expr.lines().any(|l| l.trim().starts_with("start:") || l.trim().starts_with("reasoning_text:")) {
+            return Err(format!(
+                "Grammar level '{}' defines 'start' or 'reasoning_text' rule which is system-controlled",
+                level
+            ));
+        }
+    }
+    let mut guard = GRAMMAR_FILE.lock().unwrap();
+    *guard = Some(parsed);
+    Ok(())
+}
+
+/// Get the user-defined inner Lark expression for a reasoning level, if any.
+/// Returns the expression to be inserted as the body of the reasoning_block rule.
+pub fn get_user_reasoning_grammar(level: &str) -> Option<String> {
+    let guard = GRAMMAR_FILE.lock().unwrap();
+    guard.as_ref()?.reasoning.get(level).cloned()
+}
+
+/// Legacy: load reasoning grammars from a flat YAML (level -> lark).
+/// Deprecated: use load_grammar_file instead.
+#[deprecated(note = "use load_grammar_file")]
+pub fn load_reasoning_grammars(path: &str) -> Result<(), String> {
+    load_grammar_file(path)
+}
+
 #[derive(Default)]
 struct GrammarCache {
     entries: HashMap<String, TopLevelGrammar>,
@@ -1577,6 +1635,41 @@ impl GrammarComposer {
         guidance_tokens: &GuidanceTokens,
         reasoning_level: ReasoningEffort,
     ) -> StructuredOutputsGrammar {
+        // Check for a user-defined reasoning grammar first (from the YAML file).
+        // The YAML value is the INNER Lark expression (the reasoning_block body).
+        // The system controls the framing (start rule, reasoning_block header,
+        // reasoning_text rule with special token injection).
+        let level_key = match &reasoning_level {
+            ReasoningEffort::None => return base,
+            ReasoningEffort::Low => "low",
+            ReasoningEffort::ModelDefault | ReasoningEffort::Medium => "medium",
+            ReasoningEffort::High => "high",
+            ReasoningEffort::ChainOfThought => "chain_of_thought",
+            ReasoningEffort::Custom(_) => "custom",
+        };
+        if let Some(user_inner) = get_user_reasoning_grammar(level_key) {
+            let end_id = guidance_tokens.reasoning_end_ids.first().copied().unwrap_or(0);
+            let reasoning_lark = match level_key {
+                "low" => format!(
+                    "start: reasoning_block \"\\n\" <[{}]>\\nreasoning_block[max_tokens=512]: {}",
+                    end_id, user_inner
+                ),
+                "high" | "chain_of_thought" => format!(
+                    "start: reasoning_block\\nreasoning_block: {}\\nreasoning_text: text_inner <[{}]>",
+                    user_inner.trim(), end_id
+                ),
+                // "medium" and "custom" are system-controlled (not in the YAML).
+                _ => unreachable!(
+                    "medium/custom are not in the YAML; get_user_reasoning_grammar returns None"
+                ),
+            };
+            let mut grammar =
+                StructuredOutputsGrammar::new(StructuredConstraint::Lark(reasoning_lark));
+            let mut base_mut = base;
+            grammar.compose_sequence(&mut base_mut);
+            return grammar;
+        }
+
         // Generate level-specific grammar with proper text_inner / reasoning_text separation
         let reasoning_lark = match reasoning_level {
             ReasoningEffort::None => return base,
@@ -2679,5 +2772,102 @@ mod tests {
         assert!(lark.contains("%json"));
         assert!(lark.contains("name"));
         assert!(!lark.contains("metadata"));
+    }
+
+    /// Verify the full-envelope pipeline (default reasoning + the advertised toolset)
+    /// reproduces grammar_sample.txt 1:1. Uses the in-memory mock tokenizer (the
+    /// same pattern as the other tests) and the sample file as the
+    /// checked-in oracle.
+    #[test]
+    fn test_pipeline_matches_grammar_sample() {
+        use crate::tools::ToolBuilder;
+        // the mock tokenizer (the in-memory BPE, the same pattern as the other tests)
+        let tokenizer = tokenizer();
+        // the GuidanceTokens matching the grammar_sample.txt token IDs: 248045 is the
+        // BOS (always excluded); 248044 + 248046 are the EOS pair.
+        let tokens = GuidanceTokens {
+            bos_token_ids: vec![248045],
+            eos_token_ids: vec![248046, 248044],
+            reasoning_start_ids: vec![248068],
+            reasoning_end_ids: vec![248069],
+            tool_call_start_ids: vec![248058],
+            tool_call_end_ids: vec![248059],
+            add_bos_token: false,
+            add_eos_token: true,
+        };
+        // the advertised toolset (the 5 tools from the grammar_sample.txt)
+        let tools = vec![
+            ToolBuilder::new("fetch_url_via_curl".into(), "Fetch a URL via curl".into())
+                .param("url", "string", "The URL to fetch", true)
+                .param("proxy", "string", "The proxy to use", false)
+                .build(),
+            ToolBuilder::new("fs_cat".into(), "Cat a file".into())
+                .param("path", "string", "The file path", true)
+                .build(),
+            ToolBuilder::new("fs_ls".into(), "List a directory".into())
+                .param("path", "string", "The directory path", true)
+                .build(),
+            ToolBuilder::new("get_current_time".into(), "Get the current time".into()).build(),
+            ToolBuilder::new("web_search_searxng".into(), "Search the web via searxng".into())
+                .param("query", "string", "The search query", true)
+                .param("searxng", "string", "The searxng instance", false)
+                .build(),
+        ];
+        // drive the pipeline directly (the enable_reasoning = true, the default
+        // ModelDefault reasoning level) to avoid the llg_full_enabled() Once OnceLock
+        let constraint = StructuredOutputsGrammar::new(StructuredConstraint::Lark(format!(
+            "start: text\ntext: {}\n",
+            tokens.text_grammar_mask()
+        )));
+        let tool_grammar = ToolCallGrammar::new_qwen_coder(
+            tools,
+            tokens.tool_call_start_ids[0],
+            tokens.tool_call_end_ids[0],
+            tokens.clone(),
+        );
+        let grammar = GrammarComposer::compose_all_grammars(
+            vec![constraint],
+            Some(tool_grammar),
+            &tokens,
+            16384,
+            None,
+            &tokenizer,
+            true, // the enable_reasoning (the full-envelope mode)
+            ReasoningEffort::default(),
+            false, // the force_tool_call
+        );
+        let lark = get_lark_from_top_level_grammar(&grammar);
+        println!("=== pipeline grammar ===\n{}", lark);
+        let expected = include_str!("../../grammar_sample.txt");
+        assert_eq!(
+            lark.trim(),
+            expected.trim(),
+            "the pipeline grammar must match grammar_sample.txt 1:1"
+        );
+    }
+
+    /// The YAML user-grammar loader: the checked-in example/grammars.yml loads and
+    /// its levels are returned by get_user_reasoning_grammar; the collision check
+    /// rejects a level that defines a system-controlled rule; a missing file
+    /// errors.
+    #[test]
+    fn test_yaml_grammar_file_yaml() {
+        // the checked-in example (the example/grammars.yml) — the real user-grammar file
+        load_grammar_file("example/grammars.yml").expect("the example/grammars.yml loads");
+        let low = get_user_reasoning_grammar("low").expect("low level present in the example");
+        assert!(!low.is_empty(), "the example defines a low-level reasoning body");
+        let high = get_user_reasoning_grammar("high").expect("high level present in the example");
+        assert!(!high.is_empty(), "the example defines a high-level reasoning body");
+        // collision: a level that defines a system-controlled rule is rejected
+        let dir = std::env::temp_dir();
+        let path2 = dir.join("test_load_grammar_file_collision.yml");
+        std::fs::write(&path2, "reasoning:\n  low: |\n    start: something\n").unwrap();
+        assert!(
+            load_grammar_file(path2.to_str().unwrap()).is_err(),
+            "a level defining 'start:' must be rejected"
+        );
+        let _ = std::fs::remove_file(&path2);
+        // missing file errors
+        assert!(load_grammar_file("/nonexistent/grammars.yml").is_err());
     }
 }

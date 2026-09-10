@@ -250,9 +250,18 @@ async fn main() -> Result<()> {
         args.enable_tool_grammar,
         args.num_speculative_tokens,
         args.draft_model.clone(),
+        args.reasoning_grammars.clone(),
         None, // max_prefill_chunk_tokens
         None, // min_prefill_chunk_tokens
     );
+
+    // Load user-defined reasoning grammars if provided
+    if let Some(ref path) = econfig.reasoning_grammars {
+        match xinfer::utils::guidance_grammar::load_reasoning_grammars(path) {
+            Ok(()) => tracing::info!("Loaded user-defined reasoning grammars from {}", path),
+            Err(e) => tracing::warn!("Failed to load reasoning grammars from {}: {}", path, e),
+        }
+    }
 
     // Multi-node worker nodes run a daemon loop instead of the full engine
     if econfig.num_nodes > 1 && econfig.node_rank > 0 {

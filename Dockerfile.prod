@@ -50,6 +50,10 @@ RUN rm -rf wheels
 COPY --from=base /usr/local/bin/xinfer /usr/local/bin/xinfer
 RUN chmod +x /usr/local/bin/xinfer
 
+# Copy user grammar definitions to system config path
+RUN mkdir -p /etc/xinfer
+COPY example/grammars.yml /etc/xinfer/grammars.yml
+
 RUN ln -s libnccl.so.2 /usr/lib/$(uname -m)-linux-gnu/libnccl.so
 
 ENV HUGGINGFACE_HUB_CACHE=/data PORT=80

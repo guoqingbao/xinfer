@@ -500,6 +500,12 @@ pub struct EngineConfig {
     /// External DFlash2 draft model (HuggingFace id or local directory).
     #[serde(default)]
     pub draft_model: Option<String>,
+    /// Path to a YAML file with user-defined reasoning grammars (the
+    /// `--reasoning-grammars` flag). When set, the 1-phase generation logic is
+    /// activated and the user's inner Lark expressions override the built-in
+    /// reasoning blocks for the levels they define.
+    #[serde(default)]
+    pub reasoning_grammars: Option<String>,
     pub enable_tool_grammar: bool,
 }
 
@@ -693,6 +699,7 @@ impl EngineConfig {
         enable_tool_grammar: bool,
         num_speculative_tokens: Option<usize>,
         draft_model: Option<String>,
+        reasoning_grammars: Option<String>,
         max_prefill_chunk_tokens: Option<usize>,
         min_prefill_chunk_tokens: Option<usize>,
     ) -> Self {
@@ -759,6 +766,7 @@ impl EngineConfig {
             master_port,
             num_speculative_tokens,
             draft_model,
+            reasoning_grammars,
             enable_tool_grammar,
         }
     }

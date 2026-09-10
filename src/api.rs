@@ -171,6 +171,7 @@ impl EngineBuilder {
             false,
             None, // num_speculative_tokens
             None, // draft_model
+            None, // reasoning_grammars
             None, // max_prefill_chunk_tokens
             None, // min_prefill_chunk_tokens
         );
