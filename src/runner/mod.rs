@@ -171,6 +171,25 @@ pub struct InitAck {
     pub ok: bool,
 }
 
+/// Per-sequence speculative-decode stats, fetched across the process boundary
+/// at sequence end for the server's performance report.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct SpecSeqStatsData {
+    pub mechanism: String,
+    pub steps: usize,
+    pub proposed: usize,
+    pub accepted: usize,
+    pub rejected: usize,
+    pub grammar_bound: usize,
+    pub target_bound: usize,
+    pub ff_continuations: usize,
+    /// Adaptive-K observability: min/max drafts-proposed per step and the number of
+    /// steps where K changed from the previous step (tier transitions).
+    pub k_min: usize,
+    pub k_max: usize,
+    pub k_moves: usize,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum MessageType {
     /// Sent by main process to initialize the runner.
@@ -199,6 +218,12 @@ pub enum MessageType {
     RunDecodeDFlash(Vec<DecodeSequence>),
     /// Sent by a runner in response to `RunDecodeDFlash`.
     RunResponseDFlash(Vec<Vec<u32>>),
+
+    /// Sent by the main process to request speculative fast-forward decode (the grammar-forced
+    /// ff run appended after the sampled base token).
+    RunDecodeSpecFF(Vec<DecodeSequence>),
+    /// Sent by a runner in response to `RunDecodeSpecFF`.
+    RunResponseSpecFF(Vec<Vec<u32>>),
 
     /// Sent by main process to request embedding on sequences.
     RunEmbed((Vec<Sequence>, EmbeddingStrategy)),
@@ -265,6 +290,11 @@ pub enum MessageType {
     UsableMemoryLeft(EngineConfig),
     /// shutdown subprocesses
     Shutdown,
+
+    /// Fetch per-seq speculative decoding stats from rank 0.
+    GetSpecSeqStats(usize),
+    /// Response to GetSpecSeqStats.
+    SpecSeqStatsResponse(usize, SpecSeqStatsData),
 }
 
 //inter-node communication
@@ -276,7 +306,7 @@ pub fn send_local(
     let serialized = if use_json {
         serde_json::to_vec(message).expect("JSON serialization failed")
     } else {
-        bincode::serialize(message).expect("Bincode serialization failed")
+        rmp_serde::to_vec(message).expect("Serialization failed")
     };
 
     for stream in streams.iter_mut() {
@@ -313,10 +343,10 @@ pub fn receive_local(stream: &mut LocalStream, use_json: bool) -> std::io::Resul
             )
         })?
     } else {
-        bincode::deserialize(&serialized).map_err(|err| {
+        rmp_serde::from_slice(&serialized).map_err(|err| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("Bincode deserialization failed: {err}"),
+                format!("MsgPack deserialization failed: {err}"),
             )
         })?
     };
@@ -452,7 +482,7 @@ macro_rules! def_broadcast_message_to_runners {
                         .collect();
 
                     let mut values = local_results?;
-                    let serialized = bincode::serialize(&request).expect("Bincode serialization failed");
+                    let serialized = rmp_serde::to_vec(&request).expect("Serialization failed");
 
                     for tcp_stream in remote_streams.iter_mut() {
                         crate::utils::multi_node::send_tcp(tcp_stream, &serialized)?;
@@ -460,8 +490,8 @@ macro_rules! def_broadcast_message_to_runners {
 
                     for tcp_stream in remote_streams.iter_mut() {
                         let data = crate::utils::multi_node::recv_tcp(tcp_stream)?;
-                        let response: MessageType = bincode::deserialize(&data)
-                            .expect("Bincode deserialization failed");
+                        let response: MessageType = rmp_serde::from_slice(&data)
+                            .expect("MsgPack deserialization failed");
                         match response {
                             $resp_variant(value) => values.push(value),
                             MessageType::Error(err) => {
@@ -760,9 +790,25 @@ pub fn run_runner_process(args: Vec<String>) -> anyhow::Result<()> {
                 if outputs.is_err() {
                     crate::log_error!("Runner decode error: {:?}", outputs);
                 }
+                // Single matcher-gated ingress: commit the produced tokens to this
+                // runner's FSM and send back only the FSM-passing prefixes. Plain
+                // tokens are legal by construction (sampled from the mask), so this
+                // commits rather than truncates.
+                let seq_ids: Vec<usize> = sequences.iter().map(|s| s.id).collect();
+                let gated = match outputs {
+                    Ok(toks) if !is_prefill => {
+                        let runs: Vec<Vec<u32>> = toks.iter().map(|&t| vec![t]).collect();
+                        runner.gate_commit(&seq_ids, &runs)
+                            .into_iter()
+                            .map(|v| v.into_iter().next().unwrap_or(0))
+                            .collect::<Vec<u32>>()
+                    }
+                    Ok(toks) => toks,
+                    Err(_) => vec![],
+                };
                 send_local(
                     &mut vec![stream.try_clone()?],
-                    &MessageType::RunResponse(outputs.unwrap_or(vec![])),
+                    &MessageType::RunResponse(gated),
                     false,
                 )?;
             }
@@ -771,9 +817,27 @@ pub fn run_runner_process(args: Vec<String>) -> anyhow::Result<()> {
                 if outputs.is_err() {
                     crate::log_error!("Runner DFlash decode error: {:?}", outputs);
                 }
+                // Single matcher-gated ingress: commit the produced runs to this
+                // runner's FSM and send back only the FSM-passing prefixes.
+                let seq_ids: Vec<usize> = sequences.iter().map(|s| s.id).collect();
+                let gated = match outputs {
+                    Ok(runs) => runner.gate_commit(&seq_ids, &runs),
+                    Err(_) => vec![],
+                };
                 send_local(
                     &mut vec![stream.try_clone()?],
-                    &MessageType::RunResponseDFlash(outputs.unwrap_or_default()),
+                    &MessageType::RunResponseDFlash(gated),
+                    false,
+                )?;
+            }
+            Ok(MessageType::RunDecodeSpecFF(sequences)) => {
+                let outputs = runner.run_speculative_ff(Seqs::DecodeVec(&sequences));
+                if outputs.is_err() {
+                    crate::log_error!("Runner spec-ff decode error: {:?}", outputs);
+                }
+                send_local(
+                    &mut vec![stream.try_clone()?],
+                    &MessageType::RunResponseSpecFF(outputs.unwrap_or_default()),
                     false,
                 )?;
             }
@@ -812,6 +876,14 @@ pub fn run_runner_process(args: Vec<String>) -> anyhow::Result<()> {
             }
             Ok(MessageType::FinishDecode(id)) => {
                 runner.finished(id);
+            }
+            Ok(MessageType::GetSpecSeqStats(id)) => {
+                let data = crate::speculative::spec_stats::spec_seq_stats_data(id);
+                send_local(
+                    &mut vec![stream.try_clone()?],
+                    &MessageType::SpecSeqStatsResponse(id, data),
+                    false,
+                )?;
             }
             Ok(MessageType::CaptureMambaPrefixState((seq_id, hash, preserve))) => {
                 let ret = runner.capture_mamba_prefix_state(seq_id, hash, preserve);
@@ -920,23 +992,21 @@ pub fn run_runner_process(args: Vec<String>) -> anyhow::Result<()> {
             }
             Ok(MessageType::RunDecodeMTP(sequences)) => {
                 let outputs = runner.run_mtp_decode(Seqs::DecodeVec(&sequences));
-                match outputs {
-                    Ok(multi_tokens) => {
-                        send_local(
-                            &mut vec![stream.try_clone()?],
-                            &MessageType::RunResponseMTP(multi_tokens),
-                            false,
-                        )?;
-                    }
+                // Single matcher-gated ingress: commit the accepted runs to this
+                // runner's FSM and send back only the FSM-passing prefixes.
+                let seq_ids: Vec<usize> = sequences.iter().map(|s| s.id).collect();
+                let gated = match outputs {
+                    Ok(runs) => runner.gate_commit(&seq_ids, &runs),
                     Err(e) => {
                         crate::log_error!("Runner MTP decode error: {:?}", e);
-                        send_local(
-                            &mut vec![stream.try_clone()?],
-                            &MessageType::RunResponseMTP(vec![]),
-                            false,
-                        )?;
+                        vec![]
                     }
-                }
+                };
+                send_local(
+                    &mut vec![stream.try_clone()?],
+                    &MessageType::RunResponseMTP(gated),
+                    false,
+                )?;
             }
             Ok(MessageType::ClearBlocks(block_ids)) => {
                 let ret = runner.clear_blocks(block_ids);
@@ -949,14 +1019,31 @@ pub fn run_runner_process(args: Vec<String>) -> anyhow::Result<()> {
                     false,
                 )?;
             }
+            Ok(MessageType::RunSpecDecode(sequences)) => {
+                // External DFlash drafter path (not yet implemented in this branch).
+                crate::log_warn!("RunSpecDecode received but not implemented ({} seqs)", sequences.len());
+                send_local(
+                    &mut vec![stream.try_clone()?],
+                    &MessageType::RunSpecDecodeResponse(vec![]),
+                    false,
+                )?;
+            }
+            Ok(MessageType::RunDraftAndVerify((sequences, draft_tokens))) => {
+                crate::log_warn!("RunDraftAndVerify received but not implemented ({} seqs, {} draft tokens)", sequences.len(), draft_tokens.len());
+                send_local(
+                    &mut vec![stream.try_clone()?],
+                    &MessageType::RunSpecDecodeResponse(vec![]),
+                    false,
+                )?;
+            }
             Err(e) => {
                 if e.kind() != std::io::ErrorKind::UnexpectedEof {
                     crate::log_error!("Runner exit with error: {:?}", e);
                 }
                 break;
             }
-            _ => {
-                crate::log_error!("Unexpected message type");
+            Ok(msg) => {
+                crate::log_error!("Unexpected message type: {:?}", msg);
             }
         }
     }

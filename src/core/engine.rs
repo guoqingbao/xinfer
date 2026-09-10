@@ -113,6 +113,9 @@ pub struct LLMEngine {
     pub tool_config: ToolConfig,
     pub img_cfg: Option<ImageProcessConfig>,
     pub guidance_tokens: GuidanceTokens,
+    seq_spec_stats: HashMap<usize, crate::runner::SpecSeqStatsData>,
+    /// Per-sequence QoS/scheduling stats, captured at sequence end (conditional display).
+    seq_sched_stats: HashMap<usize, crate::core::qos::SchedSeqStats>,
 }
 
 impl LLMEngine {
@@ -594,6 +597,8 @@ impl LLMEngine {
             img_cfg,
             model_name,
             guidance_tokens,
+            seq_spec_stats: HashMap::new(),
+            seq_sched_stats: HashMap::new(),
         }));
 
         Self::start_engine(engine.clone());
@@ -715,13 +720,17 @@ impl LLMEngine {
                 params.stop_sequences = Some(resolved_stop_sequences);
             }
         }
-        let seq = Sequence::new(
+        let mut seq = Sequence::new(
             token_ids,
             self.econfig.block_size,
             params,
             images,
             image_idx,
         );
+        // QoS: infer the class from the request's max output tokens (short output
+        // => latency-sensitive agentic; large => throughput). Explicit hints can
+        // override this later.
+        seq.qos_class = self.econfig.qos.infer_class(seq.sampling_params.max_tokens);
 
         let prompt_required_blocks = self.scheduler.block_manager.required_blocks(&seq);
         let requested_decode_blocks = max_tokens.div_ceil(self.econfig.block_size);
@@ -979,6 +988,15 @@ impl LLMEngine {
     }
 
     pub fn notify_runner_finished(&mut self, id: usize) -> Result<()> {
+        // Fetch the per-seq spec stats before FinishDecode (which drops them runner-side).
+        let spec_stats = self.fetch_spec_seq_stats(id);
+        if !spec_stats.mechanism.is_empty() {
+            self.seq_spec_stats.insert(id, spec_stats);
+        }
+        // Capture the per-seq QoS/scheduling stats (scheduler-side, same process).).
+        if let Some(sched_stats) = self.scheduler.sched_stats_for(id) {
+            self.seq_sched_stats.insert(id, sched_stats);
+        }
         match &mut *self.runners.write() {
             RunnerType::Thread(model_runner) => Ok(model_runner.finished(id)),
             RunnerType::Process(ref mut runner_streams) => {
@@ -999,12 +1017,45 @@ impl LLMEngine {
                 for stream in local_streams.iter_mut() {
                     send_local(&mut vec![stream.try_clone()?], &msg, false)?;
                 }
-                let serialized = bincode::serialize(&msg).expect("Bincode serialization failed");
+                let serialized = rmp_serde::to_vec(&msg).expect("MsgPack serialization failed");
                 for tcp_stream in remote_streams.iter_mut() {
                     crate::utils::multi_node::send_tcp(tcp_stream, &serialized)?;
                 }
                 Ok(())
             }
+        }
+    }
+
+    /// The cached per-seq spec stats (for the server's end-of-sequence report).
+    pub fn get_seq_spec_stats(&self, seq_id: usize) -> Option<crate::runner::SpecSeqStatsData> {
+        self.seq_spec_stats.get(&seq_id).cloned()
+    }
+
+    /// The cached per-seq QoS/scheduling stats (for the server's end-of-sequence report).
+    pub fn get_seq_sched_stats(&self, seq_id: usize) -> Option<crate::core::qos::SchedSeqStats> {
+        self.seq_sched_stats.get(&seq_id).cloned()
+    }
+
+    /// Fetch a sequence's speculative-decode stats from rank 0 (Process mode only).
+    fn fetch_spec_seq_stats(&self, id: usize) -> crate::runner::SpecSeqStatsData {
+        use crate::runner::SpecSeqStatsData;
+        match &mut *self.runners.write() {
+            RunnerType::Process(ref mut runner_streams) => {
+                if runner_streams.is_empty() {
+                    return SpecSeqStatsData::default();
+                }
+                let stream = &mut runner_streams[0];
+                let _ = send_local(
+                    &mut vec![stream.try_clone().expect("clone failed")],
+                    &MessageType::GetSpecSeqStats(id),
+                    false,
+                );
+                match receive_local(stream, false) {
+                    Ok(MessageType::SpecSeqStatsResponse(_, data)) => data,
+                    _ => SpecSeqStatsData::default(),
+                }
+            }
+            _ => SpecSeqStatsData::default(),
         }
     }
 
@@ -1105,7 +1156,7 @@ impl LLMEngine {
                     MessageType::RunDecode((sequences, false))
                 };
                 let serialized =
-                    bincode::serialize(&request).expect("Bincode serialization failed");
+                    rmp_serde::to_vec(&request).expect("MsgPack serialization failed");
 
                 // Send to remote worker nodes via TCP (fire-and-forget the responses;
                 // NCCL all-reduce synchronizes the actual computation)
@@ -1123,7 +1174,7 @@ impl LLMEngine {
                 for tcp_stream in remote_streams.iter_mut() {
                     match crate::utils::multi_node::recv_tcp(tcp_stream) {
                         Ok(data) => {
-                            let resp: MessageType = bincode::deserialize(&data)
+                            let resp: MessageType = rmp_serde::from_slice(&data)
                                 .expect("Failed to deserialize remote worker response");
                             match resp {
                                 MessageType::RunResponse(ref ids) if ids.is_empty() => {
@@ -1143,6 +1194,23 @@ impl LLMEngine {
 
                 result
             }
+        }
+    }
+
+    /// The single matcher-gated ingress for the in-process (Thread) runner: commit each
+    /// produced run to the FSM and return only the FSM-passing prefix. For IPC runners the
+    /// gate runs on the remote runner (which owns the FSM) before the runs cross the wire,
+    /// so this passes through unchanged.
+    fn gate_forward(
+        runners: &Arc<RwLock<RunnerType>>,
+        scheduled_ids: &[usize],
+        runs: &[Vec<u32>],
+    ) -> Vec<Vec<u32>> {
+        match &mut *runners.write() {
+            RunnerType::Thread(model_runner) => {
+                model_runner.gate_commit(scheduled_ids, runs)
+            }
+            RunnerType::Process(_) | RunnerType::MultiNodeMaster { .. } => runs.to_vec(),
         }
     }
 
@@ -1175,8 +1243,15 @@ impl LLMEngine {
 
                 match response {
                     MessageType::RunResponse(output_ids) => {
-                        if output_ids.len() == 0 {
-                            candle_core::bail!("Runner step error, no response!")
+                        if output_ids.is_empty() {
+                            // Runner hit a transient error (e.g. drafter mask
+                            // mismatch). Log and signal retry; do NOT kill the
+                            // entire engine. The sequence stays in the running
+                            // list and will be retried on the next tick.
+                            crate::log_warn!(
+                                "Runner returned empty response (transient error, will retry next tick)"
+                            );
+                            Ok(vec![]) // empty = "no progress this tick"
                         } else {
                             Ok(output_ids)
                         }
@@ -1218,7 +1293,9 @@ impl LLMEngine {
                         Ok(multi_tokens)
                     }
                     MessageType::RunResponseMTP(_) => {
-                        candle_core::bail!("MTP runner returned empty response")
+                        // Transient error: log and retry next tick.
+                        crate::log_warn!("MTP runner returned empty (transient error, retrying)");
+                        Ok(vec![])
                     }
                     other => {
                         candle_core::bail!("Unexpected MTP response type: {:?}", other)
@@ -1267,7 +1344,7 @@ impl LLMEngine {
                     .collect::<Vec<_>>();
                 let request = MessageType::RunDecodeMTP(sequences);
                 let serialized =
-                    bincode::serialize(&request).expect("Bincode serialization failed");
+                    rmp_serde::to_vec(&request).expect("MsgPack serialization failed");
 
                 for tcp_stream in remote_streams.iter_mut() {
                     if let Err(e) = crate::utils::multi_node::send_tcp(tcp_stream, &serialized) {
@@ -1301,7 +1378,8 @@ impl LLMEngine {
                 match receive_local(&mut stream, false)? {
                     MessageType::RunResponseDFlash(tokens) if !tokens.is_empty() => Ok(tokens),
                     MessageType::RunResponseDFlash(_) => {
-                        candle_core::bail!("DFlash runner returned empty response")
+                        crate::log_warn!("DFlash runner returned empty (transient error, retrying)");
+                        Ok(vec![])
                     }
                     other => candle_core::bail!("Unexpected DFlash response type: {:?}", other),
                 }
@@ -1341,11 +1419,80 @@ impl LLMEngine {
                     .collect::<Vec<_>>();
                 let request = MessageType::RunDecodeDFlash(sequences);
                 let serialized =
-                    bincode::serialize(&request).expect("Bincode serialization failed");
+                    rmp_serde::to_vec(&request).expect("MsgPack serialization failed");
                 for stream in remote_streams.iter_mut() {
                     crate::utils::multi_node::send_tcp(stream, &serialized)?;
                 }
                 let result = Self::run_dflash_on_local_streams(local_streams, &request);
+                for stream in remote_streams.iter_mut() {
+                    let _ = crate::utils::multi_node::recv_tcp(stream);
+                }
+                result
+            }
+        }
+    }
+
+    fn run_spec_ff_on_local_streams(
+        runner_streams: &mut Vec<LocalStream>,
+        request: &MessageType,
+    ) -> Result<Vec<Vec<u32>>> {
+        let cloned_streams: Vec<LocalStream> = runner_streams
+            .iter_mut()
+            .map(|stream| stream.try_clone().expect("clone failed"))
+            .collect();
+        let all_outputs: Result<Vec<Vec<Vec<u32>>>> = cloned_streams
+            .into_par_iter()
+            .map(|mut stream| {
+                send_local(&mut vec![stream.try_clone()?], request, false)?;
+                match receive_local(&mut stream, false)? {
+                    MessageType::RunResponseSpecFF(tokens) if !tokens.is_empty() => Ok(tokens),
+                    MessageType::RunResponseSpecFF(_) => {
+                        crate::log_warn!("Spec-FF runner returned empty (transient error, retrying)");
+                        Ok(vec![])
+                    }
+                    other => candle_core::bail!("Unexpected spec-ff response type: {:?}", other),
+                }
+            })
+            .collect();
+        all_outputs
+            .map_err(candle_core::Error::wrap)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| candle_core::Error::Msg("No response from local spec-ff runners".into()))
+    }
+
+    fn run_forward_spec_ff(
+        runners: &Arc<RwLock<RunnerType>>,
+        owned_seqs: &[Sequence],
+    ) -> Result<Vec<Vec<u32>>> {
+        match &mut *runners.write() {
+            RunnerType::Thread(model_runner) => {
+                let seq_refs: Vec<&Sequence> = owned_seqs.iter().collect();
+                model_runner.run_speculative_ff(Seqs::SeqRefs(&seq_refs))
+            }
+            RunnerType::Process(runner_streams) => {
+                let sequences = owned_seqs
+                    .iter()
+                    .map(|sequence| DecodeSequence::new(sequence))
+                    .collect::<Vec<_>>();
+                let request = MessageType::RunDecodeSpecFF(sequences);
+                Self::run_spec_ff_on_local_streams(runner_streams, &request)
+            }
+            RunnerType::MultiNodeMaster {
+                local_streams,
+                remote_streams,
+            } => {
+                let sequences = owned_seqs
+                    .iter()
+                    .map(|sequence| DecodeSequence::new(sequence))
+                    .collect::<Vec<_>>();
+                let request = MessageType::RunDecodeSpecFF(sequences);
+                let serialized =
+                    rmp_serde::to_vec(&request).expect("MsgPack serialization failed");
+                for stream in remote_streams.iter_mut() {
+                    crate::utils::multi_node::send_tcp(stream, &serialized)?;
+                }
+                let result = Self::run_spec_ff_on_local_streams(local_streams, &request);
                 for stream in remote_streams.iter_mut() {
                     let _ = crate::utils::multi_node::recv_tcp(stream);
                 }
@@ -2194,7 +2341,7 @@ impl LLMEngine {
                     } => {
                         let request = MessageType::RunEmbed((vec![seq.clone()], strategy.clone()));
                         let serialized =
-                            bincode::serialize(&request).expect("Bincode serialization failed");
+                            rmp_serde::to_vec(&request).expect("MsgPack serialization failed");
 
                         for tcp_stream in remote_streams.iter_mut() {
                             crate::utils::multi_node::send_tcp(tcp_stream, &serialized)?;
@@ -2230,7 +2377,7 @@ impl LLMEngine {
 
                         for tcp_stream in remote_streams.iter_mut() {
                             let data = crate::utils::multi_node::recv_tcp(tcp_stream)?;
-                            let response: MessageType = bincode::deserialize(&data)
+                            let response: MessageType = rmp_serde::from_slice(&data)
                                 .expect("Failed to deserialize remote worker response");
                             match response {
                                 MessageType::RunResponseEmbed(output_embed) => {
@@ -2372,14 +2519,24 @@ impl LLMEngine {
                 // Engine lock released -- server can accept new requests during forward pass
 
                 if let Some((scheduled_ids, is_prefill, owned_seqs)) = prep {
-                    let use_dflash = dflash_enabled && !is_prefill && owned_seqs.len() == 1;
-                    let use_mtp =
-                        !use_dflash && mtp_enabled && !is_prefill && owned_seqs.len() == 1;
+                    let parallel_ok = owned_seqs.len() == 1 || crate::utils::env::spec_parallel_draft();
+                    // dflash_parallel_slots caps how many concurrent sequences get a DFlash
+                    // drafter slot (MTP is a single shared drafter, no slots). Sequences
+                    // beyond the cap fall back to plain decode.
+                    let dflash_ok = parallel_ok
+                        && owned_seqs.len() <= crate::utils::env::dflash_parallel_slots().max(1);
+                    let use_dflash = dflash_enabled && !is_prefill && dflash_ok;
+                    let use_mtp = !use_dflash && mtp_enabled && !is_prefill && parallel_ok;
+                    // Speculative fast-forward: append the full grammar-forced (ff) run after
+                    // the sampled base token (the lowest-priority decode path, the fallback).
+                    let use_spec_ff = !use_mtp && !use_dflash && crate::utils::env::spec_ff() && !is_prefill;
 
                     let forward_result: Result<Vec<Vec<u32>>> = if use_mtp {
                         Self::run_forward_mtp(&runners, &owned_seqs)
                     } else if use_dflash {
                         Self::run_forward_dflash(&runners, &owned_seqs)
+                    } else if use_spec_ff {
+                        Self::run_forward_spec_ff(&runners, &owned_seqs)
                     } else {
                         Self::run_forward(&runners, &owned_seqs, is_prefill)
                             .map(|ids| ids.into_iter().map(|t| vec![t]).collect())
@@ -2387,8 +2544,27 @@ impl LLMEngine {
 
                     match forward_result {
                         Ok(multi_output_ids) => {
+                            // If all outputs are empty, the runner hit a transient
+                            // error (e.g. drafter mask mismatch). Skip finish_step
+                            // and retry on the next tick. Sequences stay in the
+                            // running list; no data is lost.
+                            if multi_output_ids.iter().all(|ids| ids.is_empty()) {
+                                crate::log_warn!(
+                                    "[Engine Loop] All runners returned empty (transient error), retrying next tick"
+                                );
+                                continue;
+                            }
+                            // Single matcher-gated ingress: commit each produced run to the
+                            // FSM and keep only the FSM-passing prefix, just before the
+                            // sequence append. spec-FF is mid-step committed (its ff read
+                            // needs the base in the FSM), so it passes through ungated.
+                            let gated = if use_spec_ff {
+                                multi_output_ids
+                            } else {
+                                Self::gate_forward(&runners, &scheduled_ids, &multi_output_ids)
+                            };
                             let mut guard = engine.write();
-                            match guard.finish_step(scheduled_ids, is_prefill, multi_output_ids) {
+                            match guard.finish_step(scheduled_ids, is_prefill, gated) {
                                 Ok(n) => task_processed = n,
                                 Err(e) => {
                                     crate::log_error!("[Engine Loop] Finish error: {:?}", e);

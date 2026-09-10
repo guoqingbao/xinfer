@@ -72,6 +72,36 @@ fn sampling_params_for_batch_index<'a>(seqs: &'a Seqs<'a>, index: usize) -> &'a 
     }
 }
 
+/// Map a xinfer Sampling strategy to the PDA GPU sampling strategy.
+#[cfg(feature = "cuda")]
+fn pda_sampling_from(sampling: &crate::utils::logits_processor::Sampling) -> attention_rs::pda::PdaSampling {
+    use crate::utils::logits_processor::Sampling as S;
+    match sampling {
+        S::ArgMax => attention_rs::pda::PdaSampling::Greedy,
+        S::All { temperature } if *temperature <= 1e-6 => attention_rs::pda::PdaSampling::Greedy,
+        S::All { temperature } => attention_rs::pda::PdaSampling::TopKTopP {
+            temperature: *temperature,
+            top_k: -1,
+            top_p: 1.0,
+        },
+        S::TopK { k, temperature } => attention_rs::pda::PdaSampling::TopKTopP {
+            temperature: *temperature,
+            top_k: *k as i32,
+            top_p: 1.0,
+        },
+        S::TopP { p, temperature } => attention_rs::pda::PdaSampling::TopKTopP {
+            temperature: *temperature,
+            top_k: -1,
+            top_p: *p,
+        },
+        S::TopKThenTopP { k, p, temperature } => attention_rs::pda::PdaSampling::TopKTopP {
+            temperature: *temperature,
+            top_k: *k as i32,
+            top_p: *p,
+        },
+    }
+}
+
 fn guided_decoding_requests<'a>(
     seqs: &'a Seqs<'a>,
     seq_ids: &'a [usize],
@@ -197,7 +227,7 @@ pub struct ModelRunner {
     cached_sampling: RwLock<Option<CachedSamplingParams>>,
     seq_tokens: RwLock<HashMap<usize, Vec<u32>>>,
     restored_prefix_sequences: RwLock<HashSet<usize>>,
-    guided_decoding: GuidedDecoding,
+    pub(crate) guided_decoding: GuidedDecoding,
     transfer: Option<Arc<Transfer>>,
     is_first_rank: bool,
     pub(crate) model_type: ModelType,
@@ -207,10 +237,20 @@ pub struct ModelRunner {
     pub(crate) mtp_num_speculative: usize,
     /// Optional external DFlash2 drafter.
     pub(crate) dflash_drafter: Option<crate::speculative::DFlashDrafter>,
+    /// PDA projected masks for MTP verify (set by the runner before each MTP step).
+    #[cfg(feature = "cuda")]
+    pub(crate) pda_projected_masks: Option<Tensor>,
 }
 
 impl ModelRunner {
     // Mamba slots track concurrent sequence states (not KV token blocks).
+
+    /// Set the PDA projected masks for the next MTP verify step.
+    /// Called by the engine before `run_mtp_decode` when a grammar is active.
+    #[cfg(feature = "cuda")]
+    pub fn set_pda_projected_masks(&mut self, masks: Option<Tensor>) {
+        self.pda_projected_masks = masks;
+    }
 
     pub(crate) fn is_mla_model(&self) -> bool {
         // Classical MLA only (FlashInfer MLA plans). DeepSeek V4 is a separate
@@ -888,6 +928,8 @@ impl ModelRunner {
             mtp_head,
             mtp_num_speculative,
             dflash_drafter,
+            #[cfg(feature = "cuda")]
+            pda_projected_masks: None,
         })
     }
 
@@ -1159,12 +1201,26 @@ impl ModelRunner {
             match &seqs {
                 Seqs::SeqRefs(sequences) => {
                     for sequence in *sequences {
-                        let count = sequence
-                            .prefill_chunk_tokens(self.config.effective_prefill_chunk_size());
-                        drafter.store_decode_hidden(
-                            &projected.narrow(0, offset, count)?,
-                            sequence.id,
-                        )?;
+                        let count = sequence.prefill_chunk_tokens(
+                            sequence
+                                .active_prefill_chunk
+                                .unwrap_or(self.config.effective_prefill_chunk_size()),
+                        );
+                        // Prefill position check: only seed DFlash context when within
+                        // context_window tokens of the prefill end. Prevents accumulating
+                        // truncated early-prefill context (which degrades draft quality).
+                        let should_seed = if is_prefill && drafter.context_window() > 0 {
+                            sequence.len().saturating_sub(sequence.num_cached_tokens)
+                                <= drafter.context_window()
+                        } else {
+                            true
+                        };
+                        if should_seed {
+                            drafter.store_decode_hidden(
+                                &projected.narrow(0, offset, count)?,
+                                sequence.id,
+                            )?;
+                        }
                         offset += count;
                     }
                 }
@@ -1307,9 +1363,12 @@ impl ModelRunner {
         let mut max_seqlen_q = 0;
         let mut max_seqlen_k = 0;
         let mut slot_mapping = Vec::new();
-        let chunk_size = self.config.effective_prefill_chunk_size();
         let mut max_context_len = 0;
         for (seq_idx, seq) in seqs.iter().enumerate() {
+            // Adaptive chunk size stamped by the scheduler (fallback: static config).
+            let chunk_size = seq
+                .active_prefill_chunk
+                .unwrap_or(self.config.effective_prefill_chunk_size());
             let num_tokens = seq.prefill_chunk_tokens(chunk_size);
             input_ids
                 .extend(&seq.token_ids[seq.num_cached_tokens..seq.num_cached_tokens + num_tokens]);
@@ -1907,8 +1966,8 @@ impl ModelRunner {
             logits.to_owned()
         };
 
-        let guided_requests = guided_decoding_requests(&seqs, &seq_ids);
-        let guided_positions: Vec<usize> = guided_requests
+        let all_requests = guided_decoding_requests(&seqs, &seq_ids);
+        let guided_positions: Vec<usize> = all_requests
             .iter()
             .enumerate()
             .filter_map(|(index, request)| request.grammar.is_some().then_some(index))
@@ -1924,23 +1983,96 @@ impl ModelRunner {
             let original_guided_logits = logits.index_select(&guided_indices, 0)?;
             let guided_requests: Vec<_> = guided_positions
                 .iter()
-                .map(|&index| guided_requests[index])
+                .map(|&index| all_requests[index])
                 .collect();
-            let (guided_logits, guided_step) = self
-                .guided_decoding
-                .apply(&original_guided_logits, &guided_requests)?;
-            let sample_logits = if guided_positions.len() == seq_ids.len() {
-                guided_logits
+            let guided_tokens: Vec<u32> = if crate::utils::env::pda_current() && self.guided_decoding.has_pda_table() {
+                // On-GPU current-position PDA masking: compute mask from the per-seq
+                // PDA control state, sample, advance. Non-guided rows sample normally.
+                let guided_logits = logits.index_select(&guided_indices, 0)?;
+                let guided_seq_ids: Vec<usize> = guided_positions
+                    .iter()
+                    .map(|&i| all_requests[i].seq_id)
+                    .collect();
+                let pda_sampling = pda_sampling_from(&cached_params.sampling);
+                let g_tokens = self
+                    .guided_decoding
+                    .pda_current_step(&guided_logits, &guided_seq_ids, &pda_sampling)?;
+                let g_tokens: Vec<u32> = g_tokens.flatten_all().unwrap().to_vec1::<u32>().unwrap();
+                let mut full = vec![0u32; seq_ids.len()];
+                for (j, &pos) in guided_positions.iter().enumerate() {
+                    full[pos] = g_tokens.get(j).copied().unwrap_or(0);
+                }
+                let non_guided: Vec<usize> = (0..seq_ids.len())
+                    .filter(|i| !guided_positions.contains(i))
+                    .collect();
+                if !non_guided.is_empty() {
+                    let ng_idx = Tensor::from_vec(
+                        non_guided.iter().map(|&i| i as u32).collect(),
+                        (non_guided.len(),),
+                        logits.device(),
+                    )?;
+                    let ng_logits = logits.index_select(&ng_idx, 0)?;
+                    let ng_tokens = self.sample_processed_logits(&ng_logits, &cached_params.sampling)?;
+                    for (j, &pos) in non_guided.iter().enumerate() {
+                        full[pos] = ng_tokens[j];
+                    }
+                }
+                full
+            } else if crate::utils::env::spec_mask_offload() {
+                // GPU offload: build mask directly (single compute_mask_or_eos call).
+                // Do NOT call apply() here - it consumes ff_tokens_cache as a side effect,
+                // causing the second compute_mask_or_eos in build_allow_mask to see a
+                // different parser state. The FSM commit for the produced token is done
+                // once, at the terminal ingress (gate_commit), just before the append.
+                if crate::utils::env::vob_sampling() {
+                    // VOB bitset path: 8x less data than F32 mask.
+                    let vob_words = self
+                        .guided_decoding
+                        .build_vob_words(&all_requests, logits.dim(1)?)
+                        .map(|words| {
+                            candle_core::Tensor::from_vec(
+                                words,
+                                (all_requests.len(), logits.dim(1)? / 32),
+                                logits.device(),
+                            )
+                        })
+                        .transpose()?;
+                    let mut tokens = self.logit_processor.sample_with_vob(
+                        &logits,
+                        &cached_params.sampling,
+                        vob_words.as_ref(),
+                    )?;
+                    self.guided_decoding.apply_fast_forward(&seq_ids, &mut tokens);
+                    tokens
+                } else {
+                    let mask = self
+                        .guided_decoding
+                        .build_allow_mask(&all_requests, logits.dim(1)?, logits.device())?;
+                    let mut tokens = self.logit_processor.sample_with_strategy_masked(
+                        &logits,
+                        &cached_params.sampling,
+                        mask.as_ref(),
+                    )?;
+                    self.guided_decoding.apply_fast_forward(&seq_ids, &mut tokens);
+                    tokens
+                }
             } else {
-                let guided_delta = (&guided_logits - &original_guided_logits)?;
-                logits.index_add(&guided_indices, &guided_delta, 0)?
+                // Original path: apply() computes masked logits via index_add.
+                let (guided_logits, _guided_step) = self
+                    .guided_decoding
+                    .apply(&original_guided_logits, &guided_requests)?;
+                let sample_logits = if guided_positions.len() == seq_ids.len() {
+                    guided_logits
+                } else {
+                    let guided_delta = (&guided_logits - &original_guided_logits)?;
+                    logits.index_add(&guided_indices, &guided_delta, 0)?
+                };
+                let mut tokens =
+                    self.sample_processed_logits(&sample_logits, &cached_params.sampling)?;
+                self.guided_decoding.apply_fast_forward(&seq_ids, &mut tokens);
+                tokens
             };
-            let mut tokens =
-                self.sample_processed_logits(&sample_logits, &cached_params.sampling)?;
-            self.guided_decoding
-                .apply_fast_forward(&seq_ids, &mut tokens);
-            self.guided_decoding.commit(&seq_ids, &tokens, guided_step);
-            tokens
+            guided_tokens
         };
 
         // Track tokens for sequences when penalties are enabled
@@ -1960,6 +2092,51 @@ impl ModelRunner {
 
         // Guided token commits are handled immediately after sampling.
         Ok(tokens)
+    }
+
+    /// Speculative fast-forward decode: sample the base token (the current `run`, which
+    /// commits it to the FSM), then append the full grammar-forced (ff) run that follows.
+    /// The ff tokens are deterministic (forced by the grammar), so they are committed
+    /// directly without model sampling. Returns `[base_token, ff_run...]` per sequence;
+    /// the next draft anchors on the last ff token (the `instead of the base token" case).
+    pub fn run_speculative_ff(&self, seqs: Seqs) -> Result<Vec<Vec<u32>>> {
+        let base_tokens = self.run(seqs, false)?;
+        let seq_ids: Vec<usize> = match &seqs {
+            Seqs::SeqRefs(seqs) => seqs.iter().map(|s| s.id()).collect(),
+            Seqs::DecodeVec(v) => v.iter().map(|s| s.id()).collect(),
+        };
+        let mut outputs: Vec<Vec<u32>> = Vec::with_capacity(seq_ids.len());
+        for (i, seq_id) in seq_ids.iter().enumerate() {
+            let mut out = vec![base_tokens[i]];
+            // spec-FF is mid-step committed (the ff read below needs the base in the FSM),
+            // so the terminal gate_commit skips this path. Commit the base token now.
+            self.guided_decoding.commit_run(*seq_id, &out);
+            // The remaining grammar run (from the FSM state after the base token is committed).
+            let remaining_ff = self.guided_decoding.ff_tokens(*seq_id);
+            if !remaining_ff.is_empty() {
+                self.guided_decoding.commit_ff_sequence(*seq_id);
+                // Report the ff continuation in the per-seq speculative stats (the same
+                // optional end-of-sequence report as MTP/DFlash).
+                crate::speculative::spec_stats::spec_stats_update_ff("SpecFF", *seq_id, remaining_ff.len());
+                out.extend(remaining_ff);
+            }
+            outputs.push(out);
+        }
+        Ok(outputs)
+    }
+
+    /// The single matcher-gated ingress: commit each sequence's produced run to the
+    /// FSM and return only the FSM-passing prefix. Every token-production path
+    /// (plain, spec-FF, MTP, DFlash) funnels through this one call just before the
+    /// sequence append, so the sequence can never hold a token the FSM rejected.
+    pub fn gate_commit(&self, seq_ids: &[usize], runs: &[Vec<u32>]) -> Vec<Vec<u32>> {
+        runs.iter()
+            .enumerate()
+            .map(|(i, run)| {
+                let n = self.guided_decoding.commit_run(seq_ids[i], run);
+                run[..n].to_vec()
+            })
+            .collect()
     }
 
     pub fn finished(&self, id: usize) {
@@ -2031,7 +2208,7 @@ impl ModelRunner {
                     label,
                     self.mtp_num_speculative
                 );
-                mtp_cap.capture_mtp(&self.device, kv_pairs, self.mtp_num_speculative)?;
+mtp_cap.capture_mtp(&self.device, kv_pairs, self.mtp_num_speculative)?;
             }
         }
 

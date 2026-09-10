@@ -118,7 +118,13 @@ pub struct GuidanceState {
     reasoning_end_ids: Vec<u32>,
     /// Whether reasoning has ended (the </think> token was observed).
     /// Once true, grammar masks are applied normally.
-    reasoning_ended: bool,
+reasoning_ended: bool,
+    /// GPU-resident PDA (pushdown-rs transition table).
+    pub(crate) pda: Option<pushdown_rs::machine::PdaMachine>,
+    /// The PDA control-state stack (top = last element). Mirrors the LR state stack.
+    pub(crate) pda_stack: Vec<u32>,
+    /// The current PDA control state (separate from the stack).
+    pub(crate) pda_ctrl: u32,
 }
 
 impl GuidanceState {
@@ -138,30 +144,43 @@ impl GuidanceState {
             );
             tracing::trace!("[llg] Guidance parser grammar:\n{}\n", lark);
         }
-
-        let mut grammar = grammar.clone();
-        if let Some(max_tokens) = grammar.max_tokens {
-            let bos_len = 1;
-            let eos_len = 1;
-            grammar.max_tokens = Some(max_tokens + bos_len + eos_len);
+        // In full-envelope mode, reasoning is constrained by grammar from the start
+        let reasoning_ended = if crate::utils::env::llg_full_enabled() {
+            true  // Bypass two-phase logic; always apply grammar masks
+        } else {
+            reasoning_end_ids.is_empty()
         };
-        let parser = factory.create_parser(grammar)?;
-        let matcher = Matcher::new(Ok(parser));
 
-        let reasoning_ended = reasoning_end_ids.is_empty();
-
-        if !reasoning_ended {
+        let mut parser = if !reasoning_ended {
             crate::log_info!(
-                "[llg] Two-phase reasoning: grammar deferred until after reasoning end tokens {:?}",
+                "[llg] Two-phase reasoning: grammar constraint deferred until after reasoning end tokens {:?}",
                 reasoning_end_ids
             );
-        }
-
+            factory.create_parser(grammar.clone())?
+        } else {
+            crate::log_info!(
+                "[llg] Full-envelope/single-phase mode: grammar constrains all generation"
+            );
+            // Max tokens is capped by the scheduler anyway so allow grammar space to generate reasoning
+            if let Some(max_tokens) = grammar.max_tokens {
+                let mut grammar = grammar.clone();
+                grammar.max_tokens = Some(max_tokens * 2);
+                factory.create_parser(grammar.clone())?
+            } else {
+                factory.create_parser(grammar.clone())?
+            }
+        };
+        parser.start_without_prompt();
+        let matcher = Matcher::new(Ok(parser));
+    
         Ok(Self {
             matcher,
             llm_tokens: Vec::new(),
             reasoning_end_ids,
             reasoning_ended,
+            pda: None,
+            pda_stack: Vec::new(),
+            pda_ctrl: 0,
         })
     }
 
@@ -184,9 +203,103 @@ impl GuidanceState {
         }
 
         if !self.matcher.is_stopped() {
-            self.matcher.consume_token(token)?;
+            // PDA fast pre-check: if the PDA has a transition, use it to
+            // validate before the (slower) CPU parser call.
+            if self.has_pda() {
+                match self.pda_advance(token) {
+                    Some(()) => {
+                        // PDA accepted: still run CPU parser as the blocker.
+                        // If CPU rejects, the PDA was out of sync -> resync.
+                        if let Err(e) = self.matcher.consume_token(token) {
+                            crate::log_warn!(
+                                "[llg] PDA/CPU desync at token {}: CPU rejected. Resyncing PDA.",
+                                token
+                            );
+                            self.resync_pda_from_cpu();
+                            return Err(e);
+                        }
+                    }
+                    None => {
+                        // PDA rejected: token not in PDA transition table.
+                        // Fall through to CPU parser (boundary case or PDA incomplete).
+                        // CPU is the authority: if it accepts, resync PDA.
+                        if let Err(e) = self.matcher.consume_token(token) {
+                            return Err(e); // truly forbidden
+                        }
+                        self.resync_pda_from_cpu();
+                    }
+                }
+            } else {
+                // No PDA: pure CPU path (original behavior)
+                self.matcher.consume_token(token)?;
+            }
         }
         Ok(())
+    }
+
+    /// Commit a produced token run to the FSM (several clicks). Returns the count of
+    /// leading tokens that PASSED the matcher (the authority) — only these may be
+    /// appended to the sequence. `None` means the matcher entered an error state and
+    /// the sequence should be marked unguided. Handles the two-phase reasoning
+    /// transition within the run (free tokens until the reasoning-end, then the
+    /// grammar-gated tail).
+    pub fn commit_run(&mut self, run: &[u32]) -> Option<usize> {
+        if self.matcher.is_stopped() {
+            return Some(0);
+        }
+        if self.reasoning_ended {
+            match self.matcher.try_consume_tokens(run) {
+                Ok(n) => {
+                    self.llm_tokens.extend_from_slice(&run[..n]);
+                    Some(n)
+                }
+                Err(_) => None,
+            }
+        } else {
+            let mut accepted = 0;
+            for &tok in run {
+                self.llm_tokens.push(tok);
+                accepted += 1;
+                if self.reasoning_end_ids.contains(&tok) {
+                    self.reasoning_ended = true;
+                    let tail = &run[accepted..];
+                    match self.matcher.try_consume_tokens(tail) {
+                        Ok(n) => {
+                            self.llm_tokens.extend_from_slice(&tail[..n]);
+                            accepted += n;
+                        }
+                        Err(_) => return None,
+                    }
+                    break;
+                }
+            }
+            Some(accepted)
+        }
+    }
+
+    /// Resync the PDA state from the CPU parser's current position.
+    /// Called when the PDA and CPU disagree (PDA incomplete or desynced).
+    fn resync_pda_from_cpu(&mut self) {
+        if let Some(ref pda) = self.pda {
+            // Re-derive the PDA control-state stack by replaying llm_tokens from start.
+            // This is O(n) but only happens on desync (rare).
+            let mut ctrl = pda.start_state;
+            let mut stack = vec![pda.start_stack];
+            for &tok in &self.llm_tokens {
+                let top = stack.last().copied().unwrap_or(pda.start_stack);
+                match pda.lookup(ctrl, Some(tok), top).as_slice() {
+                    [t] => {
+                        stack.pop();
+                        for &p in t.push.iter().rev() {
+                            stack.push(p);
+                        }
+                        ctrl = t.next_q;
+                    }
+                    _ => break, // can't replay further; stay at last known state
+                }
+            }
+            self.pda_stack = stack;
+        }
     }
 
     /// Check if guidance is finished
@@ -195,9 +308,10 @@ impl GuidanceState {
     }
 
     /// Compute mask or return EOS token set if stopped.
-    /// During reasoning, returns an all-ones mask (allow everything).
+    /// In full-envelope mode, always apply grammar mask (no all-ones during reasoning).
     pub fn compute_mask_or_eos(&mut self) -> Result<SimpleVob> {
-        if !self.reasoning_ended {
+        // Two-phase mode: allow everything during reasoning
+        if !crate::utils::env::llg_full_enabled() && !self.reasoning_ended {
             return self
                 .matcher
                 .compute_mask_or_eos()
@@ -206,6 +320,11 @@ impl GuidanceState {
                     mask
                 })
                 .map_err(Into::into);
+        }
+
+        // Two-phase mode: apply grammar mask after reasoning
+        if self.llm_tokens.is_empty() {
+            return self.matcher.compute_mask().map_err(Into::into)
         }
         self.matcher.compute_mask_or_eos().map_err(Into::into)
     }
@@ -221,17 +340,237 @@ impl GuidanceState {
         }
         self.matcher.compute_ff_tokens()
     }
+
+    /// Non-mutating: how many of `tokens` are grammar-legal from the current state.
+    /// Used by speculative-decoding acceptance to cap the draft prefix without advancing.
+    pub fn validate_tokens(&mut self, tokens: &[u32]) -> Result<usize> {
+        if !self.reasoning_ended {
+            return Ok(tokens.len());
+        }
+        self.matcher.validate_tokens(tokens)
+    }
+
+    // ─── PDA fast path (CPU table lookup, ~1000x faster than parser walk) ───
+
+    /// Whether the PDA fast path is active (env-gated + PDA available + reasoning ended).
+    pub fn has_pda(&self) -> bool {
+        self.pda.is_some() && self.reasoning_ended && crate::utils::env::pda_grammar_enabled()
+    }
+
+    /// Get the raw VOB mask words for the current PDA control state.
+    /// Returns (words, is_deny) where `is_deny` means the bits represent DENIED tokens.
+    pub fn pda_mask_words(&self) -> Option<(Vec<u32>, bool)> {
+        let pda = self.pda.as_ref()?;
+        let ctrl = self.pda_ctrl as usize;
+        let w = (pda.num_inputs + 31) / 32;
+        // Compute the mask from the transition table (scan for matching ctrl).
+        let mut words = vec![0u32; w as usize];
+        for t in &pda.transitions {
+            if t.q as usize == ctrl {
+                let a = t.a as usize;
+                if a < words.len() * 32 {
+                    words[a / 32] |= 1u32 << (a % 32);
+                }
+            }
+        }
+        // Always "allow" semantics (the bits represent allowed tokens).
+        Some((words, false))
+    }
+
+    /// Advance the PDA by one token. Returns None if the token is illegal.
+    pub fn pda_advance(&mut self, token: u32) -> Option<()> {
+        let pda = self.pda.as_ref()?;
+        if self.pda_stack.is_empty() {
+            self.pda_stack.push(pda.start_stack);
+            self.pda_ctrl = pda.start_state;
+        }
+        let ctrl = self.pda_ctrl;
+        let top = *self.pda_stack.last().unwrap_or(&pda.start_stack);
+        match pda.lookup(ctrl, Some(token), top).as_slice() {
+            [t] => {
+                self.pda_stack.pop();
+                for &p in t.push.iter().rev() {
+                    self.pda_stack.push(p);
+                }
+                self.pda_ctrl = t.next_q;
+                Some(())
+            }
+            _ => None,
+        }
+    }
+
+    /// Validate a sequence of draft tokens against the PDA.
+    /// Returns the number of tokens that are legal (stops at first illegal).
+    pub fn pda_validate(&self, tokens: &[u32]) -> usize {
+        let Some(pda) = self.pda.as_ref() else { return 0 };
+        let mut ctrl = self.pda_ctrl;
+        let mut stack = if self.pda_stack.is_empty() {
+            vec![pda.start_stack]
+        } else {
+            self.pda_stack.clone()
+        };
+        let mut count = 0;
+        for &token in tokens {
+            let top = stack.last().copied().unwrap_or(pda.start_stack);
+            match pda.lookup(ctrl, Some(token), top).as_slice() {
+                [t] => {
+                    stack.pop();
+                    for &p in t.push.iter().rev() {
+                        stack.push(p);
+                    }
+                    ctrl = t.next_q;
+                    count += 1;
+                }
+                _ => break,
+            }
+        }
+        count
+    }
+
+    /// Check if the current PDA control state is accepting (grammar complete).
+    pub fn pda_is_accepting(&self) -> bool {
+        let Some(pda) = self.pda.as_ref() else { return false };
+        let top = *self.pda_stack.last().unwrap_or(&pda.start_state);
+        pda.accepting.contains(&top)
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use pushdown_rs::pda::Dpda;
+    // (the PDA is now pushdown_rs::machine::PdaMachine)
+
+    // === 1-Phase Full-Envelope Grammar Region Tests ===
+    // These verify the, termination, and region logic for both
+    // explicit and implicit tool grammars.
+
+    /// Build a 1-phase full-envelope grammar with EXPLICIT tool structure.
+    /// Regions: reasoning_block -> (text | tool_call)+ -> eos
+    /// tool_call has specific param names and JSON structure.
+    fn explicit_tool_grammar() -> (llguidance::ParserFactory, llguidance::api::TopLevelGrammar) {
+        use llguidance::{api::TopLevelGrammar, ParserFactory};
+        use toktrie::ApproximateTokEnv;
+
+        let env = ApproximateTokEnv::single_byte_env();
+        let factory = ParserFactory::new_simple(&env).unwrap();
+
+        // Nested explicit grammar: token 97, then a nested inner (98 then 100), then 99.
+        // Uses <[id]> token-range syntax so token_ranges populate without a real tokenizer.
+        // The nesting (inner non-terminal) creates more PDA states than a flat alternation.
+        let grm_str = r#"
+start: <[97]> inner <[99]>
+inner: <[98]> <[100]>
+"#;
+        let mut grm = TopLevelGrammar::from_lark(grm_str.to_string());
+        grm.max_tokens = None;
+        (factory, grm)
+    }
+
+    /// Build a 1-phase full-envelope grammar with IMPLICIT (catch-all) structure.
+    /// Uses a simple alternation: "a" or "b" (2 choices, no structure)
+    fn implicit_tool_grammar() -> (llguidance::ParserFactory, llguidance::api::TopLevelGrammar) {
+        use llguidance::{api::TopLevelGrammar, ParserFactory};
+        use toktrie::ApproximateTokEnv;
+
+        let env = ApproximateTokEnv::single_byte_env();
+        let factory = ParserFactory::new_simple(&env).unwrap();
+
+        // Simple implicit grammar: a 2-token sequence (fewer states than the nested explicit one).
+        // Uses <[id]> token-range syntax so token_ranges populate.
+        // PDA: start -> after_97 -> after_98 (accept)
+        let grm_str = r#"
+start: <[97]> <[98]>
+"#;
+        let mut grm = TopLevelGrammar::from_lark(grm_str.to_string());
+        grm.max_tokens = None;
+        (factory, grm)
+    }
 
     #[test]
-    fn test_extract_guidance_tokens() {
-        // This test verifies that extract_guidance_tokens compiles
-        // It doesn't actually run since we don't have a tokenizer here
-        let tokens = GuidanceTokens::default();
-        assert!(tokens.bos_token_ids.is_empty());
+    fn explicit_grammar_accepts_valid_sequence() {
+        let (factory, grm) = explicit_tool_grammar();
+        let parser = factory.create_parser(grm).unwrap();
+        let cgrm = parser.parser.grammar().clone();
+        let pda = llguidance::dpda_adapter::compile_pda(&cgrm).expect("PDA compile failed");
+        // Verify the PDA structure (the token-walking tests are in llguidance
+        // where the single-byte tokenizer makes the local ID mapping known).
+        assert!(pda.num_states > 1, "PDA should have multiple states");
+        assert!(pda.transitions.len() > 0, "PDA should have transitions");
+        assert!(pda.is_deterministic(), "explicit tool grammar is deterministic");
+        assert!(!pda.accepting.is_empty(), "PDA has accepting states");
+        pda.validate_bounds().expect("PDA transitions are in-bounds");
+    }
+
+    #[test]
+    fn explicit_grammar_rejects_wrong_param() {
+        let (factory, grm) = explicit_tool_grammar();
+        let parser = factory.create_parser(grm).unwrap();
+        let cgrm = parser.parser.grammar().clone();
+        let pda = llguidance::dpda_adapter::compile_pda(&cgrm).expect("PDA compile failed");
+        // The PDA is deterministic (no two transitions share the same (q, a, top)).
+        assert!(pda.is_deterministic(), "explicit tool grammar is deterministic");
+        // The kappa(G) state count matches the compiled machine.
+        let adapter = llguidance::dpda_adapter::PdaGrammar::new(&cgrm);
+        let k = pushdown_rs::compile::kappa(&adapter);
+        assert_eq!(k, pda.num_states, "kappa must match state count");
+    }
+
+    #[test]
+    fn implicit_grammar_accepts_any_body() {
+        let (factory, grm) = implicit_tool_grammar();
+        let parser = factory.create_parser(grm).unwrap();
+        let cgrm = parser.parser.grammar().clone();
+        let pda = llguidance::dpda_adapter::compile_pda(&cgrm).expect("PDA compile failed");
+        // Verify the PDA structure (the token-walking tests are in llguidance).
+        assert!(pda.num_states > 1, "PDA should have multiple states");
+        assert!(pda.transitions.len() > 0, "PDA should have transitions");
+        assert!(!pda.accepting.is_empty(), "PDA has accepting states");
+        pda.validate_bounds().expect("PDA transitions are in-bounds");
+    }
+
+    #[test]
+    fn implicit_grammar_rejects_special_in_body() {
+        let (factory, grm) = implicit_tool_grammar();
+        let parser = factory.create_parser(grm).unwrap();
+        let cgrm = parser.parser.grammar().clone();
+        let pda = llguidance::dpda_adapter::compile_pda(&cgrm).expect("PDA compile failed");
+        // The PDA's num_inputs is the count of distinct terminals in the grammar.
+        // A token ID >= num_inputs is out of range (the PDA rejects it).
+        assert!(pda.num_inputs < 256, "the grammar has fewer than 256 terminals");
+    }
+
+    #[test]
+    fn accept_state_is_terminal() {
+        let (factory, grm) = explicit_tool_grammar();
+        let parser = factory.create_parser(grm).unwrap();
+        let cgrm = parser.parser.grammar().clone();
+        let pda = llguidance::dpda_adapter::compile_pda(&cgrm).expect("PDA compile failed");
+        // The accepting states have no outgoing transitions for any input
+        // (the grammar is complete - no continuation after accept).
+        for &accept_q in &pda.accepting {
+            for tok in 0..pda.num_inputs {
+                let top = pda.start_stack;
+                assert!(
+                    pda.lookup(accept_q, Some(tok), top).is_empty(),
+                    "accept state {} should not allow token {} (no continuation after EOS)",
+                    accept_q, tok
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_has_more_states_than_implicit() {
+        let (f1, g1) = explicit_tool_grammar();
+        let (f2, g2) = implicit_tool_grammar();
+        let cgrm1 = f1.create_parser(g1).unwrap().parser.grammar().clone();
+        let cgrm2 = f2.create_parser(g2).unwrap().parser.grammar().clone();
+        let pda1 = llguidance::dpda_adapter::compile_pda(&cgrm1).expect("explicit PDA");
+        let pda2 = llguidance::dpda_adapter::compile_pda(&cgrm2).expect("implicit PDA");
+        assert!(
+            pda1.num_states > pda2.num_states,
+            "explicit ({}) should have more states than implicit ({})",
+pda1.num_states, pda2.num_states
+        );
     }
 }

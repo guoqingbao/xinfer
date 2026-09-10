@@ -250,6 +250,8 @@ async fn main() -> Result<()> {
         args.enable_tool_grammar,
         args.num_speculative_tokens,
         args.draft_model.clone(),
+        None, // max_prefill_chunk_tokens
+        None, // min_prefill_chunk_tokens
     );
 
     // Multi-node worker nodes run a daemon loop instead of the full engine
