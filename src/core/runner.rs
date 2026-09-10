@@ -2097,11 +2097,26 @@ impl ModelRunner {
                     let mask = self
                         .guided_decoding
                         .build_allow_mask(&all_requests, logits.dim(1)?, logits.device())?;
-                    let mut tokens = self.logit_processor.sample_with_strategy_masked(
-                        &logits,
-                        &cached_params.sampling,
-                        mask.as_ref(),
-                    )?;
+                    let mut tokens = if crate::utils::env::qos_enabled() {
+                        // the QoS-gated per-sequence strategy (the additive path): each row
+                        // samples with its own temperature / top_p / top_k.
+                        let (temperature_d, top_p_d, top_k_d) =
+                            Self::resolve_perseq_sampling(&seqs, &logits)?;
+                        match mask.as_ref() {
+                            Some(m) => self.logit_processor.sample_with_strategy_perseq_masked(
+                                &logits, m, &temperature_d, &top_p_d, &top_k_d,
+                            )?,
+                            None => self.logit_processor.sample_with_strategy_perseq(
+                                &logits, &temperature_d, &top_p_d, &top_k_d,
+                            )?,
+                        }
+                    } else {
+                        self.logit_processor.sample_with_strategy_masked(
+                            &logits,
+                            &cached_params.sampling,
+                            mask.as_ref(),
+                        )?
+                    };
                     self.guided_decoding.apply_fast_forward(&seq_ids, &mut tokens);
                     tokens
                 }
