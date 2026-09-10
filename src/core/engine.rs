@@ -2630,6 +2630,7 @@ mod tests {
             tool_call_start_ids: Vec::new(),
             tool_call_end_ids: Vec::new(),
             add_bos_token: false,
+            add_eos_token: true,
         };
 
         assert_eq!(
@@ -2648,6 +2649,7 @@ mod tests {
             tool_call_start_ids: Vec::new(),
             tool_call_end_ids: Vec::new(),
             add_bos_token: false,
+            add_eos_token: true,
         };
 
         assert_eq!(
@@ -2666,6 +2668,7 @@ mod tests {
             tool_call_start_ids: Vec::new(),
             tool_call_end_ids: Vec::new(),
             add_bos_token: false,
+            add_eos_token: true,
         };
 
         assert_eq!(
@@ -2684,6 +2687,7 @@ mod tests {
             tool_call_start_ids: Vec::new(),
             tool_call_end_ids: Vec::new(),
             add_bos_token: false,
+            add_eos_token: true,
         };
 
         assert_eq!(
@@ -2702,6 +2706,7 @@ mod tests {
             tool_call_start_ids: Vec::new(),
             tool_call_end_ids: Vec::new(),
             add_bos_token: false,
+            add_eos_token: true,
         };
 
         assert_eq!(

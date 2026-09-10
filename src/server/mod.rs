@@ -1971,6 +1971,7 @@ mod tests {
             tool_call_start_ids: Vec::new(),
             tool_call_end_ids: Vec::new(),
             add_bos_token: false,
+            add_eos_token: false,
         };
 
         normalize_reasoning_controls(&mut params, &guidance_tokens);
@@ -1993,6 +1994,7 @@ mod tests {
             tool_call_start_ids: Vec::new(),
             tool_call_end_ids: Vec::new(),
             add_bos_token: false,
+            add_eos_token: false,
         };
 
         normalize_reasoning_controls(&mut params, &guidance_tokens);
@@ -2014,6 +2016,7 @@ mod tests {
             tool_call_start_ids: Vec::new(),
             tool_call_end_ids: Vec::new(),
             add_bos_token: false,
+            add_eos_token: false,
         };
 
         normalize_reasoning_controls(&mut params, &guidance_tokens);
