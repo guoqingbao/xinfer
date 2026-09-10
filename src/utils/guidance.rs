@@ -251,6 +251,7 @@ impl GuidanceState {
             match self.matcher.try_consume_tokens(run) {
                 Ok(n) => {
                     self.llm_tokens.extend_from_slice(&run[..n]);
+                    self.matcher.settle();
                     Some(n)
                 }
                 Err(_) => None,
@@ -267,6 +268,7 @@ impl GuidanceState {
                         Ok(n) => {
                             self.llm_tokens.extend_from_slice(&tail[..n]);
                             accepted += n;
+                            self.matcher.settle();
                         }
                         Err(_) => return None,
                     }
@@ -314,7 +316,7 @@ impl GuidanceState {
         if !crate::utils::env::llg_full_enabled() && !self.reasoning_ended {
             return self
                 .matcher
-                .compute_mask_or_eos()
+                .compute_mask_immut()
                 .map(|mut mask| {
                     mask.set_all(true);
                     mask
@@ -324,9 +326,9 @@ impl GuidanceState {
 
         // Two-phase mode: apply grammar mask after reasoning
         if self.llm_tokens.is_empty() {
-            return self.matcher.compute_mask().map_err(Into::into)
+            return self.matcher.compute_mask_immut().map_err(Into::into)
         }
-        self.matcher.compute_mask_or_eos().map_err(Into::into)
+        self.matcher.compute_mask_immut().map_err(Into::into)
     }
 
     /// Fast-forward tokens without consuming them (for speculative decoding).
@@ -338,7 +340,7 @@ impl GuidanceState {
         if self.matcher.is_stopped() {
             return Vec::new();
         }
-        self.matcher.compute_ff_tokens()
+        self.matcher.compute_ff_tokens_immut()
     }
 
     /// Non-mutating: how many of `tokens` are grammar-legal from the current state.
@@ -357,20 +359,24 @@ impl GuidanceState {
         self.pda.is_some() && self.reasoning_ended && crate::utils::env::pda_grammar_enabled()
     }
 
-    /// Get the raw VOB mask words for the current PDA control state.
+    /// Get the raw VOB mask words for the current PDA config.
     /// Returns (words, is_deny) where `is_deny` means the bits represent DENIED tokens.
+    /// Uses the epsilon-closure mask (the `mask_at_cfg`), consistent with the
+    /// `advance_eps` (the no stuck call dots).
     pub fn pda_mask_words(&self) -> Option<(Vec<u32>, bool)> {
         let pda = self.pda.as_ref()?;
-        let ctrl = self.pda_ctrl as usize;
+        let ctrl = self.pda_ctrl;
+        let stack = if self.pda_stack.is_empty() {
+            vec![pda.start_stack]
+        } else {
+            self.pda_stack.clone()
+        };
+        let allowed = pda.mask_at_cfg(ctrl, &stack);
         let w = (pda.num_inputs + 31) / 32;
-        // Compute the mask from the transition table (scan for matching ctrl).
         let mut words = vec![0u32; w as usize];
-        for t in &pda.transitions {
-            if t.q as usize == ctrl {
-                let a = t.a as usize;
-                if a < words.len() * 32 {
-                    words[a / 32] |= 1u32 << (a % 32);
-                }
+        for &a in &allowed {
+            if a < pda.num_inputs {
+                words[a as usize / 32] |= 1u32 << (a as usize % 32);
             }
         }
         // Always "allow" semantics (the bits represent allowed tokens).
@@ -378,24 +384,22 @@ impl GuidanceState {
     }
 
     /// Advance the PDA by one token. Returns None if the token is illegal.
+    /// Uses the epsilon-closure advance (the `advance_eps`), so it goes
+    /// through the call dots (the no stuck) — consistent with the mask
+    /// (`mask_at_cfg`, the epsilon-closure union).
     pub fn pda_advance(&mut self, token: u32) -> Option<()> {
         let pda = self.pda.as_ref()?;
         if self.pda_stack.is_empty() {
             self.pda_stack.push(pda.start_stack);
             self.pda_ctrl = pda.start_state;
         }
-        let ctrl = self.pda_ctrl;
-        let top = *self.pda_stack.last().unwrap_or(&pda.start_stack);
-        match pda.lookup(ctrl, Some(token), top).as_slice() {
-            [t] => {
-                self.pda_stack.pop();
-                for &p in t.push.iter().rev() {
-                    self.pda_stack.push(p);
-                }
-                self.pda_ctrl = t.next_q;
+        match pda.advance_eps(self.pda_ctrl, &self.pda_stack, token) {
+            Some((nq, ns)) => {
+                self.pda_ctrl = nq;
+                self.pda_stack = ns;
                 Some(())
             }
-            _ => None,
+            None => None,
         }
     }
 
