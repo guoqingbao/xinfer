@@ -4,6 +4,7 @@ pub mod prefix_cache;
 pub mod runner;
 pub mod scheduler;
 pub mod sequence;
+pub mod state_store;
 #[cfg(feature = "python")]
 use pyo3::pyclass;
 
