@@ -75,6 +75,10 @@ fn build_econfig() -> EngineConfig {
         29500,                               // master_port
         false,                               // enable_tool_grammar
         None,                                // num_speculative_tokens
+        None,                                // draft_model
+        None,                                // reasoning_grammars
+        None,                                // max_prefill_chunk_tokens
+        None,                                // min_prefill_chunk_tokens
     )
 }
 

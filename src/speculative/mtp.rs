@@ -2,7 +2,8 @@ use crate::core::runner::{Model, ModelRunner, Seqs};
 use crate::models::layers::linear::set_linear_is_prefill;
 use crate::models::qwen3_5_mtp::Qwen3_5MtpHead;
 use crate::speculative::metadata::SpecSeqInfo;
-use crate::speculative::verify::{mtp_stats_summary, mtp_stats_update, verify_draft_greedy};
+use crate::speculative::verify::verify_draft_greedy;
+use crate::speculative::spec_stats::spec_stats_update;
 use candle_core::{Result, Tensor};
 use std::sync::Arc;
 
@@ -361,6 +362,35 @@ impl ModelRunner {
         };
         let all_logits = all_logits_result?;
 
+        // Compute PDA projected masks for the draft positions (if grammar active).
+        // This walks the PDA forward through the K draft tokens, emitting K+1 VOB masks.
+        // K is dynamic (set at inference runtime, adjusted by adaptive-k).
+        #[cfg(feature = "cuda")]
+        let pda_masks: Option<Tensor> = if self.guided_decoding.has_pda_table() {
+            let seq_id = seq_info.id;
+            let draft_tensor = Tensor::from_vec(
+                draft_tokens.to_vec(),
+                (1, draft_tokens.len()),
+                self.device(),
+            )?;
+            self.guided_decoding
+                .pda_project_masks(&[seq_id], &draft_tensor)
+                .ok()
+        } else {
+            None
+        };
+
+        // Apply PDA projected masks to the verify logits (if grammar active).
+        // The masks are [K+1, words_per_vob] VOB (from pda_project_masks).
+        let all_logits = if let Some(pda_masks) = &pda_masks {
+            let words = pda_masks.dim(1).unwrap_or(all_logits.dim(1)?.div_ceil(32));
+            crate::utils::guided_decoding::mask_draft_logits(
+                &all_logits, pda_masks, words,
+            )?
+        } else {
+            all_logits
+        };
+
         let verify_result = verify_draft_greedy(&all_logits, &draft_tokens)?;
 
         if verify_result.num_accepted < verify_result.num_proposed {
@@ -384,9 +414,8 @@ impl ModelRunner {
         result_tokens.extend_from_slice(&verify_result.accepted_tokens);
         result_tokens.push(verify_result.continuation_token);
 
-        if mtp_stats_update(verify_result.num_proposed, verify_result.num_accepted) {
-            crate::log_info!("{}", mtp_stats_summary());
-        }
+        // Per-sequence stats (reported at sequence end by the server).
+        spec_stats_update("MTP", seq_info.id, &verify_result);
 
         Ok(vec![result_tokens])
     }
@@ -523,7 +552,7 @@ impl ModelRunner {
             result.push(anchors[index]);
             result.extend_from_slice(&verify_result.accepted_tokens);
             result.push(verify_result.continuation_token);
-            mtp_stats_update(verify_result.num_proposed, verify_result.num_accepted);
+            spec_stats_update("MTP", seq_info.id, &verify_result);
             outputs.push(result);
         }
         Ok(outputs)

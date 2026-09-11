@@ -12,12 +12,64 @@ use crate::server::parser::ToolConfig;
 use crate::server::ChatCompletionRequest;
 use crate::tools::Tool;
 use crate::utils::chat_template::ChatTemplate;
+use crate::utils::config::ReasoningEffort;
 use crate::utils::guidance::GuidanceTokens;
 use tokenizers::Tokenizer;
 
 const GRAMMAR_CACHE_MAX_ENTRIES: usize = 128;
 
 static GRAMMAR_CACHE: Lazy<Mutex<GrammarCache>> = Lazy::new(|| Mutex::new(GrammarCache::default()));
+
+/// User-defined grammar definitions loaded from YAML.
+/// The YAML has top-level keys: text, tool, reasoning.
+/// The "reasoning" section maps level names to inner Lark expressions.
+#[derive(serde::Deserialize, Default)]
+struct GrammarFile {
+    #[serde(default)]
+    text: Option<serde_yaml::Value>,
+    #[serde(default)]
+    tool: Option<serde_yaml::Value>,
+    #[serde(default)]
+    reasoning: HashMap<String, String>,
+}
+
+static GRAMMAR_FILE: Lazy<Mutex<Option<GrammarFile>>> =
+    Lazy::new(|| Mutex::new(None));
+
+/// Load user-defined grammar definitions from a YAML file.
+/// The "reasoning" section maps level names to inner Lark expressions.
+/// The inner expression is used IN VERBATIM as the body of the reasoning_block
+/// rule. The system (Rust code) controls the framing (start:, reasoning_block
+/// header, reasoning_text rule with special token injection).
+pub fn load_grammar_file(path: &str) -> Result<(), String> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| format!("Failed to read grammar file '{}': {}", path, e))?;
+    let parsed: GrammarFile = serde_yaml::from_str(&content)
+        .map_err(|e| format!("Failed to parse grammar YAML: {}", e))?;
+    if parsed.reasoning.is_empty() {
+        return Err(format!("Grammar file '{}' has no reasoning definitions", path));
+    }
+    // Security check: reject any YAML that defines "start" or "reasoning_text"
+    // rules (the system controls these - user injection would break the framing).
+    for (level, expr) in &parsed.reasoning {
+        if expr.lines().any(|l| l.trim().starts_with("start:") || l.trim().starts_with("reasoning_text:")) {
+            return Err(format!(
+                "Grammar level '{}' defines 'start' or 'reasoning_text' rule which is system-controlled",
+                level
+            ));
+        }
+    }
+    let mut guard = GRAMMAR_FILE.lock().unwrap();
+    *guard = Some(parsed);
+    Ok(())
+}
+
+/// Get the user-defined inner Lark expression for a reasoning level, if any.
+/// Returns the expression to be inserted as the body of the reasoning_block rule.
+pub fn get_user_reasoning_grammar(level: &str) -> Option<String> {
+    let guard = GRAMMAR_FILE.lock().unwrap();
+    guard.as_ref()?.reasoning.get(level).cloned()
+}
 
 #[derive(Default)]
 struct GrammarCache {
@@ -72,6 +124,12 @@ trait GrammarBuilder: Clone + std::fmt::Debug + Sized {
     /// Compose two grammars with alternation (OR) - defaults to cloning 'other'
     /// Override when specific alternation logic is needed
     fn compose_alternate(&mut self, other: &mut Self) -> Self {
+        other.clone()
+    }
+
+    /// Compose two grammars with sequence (AND) - defaults to cloning 'other'
+    /// Override when specific sequence logic is needed
+    fn compose_sequence(&mut self, other: &mut Self) -> Self {
         other.clone()
     }
 
@@ -463,8 +521,95 @@ impl GrammarBuilder for StructuredOutputsGrammar {
         }
     }
 
+    fn compose_sequence(&mut self, other: &mut Self) -> Self {
+        let this_lark = self.build_lark();
+        let other_lark = other.build_lark();
+
+        // Parse both grammars and combine rules, deduplicating
+        let this_lines: Vec<&str> = this_lark.lines().collect();
+        let other_lines: Vec<&str> = other_lark.lines().collect();
+
+        // Extract start rules and other rules from both
+        let this_start = this_lines
+            .first()
+            .and_then(|l| l.strip_prefix("start: "))
+            .unwrap_or("");
+        let other_start = other_lines
+            .first()
+            .and_then(|l| l.strip_prefix("start: "))
+            .unwrap_or("");
+
+        // Combine start rules (sequence: this then other)
+        let combined_start = format!("{} {}", this_start, other_start).trim().to_string();
+
+        // Collect all non-start rules from both, deduplicating
+        let mut seen = std::collections::HashSet::new();
+        let mut all_rules: Vec<String> = Vec::new();
+
+        for line in this_lines.iter().skip(1) {
+            let trimmed = line.trim();
+            if !trimmed.is_empty() && !seen.contains(trimmed) {
+                seen.insert(trimmed.to_string());
+                all_rules.push(trimmed.to_string());
+            }
+        }
+
+        for line in other_lines.iter().skip(1) {
+            let trimmed = line.trim();
+            if !trimmed.is_empty() && !seen.contains(trimmed) {
+                seen.insert(trimmed.to_string());
+                all_rules.push(trimmed.to_string());
+            }
+        }
+
+        let combined_rules = all_rules.join("\n");
+
+        Self {
+            constraint: StructuredConstraint::Lark(format!(
+                "start: {}\n{}",
+                combined_start, combined_rules
+            )),
+        }
+    }
+
     fn format(&mut self) -> TopLevelGrammar {
         TopLevelGrammar::from_lark_ascii(&self.build_lark())
+    }
+}
+
+// SIMPLE REASONING GRAMMAR
+
+/// Simple reasoning grammar wrapper for llg_full_enabled() mode
+/// Generates: start: reasoning_block
+///            reasoning_block: <[start_id]> text <[end_id]>
+///            text: <token_range_expression>
+#[derive(Clone, Debug)]
+pub struct SimpleReasoningGrammar {
+    pub start_token_id: u32,
+    pub end_token_id: u32,
+}
+
+impl SimpleReasoningGrammar {
+    pub fn new(start_id: u32, end_id: u32) -> Self {
+        Self {
+            start_token_id: start_id,
+            end_token_id: end_id,
+        }
+    }
+
+    /// Build reasoning grammar that wraps text with reasoning block tokens
+    pub fn build_lark(&self, text_rule: &str) -> String {
+        if self.start_token_id == 0 || self.end_token_id == 0 {
+            // Fallback to text-only if token IDs not set
+            return format!("start: {}\n", text_rule);
+        }
+        format!(
+            r#"start: reasoning_block
+reasoning_block: <[{}]> text <[{}]>
+{}
+"#,
+            self.start_token_id, self.end_token_id, text_rule
+        )
     }
 }
 
@@ -487,6 +632,8 @@ pub struct ToolCallGrammar {
     pub format: ToolFormat,
     marker_token_ids: HashMap<String, u32>,
     value_rules: HashMap<String, String>,
+    /// Guidance tokens for grammar mask generation (required, not optional)
+    guidance_tokens: GuidanceTokens,
 }
 
 impl Default for ToolCallGrammar {
@@ -498,12 +645,13 @@ impl Default for ToolCallGrammar {
             format: ToolFormat::Json,
             marker_token_ids: HashMap::new(),
             value_rules: HashMap::new(),
+            guidance_tokens: GuidanceTokens::default(),
         }
     }
 }
 
 impl ToolCallGrammar {
-    pub fn new_generic(tools: Vec<Tool>, start_token_id: u32, end_token_id: u32) -> Self {
+    pub fn new_generic(tools: Vec<Tool>, start_token_id: u32, end_token_id: u32, guidance_tokens: GuidanceTokens) -> Self {
         Self {
             tools,
             start_token_id,
@@ -511,9 +659,10 @@ impl ToolCallGrammar {
             format: ToolFormat::Generic,
             marker_token_ids: HashMap::new(),
             value_rules: HashMap::new(),
+            guidance_tokens,
         }
     }
-    pub fn new_qwen_coder(tools: Vec<Tool>, start_token_id: u32, end_token_id: u32) -> Self {
+    pub fn new_qwen_coder(tools: Vec<Tool>, start_token_id: u32, end_token_id: u32, guidance_tokens: GuidanceTokens) -> Self {
         Self {
             tools,
             start_token_id,
@@ -521,9 +670,10 @@ impl ToolCallGrammar {
             format: ToolFormat::QwenCoder,
             marker_token_ids: HashMap::new(),
             value_rules: HashMap::new(),
+            guidance_tokens,
         }
     }
-    pub fn new_minimax(tools: Vec<Tool>, start_token_id: u32, end_token_id: u32) -> Self {
+    pub fn new_minimax(tools: Vec<Tool>, start_token_id: u32, end_token_id: u32, guidance_tokens: GuidanceTokens) -> Self {
         Self {
             tools,
             start_token_id,
@@ -531,6 +681,7 @@ impl ToolCallGrammar {
             format: ToolFormat::MiniMax,
             marker_token_ids: HashMap::new(),
             value_rules: HashMap::new(),
+            guidance_tokens,
         }
     }
     pub fn new_glm47_moe(
@@ -538,6 +689,7 @@ impl ToolCallGrammar {
         start_token_id: u32,
         end_token_id: u32,
         marker_token_ids: HashMap<String, u32>,
+        guidance_tokens: GuidanceTokens,
     ) -> Self {
         Self {
             tools,
@@ -546,9 +698,10 @@ impl ToolCallGrammar {
             format: ToolFormat::Glm47Moe,
             marker_token_ids,
             value_rules: HashMap::new(),
+            guidance_tokens,
         }
     }
-    pub fn new_json(tools: Vec<Tool>, start_token_id: u32, end_token_id: u32) -> Self {
+    pub fn new_json(tools: Vec<Tool>, start_token_id: u32, end_token_id: u32, guidance_tokens: GuidanceTokens) -> Self {
         Self {
             tools,
             start_token_id,
@@ -556,6 +709,7 @@ impl ToolCallGrammar {
             format: ToolFormat::Json,
             marker_token_ids: HashMap::new(),
             value_rules: HashMap::new(),
+            guidance_tokens,
         }
     }
 }
@@ -581,17 +735,20 @@ impl GrammarBuilder for ToolCallGrammar {
 impl ToolCallGrammar {
     pub fn build_generic_lark(&mut self) -> String {
         if self.tools.is_empty() {
-            r#"start: text
- text: /(?s:.+?)/
-"#
-            .to_string()
+            format!(
+                r#"start: text
+ text: {}
+ "#,
+                self.guidance_tokens.text_grammar_mask()
+            )
         } else {
             format!(
                 r#"start: tool_call
-tool_call: <[{}]> text <[{}]>
-text: /(?s:.+?)/
+tool_call: <[{}]> tool_text <[{}]>
+tool_text: {}
 "#,
-                self.start_token_id, self.end_token_id
+                self.start_token_id, self.end_token_id,
+                self.guidance_tokens.text_grammar_mask()
             )
         }
     }
@@ -1005,7 +1162,7 @@ pub fn request_has_tool_grammar(
     request: &ChatCompletionRequest,
     enable_tool_grammar: bool,
 ) -> bool {
-    enable_tool_grammar
+    (enable_tool_grammar || crate::utils::env::llg_full_enabled())
         && !matches!(
             request.tool_choice.as_ref(),
             Some(crate::tools::ToolChoice::Mode(
@@ -1084,34 +1241,51 @@ impl<'a> GrammarRequestDispatcher<'a> {
         // masks until after the </think> token). The grammar only constrains the
         // structured output — tool call JSON, JSON schema, regex, etc.
         // Reasoning effort is used only for non-grammar reasoning control.
+        let enable_reasoning = crate::utils::env::llg_full_enabled() && !self.disable_reasoning;
 
-        // Only activate LLG when the request actually specifies something to constrain.
-        if constraint_grammar.is_none() && tool_grammar.is_none() {
+        // Determine if we should activate llguidance at all.
+        // This is independent of reasoning - we build a grammar whenever:
+        // 1. XINFER_LLG_FULL is set (full-envelope mode), OR
+        // 2. There are user constraints (structured outputs, response format, etc.), OR
+        // 3. There are tools to constrain
+        let should_activate_llg = crate::utils::env::llg_full_enabled()
+            || constraint_grammar.is_some()
+            || tool_grammar.is_some();
+
+        if !should_activate_llg {
             return None;
         }
 
         let max_tokens = self.request.max_tokens.unwrap_or(0);
 
         let force_tool_call = request_requires_tool_call(self.request);
+
+        // Build free text expression using token range notation
+        let free_text_expr = self.guidance_tokens.text_grammar_mask();
+
         let grammar = match (constraint_grammar, tool_grammar) {
             (None, Some(mut tool_grammar)) if force_tool_call => {
                 StructuredOutputsGrammar::new(StructuredConstraint::Lark(tool_grammar.build_lark()))
             }
             (None, Some(tool_grammar)) => {
                 let text_grammar = StructuredOutputsGrammar::new(StructuredConstraint::Lark(
-                    "start: text\ntext[stop=\"\"]: /(?s:.+?)/".to_string(),
+                    format!(r#"start: text
+text: {}
+"#, free_text_expr),
                 ));
-                GrammarComposer::compose_constraint_with_tools(text_grammar, Some(tool_grammar))
+                GrammarComposer::compose_constraint_with_tools(text_grammar, Some(tool_grammar), force_tool_call)
             }
             (constraint_grammar, tool_grammar) => {
-                // Build only the structured output constraint grammar — NO reasoning wrapping.
+                // Build only the structured output constraint grammar - NO reasoning wrapping.
                 let constraint_grammar = constraint_grammar.unwrap_or_else(|| {
                     StructuredOutputsGrammar::new(StructuredConstraint::Lark(
-                        "start: text\ntext[stop=\"\"]: /(?s:.+?)/".to_string(),
+                        format!(r#"start: text
+text: {}
+"#, free_text_expr),
                     ))
                 });
 
-                GrammarComposer::compose_constraint_with_tools(constraint_grammar, tool_grammar)
+                GrammarComposer::compose_constraint_with_tools(constraint_grammar, tool_grammar, force_tool_call)
             }
         };
 
@@ -1122,6 +1296,11 @@ impl<'a> GrammarRequestDispatcher<'a> {
             max_tokens,
             self.chat_template,
             self.tokenizer,
+            enable_reasoning,
+            self.request.reasoning_effort.as_ref()
+                .map(|s| ReasoningEffort::from_str(s.to_string()))
+                .unwrap_or(ReasoningEffort::default()),
+            force_tool_call,
         );
         grammar_cache_insert(cache_key, grammar.clone());
         Some(grammar)
@@ -1304,33 +1483,47 @@ impl<'a> GrammarRequestDispatcher<'a> {
             &self.guidance_tokens.tool_call_end_ids,
         );
 
+        if !self.enable_tool_grammar {
+            return Some(ToolCallGrammar::new_generic(
+                tools,
+                start_token_id,
+                end_token_id,
+                self.guidance_tokens.clone(),
+            ));
+        }
+
         // TODO align 1:1 with parser selection
         match self.parser_name.as_str() {
             "qwen_coder" => Some(ToolCallGrammar::new_qwen_coder(
                 tools,
                 start_token_id,
                 end_token_id,
+                self.guidance_tokens.clone(),
             )),
             "minimax_m2" => Some(ToolCallGrammar::new_minimax(
                 tools,
                 start_token_id,
                 end_token_id,
+                self.guidance_tokens.clone(),
             )),
             "glm47_moe" => Some(ToolCallGrammar::new_glm47_moe(
                 tools,
                 start_token_id,
                 end_token_id,
                 self.resolve_glm_marker_token_ids(),
+                self.guidance_tokens.clone(),
             )),
             "gemma4" => Some(ToolCallGrammar::new_json(
                 tools,
                 start_token_id,
                 end_token_id,
+                self.guidance_tokens.clone(),
             )),
             "qwen" | "json" | _ => Some(ToolCallGrammar::new_json(
                 tools,
                 start_token_id,
                 end_token_id,
+                self.guidance_tokens.clone(),
             )),
         }
     }
@@ -1348,24 +1541,22 @@ impl GrammarComposer {
         max_tokens: usize,
         chat_template: Option<crate::utils::chat_template::ChatTemplate>,
         tokenizer: &Tokenizer,
+        enable_reasoning: bool,
+        reasoning_effort: ReasoningEffort,
+        force_tool_call: bool,
     ) -> TopLevelGrammar {
         let merged_constraints = Self::merge_constraints(constraint_grammars);
         let composed_with_tools =
-            Self::compose_constraint_with_tools(merged_constraints, tool_grammar);
-        let mut grammar = Self::finalize_with_eos(composed_with_tools, guidance_tokens);
+            Self::compose_constraint_with_tools(merged_constraints, tool_grammar, force_tool_call);
+        let wrapped = if enable_reasoning {
+            Self::wrap_reasoning(composed_with_tools, guidance_tokens, reasoning_effort)
+        } else {
+            composed_with_tools
+        };
+        let mut grammar = Self::suffix_with_eos(wrapped, guidance_tokens);
 
         // Derive role from chat template: MiniMax uses "ai", most others use "assistant"
-        let role = chat_template
-            .as_ref()
-            .and_then(|t| t.get_template_string())
-            .and_then(|tmpl| {
-                if tmpl.contains("\"ai\"") || tmpl.contains("'ai'") {
-                    Some("ai".to_string())
-                } else {
-                    None
-                }
-            })
-            .unwrap_or_else(|| "assistant".to_string());
+        let role = extract_llm_role_from_template(chat_template.clone(), guidance_tokens, tokenizer);
 
         if guidance_tokens.add_bos_token {
             grammar = Self::prefix_with_bos(grammar, guidance_tokens, role);
@@ -1403,16 +1594,157 @@ impl GrammarComposer {
     fn compose_constraint_with_tools(
         base: StructuredOutputsGrammar,
         tool: Option<ToolCallGrammar>,
+        force_tool_call: bool,
     ) -> StructuredOutputsGrammar {
         match tool {
             Some(mut tool_gram) => {
                 let tool_constraint = StructuredConstraint::Lark(tool_gram.build_lark());
                 let mut tool_grammar = StructuredOutputsGrammar::new(tool_constraint);
                 let mut base_mut = base;
-                base_mut.compose_alternate(&mut tool_grammar)
+                if force_tool_call {
+                    base_mut.compose_sequence(&mut tool_grammar)
+                } else {
+                    base_mut.compose_alternate(&mut tool_grammar)
+                }
             }
             None => base,
         }
+    }
+
+    /// Wrap base grammar with reasoning block - dispatches based on reasoning effort level.
+    /// Uses sequence composition to properly chain reasoning_block BEFORE base grammar.
+    fn wrap_reasoning(
+        base: StructuredOutputsGrammar,
+        guidance_tokens: &GuidanceTokens,
+        reasoning_level: ReasoningEffort,
+    ) -> StructuredOutputsGrammar {
+        // Check for a user-defined reasoning grammar first (from the YAML file).
+        // The YAML value is the INNER Lark expression (the reasoning_block body).
+        // The system controls the framing (start rule, reasoning_block header,
+        // reasoning_text rule with special token injection).
+        let level_key = match &reasoning_level {
+            ReasoningEffort::None => return base,
+            ReasoningEffort::Low => "low",
+            ReasoningEffort::ModelDefault | ReasoningEffort::Medium => "medium",
+            ReasoningEffort::High => "high",
+            ReasoningEffort::ChainOfThought => "chain_of_thought",
+            ReasoningEffort::Custom(_) => "custom",
+        };
+        if let Some(user_inner) = get_user_reasoning_grammar(level_key) {
+            let end_id = guidance_tokens.reasoning_end_ids.first().copied().unwrap_or(0);
+            let reasoning_lark = match level_key {
+                "low" => format!(
+                    "start: reasoning_block \"\\n\" <[{}]>\\nreasoning_block[max_tokens=512]: {}",
+                    end_id, user_inner
+                ),
+                "high" | "chain_of_thought" => format!(
+                    "start: reasoning_block\\nreasoning_block: {}\\nreasoning_text: text_inner <[{}]>",
+                    user_inner.trim(), end_id
+                ),
+                // "medium" and "custom" are system-controlled (not in the YAML).
+                _ => unreachable!(
+                    "medium/custom are not in the YAML; get_user_reasoning_grammar returns None"
+                ),
+            };
+            let mut grammar =
+                StructuredOutputsGrammar::new(StructuredConstraint::Lark(reasoning_lark));
+            let mut base_mut = base;
+            grammar.compose_sequence(&mut base_mut);
+            return grammar;
+        }
+
+        // Generate level-specific grammar with proper text_inner / reasoning_text separation
+        let reasoning_lark = match reasoning_level {
+            ReasoningEffort::None => return base,
+            ReasoningEffort::Low => {
+                format!(
+                    r#"start: reasoning_block "\n" <[{}]>
+reasoning_block[max_tokens=512]: /[\x20-\x7E\x0A\x0D]+?/
+"#,
+                    guidance_tokens.reasoning_end_ids[0]
+                )
+            }
+            ReasoningEffort::ModelDefault | ReasoningEffort::Medium => {
+                // Original behavior - no structured grammar, just text with exclusion mask
+                format!(
+                    r#"start: reasoning_block
+reasoning_block: {}
+"#,
+                    guidance_tokens.reasoning_grammar_mask()
+                )
+            }
+            ReasoningEffort::High => {
+                // Scientific Method with preamble - 7-phase flow with validation checkpoints
+                format!(
+                    r#"start: reasoning_block
+reasoning_block: preamble scientific_flow
+preamble: "\nI will apply the scientific method with systematic observation, hypothesis testing, and evidence-based conclusion derivation to contextualize the concern:" text_inner
+scientific_flow: observation_setup hypothesis_formulation validation_checkpoint_1 test_design result_analysis validation_checkpoint_2 conclusion_derivation validation_checkpoint_3 reasoning_text
+observation_setup: "First, I observe the following facts:" text_inner "This raises the question:" text_inner
+hypothesis_formulation: "Based on these observations, my working hypothesis is:" text_inner "If true, we would expect to see:" text_inner
+validation_checkpoint_1: "Checkpoint: Is this hypothesis logically sound and testable? " hypothesis_validation
+hypothesis_validation: "Yes, the hypothesis is sound and testable\n\n" | "No, i must reconsider my position:\n" text_inner
+test_design: "To test this hypothesis, I need to examine:" text_inner "The key methodology involves:" text_inner
+result_analysis: "Upon analysis, the data shows:" text_inner "This " ("supports" | "refutes") " my hypothesis because:" text_inner
+validation_checkpoint_2: "Checkpoint: Is the evidence sufficient and reliable? " evidence_validation
+evidence_validation: "yes, the evidence is sufficient and reliable\n\n" | "no, i must gather more data:\n" text_inner
+conclusion_derivation: "Therefore, based on this systematic analysis, I conclude:" text_inner "My confidence in this conclusion is:" text_inner "The evidence supporting this includes:" text_inner
+validation_checkpoint_3: "Checkpoint: Does this conclusion follow logically from the analysis? " conclusion_validation
+conclusion_validation: "yes, the conclusion is logically valid\n\n" | "no, i must evaluate the concern further:\n" text_inner
+text_inner[suffix="\n\n", temperature=0.0, max_tokens=512]: /.+/
+reasoning_text: text_inner <[{}]>
+"#,
+                    guidance_tokens.reasoning_end_ids[0]
+                )
+            }
+            ReasoningEffort::ChainOfThought => {
+                // Critical Thinking with extended preamble - multi-lens convergence with validation checkpoints
+                format!(
+                    r#"start: reasoning_block
+reasoning_block: preamble multi_lens_analysis synthesis_derivation reasoning_text
+preamble: "\nTo ensure maximum rigor, I will apply a multi-lens critical analysis framework examining claims, evidence, assumptions, implications, alternatives, and synthesis:" text_inner
+multi_lens_analysis: claim_examination claim_validation evidence_assumption_evaluation evidence_validation implication_mapping implication_validation alternative_consideration alternative_validation integration_process integration_validation
+claim_examination: "Dimension 1 - The Core Claim:\nMy starting position is:" text_inner "The boundaries and scope of this claim are:" text_inner "I recognize this claim rests on certain premises that must be validated:" text_inner
+claim_validation: "Checkpoint: Is this position logically sound and well-defined?" claim_check
+claim_check: "yes, the position is sound and well-defined\n\n" | "no, i must refine my understanding:\n" text_inner "\n\n"
+evidence_assumption_evaluation: "Dimension 2 - Evidence and Assumptions:\nThe supporting evidence for this claim consists of:" text_inner "However, I must critically examine whether this evidence is:" text_inner "Additionally, there are hidden assumptions embedded in my reasoning:" text_inner "I need to determine if these are:" text_inner
+evidence_validation: "Checkpoint: Is the evidence reliable and assumptions valid?" evidence_check
+evidence_check: "yes, the evidence is reliable and assumptions are valid\n\n" | "no, i must evaluate the evidence further:\n" text_inner "\n\n"
+implication_mapping: "Dimension 3 - Logical Consequences:\nIf my claim holds, then the necessary implications are:" text_inner "These implications create further obligations for:" text_inner "I must verify that these consequences are:" text_inner
+implication_validation: "Checkpoint: Do these implications follow necessarily?" implication_check
+implication_check: "yes, the implications follow necessarily\n\n" | "no, i must reconsider the consequences:\n" text_inner "\n\n"
+alternative_consideration: "Dimension 4 - Competing Perspectives:\nAn equally valid alternative interpretation would be:" text_inner "The strengths of this alternative are:" text_inner "However, the weaknesses include:" text_inner "Comparing the two frameworks, I find that:" text_inner
+alternative_validation: "Checkpoint: Have alternatives been fairly evaluated?" alternative_check
+alternative_check: "yes, alternatives have been fairly evaluated\n\n" | "no, i must explore other perspectives:\n" text_inner "\n\n"
+integration_process: "Synthesis Across All Dimensions:\nBringing together the claim examination, evidence assessment, implication mapping, and alternative consideration, I arrive at:" text_inner "The key insights that emerge from this multi-lens analysis are:" text_inner "These insights converge on a single logical conclusion:" text_inner
+integration_validation: "Checkpoint: Does the synthesis converge logically?" integration_check
+integration_check: "yes, the synthesis converges logically\n\n" | "no, i must reconcile the dimensions:\n" text_inner "\n\n"
+synthesis_derivation: "Final Conclusion:\nTherefore, after systematic critical analysis, my logically justified position is:" text_inner "I am confident in this conclusion because:" text_inner "The limitations of this analysis include:" text_inner
+text_inner[suffix="\n\n", temperature=0.0, max_tokens=1024]: /.+/
+reasoning_text: text_inner <[{}]>
+"#,
+                    guidance_tokens.reasoning_end_ids[0]
+                )
+            }
+            #[cfg(all(not(feature = "python"), not(feature = "pyo3")))]
+            ReasoningEffort::Custom(template) => {
+                // User-provided template with token ID injection
+                let start_id = guidance_tokens.reasoning_start_ids.first().copied().unwrap_or(0);
+                let end_id = guidance_tokens.reasoning_end_ids.first().copied().unwrap_or(0);
+                let text_rule = format!(
+                    r#"reasoning_text: {}"#,
+                    guidance_tokens.reasoning_grammar_mask(),
+                );
+                template
+                    .replace("$START_ID", &start_id.to_string())
+                    .replace("$END_ID", &end_id.to_string())
+                    .replace("$REASONING_TEXT_RULE", &text_rule)
+            }
+        };
+        let mut reasoning_grammar =
+            StructuredOutputsGrammar::new(StructuredConstraint::Lark(reasoning_lark));
+        let mut base_mut = base;
+        reasoning_grammar.compose_sequence(&mut base_mut)
     }
 
     fn prefix_with_bos(
@@ -1472,7 +1804,7 @@ impl GrammarComposer {
         TopLevelGrammar::from_lark_ascii(&new_lark)
     }
 
-    fn finalize_with_eos(
+    fn suffix_with_eos(
         mut grammar: StructuredOutputsGrammar,
         guidance_tokens: &GuidanceTokens,
     ) -> TopLevelGrammar {
@@ -1692,8 +2024,91 @@ pub fn is_reasoning_grammar(grammar: &TopLevelGrammar) -> bool {
     let lark_str = get_lark_from_top_level_grammar(grammar);
     lark_str.lines().any(|l| {
         let trimmed = l.trim();
-        trimmed.starts_with("reasoning_block:") && trimmed.contains("<[") && trimmed.contains("]>")
+        trimmed.starts_with("reasoning_block: ") && trimmed.contains("<[") && trimmed.contains("]>")
     })
+}
+
+/// Extract all role names from chat template by finding strings between BOS pattern and colon.
+/// Returns a Vec of all role candidates found in the template.
+fn extract_all_role_names_from_template(template: &str, bos_pattern: &str) -> Vec<String> {
+    let mut role_names: Vec<String> = vec![];
+
+    // Find all occurrences of BOS pattern in the template
+    let mut start = 0;
+    while let Some(pos) = template[start..].find(bos_pattern) {
+        let absolute_pos = start + pos;
+        let after_bos = &template[absolute_pos + bos_pattern.len()..];
+
+        // Find the colon that marks the end of the role name
+        if let Some(colon_pos) = after_bos.find(':') {
+            // Extract the role name (trim whitespace)
+            let role_candidate = after_bos[..colon_pos].trim();
+
+            // Validate role name - should be alphanumeric with possible underscores/hyphens
+            if !role_candidate.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-') {
+                // Skip invalid role names
+                start = absolute_pos + 1;
+                continue;
+            }
+
+            if !role_names.contains(&role_candidate.to_string()) {
+                role_names.push(role_candidate.to_string());
+            }
+        }
+
+        start = absolute_pos + 1;
+    }
+
+    role_names
+}
+
+/// Extract the LLM's role name from chat template.
+/// Finds all role names, filters out non-LLM roles, and returns the most likely LLM role.
+fn extract_llm_role_from_template(
+    chat_template: Option<ChatTemplate>,
+    guidance_tokens: &GuidanceTokens,
+    tokenizer: &Tokenizer,
+) -> String {
+    // Default fallback
+    let default_role = "assistant";
+
+    // Get BOS token string representation
+    let bos_string = guidance_tokens
+        .bos_token_ids
+        .first()
+        .and_then(|id| tokenizer.decode(&[*id], false).ok())
+        .unwrap_or_else(|| "<[bos]>".to_string());
+
+    // Get the template string - clone to avoid lifetime issues
+    let template = match chat_template {
+        Some(t) => match t.get_template_string() {
+            Some(s) => s.to_string(),
+            None => return default_role.to_string(),
+        },
+        None => return default_role.to_string(),
+    };
+
+    // Step 1: Find all role names between BOS pattern and colon
+    let all_roles = extract_all_role_names_from_template(&template, &bos_string);
+
+    // Step 2: Filter out non-LLM roles
+    let excluded_roles: std::collections::HashSet<&str> =
+        ["user", "system", "tool", "tool_response", "function", "observation", "query"]
+            .iter()
+            .cloned()
+            .collect();
+
+    let llm_roles: Vec<&String> = all_roles
+        .iter()
+        .filter(|r| !excluded_roles.contains(&r.to_lowercase().as_str()))
+        .collect();
+
+    // Step 3: Return the most likely LLM role with priority
+    if llm_roles.is_empty() {
+        return default_role.to_string();
+    }
+
+    llm_roles[0].clone()
 }
 
 /// Build TopLevelGrammar from a GrammarRequest
@@ -1875,6 +2290,7 @@ mod tests {
             tool_call_start_ids: vec![151657],
             tool_call_end_ids: vec![151658],
             add_bos_token: false,
+            add_eos_token: false,
         }
     }
 
@@ -2422,5 +2838,122 @@ mod tests {
         assert!(lark.contains("%json"));
         assert!(lark.contains("name"));
         assert!(!lark.contains("metadata"));
+    }
+
+    /// Verify the full-envelope pipeline (default reasoning + the advertised toolset)
+    /// reproduces grammar_sample.txt 1:1. Uses the in-memory mock tokenizer (the
+    /// same pattern as the other tests) and the sample file as the
+    /// checked-in oracle.
+    #[test]
+    fn test_pipeline_matches_grammar_sample() {
+        use crate::tools::ToolBuilder;
+        // the mock tokenizer (the in-memory BPE, the same pattern as the other tests)
+        let tokenizer = tokenizer();
+        // the GuidanceTokens matching the grammar_sample.txt token IDs: 248045 is the
+        // BOS (always excluded); 248044 + 248046 are the EOS pair.
+        let tokens = GuidanceTokens {
+            bos_token_ids: vec![248045],
+            eos_token_ids: vec![248046, 248044],
+            reasoning_start_ids: vec![248068],
+            reasoning_end_ids: vec![248069],
+            tool_call_start_ids: vec![248058],
+            tool_call_end_ids: vec![248059],
+            add_bos_token: false,
+            add_eos_token: true,
+        };
+        // the advertised toolset (the 5 tools from the grammar_sample.txt)
+        let tools = vec![
+            ToolBuilder::new("fetch_url_via_curl".into(), "Fetch a URL via curl".into())
+                .param("url", "string", "The URL to fetch", true)
+                .param("proxy", "string", "The proxy to use", false)
+                .build(),
+            ToolBuilder::new("fs_cat".into(), "Cat a file".into())
+                .param("path", "string", "The file path", true)
+                .build(),
+            ToolBuilder::new("fs_ls".into(), "List a directory".into())
+                .param("path", "string", "The directory path", true)
+                .build(),
+            ToolBuilder::new("get_current_time".into(), "Get the current time".into()).build(),
+            ToolBuilder::new("web_search_searxng".into(), "Search the web via searxng".into())
+                .param("query", "string", "The search query", true)
+                .param("searxng", "string", "The searxng instance", false)
+                .build(),
+        ];
+        // drive the pipeline directly (the enable_reasoning = true, the default
+        // ModelDefault reasoning level) to avoid the llg_full_enabled() Once OnceLock
+        let constraint = StructuredOutputsGrammar::new(StructuredConstraint::Lark(format!(
+            "start: text\ntext: {}\n",
+            tokens.text_grammar_mask()
+        )));
+        let tool_grammar = ToolCallGrammar::new_qwen_coder(
+            tools,
+            tokens.tool_call_start_ids[0],
+            tokens.tool_call_end_ids[0],
+            tokens.clone(),
+        );
+        let grammar = GrammarComposer::compose_all_grammars(
+            vec![constraint],
+            Some(tool_grammar),
+            &tokens,
+            16384,
+            None,
+            &tokenizer,
+            true, // the enable_reasoning (the full-envelope mode)
+            ReasoningEffort::default(),
+            false, // the force_tool_call
+        );
+        let lark = get_lark_from_top_level_grammar(&grammar);
+        println!("=== pipeline grammar ===\n{}", lark);
+        // the inline oracle (the grammar_sample.txt content, pure ASCII) — the
+        // full-envelope pipeline output must match this 1:1.
+        let expected = r#"start: reasoning_block ( text | tool_call )+ eos
+reasoning_block: (<[^248044-248046,248058-248059,248068-248069]>)+ (<[248069]>)
+text: (<[^248044-248046,248058-248059,248068-248069]>)+
+tool_call: <[248058]> tool_content <[248059]>
+param_0_0: "\n<parameter=url>\n" value_string
+param_0_1: "\n<parameter=proxy>\n" value_string
+tool_0: "\n<function=fetch_url_via_curl>" param_0_0 (param_0_1)? "</function>\n"
+param_1_0: "\n<parameter=path>\n" value_string
+tool_1: "\n<function=fs_cat>" param_1_0 "</function>\n"
+param_2_0: "\n<parameter=path>\n" value_string
+tool_2: "\n<function=fs_ls>" param_2_0 "</function>\n"
+tool_3: "\n<function=get_current_time>\n" "</function>\n"
+param_4_0: "\n<parameter=query>\n" value_string
+param_4_1: "\n<parameter=searxng>\n" value_string
+tool_4: "\n<function=web_search_searxng>" param_4_0 (param_4_1)? "</function>\n"
+tool_content: tool_0 | tool_1 | tool_2 | tool_3 | tool_4
+value_string[suffix="\n</parameter>\n"]: /[\x20-\x7E\x0A\x0D]+?/
+eos: ( <[248046]> | <[248044]> )
+"#;
+        assert_eq!(
+            lark.trim(),
+            expected.trim(),
+            "the pipeline grammar must match the inline oracle 1:1"
+        );
+    }
+
+    /// The YAML user-grammar loader: the checked-in example/grammars.yml loads and
+    /// its levels are returned by get_user_reasoning_grammar; the collision check
+    /// rejects a level that defines a system-controlled rule; a missing file
+    /// errors.
+    #[test]
+    fn test_yaml_grammar_file_yaml() {
+        // the checked-in example (the example/grammars.yml) — the real user-grammar file
+        load_grammar_file("example/grammars.yml").expect("the example/grammars.yml loads");
+        let low = get_user_reasoning_grammar("low").expect("low level present in the example");
+        assert!(!low.is_empty(), "the example defines a low-level reasoning body");
+        let high = get_user_reasoning_grammar("high").expect("high level present in the example");
+        assert!(!high.is_empty(), "the example defines a high-level reasoning body");
+        // collision: a level that defines a system-controlled rule is rejected
+        let dir = std::env::temp_dir();
+        let path2 = dir.join("test_load_grammar_file_collision.yml");
+        std::fs::write(&path2, "reasoning:\n  low: |\n    start: something\n").unwrap();
+        assert!(
+            load_grammar_file(path2.to_str().unwrap()).is_err(),
+            "a level defining 'start:' must be rejected"
+        );
+        let _ = std::fs::remove_file(&path2);
+        // missing file errors
+        assert!(load_grammar_file("/nonexistent/grammars.yml").is_err());
     }
 }

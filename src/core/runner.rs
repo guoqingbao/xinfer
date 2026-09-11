@@ -72,6 +72,36 @@ fn sampling_params_for_batch_index<'a>(seqs: &'a Seqs<'a>, index: usize) -> &'a 
     }
 }
 
+/// Map a xinfer Sampling strategy to the PDA GPU sampling strategy.
+#[cfg(feature = "cuda")]
+fn pda_sampling_from(sampling: &crate::utils::logits_processor::Sampling) -> attention_rs::pda::PdaSampling {
+    use crate::utils::logits_processor::Sampling as S;
+    match sampling {
+        S::ArgMax => attention_rs::pda::PdaSampling::Greedy,
+        S::All { temperature } if *temperature <= 1e-6 => attention_rs::pda::PdaSampling::Greedy,
+        S::All { temperature } => attention_rs::pda::PdaSampling::TopKTopP {
+            temperature: *temperature,
+            top_k: -1,
+            top_p: 1.0,
+        },
+        S::TopK { k, temperature } => attention_rs::pda::PdaSampling::TopKTopP {
+            temperature: *temperature,
+            top_k: *k as i32,
+            top_p: 1.0,
+        },
+        S::TopP { p, temperature } => attention_rs::pda::PdaSampling::TopKTopP {
+            temperature: *temperature,
+            top_k: -1,
+            top_p: *p,
+        },
+        S::TopKThenTopP { k, p, temperature } => attention_rs::pda::PdaSampling::TopKTopP {
+            temperature: *temperature,
+            top_k: *k as i32,
+            top_p: *p,
+        },
+    }
+}
+
 fn guided_decoding_requests<'a>(
     seqs: &'a Seqs<'a>,
     seq_ids: &'a [usize],
@@ -197,7 +227,9 @@ pub struct ModelRunner {
     cached_sampling: RwLock<Option<CachedSamplingParams>>,
     seq_tokens: RwLock<HashMap<usize, Vec<u32>>>,
     restored_prefix_sequences: RwLock<HashSet<usize>>,
-    guided_decoding: GuidedDecoding,
+    pub(crate) guided_decoding: GuidedDecoding,
+    /// The per-seq anti-loop kicks (the sampling constraint, bridged from the engine).
+    kick_store: RwLock<crate::utils::loop_detect::KickStore>,
     transfer: Option<Arc<Transfer>>,
     is_first_rank: bool,
     pub(crate) model_type: ModelType,
@@ -207,10 +239,59 @@ pub struct ModelRunner {
     pub(crate) mtp_num_speculative: usize,
     /// Optional external DFlash2 drafter.
     pub(crate) dflash_drafter: Option<crate::speculative::DFlashDrafter>,
+    /// PDA projected masks for MTP verify (set by the runner before each MTP step).
+    #[cfg(feature = "cuda")]
+    pub(crate) pda_projected_masks: Option<Tensor>,
 }
 
 impl ModelRunner {
     // Mamba slots track concurrent sequence states (not KV token blocks).
+
+    /// Resolve the per-sequence sampling strategy (each seq.sampling_params) into the
+    /// per-batch tensors (the temperature_d, the top_p_d, the top_k_d) for the QoS-gated
+    /// per-sequence sampling path.
+    fn resolve_perseq_sampling(
+        seqs: &Seqs,
+        logits: &Tensor,
+    ) -> Result<(Tensor, Tensor, Tensor)> {
+        let b = match seqs {
+            Seqs::SeqRefs(s) => s.len(),
+            Seqs::DecodeVec(v) => v.len(),
+        };
+        let device = logits.device();
+        let mut temps = Vec::with_capacity(b);
+        let mut top_ps = Vec::with_capacity(b);
+        let mut top_ks = Vec::with_capacity(b);
+        match seqs {
+            Seqs::SeqRefs(s) => {
+                for seq in *s {
+                    let sp = &seq.sampling_params;
+                    temps.push(sp.temperature.unwrap_or(0.7));
+                    top_ps.push(sp.top_p.unwrap_or(0.95));
+                    top_ks.push(sp.top_k.unwrap_or(32) as u32);
+                }
+            }
+            Seqs::DecodeVec(v) => {
+                for seq in v.iter() {
+                    let sp = &seq.sampling_params;
+                    temps.push(sp.temperature.unwrap_or(0.7));
+                    top_ps.push(sp.top_p.unwrap_or(0.95));
+                    top_ks.push(sp.top_k.unwrap_or(32) as u32);
+                }
+            }
+        }
+        let temperature_d = Tensor::from_vec(temps, (b,), device)?;
+        let top_p_d = Tensor::from_vec(top_ps, (b,), device)?;
+        let top_k_d = Tensor::from_vec(top_ks, (b,), device)?;
+        Ok((temperature_d, top_p_d, top_k_d))
+    }
+
+    /// Set the PDA projected masks for the next MTP verify step.
+    /// Called by the engine before `run_mtp_decode` when a grammar is active.
+    #[cfg(feature = "cuda")]
+    pub fn set_pda_projected_masks(&mut self, masks: Option<Tensor>) {
+        self.pda_projected_masks = masks;
+    }
 
     pub(crate) fn is_mla_model(&self) -> bool {
         // Classical MLA only (FlashInfer MLA plans). DeepSeek V4 is a separate
@@ -882,12 +963,15 @@ impl ModelRunner {
             seq_tokens: RwLock::new(HashMap::new()),
             restored_prefix_sequences: RwLock::new(HashSet::new()),
             guided_decoding: GuidedDecoding::new(llg_factory),
+            kick_store: RwLock::new(crate::utils::loop_detect::KickStore::new()),
             transfer,
             is_first_rank: comm.rank() == 0,
             model_type,
             mtp_head,
             mtp_num_speculative,
             dflash_drafter,
+            #[cfg(feature = "cuda")]
+            pda_projected_masks: None,
         })
     }
 
@@ -1159,12 +1243,26 @@ impl ModelRunner {
             match &seqs {
                 Seqs::SeqRefs(sequences) => {
                     for sequence in *sequences {
-                        let count = sequence
-                            .prefill_chunk_tokens(self.config.effective_prefill_chunk_size());
-                        drafter.store_decode_hidden(
-                            &projected.narrow(0, offset, count)?,
-                            sequence.id,
-                        )?;
+                        let count = sequence.prefill_chunk_tokens(
+                            sequence
+                                .active_prefill_chunk
+                                .unwrap_or(self.config.effective_prefill_chunk_size()),
+                        );
+                        // Prefill position check: only seed DFlash context when within
+                        // context_window tokens of the prefill end. Prevents accumulating
+                        // truncated early-prefill context (which degrades draft quality).
+                        let should_seed = if is_prefill && drafter.context_window() > 0 {
+                            sequence.len().saturating_sub(sequence.num_cached_tokens)
+                                <= drafter.context_window()
+                        } else {
+                            true
+                        };
+                        if should_seed {
+                            drafter.store_decode_hidden(
+                                &projected.narrow(0, offset, count)?,
+                                sequence.id,
+                            )?;
+                        }
                         offset += count;
                     }
                 }
@@ -1307,9 +1405,12 @@ impl ModelRunner {
         let mut max_seqlen_q = 0;
         let mut max_seqlen_k = 0;
         let mut slot_mapping = Vec::new();
-        let chunk_size = self.config.effective_prefill_chunk_size();
         let mut max_context_len = 0;
         for (seq_idx, seq) in seqs.iter().enumerate() {
+            // Adaptive chunk size stamped by the scheduler (fallback: static config).
+            let chunk_size = seq
+                .active_prefill_chunk
+                .unwrap_or(self.config.effective_prefill_chunk_size());
             let num_tokens = seq.prefill_chunk_tokens(chunk_size);
             input_ids
                 .extend(&seq.token_ids[seq.num_cached_tokens..seq.num_cached_tokens + num_tokens]);
@@ -1757,6 +1858,11 @@ impl ModelRunner {
             Seqs::DecodeVec(v) => v.iter().map(|s| s.id()).collect(),
         };
 
+        // the anti-loop kicks (the sampling constraint, the per-row penalty): the
+        // forbid token -> -inf + the seed tokens -> a penalty scaled by the period.
+        // No-op when no kick is active for the batch.
+        let logits = self.apply_loop_kicks(&logits, &seq_ids);
+
         // Get the batch size for deciding whether to use parallel sampling
         let batch_size = match seqs {
             Seqs::SeqRefs(seqs) => seqs.len(),
@@ -1907,14 +2013,24 @@ impl ModelRunner {
             logits.to_owned()
         };
 
-        let guided_requests = guided_decoding_requests(&seqs, &seq_ids);
-        let guided_positions: Vec<usize> = guided_requests
+        let all_requests = guided_decoding_requests(&seqs, &seq_ids);
+        let guided_positions: Vec<usize> = all_requests
             .iter()
             .enumerate()
             .filter_map(|(index, request)| request.grammar.is_some().then_some(index))
             .collect();
         let tokens = if guided_positions.is_empty() {
-            self.sample_processed_logits(&logits, &cached_params.sampling)?
+            if crate::utils::env::qos_enabled() && !is_prefill {
+                // the QoS-gated per-sequence sampling (the additive path): each sequence
+                // samples with its own strategy (the per-batch temperature / top_p / top_k),
+                // instead of the single shared cached_params strategy.
+                let (temperature_d, top_p_d, top_k_d) =
+                    Self::resolve_perseq_sampling(&seqs, &logits)?;
+                self.logit_processor
+                    .sample_with_strategy_perseq(&logits, &temperature_d, &top_p_d, &top_k_d)?
+            } else {
+                self.sample_processed_logits(&logits, &cached_params.sampling)?
+            }
         } else {
             let guided_indices = Tensor::from_vec(
                 guided_positions.iter().map(|&index| index as u32).collect(),
@@ -1924,23 +2040,111 @@ impl ModelRunner {
             let original_guided_logits = logits.index_select(&guided_indices, 0)?;
             let guided_requests: Vec<_> = guided_positions
                 .iter()
-                .map(|&index| guided_requests[index])
+                .map(|&index| all_requests[index])
                 .collect();
-            let (guided_logits, guided_step) = self
-                .guided_decoding
-                .apply(&original_guided_logits, &guided_requests)?;
-            let sample_logits = if guided_positions.len() == seq_ids.len() {
-                guided_logits
+            let guided_tokens: Vec<u32> = if crate::utils::env::pda_current() && self.guided_decoding.has_pda_table() {
+                // On-GPU current-position PDA masking: compute mask from the per-seq
+                // PDA control state, sample, advance. Non-guided rows sample normally.
+                let guided_logits = logits.index_select(&guided_indices, 0)?;
+                let guided_seq_ids: Vec<usize> = guided_positions
+                    .iter()
+                    .map(|&i| all_requests[i].seq_id)
+                    .collect();
+                let pda_sampling = pda_sampling_from(&cached_params.sampling);
+                let g_tokens = self
+                    .guided_decoding
+                    .pda_current_step(&guided_logits, &guided_seq_ids, &pda_sampling)?;
+                let g_tokens: Vec<u32> = g_tokens.flatten_all().unwrap().to_vec1::<u32>().unwrap();
+                let mut full = vec![0u32; seq_ids.len()];
+                for (j, &pos) in guided_positions.iter().enumerate() {
+                    full[pos] = g_tokens.get(j).copied().unwrap_or(0);
+                }
+                let non_guided: Vec<usize> = (0..seq_ids.len())
+                    .filter(|i| !guided_positions.contains(i))
+                    .collect();
+                if !non_guided.is_empty() {
+                    let ng_idx = Tensor::from_vec(
+                        non_guided.iter().map(|&i| i as u32).collect(),
+                        (non_guided.len(),),
+                        logits.device(),
+                    )?;
+                    let ng_logits = logits.index_select(&ng_idx, 0)?;
+                    let ng_tokens = self.sample_processed_logits(&ng_logits, &cached_params.sampling)?;
+                    for (j, &pos) in non_guided.iter().enumerate() {
+                        full[pos] = ng_tokens[j];
+                    }
+                }
+                full
+            } else if crate::utils::env::spec_mask_offload() {
+                // GPU offload: build mask directly (single compute_mask_or_eos call).
+                // Do NOT call apply() here - it consumes ff_tokens_cache as a side effect,
+                // causing the second compute_mask_or_eos in build_allow_mask to see a
+                // different parser state. The FSM commit for the produced token is done
+                // once, at the terminal ingress (gate_commit), just before the append.
+                if crate::utils::env::vob_sampling() {
+                    // VOB bitset path: 8x less data than F32 mask.
+                    let vob_words = self
+                        .guided_decoding
+                        .build_vob_words(&all_requests, logits.dim(1)?)
+                        .map(|words| {
+                            candle_core::Tensor::from_vec(
+                                words,
+                                (all_requests.len(), logits.dim(1)? / 32),
+                                logits.device(),
+                            )
+                        })
+                        .transpose()?;
+                    let mut tokens = self.logit_processor.sample_with_vob(
+                        &logits,
+                        &cached_params.sampling,
+                        vob_words.as_ref(),
+                    )?;
+                    self.guided_decoding.apply_fast_forward(&seq_ids, &mut tokens);
+                    tokens
+                } else {
+                    let mask = self
+                        .guided_decoding
+                        .build_allow_mask(&all_requests, logits.dim(1)?, logits.device())?;
+                    let mut tokens = if crate::utils::env::qos_enabled() {
+                        // the QoS-gated per-sequence strategy (the additive path): each row
+                        // samples with its own temperature / top_p / top_k.
+                        let (temperature_d, top_p_d, top_k_d) =
+                            Self::resolve_perseq_sampling(&seqs, &logits)?;
+                        match mask.as_ref() {
+                            Some(m) => self.logit_processor.sample_with_strategy_perseq_masked(
+                                &logits, m, &temperature_d, &top_p_d, &top_k_d,
+                            )?,
+                            None => self.logit_processor.sample_with_strategy_perseq(
+                                &logits, &temperature_d, &top_p_d, &top_k_d,
+                            )?,
+                        }
+                    } else {
+                        self.logit_processor.sample_with_strategy_masked(
+                            &logits,
+                            &cached_params.sampling,
+                            mask.as_ref(),
+                        )?
+                    };
+                    self.guided_decoding.apply_fast_forward(&seq_ids, &mut tokens);
+                    tokens
+                }
             } else {
-                let guided_delta = (&guided_logits - &original_guided_logits)?;
-                logits.index_add(&guided_indices, &guided_delta, 0)?
+                // Original path: apply() computes masked logits via index_add.
+                let (guided_logits, _guided_step) = self
+                    .guided_decoding
+                    .apply(&original_guided_logits, &guided_requests)?;
+                let sample_logits = if guided_positions.len() == seq_ids.len() {
+                    guided_logits
+                } else {
+                    let guided_delta = (&guided_logits - &original_guided_logits)?;
+                    logits.index_add(&guided_indices, &guided_delta, 0)?
+                };
+                let mut tokens =
+                    self.sample_processed_logits(&sample_logits, &cached_params.sampling)?;
+                self.guided_decoding.apply_fast_forward(&seq_ids, &mut tokens);
+                tokens
             };
-            let mut tokens =
-                self.sample_processed_logits(&sample_logits, &cached_params.sampling)?;
-            self.guided_decoding
-                .apply_fast_forward(&seq_ids, &mut tokens);
-            self.guided_decoding.commit(&seq_ids, &tokens, guided_step);
-            tokens
+            guided_tokens
         };
 
         // Track tokens for sequences when penalties are enabled
@@ -1960,6 +2164,107 @@ impl ModelRunner {
 
         // Guided token commits are handled immediately after sampling.
         Ok(tokens)
+    }
+
+    /// Speculative fast-forward decode: sample the base token (the current `run`, which
+    /// commits it to the FSM), then append the full grammar-forced (ff) run that follows.
+    /// The ff tokens are deterministic (forced by the grammar), so they are committed
+    /// directly without model sampling. Returns `[base_token, ff_run...]` per sequence;
+    /// the next draft anchors on the last ff token (the `instead of the base token" case).
+    pub fn run_speculative_ff(&self, seqs: Seqs) -> Result<Vec<u32>> {
+        // The sampling only: the base token (the current run). The ordered-queue
+        // commit (the base + the grammar-forced continuation) is done by the
+        // single gate (the `gate_commit` with `ff = true`), so the spec-FF path
+        // no longer has its own mid-step writers.
+        self.run(seqs, false)
+    }
+
+    /// The single matcher-gated ingress: commit each sequence's produced run to the
+    /// FSM and return only the FSM-passing prefix. Every token-production path
+    /// (plain, spec-FF, MTP, DFlash) funnels through this one call just before the
+    /// sequence append, so the sequence can never hold a token the FSM rejected.
+    ///
+    /// `ff` selects the ordered-queue writer: when true (the spec-FF path) the base
+    /// run is committed, the grammar-forced continuation is read from the settled
+    /// state, and the continuation is committed — all in acquisition order, so the
+    /// queue [base, ff…] is appended as one serialized stream. When false (the
+    /// plain/MTP/DFlash paths) the whole run is committed as-is.
+    pub fn gate_commit(&self, seq_ids: &[usize], runs: &[Vec<u32>], ff: bool) -> Vec<Vec<u32>> {
+        runs.iter()
+            .enumerate()
+            .map(|(i, run)| {
+                let sid = seq_ids[i];
+                let n_base = self.guided_decoding.commit_run(sid, run);
+                let mut queue = run[..n_base].to_vec();
+                if ff {
+                    let ff_run = self.guided_decoding.ff_tokens(sid);
+                    if !ff_run.is_empty() {
+                        let n_ff = self.guided_decoding.commit_run(sid, &ff_run);
+                        queue.extend(ff_run[..n_ff].to_vec());
+                    }
+                }
+                queue
+            })
+            .collect()
+    }
+
+    /// Bridge the anti-loop kick from the engine (the sampling constraint: the
+    /// forbid token + the seed + the period). The kick is applied at the next
+    /// sampling step (the LogitsProcessor consults the kick_store).
+    pub fn set_loop_kick(&self, seq_id: usize, forbid: u32, seed: Vec<u32>, period: u32) {
+        use crate::utils::loop_detect::LoopSpan;
+        self.kick_store.write().apply(
+            seq_id,
+            &LoopSpan {
+                period,
+                unit: vec![forbid],
+                seed,
+            },
+        );
+    }
+
+    /// Clear the anti-loop kick for a sequence (the loop cleared).
+    pub fn clear_loop_kick(&self, seq_id: usize) {
+        self.kick_store.write().remove(seq_id);
+    }
+
+    /// Apply the active anti-loop kicks as a sampling constraint (the per-row
+    /// penalty on the logits, before sampling). The forbid token (the loop
+    /// trigger) is set to -inf (the hard exclusion); the seed tokens (the first
+    /// ~20% of the loop unit) get a penalty scaled by the period (the longer the
+    /// loop, the harder the kick). This is a sampling intervention, not a grammar-
+    /// mask perturbation, so the mask stays a pure function of the settled FSM
+    /// state. No-op when no kick is active for the batch.
+    fn apply_loop_kicks(&self, logits: &Tensor, seq_ids: &[usize]) -> Tensor {
+        // When the 1-phase (full-envelope) grammar is active, the grammar itself
+        // constrains the generation and breaks the loop; the sampling kick is skipped.
+        if crate::utils::env::llg_full_enabled() {
+            return logits.clone();
+        }
+        let kicks = self.kick_store.read();
+        let any_kick = seq_ids.iter().any(|&sid| kicks.is_active(sid));
+        if !any_kick {
+            return logits.clone();
+        }
+        let (b, v) = logits.dims2().expect("logits is 2-D");
+        let device = logits.device();
+        let mut flat: Vec<f32> = vec![0.0f32; b * v];
+        for (i, &sid) in seq_ids.iter().enumerate() {
+            if let Some(kick) = kicks.get(sid) {
+                if (kick.forbid as usize) < v {
+                    flat[i * v + kick.forbid as usize] = f32::NEG_INFINITY;
+                }
+                let penalty = -(kick.period as f32) * 2.0;
+                for &seed_tok in &kick.seed {
+                    if (seed_tok as usize) < v {
+                        flat[i * v + seed_tok as usize] = penalty;
+                    }
+                }
+            }
+        }
+        drop(kicks);
+        let penalty_tensor = Tensor::from_vec(flat, (b, v), device).expect("penalty tensor");
+        logits.add(&penalty_tensor).expect("add penalty to logits")
     }
 
     pub fn finished(&self, id: usize) {
@@ -2031,7 +2336,7 @@ impl ModelRunner {
                     label,
                     self.mtp_num_speculative
                 );
-                mtp_cap.capture_mtp(&self.device, kv_pairs, self.mtp_num_speculative)?;
+mtp_cap.capture_mtp(&self.device, kv_pairs, self.mtp_num_speculative)?;
             }
         }
 
@@ -2296,5 +2601,46 @@ mod tests {
         assert_eq!(requests[3].seq_id, 13);
         assert!(requests[3].grammar.is_some());
         assert_eq!(requests[3].reasoning_end_ids, &[7, 8]);
+    }
+
+    /// The QoS-gated per-sequence path: two sequences with distinct sampling params
+    /// must resolve to distinct per-batch strategy tensors (the temperature / top_p /
+    /// top_k), not a single shared strategy.
+    #[test]
+    fn test_resolve_perseq_sampling_distinct_strategies() {
+        use candle_core::{DType, Device, Tensor};
+        use super::ModelRunner;
+
+        let seqs = vec![
+            decode_sequence_with_sampling(10, Some(0.5), Some(16), Some(0.9)),
+            decode_sequence_with_sampling(11, Some(1.0), Some(64), Some(0.5)),
+        ];
+        let logits = Tensor::zeros((2, 8), DType::F32, &Device::Cpu).unwrap();
+        let (temperature_d, top_p_d, top_k_d) =
+            ModelRunner::resolve_perseq_sampling(&Seqs::DecodeVec(&seqs), &logits).unwrap();
+        assert_eq!(temperature_d.to_vec1::<f32>().unwrap(), vec![0.5, 1.0]);
+        assert_eq!(top_p_d.to_vec1::<f32>().unwrap(), vec![0.9, 0.5]);
+        assert_eq!(top_k_d.to_vec1::<u32>().unwrap(), vec![16, 64]);
+    }
+
+    fn decode_sequence_with_sampling(
+        id: usize,
+        temperature: Option<f32>,
+        top_k: Option<isize>,
+        top_p: Option<f32>,
+    ) -> DecodeSequence {
+        let mut sampling_params = SamplingParams::new_with_max_tokens(16);
+        sampling_params.temperature = temperature;
+        sampling_params.top_k = top_k;
+        sampling_params.top_p = top_p;
+        DecodeSequence {
+            id,
+            last_token: 0,
+            len: 1,
+            last_block_tokens: 1,
+            block_table_last: 0,
+            block_tables: vec![0],
+            sampling_params,
+        }
     }
 }

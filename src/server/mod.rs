@@ -894,6 +894,13 @@ pub struct Args {
     #[arg(long, default_value = None)]
     pub draft_model: Option<String>,
 
+    /// Path to a YAML file with user-defined reasoning grammars.
+    /// Keys are reasoning effort levels (low, high, chain_of_thought).
+    /// Values are Lark grammar strings with $START_ID/$END_ID/TEXT_RULE placeholders.
+    /// Levels not present in the file use the built-in default.
+    #[arg(long, default_value = None)]
+    pub reasoning_grammars: Option<String>,
+
     /// Enable grammar-based generation: tool grammar, structured outputs, and client constraints
     #[arg(long, default_value = "false")]
     pub enable_tool_grammar: bool,
@@ -1971,6 +1978,7 @@ mod tests {
             tool_call_start_ids: Vec::new(),
             tool_call_end_ids: Vec::new(),
             add_bos_token: false,
+            add_eos_token: false,
         };
 
         normalize_reasoning_controls(&mut params, &guidance_tokens);
@@ -1993,6 +2001,7 @@ mod tests {
             tool_call_start_ids: Vec::new(),
             tool_call_end_ids: Vec::new(),
             add_bos_token: false,
+            add_eos_token: false,
         };
 
         normalize_reasoning_controls(&mut params, &guidance_tokens);
@@ -2014,6 +2023,7 @@ mod tests {
             tool_call_start_ids: Vec::new(),
             tool_call_end_ids: Vec::new(),
             add_bos_token: false,
+            add_eos_token: false,
         };
 
         normalize_reasoning_controls(&mut params, &guidance_tokens);
