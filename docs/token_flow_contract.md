@@ -109,6 +109,12 @@ It is reached only via `LLMEngine::finish_step`, only from the engine loop, with
 the gate's returned runs. The PD-server prefill-transfer append is a separate path
 (outside the decode contract).
 
+`postprocess` is also the single REAP site: a sequence whose yields no token on a
+decode pass (a finished or stuckynced FSM) is marked `Finished` and deallocated
+there, so it cannot dangle and be re-scheduled forever. The engine therefore must
+not skip `finish_step` on an all-empty result — skipping it is what turned a stuck
+sequence into an infinite "all runners returned empty" spin.
+
 ## What would break the contract
 
 - A second FSM writer (a `commit_run` / `try_consume_tokens` outside the gate).
@@ -117,6 +123,8 @@ the gate's returned runs. The PD-server prefill-transfer append is a separate pa
 - A per-token settle (the settle must run once per committed batch).
 - The naive PDA `lookup` / scan in place of `advance_eps` / `mask_at_cfg`.
 - A Sequence append outside `postprocess`.
+- Skipping `finish_step` on an all-empty decode result (a stuck sequence is never
+  reaped and the engine spins retrying it forever).
 
 Each of these re-introduces a window where the FSM, the PDA, and the Sequence can
 diverge, which is the class of bug this contract exists to prevent.
