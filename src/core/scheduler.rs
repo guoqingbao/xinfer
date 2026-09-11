@@ -712,6 +712,20 @@ impl Scheduler {
             let tokens = &multi_output_ids[i];
             let seq_id = self.running[idx].id;
 
+            // A stuck sequence (the runner produced no token) must be reaped, not left
+            // dangling. Without this, the engine's "all empty" retry path skips
+            // finish_step forever and the sequence is re-scheduled indefinitely.
+            if tokens.is_empty() {
+                crate::log_warn!(
+                    "[Seq {}] produced no token (stuck); reaping to avoid a dangling sequence",
+                    seq_id
+                );
+                let seq = &mut self.running[idx];
+                seq.status = SequenceStatus::Finished;
+                self.block_manager.deallocate(seq);
+                continue;
+            }
+
             // PD server: transfer KV cache on first token, then move to next sequence.
             if self.is_pd_server() {
                 if let Some(&first_token) = tokens.first() {

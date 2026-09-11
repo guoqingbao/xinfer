@@ -2625,15 +2625,15 @@ impl LLMEngine {
 
                     match forward_result {
                         Ok(multi_output_ids) => {
-                            // If all outputs are empty, the runner hit a transient
-                            // error (e.g. drafter mask mismatch). Skip finish_step
-                            // and retry on the next tick. Sequences stay in the
-                            // running list; no data is lost.
+                            // If all outputs are empty, the runner hit a stuck state (a finished or
+                            // desynced sequence). Do NOT skip finish_step: its
+                            // postprocess reaps empty rows (marks them Finished +
+                            // deallocates), so a stuck sequence cannot dangle and be
+                            // re-scheduled forever.
                             if multi_output_ids.iter().all(|ids| ids.is_empty()) {
                                 crate::log_warn!(
-                                    "[Engine Loop] All runners returned empty (transient error), retrying next tick"
+                                    "[Engine Loop] All runners returned empty; reaping via finish_step"
                                 );
-                                continue;
                             }
                             // Single matcher-gated ingress: commit each produced run to the
                             // FSM and keep only the FSM-passing prefix, just before the
