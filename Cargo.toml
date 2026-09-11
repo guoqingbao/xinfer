@@ -42,6 +42,12 @@ zstd = "0.13"
 aes-gcm = "0.10"
 sha2 = "0.10"
 zeroize = "1.7"
+# GPUDirect Storage (the cuFile API) for the zero-copy NVMe<->GPU state store.
+cudarc = { version = "0.19", optional = true, features = ["cufile"] }
+# S3-compatible client (the AWS / MinIO / Ceph / RustFS) for the object-store
+# backend. The mature rust-s3 crate (the dgrk/rust-s3) with the reqwest-rustls
+# (the no OpenSSL) + the tokio (the async) + the blocking (the sync bridge) backends.
+rust-s3 = { version = "0.37", optional = true, features = ["with-tokio", "blocking", "tokio-rustls-tls"] }
 rand = "0.9.0"
 rayon="1.10.0"
 clap = { version = "4.4.7", features = ["derive"] }
@@ -95,6 +101,8 @@ flashinfer = ["attention-rs/flashinfer"]
 metal = ["candle-core/metal", "candle-nn/metal", "attention-rs/metal", "attention-rs/metal-flash", "dep:metal"]
 python = ["pyo3"]
 nvtx = ["dep:nvtx"]
+gds = ["cuda", "dep:cudarc"]
+s3 = ["dep:rust-s3"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
 openssl-sys = { version = "0.9", features = ["vendored"] }

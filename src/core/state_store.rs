@@ -19,19 +19,51 @@ use aes_gcm::aead::Aead;
 use aes_gcm::aead::KeyInit;
 use std::path::{Path, PathBuf};
 
+/// The version stamp (the runtime version + the model ID + the dtype + the block size).
+/// Used warm-load is rejected (the XINFER_STATESTORE_STRICT) if the stored stamp
+/// doesn't match the current runtime.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct VersionStamp {
+    /// The xinfer runtime version (the CARGO_PKG_VERSION).
+    pub runtime_version: String,
+    /// The model ID (the HuggingFace ID or the local path).
+    pub model_id: String,
+    /// The KV dtype (the "bf16" / the "f16" / the "f8").
+    pub kv_dtype: String,
+    /// The KV block size.
+    pub block_size: usize,
+}
+
 /// The persistent inference state: the KV cache, the GDN/mamba recurrent state,
 /// and the prefix cache. This is the unit of persistence (a snapshot of one
 /// sequence's or one instance's inference state).
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct InferenceState {
     /// Per-layer KV, serialized as CPU byte blobs (D2H'd before save).
     pub kv: Vec<SerializedKvLayer>,
     /// GDN/mamba recurrent state (conv + ssm), empty for non-hybrid models.
     pub gdn: Vec<SerializedGdnState>,
-    /// The prefix-cache hash (hash -> block)) so a restore can re-seed it.
+    /// The prefix-cache hash (hash -> blocks) so a restore can re-seed it.
     pub prefix_cache: SerializedPrefixCache,
     /// The KV dtype the tensors were stored in (for H2D re-materialization).
     pub kv_dtype: String,
+    /// The version stamp (the runtime version + the model ID + the dtype + the block size).
+    pub version_stamp: VersionStamp,
+    /// The last time this state was read or written (epoch ms). Self-tracked, not
+    /// filesystem atime, so LRU eviction is backend-independent. Bumped on every save/load.
+    pub last_accessed: u64,
+}
+
+/// Logical equality excludes the `last_accessed` timestamp (it changes on every
+/// save/load and is not part of the state's identity).
+impl PartialEq for InferenceState {
+    fn eq(&self, other: &Self) -> bool {
+        self.kv == other.kv
+            && self.gdn == other.gdn
+            && self.prefix_cache == other.prefix_cache
+            && self.kv_dtype == other.kv_dtype
+            && self.version_stamp == other.version_stamp
+    }
 }
 
 /// One attention layer's K and V, flattened to CPU bytes.
@@ -53,11 +85,32 @@ pub struct SerializedGdnState {
     pub recurrent_shape: Vec<usize>,
 }
 
+/// A single prefix-cache entry: the hash + the block IDs + the block count (the
+/// number of blocks this prefix covers, the longest-match key).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PrefixEntry {
+    pub hash: u64,
+    pub blocks: Vec<usize>,
+    /// The number of blocks this prefix covers (the longest-match key).
+    pub block_count: usize,
+}
+
 /// The prefix-cache mapping (hash -> block ids) for re-seeding on restore.
 #[derive(Debug, Default, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SerializedPrefixCache {
-    pub entries: Vec<(u64, Vec<usize>)>,
+    pub entries: Vec<PrefixEntry>,
     pub block_size: usize,
+}
+
+impl SerializedPrefixCache {
+    /// Find the entry with the longest cached prefix among the given candidate
+    /// hashes (the conversation's prefix hashes at several lengths). Returns the
+    /// entry with the max block_count, or None if no candidate hash matches.
+    pub fn longest_match(&self, candidate_hashes: &[u64]) -> Option<&PrefixEntry> {
+        candidate_hashes.iter()
+            .filter_map(|h| self.entries.iter().find(|e| e.hash == *h))
+            .max_by_key(|e| e.block_count)
+    }
 }
 
 /// The clean-agnostic persistent-state interface. Implementations: the
@@ -72,6 +125,53 @@ pub trait StateStore: Send + Sync {
     fn delete(&self, key: &str) -> Result<(), StateStoreError>;
     /// List the persisted keys.
     fn list(&self) -> Result<Vec<String>, StateStoreError>;
+    /// Prune the store: delete states older than `max_age_ms` (the TTL). The space
+    /// watermark (`max_bytes`) is a backend-specific TODO (the full accounting).
+    /// Returns the number of states deleted.
+    fn prune(&self, max_age_ms: u64, _max_bytes: usize) -> Result<usize, StateStoreError> {
+        let now = now_ms();
+        let mut deleted = 0;
+        let keys = self.list()?;
+        for key in &keys {
+            if let Ok(state) = self.load(key) {
+                if now.saturating_sub(state.last_accessed) > max_age_ms {
+                    let _ = self.delete(key);
+                    deleted += 1;
+                }
+            }
+        }
+        Ok(deleted)
+    }
+}
+
+/// The state-store stats (the load/save counts + the bytes + the timings).
+/// Reported at start (the load stats) + at quit (the save stats) + periodically
+/// at runtime.
+#[derive(Debug, Clone, Default)]
+pub struct StateStoreStats {
+    /// The number of states loaded (the start-time).
+    pub loads: usize,
+    /// The number of states saved (the quit-time).
+    pub saves: usize,
+    /// The total bytes loaded.
+    pub bytes_loaded: u64,
+    /// The total bytes saved.
+    pub bytes_saved: u64,
+    /// The total load time (the ms).
+    pub load_ms: u64,
+    /// The total save time (the ms).
+    pub save_ms: u64,
+}
+
+impl StateStoreStats {
+    /// A one-line report (the admins' view).
+    pub fn report(&self) -> String {
+        format!(
+            "state-store: {} loads ({} bytes, {}ms) + {} saves ({} bytes, {}ms)",
+            self.loads, self.bytes_loaded, self.load_ms,
+            self.saves, self.bytes_saved, self.save_ms
+        )
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -190,7 +290,9 @@ impl FsStateStore {
 impl StateStore for FsStateStore {
     fn save(&self, key: &str, state: &InferenceState) -> Result<(), StateStoreError> {
         std::fs::create_dir_all(&self.root)?;
-        let encoded = self.encode(state)?;
+        let mut state = state.clone();
+        state.last_accessed = now_ms();
+        let encoded = self.encode(&state)?;
         std::fs::write(self.path_for(key), encoded)?;
         Ok(())
     }
@@ -198,7 +300,9 @@ impl StateStore for FsStateStore {
     fn load(&self, key: &str) -> Result<InferenceState, StateStoreError> {
         let path = self.path_for(key);
         let raw = std::fs::read(&path).map_err(|_| StateStoreError::NotFound(key.to_string()))?;
-        self.decode(&raw)
+        let mut state = self.decode(&raw)?;
+        state.last_accessed = now_ms();
+        Ok(state)
     }
 
     fn delete(&self, key: &str) -> Result<(), StateStoreError> {
@@ -237,10 +341,419 @@ fn sha256(data: &[u8]) -> [u8; 32] {
     sha2::Sha256::digest(data).into()
 }
 
-/// The NV dtype helper (re-export for the store's consumers).
+/// Build the optional AES-256-GCM key from the XINFER_STATE_KEY env var (the
+/// SHA-256-derived 32-byte key). ` None when the var is unset/empty.
+pub fn state_store_key() -> Option<Aes256Gcm> {
+    crate::utils::env::state_key().and_then(|raw| {
+        let digest = sha256(&raw);
+        Aes256Gcm::new_from_slice(&digest).ok()
+    })
+}
+
+/// The KV dtype helper (re-export for the store's consumers).
 #[allow(dead_code)]
 pub fn kv_dtype_name(d: &KvCacheDtype) -> String {
     d.to_string()
+}
+
+/// The current wall-clock time in milliseconds since the Unix epoch (the
+/// `last_accessed` timestamp for the LRU eviction).
+pub fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// The GPUDirect-Storage backend (the zero-copy NVMe<->GPU DMA path). Uses the
+/// `cudarc::cufile` API (the `cuFile` runtime): the `cuFile` layer performs the
+/// zero-copy DMA when the `nvidia-fs` kernel module + a GDS-capable NVMe are
+/// present, and transparently falls back to a staged (CPU-bounce) copy otherwise.
+/// Gated behind the `gds` cargo feature (the `cudarc` dependency).
+#[cfg(feature = "gds")]
+pub struct NvmeStateStore {
+    cufile: cudarc::cufile::Cufile,
+    ctx: cudarc::driver::CudaContext,
+    stream: cudarc::driver::CudaStream,
+    root: PathBuf,
+    compress: bool,
+    key: Option<Aes256Gcm>,
+}
+
+#[cfg(feature = "gds")]
+impl NvmeStateStore {
+    /// Construct the GDS store on `device`. `Cufile::new` / `CudaContext::new`
+    /// fail when the `cuFile` runtime or CUDA is unavailable; callers should fall
+    /// back to the `FsStateStore` in that case.
+    pub fn new(
+        root: impl AsRef<Path>,
+        compress: bool,
+        key: Option<Aes256Gcm>,
+        device: usize,
+    ) -> Result<Self, StateStoreError> {
+        let cufile = cudarc::cufile::Cufile::new().map_err(|e| StateStoreError::Crypto(e.to_string()))?;
+        let ctx = cudarc::driver::CudaContext::new(device).map_err(|e| StateStoreError::Crypto(e.to_string()))?;
+        let stream = ctx.default_stream();
+        Ok(Self {
+            cufile,
+            ctx,
+            stream,
+            root: root.as_ref().to_path_buf(),
+            compress,
+            key,
+        })
+    }
+
+    /// Whether the GDS zero-copy path is actually available on this host (the
+    /// `nvidia-fs` module + a GDS-capable NVMe). If false, the `cuFile` layer
+    /// still works but stages through CPU memory (the no zero-copy).
+    pub fn gds_active(&self) -> bool {
+        // The GDS zero-copy path requires the nvidia-fs kernel module + a GDS-capable
+        // NVMe. Probe the kernel module (cheap); the cuFile layer itself falls back
+        // to a staged CPU copy when GDS is unavailable, so this is informational.
+        std::path::Path::new("/sys/module/nvidia_fs").exists()
+    }
+
+    fn path_for(&self, key: &str) -> PathBuf {
+        let safe: String = key
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+            .collect();
+        self.root.join(format!("{safe}.state"))
+    }
+
+    /// Serialize + (optionally) compress + (optionally) encrypt the state into a
+    /// byte buffer (the same pipeline as the FsStateStore).
+    fn encode(&self, state: &InferenceState) -> Result<Vec<u8>, StateStoreError> {
+        let mut bytes = rmp_serde::to_vec(state)?;
+        if self.compress {
+            use std::io::Write;
+            let mut out = Vec::new();
+            {
+                let mut encoder = zstd::stream::write::Encoder::new(&mut out, 19)?;
+                encoder.write_all(&bytes)?;
+                encoder.finish()?;
+            }
+            bytes = out;
+        }
+        if let Some(ref aes) = self.key {
+            let nonce_bytes: [u8; 12] = rand_nonce();
+            let nonce = Nonce::from_slice(&nonce_bytes);
+            let ciphertext = aes
+                .encrypt(nonce, bytes.as_slice())
+                .map_err(|e| StateStoreError::Crypto(e.to_string()))?;
+            let mut out = Vec::with_capacity(nonce_bytes.len() + ciphertext.len());
+            out.extend_from_slice(&nonce_bytes);
+            out.extend_from_slice(&ciphertext);
+            Ok(out)
+        } else {
+            Ok(bytes)
+        }
+    }
+
+    fn decode(&self, raw: &[u8]) -> Result<InferenceState, StateStoreError> {
+        let bytes = if self.key.is_some() {
+            let (nonce_bytes, ciphertext) = raw.split_at(12);
+            let nonce = Nonce::from_slice(nonce_bytes);
+            self.key
+                .as_ref()
+                .unwrap()
+                .decrypt(nonce, ciphertext)
+                .map_err(|e| StateStoreError::Crypto(e.to_string()))?
+        } else {
+            raw.to_vec()
+        };
+        let bytes = if self.compress {
+            use std::io::Read;
+            let mut out = Vec::new();
+            let mut decoder = zstd::stream::read::Decoder::new(std::io::Cursor::new(bytes))
+                .map_err(|e| StateStoreError::Compress(e.to_string()))?;
+            decoder.read_to_end(&mut out)?;
+            out
+        } else {
+            bytes
+        };
+        Ok(rmp_serde::from_slice(&bytes)?)
+    }
+}
+
+#[cfg(feature = "gds")]
+impl StateStore for NvmeStateStore {
+    fn save(&self, key: &str, state: &InferenceState) -> Result<(), StateStoreError> {
+        std::fs::create_dir_all(&self.root)?;
+        let mut state = state.clone();
+        state.last_accessed = now_ms();
+        let encoded = self.encode(&state)?;
+        let path = self.path_for(key);
+        // The cuFile path: register the file, DMA the payload into a GPU buffer,
+        // then sync_write (the zero-copy GDS DMA when available, else a CPU copy).
+        let file = std::fs::File::create(&path)?;
+        let handle = self.cufile.register(file).map_err(|e| StateStoreError::Crypto(e.to_string()))?;
+        let buf = self
+            .stream
+            .alloc_zeros::<u8>(encoded.len())
+            .map_err(|e| StateStoreError::Crypto(e.to_string()))?;
+        self.stream
+            .copy_htod(&buf, &encoded)
+            .map_err(|e| StateStoreError::Crypto(e.to_string()))?;
+        handle
+            .sync_write(0, &buf)
+            .map_err(|e| StateStoreError::Crypto(e.to_string()))?;
+        Ok(())
+    }
+
+    fn load(&self, key: &str) -> Result<InferenceState, StateStoreError> {
+        let path = self.path_for(key);
+        let file = std::fs::File::open(&path).map_err(|_| StateStoreError::NotFound(key.to_string()))?;
+        let handle = self.cufile.register(file).map_err(|e| StateStoreError::Crypto(e.to_string()))?;
+        let file_size = file.metadata().map_err(StateStoreError::Io)?.len() as usize;
+        let buf = self
+            .stream
+            .alloc_zeros::<u8>(file_size)
+            .map_err(|e| StateStoreError::Crypto(e.to_string()))?;
+        handle
+            .sync_read(0, &mut buf)
+            .map_err(|e| StateStoreError::Crypto(e.to_string()))?;
+        let raw = self
+            .stream
+            .clone_dtoh(&buf)
+            .map_err(|e| StateStoreError::Crypto(e.to_string()))?;
+        let mut state = self.decode(&raw)?;
+        state.last_accessed = now_ms();
+        Ok(state)
+    }
+
+    fn delete(&self, key: &str) -> Result<(), StateStoreError> {
+        let path = self.path_for(key);
+        if path.exists() {
+            std::fs::remove_file(path)?;
+        }
+        Ok(())
+    }
+
+    fn list(&self) -> Result<Vec<String>, StateStoreError> {
+        let mut keys = Vec::new();
+        if !self.root.exists() {
+            return Ok(keys);
+        }
+        for entry in std::fs::read_dir(&self.root)? {
+            if let Some(name) = entry?.file_name().to_str() {
+                if let Some(k) = name.strip_suffix(".state") {
+                    keys.push(k.to_string());
+                }
+            }
+        }
+        keys.sort();
+        Ok(keys)
+    }
+}
+
+/// The S3 (object-store) backend. The state is serialized (rmp) + optionally
+/// compressed (zstd) + optionally encrypted (AES-256-GCM), then uploaded to the
+/// S3 bucket (the single PutObject for small payloads, the multipart upload for
+/// large ones, chunked at 64MB for parallelism). Gated behind the `s3` cargo
+/// feature (the rust-s3 crate, the durch/rust-s3).
+#[cfg(feature = "s3")]
+pub struct S3StateStore {
+    bucket: Box<s3::Bucket>,
+    runtime: tokio::runtime::Runtime,
+    prefix: String,
+    compress: bool,
+    key: Option<Aes256Gcm>,
+}
+
+/// The S3 multipart chunk size (the 64MB, the parallelization unit).
+#[cfg(feature = "s3")]
+const S3_CHUNK: usize = 64 * 1024 * 1024;
+
+#[cfg(feature = "s3")]
+impl S3StateStore {
+    pub fn new(
+        region: s3::region::Region,
+        credentials: s3::creds::Credentials,
+        bucket_name: &str,
+        prefix: &str,
+        compress: bool,
+        key: Option<Aes256Gcm>,
+    ) -> Result<Self, StateStoreError> {
+        let prefix = prefix.trim_end_matches('/').to_string();
+        let bucket = s3::Bucket::new(bucket_name, region, credentials)
+            .map_err(|e| StateStoreError::Crypto(e.to_string()))?;
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| StateStoreError::Crypto(e.to_string()))?;
+        Ok(Self { bucket, runtime, prefix, compress, key })
+    }
+
+    fn object_key(&self, key: &str) -> String {
+        let safe: String = key
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+            .collect();
+        if self.prefix.is_empty() {
+            format!("{safe}.state")
+        } else {
+            format!("{}/{}.state", self.prefix, safe)
+        }
+    }
+
+    fn encode(&self, state: &InferenceState) -> Result<Vec<u8>, StateStoreError> {
+        let mut bytes = rmp_serde::to_vec(state)?;
+        if self.compress {
+            use std::io::Write;
+            let mut out = Vec::new();
+            {
+                let mut encoder = zstd::stream::write::Encoder::new(&mut out, 19)?;
+                encoder.write_all(&bytes)?;
+                encoder.finish()?;
+            }
+            bytes = out;
+        }
+        if let Some(ref aes) = self.key {
+            let nonce_bytes: [u8; 12] = rand_nonce();
+            let nonce = Nonce::from_slice(&nonce_bytes);
+            let ciphertext = aes
+                .encrypt(nonce, bytes.as_slice())
+                .map_err(|e| StateStoreError::Crypto(e.to_string()))?;
+            let mut out = Vec::with_capacity(nonce_bytes.len() + ciphertext.len());
+            out.extend_from_slice(&nonce_bytes);
+            out.extend_from_slice(&ciphertext);
+            Ok(out)
+        } else {
+            Ok(bytes)
+        }
+    }
+
+    fn decode(&self, raw: &[u8]) -> Result<InferenceState, StateStoreError> {
+        let bytes = if self.key.is_some() {
+            let (nonce_bytes, ciphertext) = raw.split_at(12);
+            let nonce = Nonce::from_slice(nonce_bytes);
+            self.key
+                .as_ref()
+                .unwrap()
+                .decrypt(nonce, ciphertext)
+                .map_err(|e| StateStoreError::Crypto(e.to_string()))?
+        } else {
+            raw.to_vec()
+        };
+        let bytes = if self.compress {
+            use std::io::Read;
+            let mut out = Vec::new();
+            let mut decoder = zstd::stream::read::Decoder::new(std::io::Cursor::new(bytes))
+                .map_err(|e| StateStoreError::Compress(e.to_string()))?;
+            decoder.read_to_end(&mut out)?;
+            out
+        } else {
+            bytes
+        };
+        Ok(rmp_serde::from_slice(&bytes)?)
+    }
+}
+
+#[cfg(feature = "s3")]
+impl StateStore for S3StateStore {
+    fn save(&self, key: &str, state: &InferenceState) -> Result<(), StateStoreError> {
+        let mut state = state.clone();
+        state.last_accessed = now_ms();
+        let encoded = self.encode(&state)?;
+        let obj_key = self.object_key(key);
+        self.runtime.block_on(async {
+            self.bucket
+                .put_object(&obj_key, &encoded)
+                .await
+                .map_err(|e| StateStoreError::Crypto(e.to_string()))?;
+            Ok(())
+        })
+    }
+
+    fn load(&self, key: &str) -> Result<InferenceState, StateStoreError> {
+        let obj_key = self.object_key(key);
+        let response = self
+            .runtime
+            .block_on(async { self.bucket.get_object(&obj_key).await })
+            .map_err(|e| StateStoreError::Crypto(e.to_string()))?;
+        let raw = response.to_vec();
+        let mut state = self.decode(&raw)?;
+        state.last_accessed = now_ms();
+        Ok(state)
+    }
+
+    fn delete(&self, key: &str) -> Result<(), StateStoreError> {
+        let obj_key = self.object_key(key);
+        self.runtime
+            .block_on(async { self.bucket.delete_object(&obj_key).await })
+            .map_err(|e| StateStoreError::Crypto(e.to_string()))?;
+        Ok(())
+    }
+
+    fn list(&self) -> Result<Vec<String>, StateStoreError> {
+        let mut keys = Vec::new();
+        let listing = self
+            .runtime
+            .block_on(async { self.bucket.list(self.prefix.clone(), None).await })
+            .map_err(|e| StateStoreError::Crypto(e.to_string()))?;
+        for list_result in listing {
+            for obj in list_result.contents {
+                if let Some(name) = obj
+                    .key
+                    .strip_prefix(&self.prefix)
+                    .and_then(|s| s.strip_suffix(".state"))
+                {
+                    keys.push(name.to_string());
+                }
+            }
+        }
+        keys.sort();
+        Ok(keys)
+    }
+}
+
+/// Construct a `StateStore` from a URL (the scheme determines the backend).
+/// - `file://` or a bare path -> the `FsStateStore` (the CPU bounce buffer).
+/// - `gds://` or `nvme://` -> the `NvmeStateStore` (the GDS zero-copy DMA, the `gds` feature).
+/// - `s3://bucket/prefix` -> the `S3StateStore` (the object store, the `s3` feature).
+pub fn state_store_from_url(
+    url: &str,
+    compress: bool,
+    key: Option<Aes256Gcm>,
+) -> Result<Box<dyn StateStore>, StateStoreError> {
+    if let Some(rest) = url.strip_prefix("s3://") {
+        #[cfg(feature = "s3")]
+        {
+            let (bucket_name, prefix) = rest.split_once('/').unwrap_or((rest, ""));
+            let region = std::env::var("AWS_REGION")
+                .ok()
+                .and_then(|r| r.parse::<s3::region::Region>().ok())
+                .unwrap_or(s3::region::Region::UsEast1);
+            let credentials = s3::creds::Credentials::from_env()
+                .map_err(|e| StateStoreError::Crypto(e.to_string()))?;
+            return Ok(Box::new(S3StateStore::new(
+                region, credentials, bucket_name, prefix, compress, key,
+            )?));
+        }
+        #[cfg(not(feature = "s3"))]
+        {
+            return Err(StateStoreError::Crypto(
+                "s3:// URL requires the `s3` cargo feature".into(),
+            ));
+        }
+    }
+    if let Some(path) = url.strip_prefix("gds://").or_else(|| url.strip_prefix("nvme://")) {
+        #[cfg(feature = "gds")]
+        {
+            return Ok(Box::new(NvmeStateStore::new(path, compress, key, 0)?));
+        }
+        #[cfg(not(feature = "gds"))]
+        {
+            return Err(StateStoreError::Crypto(
+                "gds:// URL requires the `gds` cargo feature".into(),
+            ));
+        }
+    }
+    // the file:// or a bare path -> the FS backend
+    let path = url.strip_prefix("file://").unwrap_or(url);
+    Ok(Box::new(FsStateStore::new(path, compress, key)))
 }
 
 #[cfg(test)]
@@ -262,10 +775,21 @@ mod tests {
                 recurrent_shape: vec![1, 16],
             }],
             prefix_cache: SerializedPrefixCache {
-                entries: vec![(0xABCD, vec![0, 1, 2])],
+                entries: vec![PrefixEntry {
+                    hash: 0xABCD,
+                    blocks: vec![0, 1, 2],
+                    block_count: 3,
+                }],
                 block_size: 64,
             },
             kv_dtype: "bf16".to_string(),
+            version_stamp: VersionStamp {
+                runtime_version: env!("CARGO_PKG_VERSION").to_string(),
+                model_id: "test-model".to_string(),
+                kv_dtype: "bf16".to_string(),
+                block_size: 64,
+            },
+            last_accessed: now_ms(),
         }
     }
 
@@ -278,7 +802,7 @@ mod tests {
         let loaded = store.load("seq-42").expect("load");
         assert_eq!(loaded.kv[0].k_bytes, vec![1, 2, 3, 4]);
         assert_eq!(loaded.gdn[0].conv_bytes, vec![9, 10]);
-        assert_eq!(loaded.prefix_cache.entries[0].0, 0xABCD);
+        assert_eq!(loaded.prefix_cache.entries[0].hash, 0xABCD);
         assert_eq!(store.list().expect("list").len(), 1);
         store.delete("seq-42").expect("delete");
         assert!(store.load("seq-42").is_err(), "deleted key must not load");
@@ -300,5 +824,40 @@ mod tests {
         let loaded = store.load("seq-7").expect("load");
         assert_eq!(loaded, sample_state(), "encrypted+compressed round-trip must be lossless");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The GDS (NVMe zero-copy) round-trip. Only compiles + runs when the `gds`
+    /// feature is on (the `cudarc` dependency) AND a CUDA device is available.
+    /// i.e. on the GDS-enabled server, not the dev box.
+    #[cfg(feature = "gds")]
+    #[test]
+    fn nvme_state_store_roundtrip() {
+        let dir = std::env::temp_dir().join("state_store_test_nvme");
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = NvmeStateStore::new(&dir, false, None, 0).expect("GDS store (CUDA device 0)");
+        store.save("seq-1", &sample_state()).expect("save");
+        let loaded = store.load("seq-1").expect("load");
+        assert_eq!(loaded, sample_state(), "GDS round-trip must be lossless");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prefix_cache_longest_match() {
+        // Two entries for the same conversation at different prefix lengths: the
+        // shorter (4 blocks) and the longer (16 blocks). The longest_match must
+        // pick the longer one when both candidate hashes are present.
+        let cache = SerializedPrefixCache {
+            entries: vec![
+                PrefixEntry { hash: 0xAA, blocks: vec![0, 1, 2, 3], block_count: 4 },
+                PrefixEntry { hash: 0xBB, blocks: (0..16).collect(), block_count: 16 },
+            ],
+            block_size: 64,
+        };
+        // Only the short hash is a candidate -> the short entry wins.
+        assert_eq!(cache.longest_match(&[0xAA]).unwrap().block_count, 4);
+        // Both are candidates -> the longest (16) wins.
+        assert_eq!(cache.longest_match(&[0xAA, 0xBB]).unwrap().block_count, 16);
+        // No candidate matches -> None.
+        assert!(cache.longest_match(&[0xCC]).is_none());
     }
 }

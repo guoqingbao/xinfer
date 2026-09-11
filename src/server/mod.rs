@@ -897,6 +897,14 @@ pub struct Args {
     /// Enable grammar-based generation: tool grammar, structured outputs, and client constraints
     #[arg(long, default_value = "false")]
     pub enable_tool_grammar: bool,
+
+    /// Persistent inference-state store URL. The scheme selects the backend:
+    /// a bare path or `file://` (the CPU FS), `gds://`/`nvme://` (the GPUDirect
+    /// zero-copy, the `gds` feature), or `s3://bucket/prefix` (the object store,
+    /// the `s3` feature). When set, the engine warm-loads state at boot and
+    /// checkpoints it at shutdown.
+    #[arg(long, default_value = None)]
+    pub state_store: Option<String>,
 }
 
 impl Args {

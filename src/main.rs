@@ -250,6 +250,7 @@ async fn main() -> Result<()> {
         args.enable_tool_grammar,
         args.num_speculative_tokens,
         args.draft_model.clone(),
+args.state_store.clone(),
     );
 
     // Multi-node worker nodes run a daemon loop instead of the full engine
@@ -555,6 +556,10 @@ async fn main() -> Result<()> {
             break;
         }
     }
+
+    // Checkpoint persistent state to the state store at clean shutdown (the no-op
+    // when the --state-store flag is unset).
+    engine.read().checkpoint();
 
     Ok(())
 }

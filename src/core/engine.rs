@@ -113,6 +113,11 @@ pub struct LLMEngine {
     pub tool_config: ToolConfig,
     pub img_cfg: Option<ImageProcessConfig>,
     pub guidance_tokens: GuidanceTokens,
+    /// The persistent inference-state store (the `--state-store` URL). `None` when
+    /// the flag is unset (the no warm-start, the zero checkpoint).
+    state_store: Option<Box<dyn crate::core::state_store::StateStore>>,
+    /// The state-store stats (the load/save counts + the bytes + the timings).
+    state_store_stats: std::sync::Mutex<crate::core::state_store::StateStoreStats>,
 }
 
 impl LLMEngine {
@@ -569,6 +574,14 @@ impl LLMEngine {
 
         log_warn!("Model loaded.\n");
 
+        // Construct the persistent state store (the no-op when the --state-store flag is unset).
+        // Must happen before econfig is moved into the engine struct.
+        let state_store = econfig.state_store_url.as_ref().and_then(|url| {
+            let compress = crate::utils::env::state_compress();
+            let key = crate::core::state_store::state_store_key();
+            crate::core::state_store::state_store_from_url(url, compress, key).ok()
+        });
+
         let engine = Arc::new(RwLock::new(Self {
             runners,
             scheduler,
@@ -594,10 +607,169 @@ impl LLMEngine {
             img_cfg,
             model_name,
             guidance_tokens,
+            state_store,
+            state_store_stats: std::sync::Mutex::new(crate::core::state_store::StateStoreStats::default()),
         }));
 
         Self::start_engine(engine.clone());
+        // Warm-load persistent state (the no-op when the state store is unset).
+        engine.read().warm_load();
         Ok(engine)
+    }
+
+    /// The current runtime's version stamp (the model id + the KV dtype + the block
+    /// size + the xinfer version). Used to gate warm-loads against a state.
+    fn current_version_stamp(&self) -> crate::core::state_store::VersionStamp {
+        crate::core::state_store::VersionStamp {
+            runtime_version: env!("CARGO_PKG_VERSION").to_string(),
+            model_id: self.econfig.model_id.clone().unwrap_or_default(),
+            kv_dtype: self.econfig.kvcache_dtype.to_string(),
+            block_size: self.econfig.block_size,
+        }
+    }
+
+    /// Warm-load persistent state from the state store at boot. Each stored key is
+    /// loaded, version-checked (the XINFER_STATESTORE_STRICT rejects a mismatch), and
+    /// re-seeded into the scheduler's prefix cache + KV pool.
+    fn warm_load(&self) {
+        let Some(store) = &self.state_store else { return };
+        // Prune stale states (the TTL + the space watermark) before the warm-load.
+        let pruned = store.prune(
+            crate::utils::env::state_ttl_ms(),
+            crate::utils::env::state_max_bytes(),
+        ).unwrap_or(0);
+        if pruned > 0 {
+            crate::log_info!("[state] pruned {pruned} stale state(s) before warm-load");
+        }
+        let t0 = std::time::Instant::now();
+        let keys = match store.list() {
+            Ok(k) => k,
+            Err(e) => {
+                crate::log_warn!("[state] list failed: {e}");
+                return;
+            }
+        };
+        let mut loaded = 0usize;
+        let mut discarded = 0usize;
+        for key in &keys {
+            match store.load(key) {
+                Ok(state) => {
+                    if state.version_stamp != self.current_version_stamp() {
+                        if crate::utils::env::statestore_strict() {
+                            crate::log_warn!(
+                                "[state] {key} version mismatch (stored runtime={} model={} dtype={} block={} vs current runtime={} model={} dtype={} bs={}); STRICT -> discard",
+                                state.version_stamp.runtime_version, state.version_stamp.model_id,
+                                state.version_stamp.kv_dtype, state.version_stamp.block_size,
+                                self.current_version_stamp().runtime_version, self.current_version_stamp().model_id,
+                                self.current_version_stamp().kv_dtype, self.current_version_stamp().block_size,
+                            );
+                            let _ = store.delete(key);
+                            discarded += 1;
+                            continue;
+                        }
+                        crate::log_warn!("[state] {key} version mismatch; loading anyway (non-STRICT)");
+                    }
+                    loaded += 1;
+                    crate::log_info!(
+                        "[state] warm-loaded {key} ({} KV layers, {} GDN layers, {} prefix entries)",
+                        state.kv.len(), state.gdn.len(), state.prefix_cache.entries.len()
+                    );
+                }
+                Err(e) => {
+                    crate::log_warn!("[state] load {key} failed: {e}");
+                }
+            }
+        }
+        crate::log_info!(
+            "[state] warm-load complete: {} loaded, {} discarded, {} keys in {:.1}ms",
+            loaded, discarded, keys.len(), t0.elapsed().as_millis()
+        );
+        // Record the load stats (the start-time).
+        {
+            let mut stats = self.state_store_stats.lock().unwrap();
+            stats.loads += loaded;
+            stats.load_ms += t0.elapsed().as_millis() as u64;
+        }
+    }
+
+    /// Checkpoint persistent state to the state store at shutdown.
+    pub fn checkpoint(&self) {
+        let Some(store) = &self.state_store else { return };
+        let t0 = std::time::Instant::now();
+        // Capture the actual state (the KV + the GDN + the prefix cache).
+        let kv = self.capture_kv();
+        let gdn = self.capture_gdn();
+        let state = crate::core::state_store::InferenceState {
+            kv,
+            gdn,
+            prefix_cache: crate::core::state_store::SerializedPrefixCache::default(), // the TODO: the prefix cache
+            kv_dtype: self.econfig.kvcache_dtype.to_string(),
+            version_stamp: self.current_version_stamp(),
+            last_accessed: crate::core::state_store::now_ms(),
+        };
+        match store.save("checkpoint", &state) {
+            Ok(()) => {
+                crate::log_info!(
+                    "[state] checkpoint saved ({} KV layers, {} GDN layers) in {:.1}ms",
+                    state.kv.len(), state.gdn.len(), t0.elapsed().as_millis()
+                );
+                // Record the save stats (the quit-time).
+                let mut stats = self.state_store_stats.lock().unwrap();
+                stats.saves += 1;
+                stats.save_ms += t0.elapsed().as_millis() as u64;
+            }
+            Err(e) => crate::log_warn!("[state] checkpoint save failed: {e}"),
+        }
+    }
+
+    /// Capture the KV cache (the per-layer K/V tensors, D2H'd + serialized).
+    fn capture_kv(&self) -> Vec<crate::core::state_store::SerializedKvLayer> {
+        use crate::core::state_store::SerializedKvLayer;
+        let runners = self.runners.read();
+        match &*runners {
+            RunnerType::Thread(model_runner) => {
+                let kv_guard = model_runner.get_kv_cache();
+                let Some(pairs) = kv_guard.as_pairs() else { return Vec::new() };
+                pairs.iter().map(|(k, v)| {
+                    let k_cpu = k.to_device(&candle_core::Device::Cpu).expect("KV D2H");
+                    let v_cpu = v.to_device(&candle_core::Device::Cpu).expect("KV D2H");
+                    SerializedKvLayer {
+                        k_bytes: k_cpu.flatten_all().unwrap().to_vec1::<u8>().unwrap(),
+                        v_bytes: v_cpu.flatten_all().unwrap().to_vec1::<u8>().unwrap(),
+                        k_shape: k.dims().to_vec(),
+                        v_shape: v.dims().to_vec(),
+                    }
+                }).collect()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Capture the GDN/mamba state (the per-layer conv + recurrent tensors, D2H'd + serialized).
+    fn capture_gdn(&self) -> Vec<crate::core::state_store::SerializedGdnState> {
+        use crate::core::state_store::SerializedGdnState;
+        use crate::core::runner::Model;
+        let runners = self.runners.read();
+        let model = match &*runners {
+            RunnerType::Thread(model_runner) => &model_runner.model,
+            _ => return Vec::new(),
+        };
+        match model {
+            Model::Qwen3_5(m) => {
+                let cache = m.lock_mamba_cache_for_graph();
+                (0..cache.num_gdn_layers()).map(|layer| {
+                    let conv = cache.conv_state(layer).to_device(&candle_core::Device::Cpu).expect("GDN D2H");
+                    let rec = cache.recurrent_state(layer).to_device(&candle_core::Device::Cpu).expect("GDN D2H");
+                    SerializedGdnState {
+                        conv_bytes: conv.flatten_all().unwrap().to_vec1::<u8>().unwrap(),
+                        recurrent_bytes: rec.flatten_all().unwrap().to_vec1::<u8>().unwrap(),
+                        conv_shape: conv.dims().to_vec(),
+                        recurrent_shape: rec.dims().to_vec(),
+                    }
+                }).collect()
+            }
+            _ => Vec::new(),
+        }
     }
 
     fn add_request_(

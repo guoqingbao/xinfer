@@ -210,9 +210,27 @@ fn build_fp8_e4m3_lut() -> [f32; 256] {
 }
 
 struct PleShard {
-    mmap: Arc<Mmap>,
+    data: PleData,
     data_offset: usize, // absolute byte offset of the tensor data in the file
     rows: usize,
+}
+
+/// The PLE shard backing store: an mmap (the page-cache served, the default) or a
+/// direct heap read (the SM121 unified, where an mmap would compete with the
+/// model + KV for the unified host/device memory pool).
+#[derive(Clone)]
+enum PleData {
+    Mmap(Arc<Mmap>),
+    Direct(Vec<u8>),
+}
+
+impl PleData {
+    fn get(&self, range: std::ops::Range<usize>) -> &[u8] {
+        match self {
+            PleData::Mmap(m) => &m[range],
+            PleData::Direct(d) => &d[range],
+        }
+    }
 }
 
 struct PleTable {
@@ -261,7 +279,14 @@ impl PleTable {
             {
                 continue;
             }
-            let mmap = Arc::new(unsafe { Mmap::map(&file) }.map_err(candle_core::Error::wrap)?);
+            let data = if crate::utils::env::ple_no_mmap() {
+                // the SM121 bypass: the direct heap read (the no mmap, the no page-cache
+                // competition with the model + KV on the unified memory pool).
+                PleData::Direct(std::fs::read(path).map_err(candle_core::Error::wrap)?)
+            } else {
+                // the default: the mmap (the page-cache served).
+                PleData::Mmap(Arc::new(unsafe { Mmap::map(&file) }.map_err(candle_core::Error::wrap)?))
+            };
             let data_base = 8 + header_len;
             for (key, meta) in obj {
                 let offsets = meta["data_offsets"].as_array();
@@ -271,12 +296,12 @@ impl PleTable {
                         let begin = data_base + offs[0].as_u64().unwrap_or(0) as usize;
                         scale = Some(match dtype_str {
                             "F32" => f32::from_le_bytes(
-                                mmap[begin..begin + 4]
+                                data.get(begin..begin + 4)
                                     .try_into()
                                     .map_err(candle_core::Error::wrap)?,
                             ),
                             "BF16" => half::bf16::from_le_bytes(
-                                mmap[begin..begin + 2]
+                                data.get(begin..begin + 2)
                                     .try_into()
                                     .map_err(candle_core::Error::wrap)?,
                             )
@@ -336,7 +361,7 @@ impl PleTable {
                         .and_then(|v| v.as_u64())
                         .unwrap_or(0) as usize;
                 shards[shard_idx] = Some(PleShard {
-                    mmap: mmap.clone(),
+                    data: data.clone(),
                     data_offset: begin,
                     rows: shape[0],
                 });
@@ -385,7 +410,7 @@ impl PleTable {
         let start = shard.data_offset + row * n * self.dtype.elem_size();
         match self.dtype {
             PleTableDtype::F8E4M3 => {
-                let bytes = &shard.mmap[start..start + n];
+                let bytes = shard.data.get(start..start + n);
                 for (d, &b) in dst.iter_mut().zip(bytes.iter()) {
                     *d = self.fp8_lut[b as usize] * self.scale;
                 }
@@ -393,24 +418,19 @@ impl PleTable {
             PleTableDtype::BF16 => {
                 for (i, d) in dst.iter_mut().enumerate() {
                     let o = start + i * 2;
-                    *d = half::bf16::from_le_bytes([shard.mmap[o], shard.mmap[o + 1]]).to_f32();
+                    *d = half::bf16::from_le_bytes(shard.data.get(o..o + 2).try_into().unwrap()).to_f32();
                 }
             }
             PleTableDtype::F16 => {
                 for (i, d) in dst.iter_mut().enumerate() {
                     let o = start + i * 2;
-                    *d = half::f16::from_le_bytes([shard.mmap[o], shard.mmap[o + 1]]).to_f32();
+                    *d = half::f16::from_le_bytes(shard.data.get(o..o + 2).try_into().unwrap()).to_f32();
                 }
             }
             PleTableDtype::F32 => {
                 for (i, d) in dst.iter_mut().enumerate() {
                     let o = start + i * 4;
-                    *d = f32::from_le_bytes([
-                        shard.mmap[o],
-                        shard.mmap[o + 1],
-                        shard.mmap[o + 2],
-                        shard.mmap[o + 3],
-                    ]);
+                    *d = f32::from_le_bytes(shard.data.get(o..o + 4).try_into().unwrap());
                 }
             }
         }
