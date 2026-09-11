@@ -2904,11 +2904,31 @@ mod tests {
         );
         let lark = get_lark_from_top_level_grammar(&grammar);
         println!("=== pipeline grammar ===\n{}", lark);
-        let expected = include_str!("../../grammar_sample.txt");
+        // the inline oracle (the grammar_sample.txt content, pure ASCII) — the
+        // full-envelope pipeline output must match this 1:1.
+        let expected = r#"start: reasoning_block ( text | tool_call )+ eos
+reasoning_block: (<[^248044-248046,248058-248059,248068-248069]>)+ (<[248069]>)
+text: (<[^248044-248046,248058-248059,248068-248069]>)+
+tool_call: <[248058]> tool_content <[248059]>
+param_0_0: "\n<parameter=url>\n" value_string
+param_0_1: "\n<parameter=proxy>\n" value_string
+tool_0: "\n<function=fetch_url_via_curl>" param_0_0 (param_0_1)? "</function>\n"
+param_1_0: "\n<parameter=path>\n" value_string
+tool_1: "\n<function=fs_cat>" param_1_0 "</function>\n"
+param_2_0: "\n<parameter=path>\n" value_string
+tool_2: "\n<function=fs_ls>" param_2_0 "</function>\n"
+tool_3: "\n<function=get_current_time>\n" "</function>\n"
+param_4_0: "\n<parameter=query>\n" value_string
+param_4_1: "\n<parameter=searxng>\n" value_string
+tool_4: "\n<function=web_search_searxng>" param_4_0 (param_4_1)? "</function>\n"
+tool_content: tool_0 | tool_1 | tool_2 | tool_3 | tool_4
+value_string[suffix="\n</parameter>\n"]: /[\x20-\x7E\x0A\x0D]+?/
+eos: ( <[248046]> | <[248044]> )
+"#;
         assert_eq!(
             lark.trim(),
             expected.trim(),
-            "the pipeline grammar must match grammar_sample.txt 1:1"
+            "the pipeline grammar must match the inline oracle 1:1"
         );
     }
 
