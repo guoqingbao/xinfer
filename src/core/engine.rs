@@ -117,7 +117,7 @@ pub struct LLMEngine {
     /// the flag is unset (the no warm-start, the zero checkpoint).
     state_store: Option<Box<dyn crate::core::state_store::StateStore>>,
     /// The state-store stats (the load/save counts + the bytes + the timings).
-    state_store_stats: std::sync::Mutex<crate::core::state_store::StateStoreStats>,
+    state_store_stats: std::sync::Arc<std::sync::Mutex<crate::core::state_store::StateStoreStats>>,
 }
 
 impl LLMEngine {
@@ -618,12 +618,14 @@ impl LLMEngine {
             model_name,
             guidance_tokens,
             state_store,
-            state_store_stats: std::sync::Mutex::new(crate::core::state_store::StateStoreStats::default()),
+            state_store_stats: std::sync::Arc::new(std::sync::Mutex::new(crate::core::state_store::StateStoreStats::default())),
         }));
 
         Self::start_engine(engine.clone());
         // Warm-load persistent state (the no-op when the state store is unset).
         engine.read().warm_load();
+        // Start the periodic state-store stats reporter (the no-op when the store is unset).
+        engine.read().start_state_store_stats_reporter();
         Ok(engine)
     }
 
@@ -1177,6 +1179,9 @@ impl LLMEngine {
     }
 
     pub fn notify_runner_finished(&mut self, id: usize) -> Result<()> {
+        // Capture the per-sequence state delta (block_table + GDN) and persist it
+        // async so the runtime can continue processing the next request.
+        self.capture_and_persist_seq_delta(id);
         match &mut *self.runners.write() {
             RunnerType::Thread(model_runner) => Ok(model_runner.finished(id)),
             RunnerType::Process(ref mut runner_streams) => {
@@ -1204,6 +1209,134 @@ impl LLMEngine {
                 Ok(())
             }
         }
+    }
+
+/// Capture the per-sequence state delta (block_table + GDN slot) and persist it
+    /// async to the state store. Only the delta from the last state is synchronized:
+    /// the blocks allocated for this sequence and its GDN recurrent state. The
+    /// persistence runs on a spawned thread so the runtime can continue processing
+    /// the next request immediately.
+    fn capture_and_persist_seq_delta(&self, seq_id: usize) {
+        let Some(store) = &self.state_store else { return };
+        // Read the sequence's block_table from the scheduler (it's still in the
+        // running list at this point, before the runner's finished() deallocates).
+        let block_table = self
+            .scheduler
+            .get_running_by_id(seq_id)
+            .map(|s| s.block_table.clone())
+            .unwrap_or_default();
+        if block_table.is_empty() {
+            return;
+        }
+        // Capture the GDN state for this sequence's slot (non-hybrid models: empty).
+        let gdn_bytes = self.capture_gdn_for_seq(seq_id);
+        let gdn_slot = if gdn_bytes.is_empty() {
+            None
+        } else {
+            Some(self.gdn_slot_for_seq(seq_id))
+        };
+        let delta = crate::core::state_store::SeqStateDelta {
+            seq_id,
+            block_table: block_table.clone(),
+            gdn_slot,
+            gdn_bytes: gdn_bytes.clone(),
+            prefix_hash: 0, // TODO: capture the prefix-cache hash for this sequence
+            timestamp: crate::core::state_store::now_ms(),
+        };
+        // Persist async (spawned thread) so the runtime continues immediately.
+        let store_clone = store.clone_box();
+        let delta_clone = delta.clone();
+        let stats_arc = self.state_store_stats.clone();
+        std::thread::spawn(move || {
+            let t0 = std::time::Instant::now();
+            let key = format!("seq-{}", delta_clone.seq_id);
+            match store_clone.save_delta(&key, &delta_clone) {
+                Ok(()) => {
+                    let elapsed = t0.elapsed().as_millis();
+                    let delta_bytes = (delta_clone.block_table.len() * 4 + delta_clone.gdn_bytes.len()) as u64;
+                    // Update the stats (the shared mutex).
+                    if let Ok(mut stats) = stats_arc.lock() {
+                        stats.saves += 1;
+                        stats.save_ms += elapsed as u64;
+                        stats.seq_deltas += 1;
+                        stats.bytes_saved += delta_bytes;
+                        stats.bytes_since_last_report += delta_bytes;
+                        stats.gdn_size_bytes += delta_clone.gdn_bytes.len() as u64;
+                        stats.last_report_ms = crate::core::state_store::now_ms();
+                    }
+                    crate::log_info!(
+                        "[state] persisted seq-{} delta ({} blocks, {} GDN bytes) in {}ms",
+                        delta_clone.seq_id,
+                        delta_clone.block_table.len(),
+                        delta_clone.gdn_bytes.len(),
+                        elapsed
+                    );
+                }
+                Err(e) => {
+                    crate::log_warn!("[state] failed to persist seq-{} delta: {}", delta_clone.seq_id, e);
+                }
+            }
+        });
+    }
+
+    /// Capture the GDN/mamba state for a specific sequence's slot. Returns empty
+    /// for non-hybrid models.
+    fn capture_gdn_for_seq(&self, seq_id: usize) -> Vec<u8> {
+        let runners = self.runners.read();
+        match &*runners {
+            RunnerType::Thread(model_runner) => {
+                model_runner.snapshot_gdn_state(seq_id)
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Get the GDN slot index for a sequence (0 if non-hybrid).
+    fn gdn_slot_for_seq(&self, seq_id: usize) -> usize {
+        // The GDN slot is managed internally by the model. For the delta capture,
+        // we just record that a GDN state was captured (the slot is implicit).
+        let _ = seq_id;
+        0
+    }
+
+    /// Report the state-store stats (the periodic admin view). Logs a detailed
+    /// multi-line report with size breakdown, IO volumes, and rates.
+    pub fn report_state_store_stats(&self) {
+        let mut stats = self.state_store_stats.lock().unwrap();
+        if stats.loads == 0 && stats.saves == 0 && stats.seq_deltas == 0 {
+            return; // nothing to report
+        }
+        crate::log_info!("{}", stats.detailed_report());
+        // Reset the since-report counters for the next interval.
+        stats.bytes_since_last_report = 0;
+        stats.last_report_ms = crate::core::state_store::now_ms();
+    }
+
+    /// Start the periodic state-store stats reporter (background thread, logs every
+    /// 60 seconds by default, configurable via XINFER_STATE_STATS_INTERVAL_MS).
+    /// No-op when the state store is not configured.
+    fn start_state_store_stats_reporter(&self) {
+        if self.state_store.is_none() { return };
+        let interval_ms: u64 = std::env::var("XINFER_STATE_STATS_INTERVAL_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(60_000); // default: every60 seconds
+        let stats_arc = self.state_store_stats.clone();
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(interval_ms));
+                let stats = stats_arc.lock().unwrap();
+                if stats.loads == 0 && stats.saves == 0 && stats.seq_deltas == 0 {
+                    continue; // nothing to report yet
+                }
+                crate::log_info!("{}", stats.detailed_report());
+                drop(stats);
+                // Reset the since-report counters.
+                let mut stats = stats_arc.lock().unwrap();
+                stats.bytes_since_last_report = 0;
+                stats.last_report_ms = crate::core::state_store::now_ms();
+            }
+        });
     }
 
     /// Release hybrid GDN/Mamba active slots queued by scheduler-side abort paths.

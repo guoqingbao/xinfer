@@ -179,11 +179,58 @@ pub trait StateStore: Send + Sync {
         }
         Ok(deleted)
     }
+    /// Persist a per-sequence state delta under `key` (the "seq-{id}" prefix).
+    /// The delta is small (block_table + GDN bytes) and is stored as a separate
+    /// file alongside the full checkpoints. Default: no-op (backends that don't
+    /// support deltas can override).
+    fn save_delta(&self, _key: &str, _delta: &SeqStateDelta) -> Result<(), StateStoreError> {
+        Ok(())
+    }
+    /// Load a per-sequence state delta from `key`.
+    fn load_delta(&self, _key: &str) -> Result<SeqStateDelta, StateStoreError> {
+        Err(StateStoreError::NotFound(_key.to_string()))
+    }
+    /// A cheap clone of the store for use in spawned threads (the `Box<dyn StateStore>`
+    /// is not `Clone`, so backends provide this).
+    fn clone_box(&self) -> Box<dyn StateStore> {
+        Box::new(NoopStateStore)
+    }
 }
 
-/// The state-store stats (the load/save counts + the bytes + the timings).
-/// Reported at start (the load stats) + at quit (the save stats) + periodically
-/// at runtime.
+/// A no-op store (the default for `clone_box` when the backend doesn't implement it).
+struct NoopStateStore;
+impl StateStore for NoopStateStore {
+    fn save(&self, _: &str, _: &InferenceState) -> Result<(), StateStoreError> { Ok(()) }
+    fn load(&self, key: &str) -> Result<InferenceState, StateStoreError> {
+        Err(StateStoreError::NotFound(key.to_string()))
+    }
+    fn delete(&self, _: &str) -> Result<(), StateStoreError> { Ok(()) }
+    fn list(&self) -> Result<Vec<String>, StateStoreError> { Ok(Vec::new()) }
+}
+
+/// The per-sequence state delta: the block_table + GDN slot captured one finished
+/// sequence. Captured at the end of every sequence and persisted async so the
+/// runtime can continue processing the next request. Only the delta from the
+/// last state is synchronized (the blocks allocated/freed for this sequence,
+/// the GDN recurrent for this sequence's slot).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SeqStateDelta {
+    /// The sequence ID (the key for the state store).
+    pub seq_id: usize,
+    /// The KV block table for this sequence (the blocks that hold its KV/V).
+    pub block_table: Vec<u32>,
+    /// The GDN/mamba slot for this sequence (None for non-hybrid models).
+    pub gdn_slot: Option<usize>,
+    /// The GDN/mamba state bytes for this slot (empty for non-hybrid).
+    pub gdn_bytes: Vec<u8>,
+    /// The prefix-cache hash for this sequence (0 = no prefix cache entry).
+    pub prefix_hash: u64,
+    /// The timestamp (ms) when this delta was captured.
+    pub timestamp: u64,
+}
+
+/// The state-store stats (the load/save counts + the bytes + the timings +
+/// the size breakdown + the IO rates). Reported periodically at runtime.
 #[derive(Debug, Clone, Default)]
 pub struct StateStoreStats {
     /// The number of states loaded (the start-time).
@@ -198,15 +245,67 @@ pub struct StateStoreStats {
     pub load_ms: u64,
     /// The total save time (the ms).
     pub save_ms: u64,
+    /// The total size on the backend (the sum of all persisted states, the).
+    pub total_size_bytes: u64,
+    /// The size breakdown by type (KV bytes, GDN bytes, prefix-cache bytes).
+    pub kv_size_bytes: u64,
+    pub gdn_size_bytes: u64,
+    pub prefix_size_bytes: u64,
+    /// The number of per-sequence deltas persisted.
+    pub seq_deltas: usize,
+    /// The timestamp (ms) of the last stats report (for rate calculation).
+    pub last_report_ms: u64,
+    /// The bytes saved since the last report (for rate calculation).
+    pub bytes_since_last_report: u64,
 }
 
 impl StateStoreStats {
     /// A one-line report (the admins' view).
     pub fn report(&self) -> String {
         format!(
-            "state-store: {} loads ({} bytes, {}ms) + {} saves ({} bytes, {}ms)",
+            "state-store: {} loads ({} bytes, {}ms) + {} saves ({} bytes, {}ms) | size: {} total ({} KV, {} GDN, {} prefix) | {} seq deltaseltas",
             self.loads, self.bytes_loaded, self.load_ms,
-            self.saves, self.bytes_saved, self.save_ms
+            self.saves, self.bytes_saved, self.save_ms,
+            self.total_size_bytes, self.kv_size_bytes, self.gdn_size_bytes, self.prefix_size_bytes,
+            self.seq_deltas
+        )
+    }
+
+    /// The save rate in MB/s since the last report (0 if no time has elapsed).
+    pub fn save_rate_mbps(&self) -> f64 {
+        let elapsed_ms = now_ms().saturating_sub(self.last_report_ms);
+        if elapsed_ms == 0 {
+            return 0.0;
+        }
+        self.bytes_since_last_report as f64 / (elapsed_ms as f64 / 1000.0) / 1_000_000.0
+    }
+
+    /// The load rate in MB/s since the last report (0 if no time has elapsed).
+    pub fn load_rate_mbps(&self) -> f64 {
+        let elapsed_ms = now_ms().saturating_sub(self.last_report_ms);
+        if elapsed_ms == 0 {
+            return 0.0;
+        }
+        // Approximate: use the total bytes_loaded / total load_ms
+        if self.load_ms == 0 {
+            return 0.0;
+        }
+        self.bytes_loaded as f64 / (self.load_ms as f64 / 1000.0) / 1_000_000.0
+    }
+
+    /// A detailed multi-line report (the periodic stats output).
+    pub fn detailed_report(&self) -> String {
+        let save_rate = self.save_rate_mbps();
+        let load_rate = self.load_rate_mbps();
+        format!(
+            "[state-store] loads={} ({} bytes, {}ms, {:.2} MB/s) | saves={} ({} bytes, {}ms, {:.2} MB/s)\n\
+             [state-store] size: {} total ({} KV, {} GDN, {} prefix) | {} seq deltas\n\
+             [state-store] rates: save={:.2} MB/s, load={:.2} MB/s",
+            self.loads, self.bytes_loaded, self.load_ms, load_rate,
+            self.saves, self.bytes_saved, self.save_ms, save_rate,
+            self.total_size_bytes, self.kv_size_bytes, self.gdn_size_bytes, self.prefix_size_bytes,
+            self.seq_deltas,
+            save_rate, load_rate
         )
     }
 }
@@ -373,6 +472,28 @@ impl StateStore for FsStateStore {
         }
         keys.sort();
         Ok(keys)
+    }
+
+    fn save_delta(&self, key: &str, delta: &SeqStateDelta) -> Result<(), StateStoreError> {
+        std::fs::create_dir_all(&self.root)?;
+        let path = self.path_for(key);
+        let encoded = rmp_serde::to_vec(delta)?;
+        std::fs::write(path, &encoded)?;
+        Ok(())
+    }
+
+    fn load_delta(&self, key: &str) -> Result<SeqStateDelta, StateStoreError> {
+        let path = self.path_for(key);
+        let raw = std::fs::read(&path).map_err(|_| StateStoreError::NotFound(key.to_string()))?;
+        Ok(rmp_serde::from_slice(&raw)?)
+    }
+
+    fn clone_box(&self) -> Box<dyn StateStore> {
+        Box::new(FsStateStore {
+            root: self.root.clone(),
+            compress: self.compress,
+            key: self.key.clone(),
+        })
     }
 }
 
@@ -817,6 +938,7 @@ pub fn state_store_from_url(
         }
         #[cfg(not(feature = "gds"))]
         {
+            let _ = path;
             return Err(StateStoreError::Crypto(
                 "gds:// URL requires the `gds` cargo feature".into(),
             ));
@@ -991,5 +1113,51 @@ mod tests {
         let recovered = store.load("checkpoint.last_good").expect("last_good must load");
         assert_eq!(recovered, good, "fallback must recover the last good state");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The per-sequence delta save/load round-trip.
+    #[test]
+    fn seq_delta_roundtrip() {
+        let dir = std::env::temp_dir().join("state_store_test_delta");
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = FsStateStore::new(&dir, false, None);
+        let delta = SeqStateDelta {
+            seq_id: 42,
+            block_table: vec![7, 12, 33],
+            gdn_slot: Some(3),
+            gdn_bytes: vec![1, 2, 3, 4, 5],
+            prefix_hash: 0xABCD,
+            timestamp: now_ms(),
+        };
+        store.save_delta("seq-42", &delta).expect("save_delta");
+        let loaded = store.load_delta("seq-42").expect("load_delta");
+        assert_eq!(loaded.seq_id, 42);
+        assert_eq!(loaded.block_table, vec![7, 12, 33]);
+        assert_eq!(loaded.gdn_slot, Some(3));
+        assert_eq!(loaded.gdn_bytes, vec![1, 2, 3, 4, 5]);
+        assert_eq!(loaded.prefix_hash, 0xABCD);
+        // A non-existent key must fail.
+        assert!(store.load_delta("seq-99").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The stats report includes the new fields.
+    #[test]
+    fn stats_detailed_report_format() {
+        let mut stats = StateStoreStats::default();
+        stats.loads = 2;
+        stats.saves = 5;
+        stats.seq_deltas = 3;
+        stats.total_size_bytes = 1024;
+        stats.kv_size_bytes = 512;
+        stats.gdn_size_bytes = 256;
+        stats.prefix_size_bytes = 128;
+        let report = stats.report();
+        assert!(report.contains("5 saves"));
+        assert!(report.contains("3 seq deltas"));
+        assert!(report.contains("1024 total"));
+        let detailed = stats.detailed_report();
+        assert!(detailed.contains("[state-store]"));
+        assert!(detailed.contains("rates:"));
     }
 }

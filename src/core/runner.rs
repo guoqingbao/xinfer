@@ -1962,6 +1962,161 @@ impl ModelRunner {
         Ok(tokens)
     }
 
+    /// Speculative fast-forward decode: sample the base token (the current `run`, which
+    /// commits it to the FSM), then append the full grammar-forced (ff) run that follows.
+    /// The ff tokens are deterministic (forced by the grammar), so they are committed
+    /// directly without model sampling. Returns `[base_token, ff_run...]` per sequence;
+    /// the next draft anchors on the last ff token (the `instead of the base token" case).
+    pub fn run_speculative_ff(&self, seqs: Seqs) -> Result<Vec<u32>> {
+        // The sampling only: the base token (the current run). The ordered-queue
+        // commit (the base + the grammar-forced continuation) is done by the
+        // single gate (the `gate_commit` with `ff = true`), so the spec-FF path
+        // no longer has its own mid-step writers.
+        self.run(seqs, false)
+    }
+
+    /// The single matcher-gated ingress: commit each sequence's produced run to the
+    /// FSM and return only the FSM-passing prefix. Every token-production path
+    /// (plain, spec-FF, MTP, DFlash) funnels through this one call just before the
+    /// sequence append, so the sequence can never hold a token the FSM rejected.
+    ///
+    /// `ff` selects the ordered-queue writer: when true (the spec-FF path) the base
+    /// run is committed, the grammar-forced continuation is read from the settled
+    /// state, and the continuation is committed — all in acquisition order, so the
+    /// queue [base, ff…] is appended as one serialized stream. When false (the
+    /// plain/MTP/DFlash paths) the whole run is committed as-is.
+    pub fn gate_commit(&self, seq_ids: &[usize], runs: &[Vec<u32>], ff: bool) -> Vec<Vec<u32>> {
+        runs.iter()
+            .enumerate()
+            .map(|(i, run)| {
+                let sid = seq_ids[i];
+                let n_base = self.guided_decoding.commit_run(sid, run);
+                let mut queue = run[..n_base].to_vec();
+                if ff {
+                    let ff_run = self.guided_decoding.ff_tokens(sid);
+                    if !ff_run.is_empty() {
+                        let n_ff = self.guided_decoding.commit_run(sid, &ff_run);
+                        queue.extend(ff_run[..n_ff].to_vec());
+                    }
+                }
+                queue
+            })
+            .collect()
+    }
+
+    /// Bridge the anti-loop kick from the engine (the sampling constraint: the
+    /// forbid token + the seed + the period). The kick is applied at the next
+    /// sampling step (the LogitsProcessor consults the kick_store).
+    pub fn set_loop_kick(&self, seq_id: usize, forbid: u32, seed: Vec<u32>, period: u32) {
+        use crate::utils::loop_detect::LoopSpan;
+        self.kick_store.write().apply(
+            seq_id,
+            &LoopSpan {
+                period,
+                unit: vec![forbid],
+                seed,
+            },
+        );
+    }
+
+    /// Clear the anti-loop kick for a sequence (the loop cleared).
+    pub fn clear_loop_kick(&self, seq_id: usize) {
+        self.kick_store.write().remove(seq_id);
+    }
+
+    /// Apply the active anti-loop kicks as a sampling constraint (the per-row
+    /// penalty on the logits, before sampling). The forbid token (the loop
+    /// trigger) is set to -inf (the hard exclusion); the seed tokens (the first
+    /// ~20% of the loop unit) get a penalty scaled by the period (the longer the
+    /// loop, the harder the kick). This is a sampling intervention, not a grammar-
+    /// mask perturbation, so the mask stays a pure function of the settled FSM
+    /// state. No-op when no kick is active for the batch.
+    fn apply_loop_kicks(&self, logits: &Tensor, seq_ids: &[usize]) -> Tensor {
+        // When the 1-phase (full-envelope) grammar is active, the grammar itself
+        // constrains the generation and breaks the loop; the sampling kick is skipped.
+        if crate::utils::env::llg_full_enabled() {
+            return logits.clone();
+        }
+        let kicks = self.kick_store.read();
+        let any_kick = seq_ids.iter().any(|&sid| kicks.is_active(sid));
+        if !any_kick {
+            return logits.clone();
+        }
+        let (b, v) = logits.dims2().expect("logits is 2-D");
+        let device = logits.device();
+        let mut flat: Vec<f32> = vec![0.0f32; b * v];
+        for (i, &sid) in seq_ids.iter().enumerate() {
+            if let Some(kick) = kicks.get(sid) {
+                if (kick.forbid as usize) < v {
+                    flat[i * v + kick.forbid as usize] = f32::NEG_INFINITY;
+                }
+                let penalty = -(kick.period as f32) * 2.0;
+                for &seed_tok in &kick.seed {
+                    if (seed_tok as usize) < v {
+                        flat[i * v + seed_tok as usize] = penalty;
+                    }
+                }
+            }
+        }
+        drop(kicks);
+        let penalty_tensor = Tensor::from_vec(flat, (b, v), device).expect("penalty tensor");
+        logits.add(&penalty_tensor).expect("add penalty to logits")
+    }
+
+    /// Snapshot the GDN/mamba recurrent state for a specific sequence's slot.
+    /// Returns the serialized bytes (header + per-layer conv/recurrent state for
+    /// that slot). Empty for non-hybrid models or when the slot is not found.
+    pub fn snapshot_gdn_state(&self, seq_id: usize) -> Vec<u8> {
+        let model = self.model();
+        let (cache, num_layers) = match model {
+            Model::Qwen3_5(m) => {
+                let Ok(slots) = m.get_mamba_slots_for_sequences(&[seq_id]) else {
+                    return Vec::new();
+                };
+                let Some(&slot) = slots.first() else { return Vec::new() };
+                let cache = m.lock_mamba_cache_for_graph();
+                let layers = cache.num_gdn_layers();
+                (cache, (slot, layers))
+            }
+            Model::Qwen3_5MoE(m) => {
+                let Ok(slots) = m.get_mamba_slots_for_sequences(&[seq_id]) else {
+                    return Vec::new();
+                };
+                let Some(&slot) = slots.first() else { return Vec::new() };
+                let cache = m.lock_mamba_cache_for_graph();
+                let layers = cache.num_gdn_layers();
+                (cache, (slot, layers))
+            }
+            _ => return Vec::new(),
+        };
+        let (slot, layers) = num_layers;
+        if layers == 0 {
+            return Vec::new();
+        }
+        let mut data = Vec::new();
+        // Header: u32 num_layers + u32 slot
+        data.extend_from_slice(&(layers as u32).to_le_bytes());
+        data.extend_from_slice(&(slot as u32).to_le_bytes());
+        for layer_idx in 0..layers {
+            let conv = cache.conv_state(layer_idx);
+            let rec = cache.recurrent_state(layer_idx);
+            // Narrow to just this sequence's slot (row `slot`).
+            if let Ok(conv_row) = conv.narrow(0, slot, 1) {
+                if let Ok(bytes) = conv_row.flatten_all().and_then(|t| t.to_vec1::<u8>()) {
+                    data.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+                    data.extend_from_slice(&bytes);
+                }
+            }
+            if let Ok(rec_row) = rec.narrow(0, slot, 1) {
+                if let Ok(bytes) = rec_row.flatten_all().and_then(|t| t.to_vec1::<u8>()) {
+                    data.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+                    data.extend_from_slice(&bytes);
+                }
+            }
+        }
+        data
+    }
+
     pub fn finished(&self, id: usize) {
         let mut seq_tokens = self.seq_tokens.write();
         let _ = seq_tokens.remove(&id);

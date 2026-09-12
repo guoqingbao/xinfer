@@ -487,6 +487,11 @@ impl Scheduler {
         }
     }
 
+    /// Find a running sequence by its ID (not index). Returns None if not found.
+    pub fn get_running_by_id(&self, seq_id: usize) -> Option<&Sequence> {
+        self.running.iter().find(|s| s.id == seq_id)
+    }
+
     pub fn get_waiting(&self, idx: usize) -> Option<&Sequence> {
         if idx < self.waiting.len() {
             Some(&self.waiting[idx])
