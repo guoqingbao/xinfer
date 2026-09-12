@@ -43,7 +43,7 @@ aes-gcm = "0.10"
 sha2 = "0.10"
 zeroize = "1.7"
 # GPUDirect Storage (the cuFile API) for the zero-copy NVMe<->GPU state store.
-cudarc = { version = "0.19", optional = true, features = ["cufile"] }
+cudarc = { version = "0.19", optional = true, features = ["cufile", "cuda-version-from-build-system"] }
 # S3-compatible client (the AWS / MinIO / Ceph / RustFS) for the object-store
 # backend. The mature rust-s3 crate (the dgrk/rust-s3) with the reqwest-rustls
 # (the no OpenSSL) + the tokio (the async) + the blocking (the sync bridge) backends.

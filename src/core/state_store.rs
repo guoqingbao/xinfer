@@ -418,9 +418,9 @@ pub fn now_ms() -> u64 {
 /// Gated behind the `gds` cargo feature (the `cudarc` dependency).
 #[cfg(feature = "gds")]
 pub struct NvmeStateStore {
-    cufile: cudarc::cufile::Cufile,
-    ctx: cudarc::driver::CudaContext,
-    stream: cudarc::driver::CudaStream,
+    cufile: std::sync::Arc<cudarc::cufile::Cufile>,
+    ctx: std::sync::Arc<cudarc::driver::CudaContext>,
+    stream: std::sync::Arc<cudarc::driver::CudaStream>,
     root: PathBuf,
     compress: bool,
     key: Option<Aes256Gcm>,
@@ -535,13 +535,10 @@ impl StateStore for NvmeStateStore {
         // The cuFile path: register the file, DMA the payload into a GPU buffer,
         // then sync_write (the zero-copy GDS DMA when available, else a CPU copy).
         let file = std::fs::File::create(&path)?;
-        let handle = self.cufile.register(file).map_err(|e| StateStoreError::Crypto(e.to_string()))?;
+        let mut handle = self.cufile.register(file).map_err(|e| StateStoreError::Crypto(e.to_string()))?;
         let buf = self
             .stream
-            .alloc_zeros::<u8>(encoded.len())
-            .map_err(|e| StateStoreError::Crypto(e.to_string()))?;
-        self.stream
-            .copy_htod(&buf, &encoded)
+            .clone_htod(&encoded)
             .map_err(|e| StateStoreError::Crypto(e.to_string()))?;
         handle
             .sync_write(0, &buf)
@@ -552,9 +549,9 @@ impl StateStore for NvmeStateStore {
     fn load(&self, key: &str) -> Result<InferenceState, StateStoreError> {
         let path = self.path_for(key);
         let file = std::fs::File::open(&path).map_err(|_| StateStoreError::NotFound(key.to_string()))?;
-        let handle = self.cufile.register(file).map_err(|e| StateStoreError::Crypto(e.to_string()))?;
         let file_size = file.metadata().map_err(StateStoreError::Io)?.len() as usize;
-        let buf = self
+        let mut handle = self.cufile.register(file).map_err(|e| StateStoreError::Crypto(e.to_string()))?;
+        let mut buf = self
             .stream
             .alloc_zeros::<u8>(file_size)
             .map_err(|e| StateStoreError::Crypto(e.to_string()))?;
