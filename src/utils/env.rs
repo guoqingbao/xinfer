@@ -92,3 +92,99 @@ pub fn soft_mask_disabled() -> bool {
             .unwrap_or(false)
     })
 }
+
+/// zstd compression of the inference state is ON by default. Set
+/// `XINFER_STATE_COMPRESS=0` (or `false`/`no`) to disable it.
+pub const STATE_COMPRESS_ENV: &str = "XINFER_STATE_COMPRESS";
+
+static STATE_COMPRESS: OnceLock<bool> = OnceLock::new();
+
+pub fn state_compress() -> bool {
+    *STATE_COMPRESS.get_or_init(|| {
+        env::var(STATE_COMPRESS_ENV)
+            .map(|v| !matches!(v.trim().to_lowercase().as_str(), "0" | "false" | "no"))
+            .unwrap_or(true)
+    })
+}
+
+/// `XINFER_STATE_KEY` (a raw key) enables AES-256-GCM encryption of persisted
+/// inference state. Returns the raw key bytes when set, else None.
+pub const STATE_KEY_ENV: &str = "XINFER_STATE_KEY";
+
+pub fn state_key() -> Option<Vec<u8>> {
+    env::var(STATE_KEY_ENV).ok().filter(|v| !v.trim().is_empty()).map(|v| v.into_bytes())
+}
+
+/// `XINFER_STATESTORE_STRICT=1` rejects a warm-loaded state whose version stamp
+/// (runtime version + model ID + dtype + block size) does not match the current
+/// runtime. When off (default), a mismatched state is loaded with a warning.
+pub const STATESTORE_STRICT_ENV: &str = "XINFER_STATESTORE_STRICT";
+
+static STATESTORE_STRICT: OnceLock<bool> = OnceLock::new();
+
+pub fn statestore_strict() -> bool {
+    *STATESTORE_STRICT.get_or_init(|| {
+        env::var(STATESTORE_STRICT_ENV)
+            .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false)
+    })
+}
+
+/// `XINFER_STATE_TTL_MS` (default 7 days): the max age of a persisted state before
+/// it is pruned.
+pub const STATE_TTL_MS_ENV: &str = "XINFER_STATE_TTL_MS";
+pub const DEFAULT_STATE_TTL_MS: u64 = 7 * 24 * 60 * 60 * 1000;
+
+pub fn state_ttl_ms() -> u64 {
+    env::var(STATE_TTL_MS_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_STATE_TTL_MS)
+}
+
+/// `XINFER_STATE_MAX_BYTES` (default 8 GiB): the space watermark for the state
+/// store. When the total size exceeds it, the oldest states are pruned.
+pub const STATE_MAX_BYTES_ENV: &str = "XINFER_STATE_MAX_BYTES";
+pub const DEFAULT_STATE_MAX_BYTES: usize = 8 * 1024 * 1024 * 1024;
+
+pub fn state_max_bytes() -> usize {
+    env::var(STATE_MAX_BYTES_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_STATE_MAX_BYTES)
+}
+
+/// `XINFER_PLE_NO_MMAP=1` forces the PLE n-gram table to be read directly into
+/// heap memory instead of mmap'd. On SM121-class GPUs (unified host/device
+/// memory) an mmap of a large file competes with the model + KV for the same
+/// physical pool, so the direct-read path is preferred there.
+pub const PLE_NO_MMAP_ENV: &str = "XINFER_PLE_NO_MMAP";
+
+static PLE_NO_MMAP: OnceLock<bool> = OnceLock::new();
+
+pub fn ple_no_mmap() -> bool {
+    *PLE_NO_MMAP.get_or_init(|| {
+        env::var(PLE_NO_MMAP_ENV)
+            .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false)
+    })
+}
+
+/// `XINFER_PREFILL_CHECKPOINT_MS` (default 30000): during a long chunked prefill,
+/// checkpoint the partial prompt into the prefix cache at this interval so a client
+/// disconnect mid-prefill resumes from the last checkpoint instead of restarting.
+/// Set to 0 to disable.
+pub const PREFILL_CHECKPOINT_MS_ENV: &str = "XINFER_PREFILL_CHECKPOINT_MS";
+
+static PREFILL_CHECKPOINT_MS: OnceLock<u64> = OnceLock::new();
+
+pub fn prefill_checkpoint_ms() -> u64 {
+    *PREFILL_CHECKPOINT_MS.get_or_init(|| {
+        env::var(PREFILL_CHECKPOINT_MS_ENV)
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(30_000)
+    })
+}

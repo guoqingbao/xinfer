@@ -718,6 +718,67 @@ impl BlockManager {
         self.handle_mamba_prefix_evicted_blocks(&evicted_blocks);
     }
 
+    /// Checkpoint a partial prompt into the prefix cache (the first `processed_tokens`
+    /// only, not the full `seq.token_ids`). Used during a long chunked prefill so a
+    /// client disconnect resumes from the last checkpoint instead of restarting.
+    /// `processed_tokens` is a chunk boundary (a multiple of the block size); the GDN
+    /// snapshot at that boundary is captured separately by the scheduler.
+    pub fn cache_sequence_prefix(&mut self, seq: &Sequence, processed_tokens: usize) {
+        let Some(prefix_cache) = self.prefix_cache.as_mut() else {
+            return;
+        };
+        if !prefix_cache.enabled() {
+            return;
+        }
+        if matches!(
+            seq.status,
+            SequenceStatus::Swapped | SequenceStatus::FinishSwapped
+        ) {
+            return;
+        }
+
+        let processed_tokens = processed_tokens.min(seq.token_ids.len());
+        let full_blocks = processed_tokens / self.block_size;
+        if full_blocks == 0 {
+            return;
+        }
+        if seq.block_table.len() < full_blocks {
+            return;
+        }
+
+        let tokens = &seq.token_ids[..processed_tokens];
+        let blocks: Vec<usize> = seq
+            .block_table
+            .iter()
+            .take(full_blocks)
+            .map(|&id| id as usize)
+            .collect();
+
+        crate::log_info!(
+            "Prefix cache partial checkpoint seq {} ({} of {} tokens, {} blocks)",
+            seq.id,
+            processed_tokens,
+            seq.token_ids.len(),
+            full_blocks
+        );
+
+        let (seed, seed_block) = seq
+            .images
+            .as_ref()
+            .map(|img| Self::image_seed_and_block(img, tokens, self.block_size))
+            .unwrap_or((None, None));
+        let PrefixCacheUpdate { inserted, evicted } =
+            prefix_cache.insert_prefix_with_seed(tokens, &blocks, seed, seed_block);
+        for block_id in inserted {
+            self.increment_block_ref(block_id);
+        }
+        let evicted_blocks = evicted.clone();
+        for block_id in evicted {
+            self.decrement_block_ref(block_id);
+        }
+        self.handle_mamba_prefix_evicted_blocks(&evicted_blocks);
+    }
+
     pub fn prefix_cache_enabled(&self) -> bool {
         self.prefix_cache
             .as_ref()

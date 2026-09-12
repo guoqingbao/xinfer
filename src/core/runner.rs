@@ -1962,6 +1962,73 @@ impl ModelRunner {
         Ok(tokens)
     }
 
+    /// Speculative fast-forward decode: sample the base token (the current `run`, which
+    /// commits it to the FSM), then append the full grammar-forced (ff) run that follows.
+    /// The ff tokens are deterministic (forced by the grammar), so they are committed
+    /// directly without model sampling. Returns `[base_token, ff_run...]` per sequence;
+    /// the next draft anchors on the last ff token (the `instead of the base token" case).
+    pub fn run_speculative_ff(&self, seqs: Seqs) -> Result<Vec<u32>> {
+        // The sampling only: the base token (the current run). The ordered-queue
+        // commit (the base + the grammar-forced continuation) is done by the
+        // single gate (the `gate_commit` with `ff = true`), so the spec-FF path
+        // no longer has its own mid-step writers.
+        self.run(seqs, false)
+    }
+
+    /// Snapshot the GDN/mamba recurrent state for a specific sequence's slot.
+    /// Returns the serialized bytes (header + per-layer conv/recurrent state for
+    /// that slot). Empty for non-hybrid models or when the slot is not found.
+    pub fn snapshot_gdn_state(&self, seq_id: usize) -> Vec<u8> {
+        let model = self.model();
+        let (cache, num_layers) = match model {
+            Model::Qwen3_5(m) => {
+                let Ok(slots) = m.get_mamba_slots_for_sequences(&[seq_id]) else {
+                    return Vec::new();
+                };
+                let Some(&slot) = slots.first() else { return Vec::new() };
+                let cache = m.lock_mamba_cache_for_graph();
+                let layers = cache.num_gdn_layers();
+                (cache, (slot, layers))
+            }
+            Model::Qwen3_5MoE(m) => {
+                let Ok(slots) = m.get_mamba_slots_for_sequences(&[seq_id]) else {
+                    return Vec::new();
+                };
+                let Some(&slot) = slots.first() else { return Vec::new() };
+                let cache = m.lock_mamba_cache_for_graph();
+                let layers = cache.num_gdn_layers();
+                (cache, (slot, layers))
+            }
+            _ => return Vec::new(),
+        };
+        let (slot, layers) = num_layers;
+        if layers == 0 {
+            return Vec::new();
+        }
+        let mut data = Vec::new();
+        // Header: u32 num_layers + u32 slot
+        data.extend_from_slice(&(layers as u32).to_le_bytes());
+        data.extend_from_slice(&(slot as u32).to_le_bytes());
+        for layer_idx in 0..layers {
+            let conv = cache.conv_state(layer_idx);
+            let rec = cache.recurrent_state(layer_idx);
+            // Narrow to just this sequence's slot (row `slot`).
+            if let Ok(conv_row) = conv.narrow(0, slot, 1) {
+                if let Ok(bytes) = conv_row.flatten_all().and_then(|t| t.to_vec1::<u8>()) {
+                    data.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+                    data.extend_from_slice(&bytes);
+                }
+            }
+            if let Ok(rec_row) = rec.narrow(0, slot, 1) {
+                if let Ok(bytes) = rec_row.flatten_all().and_then(|t| t.to_vec1::<u8>()) {
+                    data.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+                    data.extend_from_slice(&bytes);
+                }
+            }
+        }
+        data
+    }
+
     pub fn finished(&self, id: usize) {
         let mut seq_tokens = self.seq_tokens.write();
         let _ = seq_tokens.remove(&id);

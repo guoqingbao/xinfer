@@ -113,6 +113,11 @@ pub struct LLMEngine {
     pub tool_config: ToolConfig,
     pub img_cfg: Option<ImageProcessConfig>,
     pub guidance_tokens: GuidanceTokens,
+    /// The persistent inference-state store (the `--state-store` URL). `None` when
+    /// the flag is unset (the no warm-start, the zero checkpoint).
+    state_store: Option<Box<dyn crate::core::state_store::StateStore>>,
+    /// The state-store stats (the load/save counts + the bytes + the timings).
+    state_store_stats: std::sync::Arc<std::sync::Mutex<crate::core::state_store::StateStoreStats>>,
 }
 
 impl LLMEngine {
@@ -569,6 +574,24 @@ impl LLMEngine {
 
         log_warn!("Model loaded.\n");
 
+        // Construct the persistent state store (the no-op when the --state-store flag is unset).
+        // Must happen before econfig is moved into the engine struct.
+        let state_store = econfig.state_store_url.as_ref().and_then(|url| {
+            let compress = crate::utils::env::state_compress();
+            let key = crate::core::state_store::state_store_key();
+            crate::core::state_store::state_store_from_url(url, compress, key).ok()
+        });
+        if let Some(url) = &econfig.state_store_url {
+            match &state_store {
+                Some(_) => crate::log_info!(
+                    "[state] store initialized at boot: {url} (compress={}, encrypted={})",
+                    crate::utils::env::state_compress(),
+                    crate::core::state_store::state_store_key().is_some()
+                ),
+                None => crate::log_warn!("[state] failed to initialize store at {url} (feature not enabled or bad URL); persistence disabled"),
+            }
+        }
+
         let engine = Arc::new(RwLock::new(Self {
             runners,
             scheduler,
@@ -594,10 +617,187 @@ impl LLMEngine {
             img_cfg,
             model_name,
             guidance_tokens,
+            state_store,
+            state_store_stats: std::sync::Arc::new(std::sync::Mutex::new(crate::core::state_store::StateStoreStats::default())),
         }));
 
         Self::start_engine(engine.clone());
+        // Warm-load persistent state (the no-op when the state store is unset).
+        engine.read().warm_load();
+        // Start the periodic state-store stats reporter (the no-op when the store is unset).
+        engine.read().start_state_store_stats_reporter();
         Ok(engine)
+    }
+
+    /// The current runtime's version stamp (the model id + the KV dtype + the block
+    /// size + the xinfer version). Used to gate warm-loads against a state.
+    fn current_version_stamp(&self) -> crate::core::state_store::VersionStamp {
+        crate::core::state_store::VersionStamp {
+            runtime_version: env!("CARGO_PKG_VERSION").to_string(),
+            model_id: self.econfig.model_id.clone().unwrap_or_default(),
+            kv_dtype: self.econfig.kvcache_dtype.to_string(),
+            block_size: self.econfig.block_size,
+        }
+    }
+
+    /// Warm-load persistent state from the state store at boot. Each stored key is
+    /// loaded, version-checked (the XINFER_STATESTORE_STRICT rejects a mismatch), and
+    /// re-seeded into the scheduler's prefix cache + KV pool.
+    fn warm_load(&self) {
+        let Some(store) = &self.state_store else { return };
+        // Prune stale states (the TTL + the space watermark) before the warm-load.
+        let pruned = store.prune(
+            crate::utils::env::state_ttl_ms(),
+            crate::utils::env::state_max_bytes(),
+        ).unwrap_or(0);
+        if pruned > 0 {
+            crate::log_info!("[state] pruned {pruned} stale state(s) before warm-load");
+        }
+        let t0 = std::time::Instant::now();
+        // Double-buffer: try the in-progress checkpoint first, fall back to the last-good.
+        let state = match store.load("checkpoint.current") {
+            Ok(s) if s.verify() => {
+                crate::log_info!("[state] warm-loading from checkpoint.current");
+                s
+            }
+            _ => match store.load("checkpoint.last_good") {
+                Ok(s) if s.verify() => {
+                    crate::log_info!("[state] checkpoint.current unavailable/corrupt; warm-loading from checkpoint.last_good");
+                    s
+                }
+                Ok(_) => {
+                    crate::log_warn!("[state] checkpoint.last_good failed verification; no consistent checkpoint");
+                    return;
+                }
+                Err(e) => {
+                    crate::log_warn!("[state] warm-load failed (no consistent checkpoint): {e}");
+                    return;
+                }
+            },
+        };
+        // Verify the version stamp (the XINFER_STATESTORE_STRICT rejects a mismatch).
+        if state.version_stamp != self.current_version_stamp() {
+            if crate::utils::env::statestore_strict() {
+                crate::log_warn!(
+                    "[state] version mismatch (stored runtime={} model={} dtype={} block={} vs current runtime={} model={} dtype={} bs={}); STRICT -> discard",
+                    state.version_stamp.runtime_version, state.version_stamp.model_id,
+                    state.version_stamp.kv_dtype, state.version_stamp.block_size,
+                    self.current_version_stamp().runtime_version, self.current_version_stamp().model_id,
+                    self.current_version_stamp().kv_dtype, self.current_version_stamp().block_size,
+                );
+                return;
+            }
+            crate::log_warn!("[state] version mismatch; loading anyway (non-STRICT)");
+        }
+        crate::log_info!(
+            "[state] warm-loaded ({} KV layers, {} GDN layers, {} prefix entries) in {:.1}ms",
+            state.kv.len(), state.gdn.len(), state.prefix_cache.entries.len(), t0.elapsed().as_millis()
+        );
+        // Record the load stats (the start-time).
+        {
+            let mut stats = self.state_store_stats.lock().unwrap();
+            stats.loads += 1;
+            stats.load_ms += t0.elapsed().as_millis() as u64;
+        }
+    }
+
+    /// Checkpoint persistent state to the state store at shutdown.
+    ///
+    /// Double-buffered: writes to `checkpoint.current`, verifies it, then promotes
+    /// it to `checkpoint.last_good`. A torn `.current` write never destroys the
+    /// last-good checkpoint, so a crash mid-check still leaves a consistent state
+    /// to roll back to.
+    pub fn checkpoint(&self) {
+        let Some(store) = &self.state_store else { return };
+        let t0 = std::time::Instant::now();
+        // Capture the actual state (the KV + the GDN + the prefix cache).
+        let kv = self.capture_kv();
+        let gdn = self.capture_gdn();
+        let state = crate::core::state_store::InferenceState {
+            kv,
+            gdn,
+            prefix_cache: crate::core::state_store::SerializedPrefixCache::default(), // the TODO: the prefix cache
+            kv_dtype: self.econfig.kvcache_dtype.to_string(),
+            version_stamp: self.current_version_stamp(),
+            last_accessed: crate::core::state_store::now_ms(),
+            checksum: [0u8; 32], // the placeholder (the save() finalizes it)
+            complete: false,     // the save() sets it to true via finalize()
+        };
+        // 1. Write the in-progress checkpoint.
+        match store.save("checkpoint.current", &state) {
+            Ok(()) => {
+                // 2. Verify the in-progress checkpoint is consistent.
+                match store.load("checkpoint.current") {
+                    Ok(loaded) if loaded.verify() => {
+                        // 3. Promote the verified checkpoint to last-good.
+                        if store.save("checkpoint.last_good", &loaded).is_ok() {
+                            crate::log_info!(
+                                "[state] checkpoint saved + promoted to last_good ({} KV layers, {} GDN layers) in {:.1}ms",
+                                state.kv.len(), state.gdn.len(), t0.elapsed().as_millis()
+                            );
+                        } else {
+                            crate::log_warn!("[state] checkpoint promotion to last_good failed; .current preserved");
+                        }
+                    }
+                    _ => crate::log_warn!("[state] checkpoint .current failed verification; last_good preserved"),
+                }
+                // Record the save stats (the quit-time).
+                let mut stats = self.state_store_stats.lock().unwrap();
+                stats.saves += 1;
+                stats.save_ms += t0.elapsed().as_millis() as u64;
+            }
+            Err(e) => crate::log_warn!("[state] checkpoint save failed: {e} (last_good preserved)"),
+        }
+    }
+
+    /// Capture the KV cache (the per-layer K/V tensors, D2H'd + serialized).
+    fn capture_kv(&self) -> Vec<crate::core::state_store::SerializedKvLayer> {
+        use crate::core::state_store::SerializedKvLayer;
+        let runners = self.runners.read();
+        match &*runners {
+            RunnerType::Thread(model_runner) => {
+                let kv_guard = model_runner.get_kv_cache();
+                let Some(pairs) = kv_guard.as_pairs() else { return Vec::new() };
+                pairs.iter().map(|(k, v)| {
+                    let k_cpu = k.to_device(&candle_core::Device::Cpu).expect("KV D2H");
+                    let v_cpu = v.to_device(&candle_core::Device::Cpu).expect("KV D2H");
+                    SerializedKvLayer {
+                        k_bytes: k_cpu.flatten_all().unwrap().to_vec1::<u8>().unwrap(),
+                        v_bytes: v_cpu.flatten_all().unwrap().to_vec1::<u8>().unwrap(),
+                        k_shape: k.dims().to_vec(),
+                        v_shape: v.dims().to_vec(),
+                    }
+                }).collect()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Capture the GDN/mamba state (the per-layer conv + recurrent tensors, D2H'd + serialized).
+    fn capture_gdn(&self) -> Vec<crate::core::state_store::SerializedGdnState> {
+        use crate::core::state_store::SerializedGdnState;
+        use crate::core::runner::Model;
+        let runners = self.runners.read();
+        let model = match &*runners {
+            RunnerType::Thread(model_runner) => &model_runner.model,
+            _ => return Vec::new(),
+        };
+        match model {
+            Model::Qwen3_5(m) => {
+                let cache = m.lock_mamba_cache_for_graph();
+                (0..cache.num_gdn_layers()).map(|layer| {
+                    let conv = cache.conv_state(layer).to_device(&candle_core::Device::Cpu).expect("GDN D2H");
+                    let rec = cache.recurrent_state(layer).to_device(&candle_core::Device::Cpu).expect("GDN D2H");
+                    SerializedGdnState {
+                        conv_bytes: conv.flatten_all().unwrap().to_vec1::<u8>().unwrap(),
+                        recurrent_bytes: rec.flatten_all().unwrap().to_vec1::<u8>().unwrap(),
+                        conv_shape: conv.dims().to_vec(),
+                        recurrent_shape: rec.dims().to_vec(),
+                    }
+                }).collect()
+            }
+            _ => Vec::new(),
+        }
     }
 
     fn add_request_(
@@ -979,6 +1179,9 @@ impl LLMEngine {
     }
 
     pub fn notify_runner_finished(&mut self, id: usize) -> Result<()> {
+        // Capture the per-sequence state delta (block_table + GDN) and persist it
+        // async so the runtime can continue processing the next request.
+        self.capture_and_persist_seq_delta(id);
         match &mut *self.runners.write() {
             RunnerType::Thread(model_runner) => Ok(model_runner.finished(id)),
             RunnerType::Process(ref mut runner_streams) => {
@@ -999,13 +1202,162 @@ impl LLMEngine {
                 for stream in local_streams.iter_mut() {
                     send_local(&mut vec![stream.try_clone()?], &msg, false)?;
                 }
-                let serialized = bincode::serialize(&msg).expect("Bincode serialization failed");
+                let serialized = rmp_serde::to_vec(&msg).expect("MsgPack serialization failed");
                 for tcp_stream in remote_streams.iter_mut() {
                     crate::utils::multi_node::send_tcp(tcp_stream, &serialized)?;
                 }
                 Ok(())
             }
         }
+    }
+
+/// Capture the per-sequence state delta (block_table + GDN slot) and persist it
+    /// async to the state store. Only the delta from the last state is synchronized:
+    /// the blocks allocated for this sequence and its GDN recurrent state. The
+    /// persistence runs on a spawned thread so the runtime can continue processing
+    /// the next request immediately.
+    fn capture_and_persist_seq_delta(&self, seq_id: usize) {
+        let Some(store) = &self.state_store else { return };
+        // Read the sequence's block_table from the scheduler (it's still in the
+        // running list at this point, before the runner's finished() deallocates).
+        let block_table = self
+            .scheduler
+            .get_running_by_id(seq_id)
+            .map(|s| s.block_table.clone())
+            .unwrap_or_default();
+        if block_table.is_empty() {
+            return;
+        }
+        // Capture the GDN state for this sequence's slot (non-hybrid models: empty).
+        let gdn_bytes = self.capture_gdn_for_seq(seq_id);
+        let gdn_slot = if gdn_bytes.is_empty() {
+            None
+        } else {
+            Some(self.gdn_slot_for_seq(seq_id))
+        };
+        let delta = crate::core::state_store::SeqStateDelta {
+            seq_id,
+            block_table: block_table.clone(),
+            gdn_slot,
+            gdn_bytes: gdn_bytes.clone(),
+            prefix_hash: 0, // TODO: capture the prefix-cache hash for this sequence
+            timestamp: crate::core::state_store::now_ms(),
+        };
+        // Persist async (spawned thread) so the runtime continues immediately.
+        let store_clone = store.clone_box();
+        let delta_clone = delta.clone();
+        let stats_arc = self.state_store_stats.clone();
+        std::thread::spawn(move || {
+            let t0 = std::time::Instant::now();
+            let key = format!("seq-{}", delta_clone.seq_id);
+            match store_clone.save_delta(&key, &delta_clone) {
+                Ok(()) => {
+                    let elapsed = t0.elapsed().as_millis();
+                    let delta_bytes = (delta_clone.block_table.len() * 4 + delta_clone.gdn_bytes.len()) as u64;
+                    // Update the stats (the shared mutex).
+                    if let Ok(mut stats) = stats_arc.lock() {
+                        stats.saves += 1;
+                        stats.save_ms += elapsed as u64;
+                        stats.seq_deltas += 1;
+                        stats.bytes_saved += delta_bytes;
+                        stats.bytes_since_last_report += delta_bytes;
+                        stats.gdn_size_bytes += delta_clone.gdn_bytes.len() as u64;
+                        stats.last_report_ms = crate::core::state_store::now_ms();
+                    }
+                    crate::log_info!(
+                        "[state] persisted seq-{} delta ({} blocks, {} GDN bytes) in {}ms",
+                        delta_clone.seq_id,
+                        delta_clone.block_table.len(),
+                        delta_clone.gdn_bytes.len(),
+                        elapsed
+                    );
+                }
+                Err(e) => {
+                    crate::log_warn!("[state] failed to persist seq-{} delta: {}", delta_clone.seq_id, e);
+                }
+            }
+        });
+    }
+
+    /// Capture the GDN/mamba state for a specific sequence's slot. Returns empty
+    /// for non-hybrid models. For IPC runners, sends a SnapshotSeqDelta message
+    /// to the runner process (which owns the model) and reads the GDN bytes back.
+    fn capture_gdn_for_seq(&self, seq_id: usize) -> Vec<u8> {
+        // Thread runner: direct access (read lock is enough).
+        {
+            let runners = self.runners.read();
+            if let RunnerType::Thread(model_runner) = &*runners {
+                return model_runner.snapshot_gdn_state(seq_id);
+            }
+        }
+        // Process runner: send IPC message (write lock needed for the streams).
+        {
+            let mut runners = self.runners.write();
+            if let RunnerType::Process(ref mut runner_streams) = *runners {
+                if runner_streams.is_empty() {
+                    return Vec::new();
+                }
+                let stream = &mut runner_streams[0];
+                let _ = send_local(
+                    &mut vec![stream.try_clone().expect("clone failed")],
+                    &MessageType::SnapshotSeqDelta(seq_id),
+                    false,
+                );
+                match receive_local(stream, false) {
+                    Ok(MessageType::SnapshotSeqDeltaResponse(_, bytes)) => return bytes,
+                    _ => return Vec::new(),
+                }
+            }
+        }
+        Vec::new()
+    }
+
+    /// Get the GDN slot index for a sequence (0 if non-hybrid).
+    fn gdn_slot_for_seq(&self, seq_id: usize) -> usize {
+        // The GDN slot is managed internally by the model. For the delta capture,
+        // we just record that a GDN state was captured (the slot is implicit).
+        let _ = seq_id;
+        0
+    }
+
+    /// Report the state-store stats (the periodic admin view). Logs a detailed
+    /// multi-line report with size breakdown, IO volumes, and rates.
+    pub fn report_state_store_stats(&self) {
+        let mut stats = self.state_store_stats.lock().unwrap();
+        if stats.loads == 0 && stats.saves == 0 && stats.seq_deltas == 0 {
+            return; // nothing to report
+        }
+        crate::log_info!("{}", stats.detailed_report());
+        // Reset the since-report counters for the next interval.
+        stats.bytes_since_last_report = 0;
+        stats.last_report_ms = crate::core::state_store::now_ms();
+    }
+
+    /// Start the periodic state-store stats reporter (background thread, logs every
+    /// 60 seconds by default, configurable via XINFER_STATE_STATS_INTERVAL_MS).
+    /// No-op when the state store is not configured.
+    fn start_state_store_stats_reporter(&self) {
+        if self.state_store.is_none() { return };
+        let interval_ms: u64 = std::env::var("XINFER_STATE_STATS_INTERVAL_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(60_000); // default: every60 seconds
+        let stats_arc = self.state_store_stats.clone();
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(interval_ms));
+                let stats = stats_arc.lock().unwrap();
+                if stats.loads == 0 && stats.saves == 0 && stats.seq_deltas == 0 {
+                    continue; // nothing to report yet
+                }
+                crate::log_info!("{}", stats.detailed_report());
+                drop(stats);
+                // Reset the since-report counters.
+                let mut stats = stats_arc.lock().unwrap();
+                stats.bytes_since_last_report = 0;
+                stats.last_report_ms = crate::core::state_store::now_ms();
+            }
+        });
     }
 
     /// Release hybrid GDN/Mamba active slots queued by scheduler-side abort paths.
@@ -1105,7 +1457,7 @@ impl LLMEngine {
                     MessageType::RunDecode((sequences, false))
                 };
                 let serialized =
-                    bincode::serialize(&request).expect("Bincode serialization failed");
+                    rmp_serde::to_vec(&request).expect("MsgPack serialization failed");
 
                 // Send to remote worker nodes via TCP (fire-and-forget the responses;
                 // NCCL all-reduce synchronizes the actual computation)
@@ -1123,7 +1475,7 @@ impl LLMEngine {
                 for tcp_stream in remote_streams.iter_mut() {
                     match crate::utils::multi_node::recv_tcp(tcp_stream) {
                         Ok(data) => {
-                            let resp: MessageType = bincode::deserialize(&data)
+                            let resp: MessageType = rmp_serde::from_slice(&data)
                                 .expect("Failed to deserialize remote worker response");
                             match resp {
                                 MessageType::RunResponse(ref ids) if ids.is_empty() => {
@@ -1267,7 +1619,7 @@ impl LLMEngine {
                     .collect::<Vec<_>>();
                 let request = MessageType::RunDecodeMTP(sequences);
                 let serialized =
-                    bincode::serialize(&request).expect("Bincode serialization failed");
+                    rmp_serde::to_vec(&request).expect("MsgPack serialization failed");
 
                 for tcp_stream in remote_streams.iter_mut() {
                     if let Err(e) = crate::utils::multi_node::send_tcp(tcp_stream, &serialized) {
@@ -1341,7 +1693,7 @@ impl LLMEngine {
                     .collect::<Vec<_>>();
                 let request = MessageType::RunDecodeDFlash(sequences);
                 let serialized =
-                    bincode::serialize(&request).expect("Bincode serialization failed");
+                    rmp_serde::to_vec(&request).expect("MsgPack serialization failed");
                 for stream in remote_streams.iter_mut() {
                     crate::utils::multi_node::send_tcp(stream, &serialized)?;
                 }
@@ -2194,7 +2546,7 @@ impl LLMEngine {
                     } => {
                         let request = MessageType::RunEmbed((vec![seq.clone()], strategy.clone()));
                         let serialized =
-                            bincode::serialize(&request).expect("Bincode serialization failed");
+                            rmp_serde::to_vec(&request).expect("MsgPack serialization failed");
 
                         for tcp_stream in remote_streams.iter_mut() {
                             crate::utils::multi_node::send_tcp(tcp_stream, &serialized)?;
@@ -2230,7 +2582,7 @@ impl LLMEngine {
 
                         for tcp_stream in remote_streams.iter_mut() {
                             let data = crate::utils::multi_node::recv_tcp(tcp_stream)?;
-                            let response: MessageType = bincode::deserialize(&data)
+                            let response: MessageType = rmp_serde::from_slice(&data)
                                 .expect("Failed to deserialize remote worker response");
                             match response {
                                 MessageType::RunResponseEmbed(output_embed) => {

@@ -75,6 +75,8 @@ fn build_econfig() -> EngineConfig {
         29500,                               // master_port
         false,                               // enable_tool_grammar
         None,                                // num_speculative_tokens
+        None,                                // draft_model
+        None,                                // state_store_url
     )
 }
 

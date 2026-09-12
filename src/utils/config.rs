@@ -488,6 +488,12 @@ pub struct EngineConfig {
     /// External DFlash2 draft model (HuggingFace id or local directory).
     #[serde(default)]
     pub draft_model: Option<String>,
+    /// The persistent inference-state store URL (the `--state-store` arg). The
+    /// scheme selects the backend: a bare path or `file://` (the CPU FS),
+    /// `gds://`/`nvme://` (the GPUDirect zero-copy, the `gds` feature), or
+    /// `s3://bucket/prefix` (the object store, the `s3` feature).
+    #[serde(default)]
+    pub state_store_url: Option<String>,
     pub enable_tool_grammar: bool,
 }
 
@@ -670,6 +676,7 @@ impl EngineConfig {
         enable_tool_grammar: bool,
         num_speculative_tokens: Option<usize>,
         draft_model: Option<String>,
+        state_store_url: Option<String>,
     ) -> Self {
         let mut device_ids = device_ids.unwrap_or_default();
         if device_ids.is_empty() {
@@ -731,6 +738,7 @@ impl EngineConfig {
             master_port,
             num_speculative_tokens,
             draft_model,
+            state_store_url,
             enable_tool_grammar,
         }
     }

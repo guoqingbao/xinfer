@@ -265,6 +265,13 @@ pub enum MessageType {
     UsableMemoryLeft(EngineConfig),
     /// shutdown subprocesses
     Shutdown,
+
+    /// Capture the per-sequence state delta (GDN bytes) for persistence.
+    /// Sent by the main process before FinishDecode (the GDN state is still
+    /// available). The runner responds with the serialized GDN bytes.
+    SnapshotSeqDelta(usize),
+    /// Response to SnapshotSeqDelta: the GDN bytes for the sequence's slot.
+    SnapshotSeqDeltaResponse(usize, Vec<u8>),
 }
 
 //inter-node communication
@@ -276,7 +283,7 @@ pub fn send_local(
     let serialized = if use_json {
         serde_json::to_vec(message).expect("JSON serialization failed")
     } else {
-        bincode::serialize(message).expect("Bincode serialization failed")
+        rmp_serde::to_vec(message).expect("Serialization failed")
     };
 
     for stream in streams.iter_mut() {
@@ -313,10 +320,10 @@ pub fn receive_local(stream: &mut LocalStream, use_json: bool) -> std::io::Resul
             )
         })?
     } else {
-        bincode::deserialize(&serialized).map_err(|err| {
+        rmp_serde::from_slice(&serialized).map_err(|err| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("Bincode deserialization failed: {err}"),
+                format!("MsgPack deserialization failed: {err}"),
             )
         })?
     };
@@ -452,7 +459,7 @@ macro_rules! def_broadcast_message_to_runners {
                         .collect();
 
                     let mut values = local_results?;
-                    let serialized = bincode::serialize(&request).expect("Bincode serialization failed");
+                    let serialized = rmp_serde::to_vec(&request).expect("Serialization failed");
 
                     for tcp_stream in remote_streams.iter_mut() {
                         crate::utils::multi_node::send_tcp(tcp_stream, &serialized)?;
@@ -460,8 +467,8 @@ macro_rules! def_broadcast_message_to_runners {
 
                     for tcp_stream in remote_streams.iter_mut() {
                         let data = crate::utils::multi_node::recv_tcp(tcp_stream)?;
-                        let response: MessageType = bincode::deserialize(&data)
-                            .expect("Bincode deserialization failed");
+                        let response: MessageType = rmp_serde::from_slice(&data)
+                            .expect("MsgPack deserialization failed");
                         match response {
                             $resp_variant(value) => values.push(value),
                             MessageType::Error(err) => {
@@ -812,6 +819,16 @@ pub fn run_runner_process(args: Vec<String>) -> anyhow::Result<()> {
             }
             Ok(MessageType::FinishDecode(id)) => {
                 runner.finished(id);
+            }
+            Ok(MessageType::SnapshotSeqDelta(id)) => {
+                // Capture the GDN state for this sequence slot (before FinishDecode
+                // releases it). The runner owns the model, so it can D2H the GDN bytes.
+                let gdn_bytes = runner.snapshot_gdn_state(id);
+                send_local(
+                    &mut vec![stream.try_clone()?],
+                    &MessageType::SnapshotSeqDeltaResponse(id, gdn_bytes),
+                    false,
+                )?;
             }
             Ok(MessageType::CaptureMambaPrefixState((seq_id, hash, preserve))) => {
                 let ret = runner.capture_mamba_prefix_state(seq_id, hash, preserve);

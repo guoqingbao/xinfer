@@ -52,6 +52,10 @@ pub struct Sequence {
     pub is_tool_call_end: bool,
     pub hit_stop_sequence: bool,
     pub stop_sequence: Option<String>,
+    /// The epoch-ms of the last mid-prefill checkpoint (the partial prefix-cache
+    /// insert). 0 = not yet checkpointed. Runtime state (not serialized).
+    #[serde(skip)]
+    pub last_prefill_checkpoint_ms: u64,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -187,6 +191,7 @@ impl Sequence {
             is_tool_call_end: false,
             hit_stop_sequence: false,
             stop_sequence: None,
+            last_prefill_checkpoint_ms: 0,
         }
     }
 
@@ -393,8 +398,8 @@ mod tests {
         let mut seq = test_sequence(10_000);
         seq.mamba_prefix_warmup_tokens = Some(5_824);
 
-        let encoded = bincode::serialize(&seq).unwrap();
-        let decoded: Sequence = bincode::deserialize(&encoded).unwrap();
+        let encoded = rmp_serde::to_vec(&seq).unwrap();
+        let decoded: Sequence = rmp_serde::from_slice(&encoded).unwrap();
 
         assert_eq!(decoded.len(), seq.len());
         assert_eq!(decoded.mamba_prefix_warmup_tokens, None);

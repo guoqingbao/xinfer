@@ -250,6 +250,7 @@ async fn main() -> Result<()> {
         args.enable_tool_grammar,
         args.num_speculative_tokens,
         args.draft_model.clone(),
+args.state_store.clone(),
     );
 
     // Multi-node worker nodes run a daemon loop instead of the full engine
@@ -266,6 +267,8 @@ async fn main() -> Result<()> {
     let engine = LLMEngine::new(&econfig, dtype)?;
     if let Some(addr) = server_addr {
         run_server(engine.clone(), econfig.clone(), addr, args.ui_server).await?;
+        // Graceful shutdown reached: persist the final state before exiting.
+        engine.read().checkpoint();
         return Ok(());
     }
 
@@ -555,6 +558,10 @@ async fn main() -> Result<()> {
             break;
         }
     }
+
+    // Checkpoint persistent state to the state store at clean shutdown (the no-op
+    // when the --state-store flag is unset).
+    engine.read().checkpoint();
 
     Ok(())
 }
