@@ -25,7 +25,7 @@ environment variables (`AWS_ENDPOINT_URL` `AWS_REGION`, `AWS_ACCESS_KEY_ID`,
 | env var | default | effect |
 |---|---|---|
 | `--state-store` (CLI) | unset | the store URL; unset = no persistence |
-| `XINFER_STATE_COMPRESS` | off | zstd-compress the serialized state before write |
+| `XINFER_STATE_COMPRESS` | on | zstd-compress the serialized state before write; set `=0` to disable |
 | `XINFER_STATE_KEY` | unset | AES-256-GCM encrypt the state; the key is SHA-256'd to 32 bytes |
 | `XINFER_STATESTORE_STRICT` | off | reject a warm-load whose `version_stamp` (runtime + model + dtype + block size) does not match the current process |
 | `XINFER_STATE_TTL_MS` | 7 days | prune states not accessed within this window |

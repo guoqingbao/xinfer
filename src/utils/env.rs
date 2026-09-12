@@ -93,7 +93,8 @@ pub fn soft_mask_disabled() -> bool {
     })
 }
 
-/// `XINFER_STATE_COMPRESS=1` enables zstd compression of the inference state.
+/// zstd compression of the inference state is ON by default. Set
+/// `XINFER_STATE_COMPRESS=0` (or `false`/`no`) to disable it.
 pub const STATE_COMPRESS_ENV: &str = "XINFER_STATE_COMPRESS";
 
 static STATE_COMPRESS: OnceLock<bool> = OnceLock::new();
@@ -101,8 +102,8 @@ static STATE_COMPRESS: OnceLock<bool> = OnceLock::new();
 pub fn state_compress() -> bool {
     *STATE_COMPRESS.get_or_init(|| {
         env::var(STATE_COMPRESS_ENV)
-            .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes"))
-            .unwrap_or(false)
+            .map(|v| !matches!(v.trim().to_lowercase().as_str(), "0" | "false" | "no"))
+            .unwrap_or(true)
     })
 }
 

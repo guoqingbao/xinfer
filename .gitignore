@@ -20,3 +20,7 @@ install.sh
 /test_data
 /scripts
 __pycache__/
+# PDA QA golden fixtures (large/private - do not commit)
+test-tokenizer.json
+grammar_sample.txt
+docs/state-store-requirements.md
