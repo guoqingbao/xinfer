@@ -154,3 +154,19 @@ pub fn state_max_bytes() -> usize {
         .filter(|&n| n > 0)
         .unwrap_or(DEFAULT_STATE_MAX_BYTES)
 }
+
+/// `XINFER_PLE_NO_MMAP=1` forces the PLE n-gram table to be read directly into
+/// heap memory instead of mmap'd. On SM121-class GPUs (unified host/device
+/// memory) an mmap of a large file competes with the model + KV for the same
+/// physical pool, so the direct-read path is preferred there.
+pub const PLE_NO_MMAP_ENV: &str = "XINFER_PLE_NO_MMAP";
+
+static PLE_NO_MMAP: OnceLock<bool> = OnceLock::new();
+
+pub fn ple_no_mmap() -> bool {
+    *PLE_NO_MMAP.get_or_init(|| {
+        env::var(PLE_NO_MMAP_ENV)
+            .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false)
+    })
+}
