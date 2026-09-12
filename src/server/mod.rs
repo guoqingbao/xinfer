@@ -1495,6 +1495,26 @@ fn ui_api_config_for_addr(sock_addr: SocketAddr) -> (Option<u16>, Option<String>
 ///   - `ServerAddr::Unix(path)`      → Unix socket at `path`
 ///
 /// When `--pd-server` is active the address is ignored (binds `0.0.0.0:0` instead).
+///
+/// Waits for a termination signal (SIGINT or SIGTERM) so the server can shut
+/// down gracefully (the `checkpoint()` runs before the process exits).
+async fn shutdown_signal() {
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await;
+    }
+    #[cfg(unix)]
+    {
+        let mut sigterm =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("install SIGTERM signal handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {},
+            _ = sigterm.recv() => {},
+        }
+    }
+}
+
 pub async fn run_server(
     engine: Arc<RwLock<LLMEngine>>,
     econfig: EngineConfig,
@@ -1605,8 +1625,12 @@ pub async fn run_server(
     if is_pd_server {
         crate::log_warn!("🚀 PD server started, waiting for prefill request(s)...",);
         let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await?;
-        if let Err(e) = axum::serve(listener, app).await {
-            eprintln!("API server error: {e:?}");
+        {
+            let server = axum::serve(listener, app);
+            server
+                .with_graceful_shutdown(shutdown_signal())
+                .await
+                .ok();
         }
         return Ok(());
     }
@@ -1642,9 +1666,11 @@ pub async fn run_server(
             }
 
             tasks.push(tokio::spawn(async move {
-                if let Err(e) = axum::serve(listener, app).await {
-                    eprintln!("API server error: {e:?}");
-                }
+                let server = axum::serve(listener, app);
+                server
+                    .with_graceful_shutdown(shutdown_signal())
+                    .await
+                    .ok();
             }));
 
             if with_ui_server {
@@ -1676,9 +1702,11 @@ pub async fn run_server(
             );
 
             tasks.push(tokio::spawn(async move {
-                if let Err(e) = axum::serve(listener, app).await {
-                    eprintln!("API server error: {e:?}");
-                }
+                let server = axum::serve(listener, app);
+                server
+                    .with_graceful_shutdown(shutdown_signal())
+                    .await
+                    .ok();
             }));
         }
     }
