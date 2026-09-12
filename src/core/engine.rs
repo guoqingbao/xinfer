@@ -1280,15 +1280,36 @@ impl LLMEngine {
     }
 
     /// Capture the GDN/mamba state for a specific sequence's slot. Returns empty
-    /// for non-hybrid models.
+    /// for non-hybrid models. For IPC runners, sends a SnapshotSeqDelta message
+    /// to the runner process (which owns the model) and reads the GDN bytes back.
     fn capture_gdn_for_seq(&self, seq_id: usize) -> Vec<u8> {
-        let runners = self.runners.read();
-        match &*runners {
-            RunnerType::Thread(model_runner) => {
-                model_runner.snapshot_gdn_state(seq_id)
+        // Thread runner: direct access (read lock is enough).
+        {
+            let runners = self.runners.read();
+            if let RunnerType::Thread(model_runner) = &*runners {
+                return model_runner.snapshot_gdn_state(seq_id);
             }
-            _ => Vec::new(),
         }
+        // Process runner: send IPC message (write lock needed for the streams).
+        {
+            let mut runners = self.runners.write();
+            if let RunnerType::Process(ref mut runner_streams) = *runners {
+                if runner_streams.is_empty() {
+                    return Vec::new();
+                }
+                let stream = &mut runner_streams[0];
+                let _ = send_local(
+                    &mut vec![stream.try_clone().expect("clone failed")],
+                    &MessageType::SnapshotSeqDelta(seq_id),
+                    false,
+                );
+                match receive_local(stream, false) {
+                    Ok(MessageType::SnapshotSeqDeltaResponse(_, bytes)) => return bytes,
+                    _ => return Vec::new(),
+                }
+            }
+        }
+        Vec::new()
     }
 
     /// Get the GDN slot index for a sequence (0 if non-hybrid).

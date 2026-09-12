@@ -265,6 +265,13 @@ pub enum MessageType {
     UsableMemoryLeft(EngineConfig),
     /// shutdown subprocesses
     Shutdown,
+
+    /// Capture the per-sequence state delta (GDN bytes) for persistence.
+    /// Sent by the main process before FinishDecode (the GDN state is still
+    /// available). The runner responds with the serialized GDN bytes.
+    SnapshotSeqDelta(usize),
+    /// Response to SnapshotSeqDelta: the GDN bytes for the sequence's slot.
+    SnapshotSeqDeltaResponse(usize, Vec<u8>),
 }
 
 //inter-node communication
@@ -812,6 +819,16 @@ pub fn run_runner_process(args: Vec<String>) -> anyhow::Result<()> {
             }
             Ok(MessageType::FinishDecode(id)) => {
                 runner.finished(id);
+            }
+            Ok(MessageType::SnapshotSeqDelta(id)) => {
+                // Capture the GDN state for this sequence slot (before FinishDecode
+                // releases it). The runner owns the model, so it can D2H the GDN bytes.
+                let gdn_bytes = runner.snapshot_gdn_state(id);
+                send_local(
+                    &mut vec![stream.try_clone()?],
+                    &MessageType::SnapshotSeqDeltaResponse(id, gdn_bytes),
+                    false,
+                )?;
             }
             Ok(MessageType::CaptureMambaPrefixState((seq_id, hash, preserve))) => {
                 let ret = runner.capture_mamba_prefix_state(seq_id, hash, preserve);
