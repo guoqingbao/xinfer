@@ -171,3 +171,20 @@ pub fn ple_no_mmap() -> bool {
             .unwrap_or(false)
     })
 }
+
+/// `XINFER_PREFILL_CHECKPOINT_MS` (default 30000): during a long chunked prefill,
+/// checkpoint the partial prompt into the prefix cache at this interval so a client
+/// disconnect mid-prefill resumes from the last checkpoint instead of restarting.
+/// Set to 0 to disable.
+pub const PREFILL_CHECKPOINT_MS_ENV: &str = "XINFER_PREFILL_CHECKPOINT_MS";
+
+static PREFILL_CHECKPOINT_MS: OnceLock<u64> = OnceLock::new();
+
+pub fn prefill_checkpoint_ms() -> u64 {
+    *PREFILL_CHECKPOINT_MS.get_or_init(|| {
+        env::var(PREFILL_CHECKPOINT_MS_ENV)
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(30_000)
+    })
+}

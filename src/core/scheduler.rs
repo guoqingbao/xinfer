@@ -839,6 +839,10 @@ impl Scheduler {
                     let _ = self
                         .block_manager
                         .capture_mamba_prefix_state(seq, seq.len());
+                    // Sync the prefix cache at prefill completion (the KV + GDN are
+                    // already current), so a disconnect before decode reuses the
+                    // cached prompt instead of re-prefilling.
+                    self.block_manager.cache_sequence(seq);
                     if seq.len() > chunk_size {
                         chunk_finished_info.push((seq.id, seq.len()));
                     }
@@ -850,6 +854,17 @@ impl Scheduler {
                     remove_ids.push(seq.id);
                     let mut seq = seq.clone();
                     seq.num_cached_tokens += chunk_tokens;
+                    // 30s mid-prefill checkpoint: insert the partial prompt into the
+                    // prefix cache so a client disconnect resumes from here instead
+                    // of restarting the prefill.
+                    let interval = crate::utils::env::prefill_checkpoint_ms();
+                    if interval > 0 {
+                        let now = crate::core::state_store::now_ms();
+                        if now.saturating_sub(seq.last_prefill_checkpoint_ms) >= interval {
+                            self.block_manager.cache_sequence_prefix(&seq, seq.num_cached_tokens);
+                            seq.last_prefill_checkpoint_ms = now;
+                        }
+                    }
                     // The active mamba slot already contains the state at this
                     // chunk boundary. Keep the captured snapshot available for
                     // other requests, but do not force this in-progress request

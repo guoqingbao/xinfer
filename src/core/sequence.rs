@@ -52,6 +52,10 @@ pub struct Sequence {
     pub is_tool_call_end: bool,
     pub hit_stop_sequence: bool,
     pub stop_sequence: Option<String>,
+    /// The epoch-ms of the last mid-prefill checkpoint (the partial prefix-cache
+    /// insert). 0 = not yet checkpointed. Runtime state (not serialized).
+    #[serde(skip)]
+    pub last_prefill_checkpoint_ms: u64,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -187,6 +191,7 @@ impl Sequence {
             is_tool_call_end: false,
             hit_stop_sequence: false,
             stop_sequence: None,
+            last_prefill_checkpoint_ms: 0,
         }
     }
 
