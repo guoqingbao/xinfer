@@ -52,6 +52,43 @@ pub struct InferenceState {
     /// The last time this state was read or written (epoch ms). Self-tracked, not
     /// filesystem atime, so LRU eviction is backend-independent. Bumped on every save/load.
     pub last_accessed: u64,
+    /// SHA-256 over the serialized state with this field zeroed. Set by `finalize`
+    /// before persist; verified by `verify` on load. Proves the bytes are whole.
+    pub checksum: [u8; 32],
+    /// True only once `finalize` has run and the write completed. A torn/partial
+    /// write (crash mid-save) leaves this false, so `load` discards it and the
+    /// caller falls back to the last good checkpoint.
+    pub complete: bool,
+}
+
+impl InferenceState {
+    /// Compute the SHA-256 over the state with the checksum field zeroed.
+    fn compute_checksum(state: &InferenceState) -> [u8; 32] {
+        let mut copy = state.clone();
+        copy.checksum = [0u8; 32];
+        copy.last_accessed = 0; // metadata, excluded from the logical-state checksum
+        copy.complete = false; // flips during finalize/verify, so exclude it
+        let bytes = rmp_serde::to_vec(&copy).unwrap_or_default();
+        use sha2::Digest;
+        sha2::Sha256::digest(&bytes).into()
+    }
+
+    /// Finalize the state for persistence: stamp the checksum + mark complete.
+    /// Call this immediately before handing the state to a `'s `save`.
+    pub fn finalize(&mut self) {
+        self.checksum = Self::compute_checksum(self);
+        self.complete = true;
+    }
+
+    /// Verify the state is whole + complete. Returns false for a torn or partial
+    /// write, in which case the caller must discard it (fall back to the last
+    /// good checkpoint).
+    pub fn verify(&self) -> bool {
+        if !self.complete {
+            return false;
+        }
+        Self::compute_checksum(self) == self.checksum
+    }
 }
 
 /// Logical equality excludes the `last_accessed` timestamp (it changes on every
@@ -188,6 +225,10 @@ pub enum StateStoreError {
     Crypto(String),
     #[error("key not found: {0}")]
     NotFound(String),
+    /// The loaded state failed its integrity check (a torn or partial write). The
+    /// caller must discard it and fall back to the last good checkpoint.
+    #[error("corrupt state for key {0}: checksum or completeness failed")]
+    Corrupt(String),
 }
 
 /// The filesystem backend (the CPU bounce-buffer path). The state is serialized
@@ -292,8 +333,9 @@ impl StateStore for FsStateStore {
         std::fs::create_dir_all(&self.root)?;
         let mut state = state.clone();
         state.last_accessed = now_ms();
+        state.finalize(); // the checksum + the complete flag (the trait-level integrity)
         let encoded = self.encode(&state)?;
-        std::fs::write(self.path_for(key), encoded)?;
+        std::fs::write(self.path_for(key), &encoded)?;
         Ok(())
     }
 
@@ -302,6 +344,10 @@ impl StateStore for FsStateStore {
         let raw = std::fs::read(&path).map_err(|_| StateStoreError::NotFound(key.to_string()))?;
         let mut state = self.decode(&raw)?;
         state.last_accessed = now_ms();
+        if !state.verify() {
+            // the torn/partial write — discard it (the caller falls back to the last good checkpoint)
+            return Err(StateStoreError::Corrupt(key.to_string()));
+        }
         Ok(state)
     }
 
@@ -483,6 +529,7 @@ impl StateStore for NvmeStateStore {
         std::fs::create_dir_all(&self.root)?;
         let mut state = state.clone();
         state.last_accessed = now_ms();
+        state.finalize(); // the checksum + the complete flag (the trait-level integrity)
         let encoded = self.encode(&state)?;
         let path = self.path_for(key);
         // The cuFile path: register the file, DMA the payload into a GPU buffer,
@@ -520,6 +567,9 @@ impl StateStore for NvmeStateStore {
             .map_err(|e| StateStoreError::Crypto(e.to_string()))?;
         let mut state = self.decode(&raw)?;
         state.last_accessed = now_ms();
+        if !state.verify() {
+            return Err(StateStoreError::Corrupt(key.to_string()));
+        }
         Ok(state)
     }
 
@@ -656,6 +706,7 @@ impl StateStore for S3StateStore {
     fn save(&self, key: &str, state: &InferenceState) -> Result<(), StateStoreError> {
         let mut state = state.clone();
         state.last_accessed = now_ms();
+        state.finalize(); // the checksum + the complete flag (the trait-level integrity)
         let encoded = self.encode(&state)?;
         let obj_key = self.object_key(key);
         self.runtime.block_on(async {
@@ -676,6 +727,9 @@ impl StateStore for S3StateStore {
         let raw = response.to_vec();
         let mut state = self.decode(&raw)?;
         state.last_accessed = now_ms();
+        if !state.verify() {
+            return Err(StateStoreError::Corrupt(key.to_string()));
+        }
         Ok(state)
     }
 
@@ -790,6 +844,8 @@ mod tests {
                 block_size: 64,
             },
             last_accessed: now_ms(),
+            checksum: [0u8; 32], // the placeholder (the save() finalizes it)
+            complete: false,     // the save() sets it to true via finalize()
         }
     }
 
@@ -859,5 +915,64 @@ mod tests {
         assert_eq!(cache.longest_match(&[0xAA, 0xBB]).unwrap().block_count, 16);
         // No candidate matches -> None.
         assert!(cache.longest_match(&[0xCC]).is_none());
+    }
+
+    /// The finalize/verify operations: a finalized state verifies; the checksum
+    /// covers the logical content (kv/gdn/prefix/dtype/stamp), not the metadata.
+    #[test]
+    fn finalize_verify_roundtrip() {
+        let mut state = sample_state();
+        assert!(!state.complete, "a fresh state is not complete");
+        assert!(!state.verify(), "an incomplete state must not verify");
+        state.finalize();
+        assert!(state.complete, "finalize marks the state complete");
+        assert!(state.verify(), "a finalized state verifies");
+        // the checksum is stable across re-finalize (idempotent over the content)
+        let first = state.checksum;
+        state.finalize();
+        assert_eq!(state.checksum, first, "finalize must be idempotent over content");
+    }
+
+    /// verify() detects a tampered logical field (the checksum no longer matches).
+    #[test]
+    fn verify_detects_tampered_content() {
+        let mut state = sample_state();
+        state.finalize();
+        assert!(state.verify());
+        // tamper with the logical content (the KV bytes)
+        state.kv[0].k_bytes.push(0xFF);
+        assert!(!state.verify(), "a tampered state must fail verification");
+    }
+
+    /// verify() detects an incomplete state (the complete flag is false).
+    #[test]
+    fn verify_detects_incomplete_state() {
+        let mut state = sample_state();
+        state.finalize();
+        state.complete = false; // simulate a torn write that never completed
+        assert!(!state.verify(), "an incomplete state must fail verification");
+    }
+
+    /// The double-buffer: a corrupt .current falls back to the good .last_good.
+    #[test]
+    fn double_buffer_fallback_to_last_good() {
+        let dir = std::env::temp_dir().join("state_store_test_dbuf");
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = FsStateStore::new(&dir, false, None);
+        let good = sample_state();
+        store.save("checkpoint.last_good", &good).expect("save last_good");
+
+        // Simulate a torn .current write: save a state then corrupt its file bytes.
+        store.save("checkpoint.current", &good).expect("save current");
+        let cur_path = dir.join("checkpointcurrent.state"); // path_for sanitizes the key
+        let mut bytes = std::fs::read(&cur_path).expect("read current");
+        bytes.truncate(bytes.len() / 2); // tear the write
+        std::fs::write(&cur_path, &bytes).expect("rewrite torn current");
+
+        // load(.current) must fail verification; load(.last_good) must succeed.
+        assert!(store.load("checkpoint.current").is_err(), "torn current must not load");
+        let recovered = store.load("checkpoint.last_good").expect("last_good must load");
+        assert_eq!(recovered, good, "fallback must recover the last good state");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

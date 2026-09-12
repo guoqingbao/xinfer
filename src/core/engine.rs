@@ -581,6 +581,16 @@ impl LLMEngine {
             let key = crate::core::state_store::state_store_key();
             crate::core::state_store::state_store_from_url(url, compress, key).ok()
         });
+        if let Some(url) = &econfig.state_store_url {
+            match &state_store {
+                Some(_) => crate::log_info!(
+                    "[state] store initialized at boot: {url} (compress={}, encrypted={})",
+                    crate::utils::env::state_compress(),
+                    crate::core::state_store::state_store_key().is_some()
+                ),
+                None => crate::log_warn!("[state] failed to initialize store at {url} (feature not enabled or bad URL); persistence disabled"),
+            }
+        }
 
         let engine = Arc::new(RwLock::new(Self {
             runners,
@@ -642,57 +652,59 @@ impl LLMEngine {
             crate::log_info!("[state] pruned {pruned} stale state(s) before warm-load");
         }
         let t0 = std::time::Instant::now();
-        let keys = match store.list() {
-            Ok(k) => k,
-            Err(e) => {
-                crate::log_warn!("[state] list failed: {e}");
-                return;
+        // Double-buffer: try the in-progress checkpoint first, fall back to the last-good.
+        let state = match store.load("checkpoint.current") {
+            Ok(s) if s.verify() => {
+                crate::log_info!("[state] warm-loading from checkpoint.current");
+                s
             }
-        };
-        let mut loaded = 0usize;
-        let mut discarded = 0usize;
-        for key in &keys {
-            match store.load(key) {
-                Ok(state) => {
-                    if state.version_stamp != self.current_version_stamp() {
-                        if crate::utils::env::statestore_strict() {
-                            crate::log_warn!(
-                                "[state] {key} version mismatch (stored runtime={} model={} dtype={} block={} vs current runtime={} model={} dtype={} bs={}); STRICT -> discard",
-                                state.version_stamp.runtime_version, state.version_stamp.model_id,
-                                state.version_stamp.kv_dtype, state.version_stamp.block_size,
-                                self.current_version_stamp().runtime_version, self.current_version_stamp().model_id,
-                                self.current_version_stamp().kv_dtype, self.current_version_stamp().block_size,
-                            );
-                            let _ = store.delete(key);
-                            discarded += 1;
-                            continue;
-                        }
-                        crate::log_warn!("[state] {key} version mismatch; loading anyway (non-STRICT)");
-                    }
-                    loaded += 1;
-                    crate::log_info!(
-                        "[state] warm-loaded {key} ({} KV layers, {} GDN layers, {} prefix entries)",
-                        state.kv.len(), state.gdn.len(), state.prefix_cache.entries.len()
-                    );
+            _ => match store.load("checkpoint.last_good") {
+                Ok(s) if s.verify() => {
+                    crate::log_info!("[state] checkpoint.current unavailable/corrupt; warm-loading from checkpoint.last_good");
+                    s
+                }
+                Ok(_) => {
+                    crate::log_warn!("[state] checkpoint.last_good failed verification; no consistent checkpoint");
+                    return;
                 }
                 Err(e) => {
-                    crate::log_warn!("[state] load {key} failed: {e}");
+                    crate::log_warn!("[state] warm-load failed (no consistent checkpoint): {e}");
+                    return;
                 }
+            },
+        };
+        // Verify the version stamp (the XINFER_STATESTORE_STRICT rejects a mismatch).
+        if state.version_stamp != self.current_version_stamp() {
+            if crate::utils::env::statestore_strict() {
+                crate::log_warn!(
+                    "[state] version mismatch (stored runtime={} model={} dtype={} block={} vs current runtime={} model={} dtype={} bs={}); STRICT -> discard",
+                    state.version_stamp.runtime_version, state.version_stamp.model_id,
+                    state.version_stamp.kv_dtype, state.version_stamp.block_size,
+                    self.current_version_stamp().runtime_version, self.current_version_stamp().model_id,
+                    self.current_version_stamp().kv_dtype, self.current_version_stamp().block_size,
+                );
+                return;
             }
+            crate::log_warn!("[state] version mismatch; loading anyway (non-STRICT)");
         }
         crate::log_info!(
-            "[state] warm-load complete: {} loaded, {} discarded, {} keys in {:.1}ms",
-            loaded, discarded, keys.len(), t0.elapsed().as_millis()
+            "[state] warm-loaded ({} KV layers, {} GDN layers, {} prefix entries) in {:.1}ms",
+            state.kv.len(), state.gdn.len(), state.prefix_cache.entries.len(), t0.elapsed().as_millis()
         );
         // Record the load stats (the start-time).
         {
             let mut stats = self.state_store_stats.lock().unwrap();
-            stats.loads += loaded;
+            stats.loads += 1;
             stats.load_ms += t0.elapsed().as_millis() as u64;
         }
     }
 
     /// Checkpoint persistent state to the state store at shutdown.
+    ///
+    /// Double-buffered: writes to `checkpoint.current`, verifies it, then promotes
+    /// it to `checkpoint.last_good`. A torn `.current` write never destroys the
+    /// last-good checkpoint, so a crash mid-check still leaves a consistent state
+    /// to roll back to.
     pub fn checkpoint(&self) {
         let Some(store) = &self.state_store else { return };
         let t0 = std::time::Instant::now();
@@ -706,19 +718,33 @@ impl LLMEngine {
             kv_dtype: self.econfig.kvcache_dtype.to_string(),
             version_stamp: self.current_version_stamp(),
             last_accessed: crate::core::state_store::now_ms(),
+            checksum: [0u8; 32], // the placeholder (the save() finalizes it)
+            complete: false,     // the save() sets it to true via finalize()
         };
-        match store.save("checkpoint", &state) {
+        // 1. Write the in-progress checkpoint.
+        match store.save("checkpoint.current", &state) {
             Ok(()) => {
-                crate::log_info!(
-                    "[state] checkpoint saved ({} KV layers, {} GDN layers) in {:.1}ms",
-                    state.kv.len(), state.gdn.len(), t0.elapsed().as_millis()
-                );
+                // 2. Verify the in-progress checkpoint is consistent.
+                match store.load("checkpoint.current") {
+                    Ok(loaded) if loaded.verify() => {
+                        // 3. Promote the verified checkpoint to last-good.
+                        if store.save("checkpoint.last_good", &loaded).is_ok() {
+                            crate::log_info!(
+                                "[state] checkpoint saved + promoted to last_good ({} KV layers, {} GDN layers) in {:.1}ms",
+                                state.kv.len(), state.gdn.len(), t0.elapsed().as_millis()
+                            );
+                        } else {
+                            crate::log_warn!("[state] checkpoint promotion to last_good failed; .current preserved");
+                        }
+                    }
+                    _ => crate::log_warn!("[state] checkpoint .current failed verification; last_good preserved"),
+                }
                 // Record the save stats (the quit-time).
                 let mut stats = self.state_store_stats.lock().unwrap();
                 stats.saves += 1;
                 stats.save_ms += t0.elapsed().as_millis() as u64;
             }
-            Err(e) => crate::log_warn!("[state] checkpoint save failed: {e}"),
+            Err(e) => crate::log_warn!("[state] checkpoint save failed: {e} (last_good preserved)"),
         }
     }
 
