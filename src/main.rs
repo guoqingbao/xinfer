@@ -267,6 +267,8 @@ args.state_store.clone(),
     let engine = LLMEngine::new(&econfig, dtype)?;
     if let Some(addr) = server_addr {
         run_server(engine.clone(), econfig.clone(), addr, args.ui_server).await?;
+        // Graceful shutdown reached: persist the final state before exiting.
+        engine.read().checkpoint();
         return Ok(());
     }
 
