@@ -793,7 +793,18 @@ pub fn state_store_from_url(
     if let Some(path) = url.strip_prefix("gds://").or_else(|| url.strip_prefix("nvme://")) {
         #[cfg(feature = "gds")]
         {
-            return Ok(Box::new(NvmeStateStore::new(path, compress, key, 0)?));
+            // The GDS backend requires the cuFile runtime (the nvidia-fs module + a
+            // GDS-capable NVMe). When it is unavailable, Cufile::new panics; catch
+            // that and degrade to the CPU-bounce FS backend on the same path so a
+            // missing GDS stack never takes the engine down.
+            match std::panic::catch_unwind(|| NvmeStateStore::new(path, compress, key.clone(), 0)) {
+                Ok(store) => return Ok(Box::new(store)),
+                Err(_) => {
+                    crate::log_warn!(
+                        "[state] GDS runtime unavailable; degrading to the FS backend at {path}"
+                    );
+                }
+            }
         }
         #[cfg(not(feature = "gds"))]
         {
