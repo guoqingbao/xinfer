@@ -419,6 +419,9 @@ pub fn now_ms() -> u64 {
 #[cfg(feature = "gds")]
 pub struct NvmeStateStore {
     cufile: std::sync::Arc<cudarc::cufile::Cufile>,
+    /// Held to keep the CudaContext alive (the stream borrows from it); never read
+    /// directly, hence the allow.
+    #[allow(dead_code)]
     ctx: std::sync::Arc<cudarc::driver::CudaContext>,
     stream: std::sync::Arc<cudarc::driver::CudaStream>,
     root: PathBuf,
@@ -550,7 +553,7 @@ impl StateStore for NvmeStateStore {
         let path = self.path_for(key);
         let file = std::fs::File::open(&path).map_err(|_| StateStoreError::NotFound(key.to_string()))?;
         let file_size = file.metadata().map_err(StateStoreError::Io)?.len() as usize;
-        let mut handle = self.cufile.register(file).map_err(|e| StateStoreError::Crypto(e.to_string()))?;
+        let handle = self.cufile.register(file).map_err(|e| StateStoreError::Crypto(e.to_string()))?;
         let mut buf = self
             .stream
             .alloc_zeros::<u8>(file_size)
@@ -785,6 +788,7 @@ pub fn state_store_from_url(
         }
         #[cfg(not(feature = "s3"))]
         {
+            let _ = rest;
             return Err(StateStoreError::Crypto(
                 "s3:// URL requires the `s3` cargo feature".into(),
             ));
@@ -798,7 +802,12 @@ pub fn state_store_from_url(
             // that and degrade to the CPU-bounce FS backend on the same path so a
             // missing GDS stack never takes the engine down.
             match std::panic::catch_unwind(|| NvmeStateStore::new(path, compress, key.clone(), 0)) {
-                Ok(store) => return Ok(Box::new(store)),
+                Ok(Ok(store)) => return Ok(Box::new(store)),
+                Ok(Err(e)) => {
+                    crate::log_warn!(
+                        "[state] GDS store init failed ({e}); degrading to the FS backend at {path}"
+                    );
+                }
                 Err(_) => {
                     crate::log_warn!(
                         "[state] GDS runtime unavailable; degrading to the FS backend at {path}"
