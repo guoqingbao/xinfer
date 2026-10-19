@@ -35,6 +35,134 @@ impl LogitsProcessor {
         }
     }
 
+    /// Sample a single token from a CPU logits row (the `SmpD` actor's sampling path).
+    /// Applies the temperature + the top-k/top-p filtering + the multinomial sampling.
+    pub fn sample_cpu_row(&self, logits: &[f32], _seq_id: usize) -> Option<u32> {
+        if logits.is_empty() {
+            return None;
+        }
+        // Apply the temperature (the ArgMax strategy is temperature-free).
+        let temperature = match &self.sampling {
+            Sampling::ArgMax => 1.0,
+            Sampling::All { temperature } => *temperature,
+            Sampling::TopK { temperature, .. } => *temperature,
+            Sampling::TopP { temperature, .. } => *temperature,
+            Sampling::TopKThenTopP { temperature, .. } => *temperature,
+        };
+        let scaled: Vec<f32> = if temperature > 0.0 {
+            logits.iter().map(|&l| l / temperature).collect()
+        } else {
+            logits.to_vec()
+        };
+        // Compute the softmax (the probabilities).
+        let max_logit = scaled.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let exps: Vec<f32> = scaled.iter().map(|&l| (l - max_logit).exp()).collect();
+        let sum: f32 = exps.iter().sum();
+        if sum == 0.0 || sum.is_nan() {
+            return None;
+        }
+        let mut probs: Vec<f32> = exps.iter().map(|&e| e / sum).collect();
+
+        // Apply the top-k / top-p filtering.
+        match &self.sampling {
+            Sampling::TopK { k, .. } => {
+                let k = *k;
+                if k > 0 && k < probs.len() {
+                    let mut indexed: Vec<(usize, f32)> = probs.iter().enumerate().map(|(i, &p)| (i, p)).collect();
+                    indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                    let threshold = indexed[k - 1].1;
+                    for p in probs.iter_mut() {
+                        if *p < threshold {
+                            *p = 0.0;
+                        }
+                    }
+                }
+            }
+            Sampling::TopP { p, .. } => {
+                let p = *p;
+                if p > 0.0 && p < 1.0 {
+                    let mut indexed: Vec<(usize, f32)> = probs.iter().enumerate().map(|(i, &p)| (i, p)).collect();
+                    indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                    let mut cumsum = 0.0;
+                    let mut keep = 0usize;
+                    for (i, &(_, prob)) in indexed.iter().enumerate() {
+                        cumsum += prob;
+                        if cumsum >= p {
+                            keep = i + 1;
+                            break;
+                        }
+                        keep = i + 1;
+                    }
+                    for (i, p_) in probs.iter_mut().enumerate() {
+                        if i >= keep {
+                            *p_ = 0.0;
+                        }
+                    }
+                }
+            }
+            Sampling::TopKThenTopP { k, p, .. } => {
+                // Apply top-k then top-p (the combined strategy).
+                if *k > 0 && *k < probs.len() {
+                    let mut indexed: Vec<(usize, f32)> = probs.iter().enumerate().map(|(i, &p)| (i, p)).collect();
+                    indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                    let threshold = indexed[*k - 1].1;
+                    for p in probs.iter_mut() {
+                        if *p < threshold {
+                            *p = 0.0;
+                        }
+                    }
+                }
+                if *p > 0.0 && *p < 1.0 {
+                    let mut indexed: Vec<(usize, f32)> = probs.iter().enumerate().map(|(i, &p)| (i, p)).collect();
+                    indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                    let mut cumsum = 0.0;
+                    let mut keep = 0usize;
+                    for (i, &(_, prob)) in indexed.iter().enumerate() {
+                        cumsum += prob;
+                        if cumsum >= *p {
+                            keep = i + 1;
+                            break;
+                        }
+                        keep = i + 1;
+                    }
+                    for (i, p_) in probs.iter_mut().enumerate() {
+                        if i >= keep {
+                            *p_ = 0.0;
+                        }
+                    }
+                }
+            }
+            Sampling::ArgMax | Sampling::All { .. } => {
+                // No filtering (the ArgMax is the greedy, the All is the plain multinomial).
+            }
+        }
+
+        // Re-normalize after the filtering.
+        let sum: f32 = probs.iter().sum();
+        if sum == 0.0 || sum.is_nan() {
+            return None;
+        }
+        let probs: Vec<f32> = probs.into_iter().map(|p| p / sum).collect();
+
+        // Sample a token (the ArgMax is the greedy, the others use the multinomial).
+        match self.sampling {
+            Sampling::ArgMax => {
+                let mut max_idx = 0;
+                for (i, &p) in probs.iter().enumerate() {
+                    if p > probs[max_idx] {
+                        max_idx = i;
+                    }
+                }
+                Some(max_idx as u32)
+            }
+            _ => {
+                let distr = rand::distr::weighted::WeightedIndex::new(&probs).ok()?;
+                let mut rng = self.rng.lock();
+                Some(distr.sample(&mut *rng) as u32)
+            }
+        }
+    }
+
     pub fn new(
         seed: u64,
         temperature: Option<f32>,

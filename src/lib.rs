@@ -2,6 +2,7 @@
 use pyo3::prelude::*;
 pub mod api;
 pub mod core;
+pub mod domain;
 pub mod mcp;
 pub mod models;
 #[cfg(feature = "python")]

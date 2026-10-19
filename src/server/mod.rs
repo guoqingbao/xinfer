@@ -24,7 +24,6 @@ use axum::Router;
 use candle_core::{Result, Tensor};
 use colored::*;
 use local_ip_address::{local_ip, local_ipv6};
-use parking_lot::RwLock;
 use regex::Regex;
 use rustchatui::start_ui_server;
 use serde_json::json;
@@ -642,7 +641,7 @@ pub struct UsageResponse {
 }
 
 pub struct ServerData {
-    pub engine: Arc<RwLock<LLMEngine>>,
+    pub engine: Arc<LLMEngine>,
     pub econfig: EngineConfig,
     pub mcp_manager: Option<Arc<crate::mcp::McpClientManager>>,
 }
@@ -1488,16 +1487,13 @@ fn ui_api_config_for_addr(sock_addr: SocketAddr) -> (Option<u16>, Option<String>
 ///
 /// When `--pd-server` is active the address is ignored (binds `0.0.0.0:0` instead).
 pub async fn run_server(
-    engine: Arc<RwLock<LLMEngine>>,
+    engine: Arc<LLMEngine>,
     econfig: EngineConfig,
     addr: ServerAddr,
     with_ui_server: bool,
 ) -> Result<()> {
     use axum::extract::DefaultBodyLimit;
-    let (has_vision, model_name, resolved_max_model_len) = {
-        let e = engine.read();
-        e.get_model_info()
-    };
+    let (has_vision, model_name, resolved_max_model_len) = engine.get_model_info();
     let has_vision = Arc::new(has_vision);
     let exposed_model_id = resolve_engine_model_id(&econfig).unwrap_or_else(|| model_name.clone());
     let exposed_max_model_len = resolved_max_model_len;

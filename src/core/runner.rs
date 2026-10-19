@@ -163,16 +163,6 @@ impl Model {
     }
 }
 
-pub enum RunnerType {
-    Thread(ModelRunner),
-    Process(Vec<LocalStream>),
-    /// Master node in multi-node inference: local IPC streams + TCP streams to worker nodes.
-    MultiNodeMaster {
-        local_streams: Vec<LocalStream>,
-        remote_streams: Vec<std::net::TcpStream>,
-    },
-}
-
 pub struct CpuTqLayerCache {
     pub k_absmax: Option<Tensor>,
     pub k_quant: Option<Tensor>,

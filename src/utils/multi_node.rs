@@ -288,34 +288,6 @@ pub fn recv_tcp(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
 }
 
 #[cfg(feature = "nccl")]
-fn forward_to_local_runners(
-    runner_streams: &mut Vec<interprocess::local_socket::Stream>,
-    msg: &crate::runner::MessageType,
-) -> candle_core::Result<crate::runner::MessageType> {
-    use crate::runner::{receive_local, send_local, MessageType};
-    use interprocess::local_socket::Stream as LocalStream;
-    use interprocess::TryClone;
-    use rayon::iter::{IntoParallelIterator, ParallelIterator};
-
-    let cloned_streams: Vec<LocalStream> = runner_streams
-        .iter_mut()
-        .map(|s| s.try_clone().expect("clone failed"))
-        .collect();
-
-    let responses: candle_core::Result<Vec<MessageType>> = cloned_streams
-        .into_par_iter()
-        .map(|mut stream| {
-            send_local(&mut vec![stream.try_clone()?], msg, false)?;
-            receive_local(&mut stream, false).map_err(candle_core::Error::wrap)
-        })
-        .collect();
-
-    responses?
-        .into_iter()
-        .next()
-        .ok_or_else(|| candle_core::Error::Msg("No response from local runners".to_string()))
-}
-
 /// Run the worker daemon on non-master nodes.
 ///
 /// This function:
@@ -329,8 +301,8 @@ pub fn run_worker_daemon(
     dtype: candle_core::DType,
 ) -> candle_core::Result<()> {
     use crate::core::engine::LLMEngine;
-    use crate::core::runner::RunnerType;
     use crate::runner::MessageType;
+    use ractor::rpc::CallResult;
 
     crate::log_info!(
         "[Multi-Node Worker] Starting daemon on node {} with {} local GPUs",
@@ -338,7 +310,7 @@ pub fn run_worker_daemon(
         econfig.device_ids.as_ref().map(|d| d.len()).unwrap_or(1)
     );
 
-    let engine = LLMEngine::new(econfig, dtype)?;
+    let engine = crate::core::engine::GLOBAL_RT.block_on(LLMEngine::new(econfig, dtype))?;
 
     let mn_config = MultiNodeConfig {
         num_nodes: econfig.num_nodes,
@@ -391,21 +363,18 @@ pub fn run_worker_daemon(
             | MessageType::KvCacheRelease(_)
             | MessageType::CheckKvCacheRelease(_)
             | MessageType::ClearBlocks(_) => {
-                let runners = engine.read().runners.clone();
-                let response = {
-                    let mut guard = runners.write();
-                    match &mut *guard {
-                        RunnerType::Process(ref mut runner_streams) => {
-                            match forward_to_local_runners(runner_streams, &msg) {
-                                Ok(response) => response,
-                                Err(e) => MessageType::Error(format!("{:?}", e)),
-                            }
-                        }
-                        _ => {
-                            crate::log_error!("[Multi-Node Worker] Expected Process runner type");
-                            MessageType::Error("Expected Process runner type".to_string())
-                        }
-                    }
+                // The raw forward (the multi-node worker forwards arbitrary messages to
+                // the local runners via the FwdD actor's forward_raw escape hatch, the
+                // sole socket writer).
+                let response = crate::core::engine::GLOBAL_RT.block_on(
+                    engine.as_ref().fwd.call(
+                        |r| crate::domain::fwd::FwdMessage::ForwardRaw(msg.clone(), r),
+                        None,
+                    ),
+                );
+                let response = match response {
+                    Ok(CallResult::Success(m)) => m,
+                    _ => MessageType::Error("forward_raw failed".into()),
                 };
 
                 let response_data =
@@ -416,7 +385,7 @@ pub fn run_worker_daemon(
                 }
             }
             MessageType::FinishDecode(id) => {
-                let mut guard = engine.write();
+                let guard = engine.as_ref();
                 let _ = guard.notify_runner_finished(id);
             }
             MessageType::Shutdown => {

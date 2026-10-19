@@ -27,6 +27,7 @@ toktrie_hf_tokenizers = "1.7"
 toktrie = "1.4"
 half = { version = "2.5.0", features = ["num-traits", "use-intrinsics", "rand_distr"] }
 tokio = { version = "1.38.0", features = ["sync"] }
+ractor = { version = "0.16.5", features = ["actor-macros", "async-trait"] }
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 either = { version = "1.13.0", features = ["serde"] }

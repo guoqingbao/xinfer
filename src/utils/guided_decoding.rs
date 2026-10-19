@@ -19,7 +19,7 @@ pub struct GuidedDecodingStep {
 }
 
 impl GuidedDecodingStep {
-    fn none() -> Self {
+    pub fn none() -> Self {
         Self {
             guided_seq_ids: None,
         }

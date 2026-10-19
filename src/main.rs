@@ -263,7 +263,7 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    let engine = LLMEngine::new(&econfig, dtype)?;
+    let engine = LLMEngine::new(&econfig, dtype).await?;
     if let Some(addr) = server_addr {
         run_server(engine.clone(), econfig.clone(), addr, args.ui_server).await?;
         return Ok(());
@@ -295,7 +295,7 @@ async fn main() -> Result<()> {
     }
 
     let (resolved_max_model_len, resolved_max_num_seqs) = {
-        let e = engine.read();
+        let e = engine.as_ref();
         let (_, _, mml) = e.get_model_info();
         (mml.unwrap_or(32768usize), e.econfig.max_num_seqs)
     };
@@ -359,9 +359,9 @@ async fn main() -> Result<()> {
                         print!("\n🌀 Chat history cleared. Start a new conversation.\n");
                         chat_history.clear(); //start a new chat
                         if prefix_cache {
-                            let e = engine.read();
+                            let e = engine.as_ref();
                             chat_context_left =
-                                total_available_tokens - e.get_num_cached_tokens() as i64;
+                                total_available_tokens - e.get_num_cached_tokens().await as i64;
                         } else {
                             chat_context_left = total_available_tokens;
                         }
@@ -379,7 +379,7 @@ async fn main() -> Result<()> {
         let mut outputs = {
             if interactive {
                 let preprocessed = {
-                    let e = engine.read();
+                    let e = engine.as_ref();
                     let mut p = e
                         .preprocess(
                             std::slice::from_ref(&request_params),
@@ -391,8 +391,8 @@ async fn main() -> Result<()> {
                     p.pop().expect("preprocess returned 0 items for 1 input")
                 };
                 let (seq_id, prompt_length, _prefilled_reasoning_end, stream) = {
-                    let mut e = engine.write();
-                    match e.generate_stream(preprocessed, None, &None) {
+                    let e = engine.as_ref();
+                    match e.generate_stream(preprocessed, None, &None).await {
                         Ok((seq_id, prompt_length, prefilled_reasoning_end, stream)) => {
                             (seq_id, prompt_length, prefilled_reasoning_end, stream)
                         }
@@ -456,8 +456,8 @@ async fn main() -> Result<()> {
                     decode_output,
                 ) = handle.await.map_err(candle_core::Error::wrap)?;
                 if prefix_cache {
-                    let e = engine.read();
-                    chat_context_left = total_available_tokens - e.get_num_cached_tokens() as i64;
+                    let e = engine.as_ref();
+                    chat_context_left = total_available_tokens - e.get_num_cached_tokens().await as i64;
                 } else {
                     chat_context_left =
                         total_available_tokens - prompt_length as i64 - decoded_length as i64;
@@ -478,15 +478,15 @@ async fn main() -> Result<()> {
                 xinfer::log_warn!("Starting the inference...");
 
                 let (preprocessed, tokenizer) = {
-                    let e = engine.read();
+                    let e = engine.as_ref();
                     (
                         e.preprocess(&params, &message_list, &Vec::new(), false)?,
                         Arc::new(e.tokenizer.clone()),
                     )
                 };
                 let receivers = {
-                    let mut e = engine.write();
-                    e.generate_sync(preprocessed, None, &None)?
+                    let e = engine.as_ref();
+                    e.generate_sync(preprocessed, None, &None).await?
                 };
                 let results = LLMEngine::collect_sync_results(receivers, tokenizer, None).await?;
                 // GenerationOutput is returned directly

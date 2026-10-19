@@ -1,19 +1,14 @@
 // src/core/block_manager.rs
 use super::prefix_cache::{PrefixCache, PrefixCacheConfig, PrefixCacheUpdate};
-use super::runner::RunnerType;
 use super::sequence::{Sequence, SequenceStatus};
-use crate::def_broadcast_message_to_runners;
-use crate::runner::{receive_local, send_local, MessageType};
 use crate::utils::env::{mamba_snapshot_block_stride_blocks, MAMBA_SNAPSHOT_BLOCK_STRIDE_ENV};
 use crate::utils::image::ImageData;
+use crate::domain::fwd::FwdMessage;
 use candle_core::Result;
-use interprocess::{local_socket::Stream as LocalStream, TryClone};
-use parking_lot::RwLock;
-use rayon::iter::IntoParallelIterator;
-use rayon::iter::ParallelIterator;
+use ractor::rpc::CallResult;
+use ractor::RpcReplyPort;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
-use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone)]
@@ -46,7 +41,7 @@ pub struct BlockManager {
     // prefix-cache mode: sequence-owned suffix blocks swapped to CPU, prefix stays on GPU
     seq_swap_states: HashMap<usize, SeqSwapState>,
     block_size: usize,
-    runners: Arc<RwLock<RunnerType>>,
+    fwd: ractor::ActorRef<FwdMessage>,
     prefix_cache: Option<PrefixCache>,
     mamba_prefix_enabled: bool,
     mamba_snapshot_block_stride_blocks: usize,
@@ -56,8 +51,21 @@ pub struct BlockManager {
 }
 
 impl BlockManager {
+    /// Extract the success value from a Ractor RPC call on the `FwdD` actor, or a
+    /// default. Wraps the `ActorRef::call` + `CallResult` extraction.
+    async fn fwd_call<T: Send + 'static>(
+        &self,
+        builder: impl FnOnce(RpcReplyPort<T>) -> FwdMessage,
+        default: T,
+    ) -> T {
+        match self.fwd.call(builder, None).await {
+            Ok(CallResult::Success(v)) => v,
+            _ => default,
+        }
+    }
+
     pub fn new(
-        runners: Arc<RwLock<RunnerType>>,
+        fwd: ractor::ActorRef<FwdMessage>,
         num_blocks: usize,
         num_cpu_blocks: usize,
         block_size: usize,
@@ -111,7 +119,7 @@ impl BlockManager {
             swapped_map: HashMap::new(),
             seq_swap_states: HashMap::new(),
             block_size,
-            runners,
+            fwd,
             prefix_cache,
             mamba_prefix_enabled,
             mamba_snapshot_block_stride_blocks,
@@ -193,7 +201,7 @@ impl BlockManager {
         (Some(seed), Some(first_pos / block_size))
     }
 
-    pub fn required_blocks(&mut self, seq: &Sequence) -> usize {
+    pub async fn required_blocks(&mut self, seq: &Sequence) -> usize {
         if self.prefix_cache.is_some() {
             let mut prefix_cache = self.prefix_cache.take().unwrap();
             let (seed, seed_block) = seq
@@ -208,7 +216,7 @@ impl BlockManager {
                 seq.id,
                 self.adjusted_matched_blocks(seq.token_ids.len(), prefix_match.matched_blocks),
                 prefix_match.last_hash,
-            );
+            ).await;
             self.prefix_cache = Some(prefix_cache);
             seq.num_blocks().saturating_sub(matched_blocks)
         } else {
@@ -216,19 +224,19 @@ impl BlockManager {
         }
     }
 
-    pub fn can_allocate(&mut self, seq: &Sequence) -> bool {
-        self.free_block_ids.len() >= self.required_blocks(seq)
+    pub async fn can_allocate(&mut self, seq: &Sequence) -> bool {
+        self.free_block_ids.len() >= self.required_blocks(seq).await
     }
 
     pub fn can_allocate_without_prefix(&self, seq: &Sequence) -> bool {
         self.free_block_ids.len() >= seq.num_blocks()
     }
 
-    pub fn allocate(&mut self, seq: &mut Sequence) -> Result<()> {
+    pub async fn allocate(&mut self, seq: &mut Sequence) -> Result<()> {
         assert!(seq.block_table.is_empty());
         if self.prefix_cache.is_some() {
             let mut prefix_cache = self.prefix_cache.take().unwrap();
-            let result = self.allocate_with_prefix(seq, &mut prefix_cache);
+            let result = self.allocate_with_prefix(seq, &mut prefix_cache).await;
             self.prefix_cache = Some(prefix_cache);
             result
         } else {
@@ -346,7 +354,7 @@ impl BlockManager {
         }
     }
 
-    fn resolve_mamba_matched_blocks(
+    async fn resolve_mamba_matched_blocks(
         &mut self,
         prefix_cache: &PrefixCache,
         seq_id: usize,
@@ -372,10 +380,10 @@ impl BlockManager {
                 matched_blocks -= 1;
                 continue;
             }
-            match self.try_has_mamba_prefix_state(candidate_hash) {
+            match self.try_has_mamba_prefix_state(candidate_hash).await {
                 Ok(true) => break,
                 Ok(false) => {
-                    self.invalidate_mamba_prefix_hash(candidate_hash);
+                    self.invalidate_mamba_prefix_hash(candidate_hash).await;
                     matched_blocks -= 1;
                 }
                 Err(e) => {
@@ -391,7 +399,7 @@ impl BlockManager {
         matched_blocks
     }
 
-    fn allocate_with_prefix(
+    async fn allocate_with_prefix(
         &mut self,
         seq: &mut Sequence,
         prefix_cache: &mut PrefixCache,
@@ -416,7 +424,7 @@ impl BlockManager {
                 seq.id,
                 raw_matched_blocks,
                 last_hash,
-            );
+            ).await;
         }
 
         seq.mamba_prefix_hash = None;
@@ -519,7 +527,7 @@ impl BlockManager {
         Ok(())
     }
 
-    pub fn capture_mamba_prefix_state(
+    pub async fn capture_mamba_prefix_state(
         &mut self,
         seq: &Sequence,
         processed_tokens: usize,
@@ -564,7 +572,7 @@ impl BlockManager {
             return None;
         };
         let preserve_snapshot = seq.output_ids.is_empty() || final_decode_snapshot;
-        match self.try_capture_mamba_prefix_state(seq.id, hash, preserve_snapshot) {
+        match self.try_capture_mamba_prefix_state(seq.id, hash, preserve_snapshot).await {
             Ok(true) => {
                 if let Some(&block_id_u32) = seq.block_table.get(full_blocks.saturating_sub(1)) {
                     let block_id = block_id_u32 as usize;
@@ -613,7 +621,7 @@ impl BlockManager {
         }
     }
 
-    fn invalidate_mamba_prefix_hash(&mut self, hash: u64) {
+    async fn invalidate_mamba_prefix_hash(&mut self, hash: u64) {
         self.valid_mamba_prefix_hashes.remove(&hash);
         if let Some(block_id) = self.mamba_prefix_block_by_hash.remove(&hash) {
             if let Some(hashes) = self.mamba_prefix_hashes_by_block.get_mut(&block_id) {
@@ -623,7 +631,7 @@ impl BlockManager {
                 }
             }
         }
-        if let Err(e) = self.try_remove_mamba_prefix_state(hash) {
+        if let Err(e) = self.try_remove_mamba_prefix_state(hash).await {
             crate::log_warn!(
                 "Failed to remove invalidated mamba prefix snapshot hash {}: {}",
                 hash,
@@ -632,7 +640,7 @@ impl BlockManager {
         }
     }
 
-    fn handle_mamba_prefix_evicted_blocks(&mut self, evicted_block_ids: &[usize]) {
+    async fn handle_mamba_prefix_evicted_blocks(&mut self, evicted_block_ids: &[usize]) {
         if !self.mamba_prefix_enabled || evicted_block_ids.is_empty() {
             return;
         }
@@ -644,7 +652,7 @@ impl BlockManager {
                     removed_hashes += 1;
                     self.valid_mamba_prefix_hashes.remove(&hash);
                     self.mamba_prefix_block_by_hash.remove(&hash);
-                    if let Err(e) = self.try_remove_mamba_prefix_state(hash) {
+                    if let Err(e) = self.try_remove_mamba_prefix_state(hash).await {
                         crate::log_warn!(
                             "Failed to remove mamba prefix snapshot hash {} for evicted block {}: {}",
                             hash,
@@ -664,7 +672,7 @@ impl BlockManager {
         }
     }
 
-    pub fn cache_sequence(&mut self, seq: &Sequence) {
+    pub async fn cache_sequence(&mut self, seq: &Sequence) {
         let Some(prefix_cache) = self.prefix_cache.as_mut() else {
             return;
         };
@@ -715,7 +723,7 @@ impl BlockManager {
         for block_id in evicted {
             self.decrement_block_ref(block_id);
         }
-        self.handle_mamba_prefix_evicted_blocks(&evicted_blocks);
+        self.handle_mamba_prefix_evicted_blocks(&evicted_blocks).await;
     }
 
     pub fn prefix_cache_enabled(&self) -> bool {
@@ -732,7 +740,7 @@ impl BlockManager {
 
     /// Returns how many tokens of `seq` are already cached in the prefix cache.
     /// Used to decide whether to do local prefill vs transfer to PD server.
-    pub fn get_prefix_cache_match_tokens(&mut self, seq: &Sequence) -> usize {
+    pub async fn get_prefix_cache_match_tokens(&mut self, seq: &Sequence) -> usize {
         if self.prefix_cache.is_none() {
             return 0;
         }
@@ -752,12 +760,12 @@ impl BlockManager {
             seq.id,
             self.adjusted_matched_blocks(seq.token_ids.len(), prefix_match.matched_blocks),
             prefix_match.last_hash,
-        );
+        ).await;
         self.prefix_cache = Some(prefix_cache);
         matched_blocks * self.block_size
     }
 
-    pub fn clear_prefix_cache(&mut self) {
+    pub async fn clear_prefix_cache(&mut self) {
         let Some(prefix_cache) = self.prefix_cache.as_mut() else {
             return;
         };
@@ -766,10 +774,10 @@ impl BlockManager {
         for block_id in evicted {
             self.decrement_block_ref(block_id);
         }
-        self.handle_mamba_prefix_evicted_blocks(&evicted_blocks);
+        self.handle_mamba_prefix_evicted_blocks(&evicted_blocks).await;
     }
 
-    pub fn evict_prefix_cache_blocks(&mut self, num_blocks: usize) -> usize {
+    pub async fn evict_prefix_cache_blocks(&mut self, num_blocks: usize) -> usize {
         let Some(prefix_cache) = self.prefix_cache.as_mut() else {
             return 0;
         };
@@ -782,11 +790,11 @@ impl BlockManager {
         for block_id in evicted {
             self.decrement_block_ref(block_id);
         }
-        self.handle_mamba_prefix_evicted_blocks(&evicted_blocks);
+        self.handle_mamba_prefix_evicted_blocks(&evicted_blocks).await;
         evicted_count
     }
 
-    pub fn evict_prefix_cache_until_free(&mut self, min_free_blocks: usize) -> usize {
+    pub async fn evict_prefix_cache_until_free(&mut self, min_free_blocks: usize) -> usize {
         let mut total_evicted = 0;
         loop {
             if self.free_block_ids.len() >= min_free_blocks {
@@ -806,7 +814,7 @@ impl BlockManager {
             for block_id in evicted {
                 self.decrement_block_ref(block_id);
             }
-            self.handle_mamba_prefix_evicted_blocks(&evicted_blocks);
+            self.handle_mamba_prefix_evicted_blocks(&evicted_blocks).await;
         }
         total_evicted
     }
@@ -860,146 +868,56 @@ impl BlockManager {
         (total_cpu_blocks - self.free_cpu_block_ids.len()) as f32 / total_cpu_blocks as f32
     }
 
-    // def try_transfer_prefill
-    def_broadcast_message_to_runners!(
-        pub, // visibility
-        try_transfer_prefill, // function name to create
-        transfer_prefill, // thread-mode method name
-        (seq: &Sequence), // arguments
-        MessageType::TransferPrefill, // message to send
-        (seq.clone()), // message payload (must clone)
-        MessageType::TransferPrefillResponse, // response to match
-        bool // inner return type
-    );
+    // The broadcast ops now go through the FwdD actor (the FwdRef proxy), not a
+    // direct Runner reference. Each method drives the FwdD actor's Ractor RPC
+    // (the async call, the no blocking Response).
+    pub async fn try_transfer_prefill(&self, seq: &Sequence) -> Result<bool> {
+        Ok(self.fwd_call(|r| FwdMessage::TryTransferPrefill(seq.clone(), r), false).await)
+    }
 
-    // def try_receive_prefill
-    def_broadcast_message_to_runners!(
-        pub, // visibility
-        try_receive_prefill,
-        try_receive_prefill,
-        (available_tokens: usize),
-        MessageType::ReceivePrefill,
-        (available_tokens),
-        MessageType::ReceivePrefillResponse,
-        (bool, Option<Sequence>)
-    );
+    pub async fn try_receive_prefill(&self, available_tokens: usize) -> Result<(bool, Option<Sequence>)> {
+        Ok(self.fwd_call(|r| FwdMessage::TryReceivePrefill(available_tokens, r), (false, None)).await)
+    }
 
-    // def try_check_prefill_status
-    def_broadcast_message_to_runners!(
-        pub,
-        try_check_prefill_status,
-        check_prefill_status,
-        (seq_id: usize),
-        MessageType::CheckPrefillStatus,
-        (seq_id),
-        MessageType::CheckPrefillStatusResponse,
-        bool
-    );
+    pub async fn try_check_prefill_status(&self, seq_id: usize) -> Result<bool> {
+        Ok(self.fwd_call(|r| FwdMessage::TryCheckPrefillStatus(seq_id, r), false).await)
+    }
 
-    // def try_swap_kvcache
-    def_broadcast_message_to_runners!(
-        pub,
-        try_swap_kvcache,
-        swap_kvcache,
-        (mappings: HashMap<usize, usize>, swap_in: bool),
-        MessageType::KVCacheSwap,
-        ((mappings.clone(), swap_in)),
-        MessageType::KVCacheSwapResponse,
-        bool
-    );
+    pub async fn try_swap_kvcache(&self, mappings: HashMap<usize, usize>, swap_in: bool) -> Result<bool> {
+        Ok(self.fwd_call(|r| FwdMessage::TrySwapKvcache(mappings, swap_in, r), false).await)
+    }
 
-    // def try_send_kvcache
-    def_broadcast_message_to_runners!(
-        pub,
-        try_send_kvcache,
-        send_kvcache,
-        (seq: &Sequence, token: u32),
-        MessageType::KvCacheSend,
-        ((seq.clone(), token)),
-        MessageType::KvCacheSendResponse,
-        bool
-    );
+    pub async fn try_send_kvcache(&self, seq: &Sequence, token: u32) -> Result<bool> {
+        Ok(self.fwd_call(|r| FwdMessage::TrySendKvcache(seq.clone(), token, r), false).await)
+    }
 
-    // def try_receive_kvcache
-    def_broadcast_message_to_runners!(
-        pub,
-        try_receive_kvcache,
-        receive_kvcache,
-        (seq: &Sequence),
-        MessageType::KvCacheReceive,
-        (seq.clone()),
-        MessageType::KvCacheReceiveResponse,
-        (bool, u32, usize, usize)
-    );
+    pub async fn try_receive_kvcache(&self, seq: &Sequence) -> Result<(bool, u32, usize, usize)> {
+        Ok(self.fwd_call(|r| FwdMessage::TryReceiveKvcache(seq.clone(), r), (false, 0, 0, 0)).await)
+    }
 
-    // After the client received prefill kvcache, it can call PD server to release
-    // corresponding kvcache backup
-    // def try_release_remote_kvcache
-    def_broadcast_message_to_runners!(
-        pub,
-        try_release_remote_kvcache,
-        release_remote_kvcache,
-        (seq_id: usize),
-        MessageType::KvCacheRelease,
-        (seq_id),
-        MessageType::KvCacheReleaseResponse,
-        bool
-    );
+    pub async fn try_release_remote_kvcache(&self, seq_id: usize) -> Result<bool> {
+        Ok(self.fwd_call(|r| FwdMessage::TryReleaseRemoteKvcache(seq_id, r), false).await)
+    }
 
-    // def try_check_kvcache_release
-    def_broadcast_message_to_runners!(
-        pub,
-        try_check_kvcache_release,
-        check_kvcache_release,
-        (seq_id: usize),
-        MessageType::CheckKvCacheRelease,
-        (seq_id),
-        MessageType::CheckKvCacheReleaseResponse,
-        bool
-    );
+    pub async fn try_check_kvcache_release(&self, seq_id: usize) -> Result<bool> {
+        Ok(self.fwd_call(|r| FwdMessage::TryCheckKvcacheRelease(seq_id, r), false).await)
+    }
 
-    // Capture and query mamba prefix states for hybrid models.
-    def_broadcast_message_to_runners!(
-        pub,
-        try_capture_mamba_prefix_state,
-        capture_mamba_prefix_state,
-        (seq_id: usize, hash: u64, preserve: bool),
-        MessageType::CaptureMambaPrefixState,
-        ((seq_id, hash, preserve)),
-        MessageType::CaptureMambaPrefixStateResponse,
-        bool
-    );
-    def_broadcast_message_to_runners!(
-        pub,
-        try_has_mamba_prefix_state,
-        has_mamba_prefix_state,
-        (hash: u64),
-        MessageType::HasMambaPrefixState,
-        (hash),
-        MessageType::HasMambaPrefixStateResponse,
-        bool
-    );
-    def_broadcast_message_to_runners!(
-        pub,
-        try_remove_mamba_prefix_state,
-        remove_mamba_prefix_state,
-        (hash: u64),
-        MessageType::RemoveMambaPrefixState,
-        (hash),
-        MessageType::RemoveMambaPrefixStateResponse,
-        bool
-    );
-    // Zero specific blocks
-    def_broadcast_message_to_runners!(
-        pub,
-        try_clear_blocks,
-        clear_blocks,
-        (block_ids: Vec<u32>),
-        MessageType::ClearBlocks,
-        (block_ids.clone()),
-        MessageType::ClearBlocksResponse,
-        bool
-    );
+    pub async fn try_capture_mamba_prefix_state(&self, seq_id: usize, hash: u64, preserve: bool) -> Result<bool> {
+        Ok(self.fwd_call(|r| FwdMessage::TryCaptureMambaPrefixState(seq_id, hash, preserve, r), false).await)
+    }
+
+    pub async fn try_has_mamba_prefix_state(&self, hash: u64) -> Result<bool> {
+        Ok(self.fwd_call(|r| FwdMessage::TryHasMambaPrefixState(hash, r), false).await)
+    }
+
+    pub async fn try_remove_mamba_prefix_state(&self, hash: u64) -> Result<bool> {
+        Ok(self.fwd_call(|r| FwdMessage::TryRemoveMambaPrefixState(hash, r), false).await)
+    }
+
+    pub async fn try_clear_blocks(&self, block_ids: Vec<u32>) -> Result<bool> {
+        Ok(self.fwd_call(|r| FwdMessage::TryClearBlocks(block_ids, r), false).await)
+    }
 
     /// Can we swap-out `seq` (i.e., move its GPU blocks to CPU swap space)?
     #[allow(unused)]
@@ -1073,9 +991,9 @@ impl BlockManager {
 
     /// Swap out the GPU blocks of `seq` into CPU swap space.
     /// Caller need to deallocate the gpu blocks used in this seq
-    pub fn swap_out(&mut self, seq: &mut Sequence) -> Result<()> {
+    pub async fn swap_out(&mut self, seq: &mut Sequence) -> Result<()> {
         if self.prefix_cache_enabled() {
-            return self.swap_out_suffix(seq);
+            return self.swap_out_suffix(seq).await;
         }
         let num_blocks = seq.block_table.len();
         if self.free_cpu_block_ids.len() < num_blocks {
@@ -1106,7 +1024,7 @@ impl BlockManager {
         // Actual data copy GPU → CPU. Return the CPU blocks to the free list if
         // the runner cannot complete the copy; otherwise a failed preemption
         // would permanently consume swap capacity.
-        if let Err(e) = self.copy_kv_cache(mapping.clone(), false) {
+        if let Err(e) = self.copy_kv_cache(mapping.clone(), false).await {
             for cpu_bid in cpu_ids {
                 self.free_cpu_block_ids.push_back(cpu_bid);
             }
@@ -1131,7 +1049,7 @@ impl BlockManager {
         Ok(())
     }
 
-    fn swap_out_suffix(&mut self, seq: &mut Sequence) -> Result<()> {
+    async fn swap_out_suffix(&mut self, seq: &mut Sequence) -> Result<()> {
         let (prefix_blocks, suffix_blocks) = self.split_prefix_suffix(seq);
         if suffix_blocks == 0 {
             candle_core::bail!("Seq {} has no sequence-owned suffix blocks to swap", seq.id);
@@ -1164,7 +1082,7 @@ impl BlockManager {
             cpu_ids.push(cpu_bid);
         }
 
-        if let Err(e) = self.copy_kv_cache(mapping.clone(), false) {
+        if let Err(e) = self.copy_kv_cache(mapping.clone(), false).await {
             for cpu_bid in cpu_ids {
                 self.free_cpu_block_ids.push_back(cpu_bid);
             }
@@ -1205,9 +1123,9 @@ impl BlockManager {
     }
 
     /// Need to preallocate new spaces for the seq before calling this function
-    pub fn swap_in(&mut self, seq: &mut Sequence) -> Result<()> {
+    pub async fn swap_in(&mut self, seq: &mut Sequence) -> Result<()> {
         if self.seq_swap_states.contains_key(&seq.id) {
-            return self.swap_in_suffix(seq);
+            return self.swap_in_suffix(seq).await;
         }
         let cpu_ids = self
             .swapped_map
@@ -1230,7 +1148,7 @@ impl BlockManager {
 
         // Actual data copy CPU → GPU. Keep the CPU ownership record on failure
         // so the scheduler can retry or explicitly release it.
-        if let Err(e) = self.copy_kv_cache(mapping.clone(), true) {
+        if let Err(e) = self.copy_kv_cache(mapping.clone(), true).await {
             self.swapped_map.insert(seq.id, cpu_ids);
             return Err(e);
         }
@@ -1245,7 +1163,7 @@ impl BlockManager {
         Ok(())
     }
 
-    fn swap_in_suffix(&mut self, seq: &mut Sequence) -> Result<()> {
+    async fn swap_in_suffix(&mut self, seq: &mut Sequence) -> Result<()> {
         let state = self
             .seq_swap_states
             .get(&seq.id)
@@ -1275,7 +1193,7 @@ impl BlockManager {
             .collect();
         let swapped_blocks = mapping.len();
 
-        self.copy_kv_cache(mapping, true)?;
+        self.copy_kv_cache(mapping, true).await?;
 
         self.seq_swap_states.remove(&seq.id);
         for cpu_bid in state.cpu_block_ids {
@@ -1316,8 +1234,8 @@ impl BlockManager {
         }
     }
 
-    fn copy_kv_cache(&self, mappings: HashMap<usize, usize>, swap_in: bool) -> Result<()> {
-        if self.try_swap_kvcache(mappings, swap_in)? {
+    async fn copy_kv_cache(&self, mappings: HashMap<usize, usize>, swap_in: bool) -> Result<()> {
+        if self.try_swap_kvcache(mappings, swap_in).await? {
             Ok(())
         } else {
             candle_core::bail!(

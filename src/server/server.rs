@@ -420,7 +420,7 @@ pub async fn chat_completion(
         tokenizer,
         chat_template,
     ) = {
-        let e = data.engine.read();
+        let e = data.engine.as_ref();
         (
             e.img_cfg.clone(),
             e.model_type.clone(),
@@ -563,7 +563,7 @@ pub async fn chat_completion(
             crate::log_warn!("Stream request has session_id {sid}");
         }
         let preprocessed = {
-            let e = data.engine.read();
+            let e = data.engine.as_ref();
             match e.preprocess(
                 std::slice::from_ref(&params),
                 std::slice::from_ref(&messages),
@@ -581,8 +581,8 @@ pub async fn chat_completion(
             }
         };
         let (seq_id, prompt_length, prefilled_reasoning_end, stream) = {
-            let mut e = data.engine.write();
-            match e.generate_stream(preprocessed, image_data, &logger) {
+            let e = data.engine.as_ref();
+            match e.generate_stream(preprocessed, image_data, &logger).await {
                 Ok((seq_id, prompt_length, prefilled_reasoning_end, stream)) => {
                     (seq_id, prompt_length, prefilled_reasoning_end, stream)
                 }
@@ -640,7 +640,7 @@ pub async fn chat_completion(
             let stream_ctx =
                 StreamingContext::new(seq_id, model_id.to_string(), created, response_tx.clone());
             if !stream_ctx.send_role_start() {
-                let mut e = engine_clone.write();
+                let e = engine_clone.as_ref();
                 e.cancel(seq_id);
                 let _ = response_tx.try_send(ChatResponse::Done);
                 return;
@@ -668,7 +668,7 @@ pub async fn chat_completion(
                                 "[Seq {}] Stream client disconnected during prefill/stream",
                                 current_seq_id
                             );
-                            let mut e = engine_clone.write();
+                            let e = engine_clone.as_ref();
                             e.cancel(current_seq_id);
                             break;
                         }
@@ -737,7 +737,7 @@ pub async fn chat_completion(
                                             "[Seq {}] Stream send error (disconnected)",
                                             current_seq_id
                                         );
-                                        let mut e = engine_clone.write();
+                                        let e = engine_clone.as_ref();
                                         e.cancel(current_seq_id);
                                         break;
                                     }
@@ -778,7 +778,7 @@ pub async fn chat_completion(
                                             current_seq_id,
                                             tool_buffer_timeout
                                         );
-                                        let mut e = engine_clone.write();
+                                        let e = engine_clone.as_ref();
                                         e.cancel(current_seq_id);
                                         buffering_cancel_requested = true;
                                     }
@@ -828,7 +828,7 @@ pub async fn chat_completion(
                                         l.log_stream_token(&safe_text);
                                     }
                                     if !reasoning_router.send(&safe_text, false, &stream_ctx) {
-                                        let mut e = engine_clone.write();
+                                        let e = engine_clone.as_ref();
                                         e.cancel(current_seq_id);
                                         break;
                                     }
@@ -859,7 +859,7 @@ pub async fn chat_completion(
                                     "[Seq {}] Stream send error (disconnected)",
                                     current_seq_id
                                 );
-                                let mut e = engine_clone.write();
+                                let e = engine_clone.as_ref();
                                 e.cancel(current_seq_id);
                                 break;
                             }
@@ -959,7 +959,7 @@ pub async fn chat_completion(
                                     l.log_stream_token(&safe_suppressed);
                                 }
                                 if !stream_ctx.send_token(&safe_suppressed) {
-                                    let mut e = engine_clone.write();
+                                    let e = engine_clone.as_ref();
                                     e.cancel(current_seq_id);
                                     break;
                                 }
@@ -1065,7 +1065,7 @@ pub async fn chat_completion(
                                         "[Seq {}] Stream send error (disconnected)",
                                         current_seq_id
                                     );
-                                    let mut e = engine_clone.write();
+                                    let e = engine_clone.as_ref();
                                     e.cancel(current_seq_id);
                                     break;
                                 }
@@ -1101,9 +1101,10 @@ pub async fn chat_completion(
                                 error: None,
                             }],
                             usage: include_usage.then_some({
-                                let engine = engine_clone.read();
+                                let engine = engine_clone.as_ref();
                                 let cached = engine
                                     .get_num_cached_tokens_for_seq(current_seq_id)
+                                    .await
                                     .unwrap_or(0);
                                 let reasoning_tokens =
                                     crate::utils::chat_template::extract_reasoning_content(
@@ -1155,8 +1156,8 @@ pub async fn chat_completion(
                         crate::log_warn!("--- Performance Metrics ---");
                         if prompt_time_taken > 0.0 {
                             let cached = engine_clone
-                                .read()
                                 .get_num_cached_tokens_for_seq(current_seq_id)
+                                .await
                                 .unwrap_or(0);
                             let actual_prefill = prompt_length.saturating_sub(cached);
                             if cached > 0 {
@@ -1181,8 +1182,8 @@ pub async fn chat_completion(
                             }
                         } else {
                             let cached = engine_clone
-                                .read()
                                 .get_num_cached_tokens_for_seq(current_seq_id)
+                                .await
                                 .unwrap_or(prompt_length);
                             crate::log_info!(
                                 "[Seq {}] ⏳️ Prompt: {} tokens (fully cached, {} from prefix cache)",
@@ -1252,7 +1253,7 @@ pub async fn chat_completion(
         let mut total_decoded_time_taken = 0f32;
         let mut choices = Vec::new();
         let tokenizer = {
-            let e = data.engine.read();
+            let e = data.engine.as_ref();
             Arc::new(e.tokenizer.clone())
         };
 
@@ -1261,7 +1262,7 @@ pub async fn chat_completion(
             messages.len()
         );
         let preprocessed = {
-            let e = data.engine.read();
+            let e = data.engine.as_ref();
             match e.preprocess(
                 std::slice::from_ref(&current_params),
                 std::slice::from_ref(&messages),
@@ -1276,8 +1277,8 @@ pub async fn chat_completion(
             }
         };
         let receivers = {
-            let mut e = data.engine.write();
-            match e.generate_sync(preprocessed, image_data, &logger) {
+            let e = data.engine.as_ref();
+            match e.generate_sync(preprocessed, image_data, &logger).await {
                 Ok(receivers) => receivers,
                 Err(e) => {
                     crate::log_error!("Completion generation failed: {:?}", e);
@@ -1448,11 +1449,11 @@ pub async fn chat_completion(
         );
 
         let (cached_tokens_total, reasoning_tokens_total): (usize, usize) = {
-            let engine = data.engine.read();
-            let cached: usize = sync_seq_ids
-                .iter()
-                .filter_map(|sid| engine.get_num_cached_tokens_for_seq(*sid))
-                .sum();
+            let engine = data.engine.as_ref();
+            let mut cached: usize = 0;
+            for sid in &sync_seq_ids {
+                cached += engine.get_num_cached_tokens_for_seq(*sid).await.unwrap_or(0);
+            }
             // Reasoning text is extracted directly from each choice's
             // `decode_output` rather than from `message.reasoning_content`,
             // because the latter is only populated on the env-gated tools
@@ -1525,8 +1526,8 @@ pub async fn create_embeddings(
 
     let model_name = model.unwrap_or_else(|| "default".to_string());
 
-    let mut engine = data.engine.write();
-    let (vectors, prompt_tokens) = match engine.embed(&inputs, embedding_type.clone()) {
+    let engine = data.engine.as_ref();
+    let (vectors, prompt_tokens) = match engine.embed(&inputs, embedding_type.clone()).await {
         Ok(res) => res,
         Err(e) => return ChatResponder::ModelError(format!("Embedding generation failed: {e:?}")),
     };
@@ -1577,8 +1578,8 @@ pub async fn get_usage(
     State(state): State<Arc<ServerData>>,
     Query(request): Query<UsageQuery>,
 ) -> ChatResponder {
-    let engine = state.engine.read();
-    let stats = match engine.get_usage_stats(request.session_id.clone()) {
+    let engine = state.engine.as_ref();
+    let stats = match engine.get_usage_stats(request.session_id.clone()).await {
         Ok(s) => s,
         Err(e) => {
             return ChatResponder::InternalError(format!("Failed to obtain usage status {:?}", e));
@@ -1616,7 +1617,7 @@ pub async fn tokenize(
             // For messages, we need to apply chat template
             // First convert to internal Message format
             let img_cfg = {
-                let e = data.engine.read();
+                let e = data.engine.as_ref();
                 e.img_cfg.clone()
             };
             let (converted_messages, _) =
@@ -1631,7 +1632,7 @@ pub async fn tokenize(
                 };
 
             // Apply chat template using engine's template
-            let engine = data.engine.read();
+            let engine = data.engine.as_ref();
             let mut template = engine.get_chat_template();
             template.set_messages(&converted_messages);
             let prompt = match template.apply_chat_template(&Vec::new(), false) {
@@ -1651,7 +1652,7 @@ pub async fn tokenize(
 
     // Get tokenizer and tokenize
     let tokenizer = {
-        let e = data.engine.read();
+        let e = data.engine.as_ref();
         e.tokenizer.clone()
     };
 
@@ -1693,7 +1694,7 @@ pub async fn detokenize(
     let skip_special_tokens = request.skip_special_tokens.unwrap_or(true);
 
     let tokenizer = {
-        let e = data.engine.read();
+        let e = data.engine.as_ref();
         e.tokenizer.clone()
     };
 
