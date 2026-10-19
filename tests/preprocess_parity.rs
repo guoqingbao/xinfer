@@ -76,7 +76,7 @@ fn build_econfig() -> EngineConfig {
         false,                               // enable_tool_grammar
         None,                                // num_speculative_tokens
         None,                                // draft_model
-        None,                                // lora_model
+        xinfer::utils::config::LoraConfig::default(), // lora
     )
 }
 

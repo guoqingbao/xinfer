@@ -19,21 +19,23 @@ non-empty prefill step for correct sampling.
 - `--prefix-cache-max-tokens <N>`: cap cache size in tokens (rounded down to block size).
 
 If `--prefix-cache-max-tokens` is not set, defaults are:
-- Normal mode: ~50% of GPU KV blocks
-- PD server: ~75% of GPU KV blocks
-- PD client: ~35% of GPU KV blocks
+- Normal mode: 65% of GPU KV blocks
+- PD server: 80% of GPU KV blocks
+- PD client: 50% of GPU KV blocks
 
 ## Hybrid Mamba Snapshot Stride
 For hybrid Mamba models (for example Qwen3.5), prefix reuse also needs a
 compatible Mamba snapshot at the matched boundary.
 
 Use environment variable `XINFER_MAMBA_SNAPSHOT_STRIDE_BLOCKS` to control
-sparse snapshot capture during decode (larger stride side usefull for limited GPU memory):
-- Default: `1` blocks
+sparse snapshot capture during decode (larger stride is useful for limited GPU memory):
+- Default: `ceil(effective_prefill_chunk_size / block_size)` blocks (computed at engine
+  startup; with the default 8192-token prefill chunk and 64-token blocks, that is 128).
+  The env var overrides this computed default.
 - Minimum valid value: `1` (capture every block)
 - Effective snapshot boundary in tokens: `block_size * stride`
 
-Example with default `block_size=64` and stride `8`:
+Example with `block_size=64` and stride `8`:
 - Decode snapshot boundary is every `512` tokens.
 - Effective hybrid prefix reuse is aligned to the nearest captured boundary.
 

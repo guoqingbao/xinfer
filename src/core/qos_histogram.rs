@@ -333,18 +333,73 @@ impl ReuseEvidence {
     }
 }
 
+/// The per-drafter acceptance profile (the §spec-decode` extension of the
+/// `WorkloadHistogram`). The per-drafter (the MTP / the DFlash / the chained)
+/// acceptance-rate EMA + the per-batch curve. Populated only when speculative
+/// decoding is active (the `uses_builtin_mtp` / the `uses_dflash`); when spec
+/// decode is off the profile stays at its default (the ` data, the `select`
+/// returns the MTP default). The coding-agent workload (the high DFlash
+/// acceptance at the high batch) → the DFlash; the chatbot workload (the high
+/// MTP acceptance stable) → the MTP; the mixed workload (the both high) → the
+/// chained.
+#[derive(Debug, Clone, Default)]
+pub struct DrafterProfile {
+    /// The per-drafter acceptance-rate EMA (the 0..1 fraction). The index is the
+    /// drafter kind (the 0 = the MTP, the 1 = the DFlash, the 2 = the chained).
+    pub accept_ema: [f64; 3],
+    /// The per-drafter per-batch curve (the (batch_size, acceptance_rate) pairs).
+    pub per_batch: [Vec<(usize, f64)>; 3],
+}
+
+impl DrafterProfile {
+    /// Record one acceptance observation for a drafter kind (the 0 = the MTP,
+    /// the 1 = the DFlash, the 2 = the chained).
+    pub fn observe(&mut self, kind: usize, batch_size: usize, accept_frac: f64) {
+        if kind >= 3 {
+            return;
+        }
+        // The EMA update (the 0.9/0.1 decay, matching the existing EMAs).
+        self.accept_ema[kind] = if self.accept_ema[kind] == 0.0 && self.per_batch[kind].is_empty() {
+            accept_frac
+        } else {
+            0.9 * self.accept_ema[kind] + 0.1 * accept_frac
+        };
+        // The per-batch curve (the rolling rate at this batch size).
+        if let Some(last) = self.per_batch[kind].iter_mut().rev().find(|(b, _)| *b == batch_size) {
+            last.1 = self.accept_ema[kind];
+        } else {
+            self.per_batch[kind].push((batch_size, self.accept_ema[kind]));
+        }
+    }
+
+    /// The best drafter for the workload class (the highest acceptance EMA).
+    pub fn select(&self) -> usize {
+        let mtp = self.accept_ema[0];
+        let dflash = self.accept_ema[1];
+        if mtp > 0.0 && dflash > 0.0 && (mtp + dflash) / 2.0 > mtp.max(dflash) * 0.9 {
+            2 // The mixed: the chained (the both high).
+        } else if dflash > mtp {
+            1 // The coding-agent: the DFlash (the higher acceptance).
+        } else {
+            0 // The chatbot: the MTP (the higher acceptance).
+        }
+    }
+}
+
 /// The per-class bounded histogram (the §1 core, the bounded-memory streaming
 /// estimators). The matrix is keyed by the (regime × class) — the bounded class
 /// set {Latency, Throughput} × {Contended, Uncontended}.
 ///
-/// The CORE fields (this branch, the `qos` branch): the `itl` (the P² p95), the
+/// The CORE fields (the `qos` branch): the `itl` (the P² p95), the
 /// `output_len` (the CDF), the `batch_size` (the EMA), the `prefix_hit` (the
 /// EMA), the `kv_pressure` (the EMA), the `exposed_time` (the 3×2), the
 /// `request_states` (the 8-count), the `preemptions` (the 2-count), the
 /// `turns`, the `reuse_evidence` (the 256-ring).
 ///
-/// The perENSION fields (the later branches, via the stack): the `spec_accept`
-/// (the `spec-decode` branch), the `grammar_active` (the `llg` branch), etc.
+/// The EXTENSION fields (the later branches, via the stack): the
+/// `drafter_profile` (the `spec-decode` branch, the per-drafter acceptance
+/// tracking, the populated only when spec decode is active), the
+/// `grammar_active` (the `llg` branch), etc.
 #[derive(Debug, Clone)]
 pub struct WorkloadHistogram {
     /// The ITL P² estimator (the [ × class: the [Contended|Uncontended][Latency|Throughput]).
@@ -367,6 +422,9 @@ pub struct WorkloadHistogram {
     pub turns: u64,
     /// The reuse-evidence 256-ring (the class: the [Latency|Throughput]).
     pub reuse_evidence: [ReuseEvidence; 2],
+    /// The per-drafter acceptance profile (the `spec-decode` extension, the
+    /// populated only when spec decode is active).
+    pub drafter_profile: DrafterProfile,
 }
 
 impl WorkloadHistogram {
@@ -390,6 +448,7 @@ impl WorkloadHistogram {
             preemptions: [0, 0],
             turns: 0,
             reuse_evidence: [ReuseEvidence::default(), ReuseEvidence::default()],
+            drafter_profile: DrafterProfile::default(),
         }
     }
 

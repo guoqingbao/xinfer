@@ -13,7 +13,7 @@ use crate::models::layers::distributed::Comm;
 use crate::models::layers::distributed::Id;
 use crate::models::layers::VarBuilderX;
 use crate::runner::{
-    send_and_expect_ack, MessageType, RunnerInitRequest,
+    send_and_expect_ack, MessageType, RunnerInitRequest, SpecSeqStatsData,
 };
 use crate::server::logger::ChatCompletionLogger;
 use crate::server::parser::{detect_prefilled_reasoning_end_marker, ToolConfig};
@@ -47,6 +47,7 @@ use interprocess::local_socket::{GenericNamespaced, ToNsName};
 use interprocess::local_socket::{ListenerOptions, Stream as LocalStream};
 use once_cell::sync::Lazy;
 use parking_lot::RwLock;
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -134,6 +135,7 @@ pub struct LLMEngine {
     pub tool_config: ToolConfig,
     pub img_cfg: Option<ImageProcessConfig>,
     pub guidance_tokens: GuidanceTokens,
+    seq_spec_stats: std::sync::Mutex<HashMap<usize, SpecSeqStatsData>>,
 }
 
 impl LLMEngine {
@@ -674,6 +676,7 @@ impl LLMEngine {
             img_cfg,
             model_name,
             guidance_tokens,
+            seq_spec_stats: std::sync::Mutex::new(HashMap::new()),
         });
 
         Self::start_engine(engine.clone());
@@ -1059,6 +1062,15 @@ pub async fn get_available_kv_tokens(&self) -> usize {
     }
 
 pub async fn notify_runner_finished(&self, id: usize) -> Result<()> {
+        // The capture-before-drop: the per-seq spec stats were pulled from the
+        // runner by the SchedD at finish-detection (the `fwd_finished`, BEFORE the
+        // `Finished` message dropped them runner-side) + stashed in the SchedD-owned
+        // map. Read that surviving copy (the no post-drop race) into the engine cache.
+        if let Some(spec_stats) = rpc_value(&self.sched, |r| SchedMessage::GetSpecStats(id, r), None).await {
+            if !spec_stats.mechanism.is_empty() {
+                self.seq_spec_stats.lock().unwrap().insert(id, spec_stats);
+            }
+        }
         let _ = self.fwd.send_message(FwdMessage::Finished(id));
         Ok(())
     }
@@ -1067,6 +1079,11 @@ pub async fn notify_runner_finished(&self, id: usize) -> Result<()> {
     /// server's per-sequence display. Delegates to the scheduler (same process).
     pub async fn get_seq_report(&self, seq_id: usize) -> Option<SeqReport> {
         rpc_value(&self.sched, |r| SchedMessage::GetSeqReport(seq_id, r), None).await
+    }
+
+    /// The cached per-seq spec stats (for the server's end-of-sequence report).
+    pub fn get_seq_spec_stats(&self, seq_id: usize) -> Option<SpecSeqStatsData> {
+        self.seq_spec_stats.lock().unwrap().get(&seq_id).cloned()
     }
 
     /// Release hybrid GDN/Mamba active slots queued by scheduler-side abort paths.
@@ -1666,10 +1683,10 @@ pub async fn notify_runner_finished(&self, id: usize) -> Result<()> {
         Ok((outputs, prompt_tokens))
     }
 
-    pub fn start_engine(engine: Arc<Self>) {
+pub fn start_engine(engine: Arc<Self>) {
         // The engine loop runs as a tokio task (the Ractor actors are async). It
         // drives the SchedD actor's Step RPC (the schedule -> forward -> postprocess
-        // -> delivery ->).
+        // -> delivery -> cleanup).
         GLOBAL_RT.spawn(async move {
             let (is_pd_server, sched) = {
                 (engine.is_pd_mode() && engine.is_pd_server(), engine.sched.clone())
@@ -1682,6 +1699,10 @@ pub async fn notify_runner_finished(&self, id: usize) -> Result<()> {
                 }
                 // The inference step is driven by the SchedD actor (the schedule -> forward -> postprocess -> stream delivery).
                 let task_processed = rpc_value(&sched, |r| SchedMessage::Step(r), 0).await;
+                // The periodic decode throughput log (the may_print_decoding_throughput has its
+                // own 10s gate, so calling it every iteration is safe).
+                let active_indices = rpc_value(&sched, |r| SchedMessage::GetActiveIndices(r), Vec::new()).await;
+                engine.may_print_decoding_throughput(&active_indices).await;
                 if task_processed == 0 {
                     engine.check_canceled(None).await;
                     tokio::time::sleep(std::time::Duration::from_millis(if is_pd_server {

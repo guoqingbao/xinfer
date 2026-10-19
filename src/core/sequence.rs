@@ -68,6 +68,13 @@ pub struct Sequence {
     /// processed this step.
     #[serde(default)]
     pub active_prefill_chunk: Option<usize>,
+    /// The per-seq dynamic speculative-draft K for this step (the no global K).
+    /// Set by the scheduler's `prepare_step_view` (the per-seq knee of the rolling
+    /// prefix-acceptance curve); travels with the sequence clone + the `DecodeSequence`
+    /// IPC so the runner drafts exactly this many tokens (the no fixed ceiling).
+    /// 0 = SD not enabled for this seq (the plain decode).
+    #[serde(default)]
+    pub spec_k: usize,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -79,6 +86,10 @@ pub struct DecodeSequence {
     pub block_table_last: u32,
     pub block_tables: Vec<u32>,
     pub sampling_params: SamplingParams,
+    /// The per-seq dynamic speculative-draft K for this step (the no global K).
+    /// 0 = SD not enabled (the plain decode).
+    #[serde(default)]
+    pub spec_k: usize,
 }
 
 impl DecodeSequence {
@@ -95,6 +106,7 @@ impl DecodeSequence {
             block_table_last,
             block_tables: sequence.block_table.clone(),
             sampling_params: sequence.sampling_params.clone(),
+            spec_k: sequence.spec_k,
         }
     }
 
@@ -206,6 +218,7 @@ impl Sequence {
             qos_class: QosClass::default(),
             sched_stats: Default::default(),
             active_prefill_chunk: None,
+            spec_k: 0,
         }
     }
 

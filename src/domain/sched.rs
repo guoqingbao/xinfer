@@ -14,6 +14,7 @@
 use ractor::ActorProcessingErr;
 use ractor::rpc::CallResult;
 use ractor::{Actor, ActorRef, RpcReplyPort};
+use std::collections::HashMap;
 use std::sync::Mutex;
 
 use crate::core::scheduler::Scheduler;
@@ -24,6 +25,7 @@ use crate::domain::http::HttpMessage;
 use crate::domain::stream::StreamMessage;
 use crate::domain::OwnedSeqs;
 use crate::runner::MessageType;
+use crate::runner::SpecSeqStatsData;
 
 /// The scheduler actor.
 pub struct SchedD;
@@ -44,6 +46,11 @@ pub struct SchedState {
     mtp_enabled: bool,
     /// Whether the model uses DFlash (the speculative decode).
     dflash_enabled: bool,
+    /// The per-seq speculative-decode stats captured at finish (the capture-
+    /// before-drop: pulled from the runner in `fwd_finished` BEFORE the `Finished`
+    /// message drops them runner-side, so the server's end-of-sequence report reads
+    /// a surviving in-process copy). Keyed by seq id; dropped on `GetSpecStats`.
+    spec_stats: Mutex<HashMap<usize, SpecSeqStatsData>>,
 }
 
 /// The `SchedD` actor's message enum (the explicit form).
@@ -82,6 +89,12 @@ pub enum SchedMessage {
     PrintFreeBlocks,
     /// The end-of-sequence scheduling report (the cached tokens + the QoS stats).
     GetSeqReport(usize, RpcReplyPort<Option<crate::core::qos::SeqReport>>),
+    /// The per-seq speculative-decode stats captured at finish (the capture-
+    /// before-drop: read from the `SchedD`-owned map, the no runner-side drop race).
+    /// Returns `None` once taken (the map entry is removed on read).
+    GetSpecStats(usize, RpcReplyPort<Option<SpecSeqStatsData>>),
+    /// The active (running) sequence indices (for the periodic decode throughput log).
+    GetActiveIndices(RpcReplyPort<Vec<usize>>),
 }
 
 #[ractor::async_trait]
@@ -115,6 +128,7 @@ impl ractor::Actor for SchedD {
             http: Mutex::new(None),
             mtp_enabled,
             dflash_enabled,
+            spec_stats: Mutex::new(HashMap::new()),
         })
     }
 
@@ -214,6 +228,15 @@ impl ractor::Actor for SchedD {
             GetSeqReport(seq_id, reply) => {
                 let _ = reply.send(state.scheduler.get_seq_report(seq_id));
             }
+            GetActiveIndices(reply) => {
+                let _ = reply.send(state.scheduler.get_active_indices());
+            }
+            GetSpecStats(seq_id, reply) => {
+                // Take the captured per-seq spec stats (the no runner-side
+                // drop race). Removed on read so a seq's stats are surfaced once.
+                let data = state.spec_stats.lock().unwrap().remove(&seq_id);
+                let _ = reply.send(data);
+            }
         }
         Ok(())
     }
@@ -254,10 +277,18 @@ impl SchedState {
 
         // Phase 2: forward pass (through the FwdD actor, the sole model path).
         // The single-sequence check (the forward routing: the run_mtp_decode / the run_dflash_decode
-        // only work for a single sequence; the batch is the run_mtp_decode_batch). Computed BEFORE
-        // the snapshot (the scheduled_ids.len() == the owned_seqs.len()).
-        let use_dflash = self.dflash_enabled && !is_prefill && scheduled_ids.len() == 1;
-        let use_mtp = self.mtp_enabled && !use_dflash && !is_prefill && scheduled_ids.len() == 1;
+        // only work for a single sequence; the batch is the run_mtp_decode_batch). The env-var
+        // handling (the spec_parallel_draft / the dflash_parallel_slots) allows multi-sequence
+        // drafting. Computed BEFORE the snapshot (the scheduled_ids.len() == the owned_seqs.len()).
+        let parallel_ok = scheduled_ids.len() == 1 || crate::utils::env::spec_parallel_draft();
+        let dflash_ok = parallel_ok
+            && scheduled_ids.len() <= crate::utils::env::dflash_parallel_slots().max(1);
+        let use_dflash = self.dflash_enabled && !is_prefill && dflash_ok;
+        let use_mtp = self.mtp_enabled && !use_dflash && !is_prefill && parallel_ok;
+        // Speculative fast-forward: append the full grammar-forced (ff) run after the sampled base
+        // token (the lowest-priority decode path, the fallback). The spec-FF commit (c9aa0ff4),
+        // folded into the Option 1 order (computed BEFORE the snapshot, like use_mtp/use_dflash).
+        let use_spec_ff = !use_mtp && !use_dflash && crate::utils::env::spec_ff() && !is_prefill;
 
         // The single-writer step view (the Option 5, the no write-after-snapshot): the Scheduler does
         // ALL the writes (the speculative pre-alloc) + the freeze (the Sequence snapshot) in ONE
@@ -266,14 +297,30 @@ impl SchedState {
         // the single-sequence check).
         let owned_seqs = self.scheduler.prepare_step_view(&scheduled_ids, is_prefill).await;
 
+        // The MTP per-seq next-step K feedback (the runner-computed dynamic-K, the no the
+        // scheduler guessing from an empty cross-process global). The no-MTP paths leave it
+        // empty (the no K feedback, the prior behavior).
+        let mut mtp_next_k: Vec<usize> = Vec::new();
         let forward_result: Result<Vec<Vec<u32>>, String> = if use_mtp {
             let sequences: Vec<crate::core::sequence::DecodeSequence> =
                 owned_seqs.iter().map(crate::core::sequence::DecodeSequence::new).collect();
-            self.fwd_call_run_mtp(&sequences).await
+            match self.fwd_call_run_mtp(&sequences).await {
+                Ok(step_outs) => {
+                    // The capture the per-seq next-K (the runner-computed, the dynamic-K
+                    // feedback) + extract the tokens (the no change to the postprocess/delivery).
+                    mtp_next_k = step_outs.iter().map(|o| o.next_k).collect();
+                    Ok(step_outs.into_iter().map(|o| o.tokens).collect())
+                }
+                Err(e) => Err(e),
+            }
         } else if use_dflash {
             let sequences: Vec<crate::core::sequence::DecodeSequence> =
                 owned_seqs.iter().map(crate::core::sequence::DecodeSequence::new).collect();
-            self.fwd_call_run_dflash(&sequences).await
+self.fwd_call_run_dflash(&sequences).await
+        } else if use_spec_ff {
+            let sequences: Vec<crate::core::sequence::DecodeSequence> =
+                owned_seqs.iter().map(crate::core::sequence::DecodeSequence::new).collect();
+            self.fwd_call_run_spec_ff(&sequences).await
         } else {
             let owned = if is_prefill {
                 OwnedSeqs::Prefill(owned_seqs)
@@ -288,6 +335,14 @@ impl SchedState {
         // Phase 3: postprocess + stream delivery + cleanup.
         match forward_result {
             Ok(multi_output_ids) => {
+                // The dynamic-K feedback: the runner-reported per-seq next-K (the
+                // rolling prefix-curve knee, the no the scheduler guessing from an empty
+                // cross-process global) is recorded into the scheduler's per-seq K map,
+                // so the NEXT step's pre-alloc uses the runner's real signal. The no-MTP
+                // paths leave mtp_next_k empty (the no K feedback, the prior behavior).
+                if !mtp_next_k.is_empty() {
+                    self.scheduler.record_spec_k_feedback(&scheduled_ids, &mtp_next_k);
+                }
                 // Prefill: filter sequences still chunking from those done.
                 let (indices, output_by_running_index) = if is_prefill {
                     let (indices, finished_indices) =
@@ -512,10 +567,11 @@ impl SchedState {
         }
     }
 
-    async fn fwd_call_run_mtp(&self, sequences: &[crate::core::sequence::DecodeSequence]) -> Result<Vec<Vec<u32>>, String> {
+    async fn fwd_call_run_mtp(&self, sequences: &[crate::core::sequence::DecodeSequence]) -> Result<Vec<crate::runner::SpecStepOut>, String> {
         // Use the FwdD actor's RunMtp RPC (which correctly handles the
-        // RunResponseMTP response), not the generic ForwardRaw escape hatch
-        // (which only handles the plain RunResponse).
+        // RunResponseMTP response, the per-seq tokens + the next-step dynamic K),
+        // not the generic ForwardRaw escape hatch (which only handles the plain
+        // RunResponse).
         match self.fwd.call(|r| FwdMessage::RunMtp(sequences.to_vec(), r), None).await {
             Ok(CallResult::Success(result)) => result,
             _ => Err("IPC round_trip failed (timeout or actor stopped)".into()),
@@ -527,6 +583,16 @@ impl SchedState {
         // RunResponseDFlash response), not the generic ForwardRaw escape hatch
         // (which only handles the plain RunResponse).
         match self.fwd.call(|r| FwdMessage::RunDflash(sequences.to_vec(), r), None).await {
+            Ok(CallResult::Success(result)) => result,
+            _ => Err("IPC round_trip failed (timeout or actor stopped)".into()),
+        }
+    }
+
+async fn fwd_call_run_spec_ff(&self, sequences: &[crate::core::sequence::DecodeSequence]) -> Result<Vec<Vec<u32>>, String> {
+        // Use the FwdD actor's RunSpecFf RPC (which correctly handles the
+        // RunResponseSpecFF response), not the generic ForwardRaw escape hatch
+        // (which only handles the plain RunResponse).
+        match self.fwd.call(|r| FwdMessage::RunSpecFf(sequences.to_vec(), r), None).await {
             Ok(CallResult::Success(result)) => result,
             _ => Err("IPC round_trip failed (timeout or actor stopped)".into()),
         }
@@ -549,6 +615,22 @@ impl SchedState {
     }
 
     async fn fwd_finished(&self, seq_id: usize) {
+        // The capture-before-drop: pull the per-seq spec stats from the runner
+        // BEFORE the `Finished` message drops them (the runner's `FinishDecode` ->
+        // `spec_seq_report` removes the entry). Without this the server's end-of-
+        // sequence report (the lazy `notify_runner_finished` fetch) reads an already-
+        // dropped entry + the "[Seq N] <mechanism> Speculation" line is skipped.
+        let captured = match self
+            .fwd
+            .call(|r| FwdMessage::FetchSpecSeqStats(seq_id, r), None)
+            .await
+        {
+            Ok(CallResult::Success(data)) if !data.mechanism.is_empty() => Some(data),
+            _ => None,
+        };
+        if let Some(data) = captured {
+            self.spec_stats.lock().unwrap().insert(seq_id, data);
+        }
         let _ = self.fwd.send_message(FwdMessage::Finished(seq_id));
     }
 

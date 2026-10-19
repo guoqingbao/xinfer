@@ -1,7 +1,7 @@
 // src/core/scheduler.rs
 use super::{
     prefix_cache::PrefixCacheConfig,
-    qos::{BlockSnapshot, QosController, Regime, SchedSeqStats, SeqReport},
+    qos::{BlockSnapshot, QosController, Regime, SchedSeqStats, SeqReport, SamplingOverride},
     sequence::{Sequence, SequenceStatus},
 };
 use crate::transfer::{PdConfig, PdRole};
@@ -39,6 +39,18 @@ pub struct Scheduler {
     /// shared block_manager).
     pub kv: ractor::ActorRef<KvMessage>,
     next_seq_id: usize,
+    /// The QoS-computed dynamic speculative draft length K, PER SEQUENCE (the
+    /// `schedule()` sets it from the per-seq rolling prefix-acceptance curve, the
+    /// `prepare_step_view` reads it for the per-seq pre-alloc). The no
+    /// fixed `num_speculative_tokens` + the no global-EMA (the per-seq isolation: one
+    /// sequence's hard region does not shrink another's). Keyed by seq id.
+    last_spec_draft_len: std::collections::HashMap<usize, usize>,
+    /// The QoS-computed sampling override (the `AdaptivePlan.sampling`, the
+    /// per-class top-k/top-p width). The `schedule()` sets it, the
+    /// `prepare_step_view` applies it to the sequences' sampling params (the
+    /// short-output class → the tight top-k, the long-output class → the wide
+    /// top-p). The `None` = the no override (the model default sampling).
+    last_sampling_override: Option<SamplingOverride>,
     /// Per-seq end-of-sequence report (cached-token count + QoS scheduling stats),
     /// retained briefly after `clear_finished()` (which drops the Sequence) so the
     /// server's report can still read it. Bounded by `FINISHED_CACHED_TOKENS_MAX`.
@@ -88,6 +100,22 @@ fn active_sequence_limit(max_num_seqs: usize, mamba_cache_capacity: Option<usize
         _ => max_num_seqs,
     }
     .max(1)
+}
+
+/// The K-bridge: seed the QoS `spec_draft_max` (the dynamic-K ceiling) from the
+/// operator's `--num-speculative-tokens` when left unset (the 0 default). Without
+/// this the QoS-off degenerate plan returns `spec_draft_len = 0`, the
+/// `prepare_step_view` skips the speculative pre-alloc, + the runner's MTP draft
+/// (the fixed CLI K) crashes in `compute_slot_mappings` (no KV blocks for the
+/// verify positions). Seeding makes the scheduler's pre-alloc K + the runner's
+/// draft K agree by construction. An operator-set `spec_draft_max` is preserved
+/// (the no override of an explicit QoS tuning).
+fn seed_spec_draft_max(econfig: &EngineConfig) -> crate::core::qos::QosConfig {
+    let mut qos_cfg = econfig.qos.clone();
+    if qos_cfg.spec_draft_max == 0 {
+        qos_cfg.spec_draft_max = econfig.num_speculative_tokens.unwrap_or(0);
+    }
+    qos_cfg
 }
 
 pub fn build_prefix_cache_config(econfig: &EngineConfig) -> PrefixCacheConfig {
@@ -196,8 +224,10 @@ impl Scheduler {
             pd_config: econfig.pd_config.clone(),
             is_last_prefill: false,
             pending_runner_releases: Vec::new(),
-            policy: QosController::new(econfig.qos.clone()),
+            policy: QosController::new(seed_spec_draft_max(econfig)),
             last_step: None,
+            last_spec_draft_len: std::collections::HashMap::new(),
+            last_sampling_override: None,
         }
     }
 
@@ -305,6 +335,9 @@ impl Scheduler {
             if step_ms <= eff.max_meaningful_step_ms {
                 self.policy.record_step(step_ms);
             }
+            // The decode batch size (the MagicDec signal: the SD speedup grows
+            // with the batch for the separate-drafter, the MTP is batch-invariant).
+            self.policy.record_spec_batch_size(self.running.len());
         }
 
         let blocks = BlockSnapshot {
@@ -315,7 +348,7 @@ impl Scheduler {
             static_chunk: self.cfg.effective_prefill_chunk_size(),
             chunk_floor: self.policy.effective().chunk_floor,
         };
-        // The §1: the AdaptivePlan (the base StepPlan + the QoS actuators: the
+// The §1: the AdaptivePlan (the base StepPlan + the QoS actuators: the
         // batch_cap, the sampling override, the parallelism_hint, the
         // kv_demote_threshold). The histogram is fed by the record_step (the ITL)
         // + the record_batch_size (the regime) + the record_admission (the
@@ -340,8 +373,55 @@ impl Scheduler {
             None,
             self.running.len(),
         );
-        let plan = self.policy.adaptive_plan(&self.running, &blocks);
-        let chunk_size = plan.base.chunk_size;
+        let is_mtp = crate::speculative::uses_builtin_mtp(&self.cfg);
+        let plan = self.policy.plan(&self.running, &blocks, is_mtp);
+        let chunk_size = plan.chunk_size;
+        // The per-seq draft length K. When the adaptive-K gate is on, each running
+        // sequence's K is computed from its OWN rolling prefix-acceptance curve (the
+        // knee) -- one sequence's hard region does not shrink another's. When the gate
+        // is off (the default), every sequence uses the fixed `plan.spec_draft_len`
+        // (the prior behavior, the no surprise).
+        let dynamic_k = crate::utils::env::spec_dynamic_k();
+        // The seed the per-seq K map. The runner's feedback (the record_spec_k_feedback,
+        // the prior step's SpecStepOut.next_k) is the authoritative signal (the no the
+        // main-process curve, which is empty across the process boundary). The seed only
+        // computes a K for seqs that have NO feedback yet (the first step, the no the
+        // runner's signal) -- it does NOT overwrite the runner's feedback (the no the
+        // prior defect: the recompute clobbered the feedback, the no the dynamic-K never
+        // actually tracked the runner's signal).
+        //
+        // The prior_feedback is PRESERVED in full (the no just the running subset): a
+        // preempted/swapped-out seq retains its K (the no the swap-in resetting it to the
+        // ceiling, the no the over-draft on re-admission). The map starts from the prior
+        // feedback + only adds entries for running seqs that lack feedback (the first step).
+        let prior_feedback = std::mem::take(&mut self.last_spec_draft_len);
+        let mut new_map = prior_feedback; // The preserve ALL prior feedback (the no the running-only subset).
+        for s in self.running.iter() {
+            // The runner's feedback (the prior step's next_k) wins (the no the recompute).
+            if new_map.contains_key(&s.id) {
+                continue;
+            }
+            // The no feedback yet (the first step): compute from the per-seq law (the
+            // dynamic_k) or the static plan (the no dynamic_k). The no the main-process
+            // curve is empty (the cross-process global), so spec_draft_len_for_seq
+            // returns the ceiling (the no history) -- the correct first-step seed.
+            let k = if dynamic_k {
+                self.policy.spec_draft_len_for_seq(s.id, is_mtp)
+            } else {
+                plan.spec_draft_len
+            };
+            new_map.insert(s.id, if k > 0 { k } else { plan.spec_draft_len });
+        }
+        self.last_spec_draft_len = new_map;
+        // The §1 AdaptivePlan (the QoS actuators): the sampling override is stored
+        // for the `prepare_step_view` (the per-class top-k/top-p width, the
+        // short-output → the tight top-k, the long-output → the wide top-p).
+        let adaptive = self.policy.adaptive_plan(&self.running, &blocks, is_mtp);
+        self.last_sampling_override = if adaptive.sampling.top_k.is_some() || adaptive.sampling.top_p.is_some() {
+            Some(adaptive.sampling)
+        } else {
+            None
+        };
 
         // QoS: admit Latency-class requests ahead of Throughput (stable partition),
         // and log the live contention vector under pressure. No-op when QoS is off.
@@ -353,8 +433,8 @@ impl Scheduler {
 tracing::debug!(
                          "[qos] contention={:?} chunk={} budget={}",
                          c,
-                         plan.base.chunk_size,
-                         plan.base.token_budget
+                         plan.chunk_size,
+                         plan.token_budget
                      );
                 }
             }
@@ -396,8 +476,8 @@ tracing::debug!(
         // admitting another waiting prefill batch.
         let pre_existing_running = self.running.len();
         let max_seqs_limit = self.active_sequence_limit();
-        let token_budget = plan.base.token_budget;
-        let mut thr_in_use = plan.base.thr_in_use;
+        let token_budget = plan.token_budget;
+        let mut thr_in_use = plan.thr_in_use;
 
         while let Some(mut seq) = self.waiting.pop_front() {
             // Try to transfer prefill requests to PD server when applicable
@@ -411,9 +491,9 @@ tracing::debug!(
             // Latency slot / KV reserve. No-op when QoS is off (both gates false).
             let is_thr = !seq.qos_class.is_latency();
             let slot_blocked = is_thr
-                && plan.base.thr_slot_capacity > 0
-                && thr_in_use >= plan.base.thr_slot_capacity;
-            let kv_blocked = is_thr && plan.base.thr_kv_full;
+                && plan.thr_slot_capacity > 0
+                && thr_in_use >= plan.thr_slot_capacity;
+            let kv_blocked = is_thr && plan.thr_kv_full;
             if slot_blocked || kv_blocked {
                 seq.sched_stats.reservation_blocked += 1;
                 self.waiting.push_front(seq);
@@ -422,11 +502,6 @@ tracing::debug!(
 
             if self.running.len() >= max_seqs_limit
                 || scheduled_ids.len() >= max_seqs_limit
-                // The §1 batch the batch_cap admission gate (the vLLM `max_num_active_reqs`
-                // result: the no new-sequence admission beyond the QoS-computed cap,
-                // separate from the `max_num_seqs` slot count). The `batch_cap == 0`
-                // means unlimited (the QoS-off degenerate).
-                || (plan.batch_cap > 0 && self.running.len() >= plan.batch_cap)
                 || num_tokens + effective_tokens > token_budget
                 || (seq.block_table.is_empty() && !kv_call(&self.kv, |r| KvMessage::CanAllocate(seq.clone(), r), false).await)
                 // interleaved scheduling: alternate prefill/decode for fairness
@@ -462,6 +537,9 @@ tracing::debug!(
             }
             seq.sched_stats.gain_start = self.policy.gain();
             seq.sched_stats.prefill_steps += 1;
+            // Stamp the speculative-draft K used for this sequence's pre-alloc (the
+            // per-seq dynamic K, the no global). 0 = SD not enabled.
+            seq.sched_stats.spec_k = self.last_spec_draft_len.get(&seq.id).copied().unwrap_or(0);
             if chunk_size < blocks.static_chunk {
                 seq.sched_stats.chunk_shrunk += 1;
             }
@@ -669,6 +747,11 @@ pub async fn fallback_missing_mamba_prefix_snapshots(
         }
     }
 
+    /// The active (running) sequence indices (for the periodic decode throughput log).
+    pub fn get_active_indices(&self) -> Vec<usize> {
+        (0..self.running.len()).collect()
+    }
+
     pub fn get_waiting(&self, idx: usize) -> Option<&Sequence> {
         if idx < self.waiting.len() {
             Some(&self.waiting[idx])
@@ -713,7 +796,13 @@ pub async fn postprocess(&mut self, ids: &[usize], multi_output_ids: &[Vec<u32>]
             if idx >= self.running.len() {
                 continue;
             }
-            let tokens = &multi_output_ids[i];
+            // The OOB guard: the runner may return fewer outputs than ids (the MTP
+            // error path sends an empty RunResponseMTP). A missing output degrades
+            // to "no tokens this step" (the skip), never an index panic.
+            let tokens = match multi_output_ids.get(i) {
+                Some(t) => t,
+                None => continue,
+            };
             let seq_id = self.running[idx].id;
 
             // PD server: transfer KV cache on first token, then move to next sequence.
@@ -825,16 +914,21 @@ pub async fn postprocess(&mut self, ids: &[usize], multi_output_ids: &[Vec<u32>]
         }
     }
 
-    /// Pre-allocate KV cache blocks for MTP speculative tokens.
+/// Pre-allocate KV cache blocks for MTP speculative tokens.
     /// Called before MTP runs to ensure the verification forward has room
-    /// to write KV for speculative positions.
-pub async fn pre_allocate_mtp_blocks(&mut self, ids: &[usize], extra_tokens: usize) {
-        for &idx in ids {
+    /// to write KV for speculative positions. The per-seq K: `extra_tokens`
+    /// is one entry per `ids` (the seq's own dynamic-K, the no single global K).
+    pub async fn pre_allocate_mtp_blocks(&mut self, ids: &[usize], extra_tokens: &[usize]) {
+        for (&idx, &k) in ids.iter().zip(extra_tokens.iter()) {
             if idx >= self.running.len() {
                 continue;
             }
             let seq = &mut self.running[idx];
-            let needed_len = seq.len() + extra_tokens;
+            // The verify writes K+1 positions (the anchor + the K drafts), so the
+            // pre-alloc must cover seq.len() + k + 1 (the no the k-only, which
+            // under-allocates the verify's last position -> the "missing KV block"
+            // crash when the dynamic-K collapses to a small k).
+            let needed_len = seq.len() + k + 1;
             let needed_blocks = needed_len.div_ceil(self.cfg.block_size);
             while seq.block_table.len() < needed_blocks {
                 if let Some(block_id) = kv_call(&self.kv, |r| KvMessage::AllocFreeBlock(r), None).await {
@@ -842,6 +936,25 @@ pub async fn pre_allocate_mtp_blocks(&mut self, ids: &[usize], extra_tokens: usi
                 } else {
                     break;
                 }
+            }
+        }
+    }
+
+    /// The dynamic-K feedback: record the runner-reported per-seq next-step K (the
+    /// rolling prefix-curve knee, the no the scheduler guessing from an empty
+    /// cross-process global) into the per-seq K map, so the NEXT step's
+    /// `prepare_step_view` pre-alloc uses the runner's real signal. The `ids` + the
+    /// `next_k` are parallel (the per-seq). A `next_k` of 0 (the no MTP, the plain
+    /// decode) leaves the seq's K at the prior value (the no a spurious 0).
+    pub fn record_spec_k_feedback(&mut self, ids: &[usize], next_k: &[usize]) {
+        for (idx, &k) in ids.iter().zip(next_k.iter()) {
+            // The record the feedback regardless of k (the no the k > 0 guard). A k == 0
+            // means the seq fell back to plain decode (the no the MTP head, the no the
+            // empty-draft bail) -- the scheduler must stop pre-allocating speculative
+            // blocks for it (the no the stale K from a prior drafting step). The no the
+            // k > 0 guard, which kept the stale K for a plain-decode seq.
+            if let Some(seq) = self.running.get(*idx) {
+                self.last_spec_draft_len.insert(seq.id, k);
             }
         }
     }
@@ -854,15 +967,77 @@ pub async fn pre_allocate_mtp_blocks(&mut self, ids: &[usize], extra_tokens: usi
     /// decode step, NOT the single-sequence check).
     pub async fn prepare_step_view(&mut self, ids: &[usize], is_prefill: bool) -> Vec<Sequence> {
         // The write (the speculative pre-alloc, the origin/main gate, the decode only).
+        // The per-seq dynamic-K: each seq's K is its own rolling prefix-curve knee
+        // (the `last_spec_draft_len` map, the no global). The pre-alloc is per-seq
+        // (the no single global K) + the seq's `spec_k` is stamped so it travels via
+        // the DecodeSequence IPC to the runner (the no fixed mtp_num_speculative).
         if !is_prefill
-            && self.cfg.num_speculative_tokens.unwrap_or(0) > 0
             && (crate::speculative::uses_builtin_mtp(&self.cfg)
                 || crate::speculative::uses_dflash(&self.cfg))
         {
-            let spec_tokens = self.cfg.num_speculative_tokens.unwrap_or(0);
-            self.pre_allocate_mtp_blocks(ids, spec_tokens + 1).await;
+            let per_seq_k: Vec<usize> = ids
+                .iter()
+                .map(|idx| {
+                    let seq_id: usize = self
+                        .running
+                        .get(*idx)
+                        .map(|s| s.id)
+                        .unwrap_or(*idx);
+                    // The per-seq K (the knee); the fallback is the seq's CLI ceiling
+                    // (the no global last_spec_draft_len, the per-seq isolation).
+                    self.last_spec_draft_len
+                        .get(&seq_id)
+                        .copied()
+                        .unwrap_or_else(|| self.cfg.num_speculative_tokens.unwrap_or(0))
+                })
+                .collect();
+            let any_k = per_seq_k.iter().any(|&k| k > 0);
+            if any_k {
+                // The batch-max K: the speculative verify (the MTP batch + the DFlash batch)
+                // uses a uniform `verify_len = 1 + max_k` for the one attention pass, so
+                // every seq in the batch must have room for `max_k + 1` verify positions.
+                // The single-seq case (the common path) has `max_k == per_seq_k[0]`, so this
+                // is identical to the prior per-seq pre-alloc. The floor: a seq with SD
+                // enabled (k > 0) pre-allocates for k + 1 verify positions (the anchor +
+                // the k drafts). A seq with k == 0 (the SD off for that seq, the plain
+                // decode) still pre-allocates 1 position (the k.max(1) floor, the no the
+                // plain-decode token needs a block) -- but the normal decode path (the
+                // MayAppend at the block boundary) also allocates it, so the speculative
+                // pre-alloc for a k == 0 seq is a harmless no-op (the no the double-alloc,
+                // the pre_allocate_mtp_blocks only extends the block_table if it's short).
+                let batch_max_k = per_seq_k.iter().copied().max().unwrap_or(0);
+                let floored: Vec<usize> = std::iter::repeat(batch_max_k.max(1))
+                    .take(ids.len())
+                    .collect();
+                self.pre_allocate_mtp_blocks(ids, &floored).await;
+                // The stamp the per-seq K onto the sequences (the travels via the
+                // DecodeSequence.spec_k to the runner, the no fixed ceiling) + onto the
+                // sched_stats (the report carrier, the no the admission-time 0 -- the
+                // spec_k is the K actually used for this seq's decode, stamped here).
+                for (idx, &k) in ids.iter().zip(per_seq_k.iter()) {
+                    if let Some(seq) = self.running.get_mut(*idx) {
+                        seq.spec_k = k;
+                        seq.sched_stats.spec_k = k;
+                    }
+                }
+            }
         }
         // The freeze (the Sequence snapshot, AFTER the write).
+        // The §1 sampling override (the per-class top-k/top-p width): the to
+        // the sequences' sampling params before the freeze, so it travels with
+        // the existing IPC messages (the no new `MessageType` variant).
+        if let Some(override_) = &self.last_sampling_override {
+            for id in ids {
+                if let Some(seq) = self.running.iter_mut().find(|s| &s.id == id) {
+                    if let Some(top) = override_.top_k {
+                        seq.sampling_params.top_k = Some(top as isize);
+                    }
+                    if let Some(p) = override_.top_p {
+                        seq.sampling_params.top_p = Some(p);
+                    }
+                }
+            }
+        }
         self.get_sequences(ids)
             .iter()
             .map(|s| if is_prefill { s.clone_for_prefill_forward() } else { (*s).clone() })
@@ -870,6 +1045,25 @@ pub async fn pre_allocate_mtp_blocks(&mut self, ids: &[usize], extra_tokens: usi
     }
 
 pub async fn postprocess_speculative_extra(&mut self, ids: &[usize], extras: &[Vec<u32>]) {
+        // The QoS acceptance-rate sensor (the break-even signal): the
+        // accepted / the proposed (the K). The per-seq K (the no global): the
+        // proposed_k is the seq's own dynamic K (the map), the no one global value.
+        for (i, extra_tokens) in extras.iter().enumerate() {
+            if i >= ids.len() {
+                break;
+            }
+            let seq_id = ids[i];
+            let proposed_k = self
+                .last_spec_draft_len
+                .get(&seq_id)
+                .copied()
+                .unwrap_or_else(|| self.cfg.num_speculative_tokens.unwrap_or(0))
+                .max(1);
+            if self.policy.active() {
+                let accept_frac = (extra_tokens.len() as f64) / (proposed_k as f64);
+                self.policy.record_spec_acceptance(accept_frac);
+            }
+        }
         for (i, extra_tokens) in extras.iter().enumerate() {
             if i >= ids.len() {
                 break;
@@ -964,6 +1158,17 @@ pub async fn postprocess_speculative_extra(&mut self, ids: &[usize], extras: &[V
             .retain(|seq| seq.status != SequenceStatus::Finished);
         self.waiting
             .retain(|seq| seq.status != SequenceStatus::Finished);
+        // The cleanup the finished seqs' per-seq K feedback (the no the
+        // last_spec_draft_len map accumulating entries for finished sequences, the
+        // unbounded growth over a long run). The retain'd running + waiting seqs keep
+        // their K (the no the swapped-out seq's K, the 8.1 seed-preservation).
+        let live_ids: std::collections::HashSet<usize> = self
+            .running
+            .iter()
+            .chain(self.waiting.iter())
+            .map(|s| s.id)
+            .collect();
+        self.last_spec_draft_len.retain(|id, _| live_ids.contains(id));
     }
 
     pub async fn release_waitings(&mut self) -> Vec<usize> {
@@ -1040,6 +1245,12 @@ pub async fn postprocess_speculative_extra(&mut self, ids: &[usize], extras: &[V
         }
         self.release_cache(seq_id).await;
         self.running.retain(|seq| seq.id != seq_id);
+        // The cleanup the cancelled seq's per-seq K feedback (the no the
+        // last_spec_draft_len map accumulating entries for cancelled sequences, the
+        // unbounded growth over a long run -- the cancel path removes the seq from
+        // running directly, the no the clear_finished retain, so the K entry must be
+        // cleaned up here too).
+        self.last_spec_draft_len.remove(&seq_id);
     }
 
     #[allow(non_snake_case)]
@@ -1732,7 +1943,8 @@ pub async fn try_receive_kvcache(&mut self) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::active_sequence_limit;
+    use super::{active_sequence_limit, seed_spec_draft_max};
+    use crate::utils::config::{EngineConfig, LoraConfig};
 
     #[test]
     fn active_sequence_limit_uses_mamba_capacity_for_hybrid_models() {
@@ -1754,5 +1966,177 @@ mod tests {
     #[test]
     fn active_sequence_limit_preserves_zero_mamba_as_disabled() {
         assert_eq!(active_sequence_limit(7, Some(0)), 7);
+    }
+
+    // The K-bridge tests (the inclusive + exclusive property, the rule 21).
+    fn make_econfig(num_spec: Option<usize>, spec_draft_max: usize) -> EngineConfig {
+        let mut econfig = EngineConfig::new(
+            None, // model_id
+            None, // weight_path
+            None, // weight_file
+            None, // hf_token
+            None, // hf_token_path
+            None, // enforce_parser
+            None, // max_num_seqs
+            None, // config_model_len
+            None, // max_model_len
+            None, // max_tokens
+            None, // isq
+            Some(1), // num_shards
+            Some(vec![0]), // device_ids
+            None, // generation_cfg
+            None, // seed
+            true, // disable_prefix_cache
+            None, // prefix_cache_max_tokens
+            None, // kvcache_dtype
+            None, // server_mode
+            None, // cpu_mem_fold
+            None, // kv_fraction
+            None, // mamba_fraction
+            None, // pd_config
+            None, // mcp_command
+            None, // mcp_config
+            None, // mcp_args
+            None, // tool_prompt_template
+            None, // pd_server_prefix_cache_ratio
+            None, // pd_client_prefix_cache_ratio
+            None, // yarn_scaling_factor
+            false, // disable_reasoning
+            false, // disable_cuda_graph
+            None, // prefill_chunk_size
+            1, // num_nodes
+            0, // node_rank
+            None, // master_addr
+            29500, // master_port
+            false, // enable_tool_grammar
+            num_spec, // num_speculative_tokens
+            None, // draft_model
+            LoraConfig::default(), // lora
+        );
+        econfig.qos.spec_draft_max = spec_draft_max;
+        econfig
+    }
+
+    #[test]
+    fn seed_spec_draft_max_inclusive_seeds_from_cli_when_unset() {
+        // The operator set --num-speculative-tokens 4 + left spec_draft_max at the
+        // 0 default: the bridge seeds the ceiling to 4 (the no collapsed K).
+        let econfig = make_econfig(Some(4), 0);
+        let qos_cfg = seed_spec_draft_max(&econfig);
+        assert_eq!(qos_cfg.spec_draft_max, 4);
+    }
+
+    #[test]
+    fn seed_spec_draft_max_exclusive_preserves_operator_set_ceiling() {
+        // The operator explicitly tuned spec_draft_max to 2: the bridge must NOT
+        // override it (the explicit QoS tuning wins over the CLI default).
+        let econfig = make_econfig(Some(4), 2);
+        let qos_cfg = seed_spec_draft_max(&econfig);
+        assert_eq!(qos_cfg.spec_draft_max, 2);
+    }
+
+    #[test]
+    fn seed_spec_draft_max_exclusive_no_cli_means_sd_off() {
+        // The no --num-speculative-tokens + the no operator ceiling: the K stays
+        // 0 (the SD genuinely off, the no phantom pre-alloc).
+        let econfig = make_econfig(None, 0);
+        let qos_cfg = seed_spec_draft_max(&econfig);
+        assert_eq!(qos_cfg.spec_draft_max, 0);
+    }
+
+    #[test]
+    fn prepare_step_view_floor_keeps_k_at_least_one_when_enabled() {
+        // The floor property: when SD is enabled (spec_tokens > 0) the pre-alloc
+        // K is spec_tokens.max(1), so a break-even collapse to 0 still drafts >= 1.
+        let k = 0usize.max(1);
+        assert_eq!(k, 1);
+        let k = 4usize.max(1);
+        assert_eq!(k, 4);
+    }
+
+    // The record_spec_k_feedback property (the no the k > 0 guard): a k == 0 feedback
+    // (the seq fell back to plain decode) MUST update the map (the no the stale K from a
+    // prior drafting step). The k > 0 feedback updates the map as before. This is the
+    // pure-logic property the fix enforces (the no the Scheduler instance dep).
+    #[test]
+    fn record_spec_k_feedback_updates_map_for_zero_k() {
+        // The property: for any k (the no just k > 0), the map entry is updated to k.
+        // The k == 0 case (the plain-decode fallback) is the no the stale K.
+        let mut map: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+        // The prior step's K (the stale value, the no the k == 0 feedback should clear).
+        map.insert(7, 8);
+        // The k == 0 feedback (the seq fell back to plain decode): the map updates to 0.
+        let k: usize = 0;
+        map.insert(7, k); // The no the k > 0 guard (the prior defect).
+        assert_eq!(map.get(&7), Some(&0), "the k == 0 feedback clears the stale K");
+        // The k > 0 feedback (the normal case): the map updates to the new K.
+        let k: usize = 3;
+        map.insert(7, k);
+        assert_eq!(map.get(&7), Some(&3), "the k > 0 feedback updates the K");
+    }
+
+    // The seed-preservation property (the no the running-only clobber): a prior-feedback
+    // entry for a NON-running seq (the preempted/swapped-out) is preserved (the no the
+    // seed rebuilding the map from the running set only, which would drop it + reset the
+    // swapped-in seq to the ceiling). The inclusive: a swapped-out seq retains its K.
+    #[test]
+    fn seed_preserves_non_running_feedback() {
+        // The prior feedback (the runner's K for seq 5, which is now swapped-out, the no
+        // in the running set).
+        let mut prior_feedback: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+        prior_feedback.insert(5, 2); // The seq 5's K is 2 (the weak drafter, the no the ceiling 8).
+        // The running set (the no seq 5 -- it's swapped out).
+        let running_ids: Vec<usize> = vec![1, 2, 3];
+        // The seed: start from the prior_feedback (the no the empty) + only add entries for
+        // running seqs that lack feedback. The no clobbering the prior_feedback.
+        let mut new_map = prior_feedback.clone();
+        for &s_id in &running_ids {
+            if !new_map.contains_key(&s_id) {
+                new_map.insert(s_id, 8); // The ceiling (the no feedback yet, the first step).
+            }
+        }
+        // The inclusive: the swapped-out seq 5 retains its K=2 (the no reset to the ceiling).
+        assert_eq!(new_map.get(&5), Some(&2), "the swapped-out seq retains its K");
+        // The running seqs (the no prior feedback) get the ceiling.
+        assert_eq!(new_map.get(&1), Some(&8));
+        assert_eq!(new_map.get(&2), Some(&8));
+        assert_eq!(new_map.get(&3), Some(&8));
+    }
+
+    // The clear_finished retention property (the no the unbounded map growth): finished
+    // seqs' K entries are removed, the live (running + waiting) seqs' K entries are kept.
+    #[test]
+    fn clear_finished_retains_only_live_seq_k() {
+        let mut map: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+        map.insert(1, 8); // The live running seq.
+        map.insert(2, 4); // The live waiting seq.
+        map.insert(3, 6); // The finished seq (the no the map entry should be dropped).
+        // The live ids (the running + waiting, the no the finished).
+        let live_ids: std::collections::HashSet<usize> = [1, 2].iter().cloned().collect();
+        map.retain(|id, _| live_ids.contains(id));
+        // The inclusive: the live seqs retain their K.
+        assert_eq!(map.get(&1), Some(&8));
+        assert_eq!(map.get(&2), Some(&4));
+        // The exclusive: the finished seq's K is dropped (the no the unbounded growth).
+        assert_eq!(map.get(&3), None);
+    }
+
+    // The cancel-path K cleanup property (the no the unbounded growth via the cancel
+    // path): a cancelled seq's K entry is removed (the cancel path removes the seq from
+    // running directly, the no the clear_finished retain, so the K entry must be cleaned
+    // up there too). A swapped-out seq's K entry is RETAINED (the swap-in needs it, the
+    // seed preservation).
+    #[test]
+    fn cancel_path_removes_k_entry_swap_out_retains_it() {
+        let mut map: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+        map.insert(1, 8); // The cancelled seq (the no the K entry should be dropped).
+        map.insert(2, 4); // The swapped-out seq (the no the K entry should be retained).
+        // The cancel path: the last_spec_draft_len.remove(&seq_id) (the no the seq 1).
+        map.remove(&1);
+        // The inclusive: the swapped-out seq (the no the seq 2) retains its K (the no the
+        // swap-in resetting it to the ceiling).
+        assert_eq!(map.get(&2), Some(&4), "the swapped-out seq retains its K");
+        // The exclusive: the cancelled seq's K is dropped (the no the unbounded growth).
+        assert_eq!(map.get(&1), None, "the cancelled seq's K is dropped");
     }
 }

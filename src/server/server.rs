@@ -322,8 +322,9 @@ impl StreamingContext {
             .is_ok()
     }
 
-    /// Deliver a routed chunk (content or reasoning) - the single delivery point the
-    /// output reservoir drains through.
+/// Send a buffered chunk (the output reservoir drain). Routes to the reasoning
+    /// or the content channel based on the `is_reasoning` flag. Returns false if the
+    /// client disconnected.
     fn send_chunk(&self, text: &str, is_reasoning: bool) -> bool {
         if is_reasoning {
             self.send_reasoning_token(text)
@@ -734,15 +735,14 @@ pub async fn chat_completion(
             let reasoning_router =
                 ReasoningContentRouter::new(crate::utils::env::stream_as_reasoning_content());
 
+            let mut current_stream = stream;
+            let current_seq_id = seq_id;
+
             // Output reservoir: smooths bursty token delivery into a steady drip.
-            // Default on; XINFER_STREAM_RESERVOIR=0 restores the legacy push path.
             let reservoir_enabled = crate::utils::env::stream_reservoir();
             let mut reservoir = OutputReservoir::new(reservoir_enabled);
             let mut drain_timer = tokio::time::interval(reservoir.drain_interval());
             drain_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-
-            let mut current_stream = stream;
-            let current_seq_id = seq_id;
 
             loop {
                 let item = tokio::select! {
@@ -760,7 +760,7 @@ pub async fn chat_completion(
                             e.cancel(current_seq_id);
                             break;
                         }
-                        continue;
+continue;
                     }
                     _ = async {
                         if reservoir.is_enabled() {
@@ -787,7 +787,7 @@ pub async fn chat_completion(
                                 "[Seq {}] Stream send error (disconnected)",
                                 current_seq_id
                             );
-                            engine_clone.cancel(current_seq_id);
+engine_clone.cancel(current_seq_id);
                             break;
                         }
                         continue;
@@ -862,7 +862,7 @@ pub async fn chat_completion(
                                     if let Some((rtext, is_reasoning)) =
                                         reasoning_router.route(&text, was_in_reasoning)
                                     {
-reservoir.push(rtext, is_reasoning);
+                                        reservoir.push(rtext, is_reasoning);
                                         if !reservoir.is_enabled() {
                                             // Pass-through: deliver immediately (legacy behavior).
                                             if let Some((t, r)) = reservoir.pop() {
@@ -871,7 +871,7 @@ reservoir.push(rtext, is_reasoning);
                                                         "[Seq {}] Stream send error (disconnected)",
                                                         current_seq_id
                                                     );
-                                                    engine_clone.cancel(current_seq_id);
+engine_clone.cancel(current_seq_id);
                                                     break;
                                                 }
                                             }
@@ -966,6 +966,7 @@ reservoir.push(rtext, is_reasoning);
 if let Some((rtext, is_reasoning)) = reasoning_router.route(&safe_text, false) {
                                         reservoir.push(rtext, is_reasoning);
                                         if !reservoir.is_enabled() {
+                                            // Pass-through: deliver immediately (legacy behavior).
                                             if let Some((t, r)) = reservoir.pop() {
                                                 if !stream_ctx.send_chunk(&t, r) {
                                                     engine_clone.cancel(current_seq_id);
@@ -999,6 +1000,7 @@ if let Some((rtext, is_reasoning)) = reasoning_router.route(&safe_text, false) {
 if let Some((rtext, is_reasoning)) = reasoning_router.route(&token, was_in_reasoning) {
                                 reservoir.push(rtext, is_reasoning);
                                 if !reservoir.is_enabled() {
+                                    // Pass-through: deliver immediately (legacy behavior).
                                     if let Some((t, r)) = reservoir.pop() {
                                         if !stream_ctx.send_chunk(&t, r) {
                                             crate::log_error!(
@@ -1355,19 +1357,56 @@ if let Some((rtext, is_reasoning)) = reasoning_router.route(&token, was_in_reaso
                             current_seq_id,
                             total_decoded_tokens,
                             decode_time_taken,
-                            total_decoded_tokens as f32 / decode_time_taken.max(0.001)
-                        );
+total_decoded_tokens as f32 / decode_time_taken.max(0.001)
+                         );
 
-                        // Per-sequence QoS scheduling report: shows the controller's
+// Per-sequence QoS scheduling report: shows the controller's
                         // learning trajectory (gain start->end, measured ITL vs SLO)
                         // so it's clear whether QoS is adapting and holding the SLO.
                         // Only reported when QoS was actually active for this sequence.
+                        // The capture-before-drop: the per-seq spec stats were pulled
+                        // from the runner by the SchedD at finish-detection (before the
+                        // `Finished` message dropped them runner-side) + stashed in the
+                        // SchedD-owned map. notify_runner_finished reads that surviving
+                        // copy into the engine cache, so the "[Seq N] <mechanism>
+                        // Speculation" line below (the MTP / DFlash / SpecFF) is present.
+                        let _ = engine_clone.notify_runner_finished(current_seq_id).await;
                         if let Some(report) = engine_clone.get_seq_report(current_seq_id).await {
                             if let Some(qos_line) = report.sched.report() {
                                 crate::log_info!(
                                     "[Seq {}] Scheduling: {}",
                                     current_seq_id,
                                     qos_line
+                                );
+                            }
+                        }
+
+                        // Per-sequence speculative-decode report (shown only when a
+                        // spec mechanism was active for this sequence).
+                        if let Some(spec) = engine_clone.get_seq_spec_stats(current_seq_id) {
+                            if !spec.mechanism.is_empty() {
+                                let label = format!("{} Speculation", spec.mechanism);
+                                let rate = if spec.proposed > 0 {
+                                    spec.accepted as f64 / spec.proposed as f64 * 100.0
+                                } else {
+                                    0.0
+                                };
+                                let avg = if spec.steps > 0 {
+                                    (spec.accepted + 2 * spec.steps) as f64 / spec.steps as f64
+                                } else {
+                                    1.0
+                                };
+                                crate::log_info!(
+                                    "[Seq {}] {}: steps={} proposed={} accepted={} rate={:.1}% avg_tok/step={:.2} | bound(tgt/grm): {}/{}",
+                                    current_seq_id,
+                                    label,
+                                    spec.steps,
+                                    spec.proposed,
+                                    spec.accepted,
+                                    rate,
+                                    avg,
+                                    spec.target_bound,
+                                    spec.grammar_bound
                                 );
                             }
                         }

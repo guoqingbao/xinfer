@@ -163,6 +163,117 @@ impl LogitsProcessor {
         }
     }
 
+    /// The post-sampling probability distribution for one logit row (the
+    /// temperature + top-k + top-p transform, the no the categorical draw). This is
+    /// the exact `p_target` the engine would sample from -- used by the lossless
+    /// rejection-sampling verify (the `verify_draft_rejection`) so the target
+    /// distribution matches what the normal decode produces. Returns the normalized
+    /// probs (the `None` when the row is empty / the transform degenerates).
+    pub fn sampling_probs_row(&self, logits: &[f32]) -> Option<Vec<f32>> {
+        if logits.is_empty() {
+            return None;
+        }
+        // The temperature (the ArgMax strategy is temperature-free).
+        let temperature = match &self.sampling {
+            Sampling::ArgMax => 1.0,
+            Sampling::All { temperature } => *temperature,
+            Sampling::TopK { temperature, .. } => *temperature,
+            Sampling::TopP { temperature, .. } => *temperature,
+            Sampling::TopKThenTopP { temperature, .. } => *temperature,
+        };
+        let scaled: Vec<f32> = if temperature > 0.0 {
+            logits.iter().map(|&l| l / temperature).collect()
+        } else {
+            logits.to_vec()
+        };
+        // The softmax (the probabilities).
+        let max_logit = scaled.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let exps: Vec<f32> = scaled.iter().map(|&l| (l - max_logit).exp()).collect();
+        let sum: f32 = exps.iter().sum();
+        if sum == 0.0 || sum.is_nan() {
+            return None;
+        }
+        let mut probs: Vec<f32> = exps.iter().map(|&e| e / sum).collect();
+
+        // The top-k / top-p filtering (the same transform as sample_cpu_row).
+        match &self.sampling {
+            Sampling::TopK { k, .. } => {
+                let k = *k;
+                if k > 0 && k < probs.len() {
+                    let mut indexed: Vec<(usize, f32)> = probs.iter().enumerate().map(|(i, &p)| (i, p)).collect();
+                    indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                    let threshold = indexed[k - 1].1;
+                    for p in probs.iter_mut() {
+                        if *p < threshold {
+                            *p = 0.0;
+                        }
+                    }
+                }
+            }
+            Sampling::TopP { p, .. } => {
+                let p = *p;
+                if p > 0.0 && p < 1.0 {
+                    let mut indexed: Vec<(usize, f32)> = probs.iter().enumerate().map(|(i, &p)| (i, p)).collect();
+                    indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                    let mut cumsum = 0.0;
+                    let mut keep = 0usize;
+                    for (i, &(_, prob)) in indexed.iter().enumerate() {
+                        cumsum += prob;
+                        if cumsum >= p {
+                            keep = i + 1;
+                            break;
+                        }
+                        keep = i + 1;
+                    }
+                    for (i, p_) in probs.iter_mut().enumerate() {
+                        if i >= keep {
+                            *p_ = 0.0;
+                        }
+                    }
+                }
+            }
+            Sampling::TopKThenTopP { k, p, .. } => {
+                if *k > 0 && *k < probs.len() {
+                    let mut indexed: Vec<(usize, f32)> = probs.iter().enumerate().map(|(i, &p)| (i, p)).collect();
+                    indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                    let threshold = indexed[*k - 1].1;
+                    for p in probs.iter_mut() {
+                        if *p < threshold {
+                            *p = 0.0;
+                        }
+                    }
+                }
+                if *p > 0.0 && *p < 1.0 {
+                    let mut indexed: Vec<(usize, f32)> = probs.iter().enumerate().map(|(i, &p)| (i, p)).collect();
+                    indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                    let mut cumsum = 0.0;
+                    let mut keep = 0usize;
+                    for (i, &(_, prob)) in indexed.iter().enumerate() {
+                        cumsum += prob;
+                        if cumsum >= *p {
+                            keep = i + 1;
+                            break;
+                        }
+                        keep = i + 1;
+                    }
+                    for (i, p_) in probs.iter_mut().enumerate() {
+                        if i >= keep {
+                            *p_ = 0.0;
+                        }
+                    }
+                }
+            }
+            Sampling::ArgMax | Sampling::All { .. } => {}
+        }
+
+        // The re-normalize after the filtering.
+        let sum: f32 = probs.iter().sum();
+        if sum == 0.0 || sum.is_nan() {
+            return None;
+        }
+        Some(probs.into_iter().map(|p| p / sum).collect())
+    }
+
     pub fn new(
         seed: u64,
         temperature: Option<f32>,
@@ -397,6 +508,94 @@ impl LogitsProcessor {
             }
         };
         Ok(next_tokens)
+    }
+
+    /// Sample `sample_with_strategy`, but with an optional per-row grammar allow-mask
+    /// (`[batch, vocab]` u8, 1 = legal) offloaded into the fused CUDA sampler's top-k
+    /// stage, so disallowed vocab is dropped without a separate CPU biasing pass.
+    pub fn sample_with_strategy_masked(
+        &self,
+        logits: &Tensor,
+        sampling: &Sampling,
+        mask: Option<&Tensor>,
+    ) -> Result<Vec<u32>> {
+        #[cfg(feature = "cuda")]
+        {
+            let (k, p, t) = match sampling {
+                Sampling::TopKThenTopP { k, p, temperature } => (*k, *p, *temperature),
+                Sampling::TopK { k, temperature } => (*k, 1.0, *temperature),
+                Sampling::TopP { p, temperature } => (256, *p, *temperature),
+                _ => (0, 0.0, 0.0),
+            };
+            let should_run = matches!(
+                sampling,
+                Sampling::TopKThenTopP { .. } | Sampling::TopK { .. } | Sampling::TopP { .. }
+            );
+            if should_run && k > 0 {
+                let seed = {
+                    use rand::RngCore;
+                    self.rng.lock().next_u64()
+                };
+                let sampler = self.fast_sampler.lock().unwrap();
+                return match mask {
+                    Some(m) => sampler.sample_cuda_masked(logits, k, p as f32, t, seed, Some(m)),
+                    None => sampler.sample_cuda(logits, k, p as f32, t, seed),
+                };
+            }
+        }
+        // Non-CUDA build or unsupported strategy: fall back to the plain sampler. On this
+        // path the caller has already folded the mask into the logits (CPU where_cond).
+        self.sample_with_strategy(logits, sampling)
+    }
+
+    /// Sample with a VOB bitset mask (`[b, v/32]` U32). 8x less data than the
+    /// F32 mask path. Uses the fused `sample_cuda_vob` kernel (bitwise AND).
+    pub fn sample_with_vob(
+        &self,
+        logits: &Tensor,
+        sampling: &Sampling,
+        vob: Option<&Tensor>,
+    ) -> Result<Vec<u32>> {
+        #[cfg(feature = "cuda")]
+        {
+            let (k, p, t) = match sampling {
+                Sampling::TopKThenTopP { k, p, temperature } => (*k, *p, *temperature),
+                Sampling::TopK { k, temperature } => (*k, 1.0, *temperature),
+                Sampling::TopP { p, temperature } => (256, *p, *temperature),
+                _ => (0, 0.0, 0.0),
+            };
+            let should_run = matches!(
+                sampling,
+                Sampling::TopKThenTopP { .. } | Sampling::TopK { .. } | Sampling::TopP { .. }
+            );
+            if should_run && k > 0 {
+                let seed = {
+                    use rand::RngCore;
+                    self.rng.lock().next_u64()
+                };
+                let sampler = self.fast_sampler.lock().unwrap();
+                return sampler.sample_cuda_vob(logits, k, p as f32, t, seed, vob);
+            }
+        }
+        // Fallback: convert VOB to F32 mask and use the existing path.
+        let mask = vob.map(|vob_tensor| {
+            let words = vob_tensor.flatten_all()?.to_vec1::<u32>()?;
+            let (b, vw) = vob_tensor.dims2()?;
+            let vocab = vw * 32;
+            let mut allow = vec![1u8; b * vocab];
+            for (bi, word) in words.iter().enumerate() {
+                let row = bi / vw;
+                let col = bi % vw;
+                for bit in 0..32 {
+                    let idx = col * 32 + bit;
+                    if idx < vocab && (word >> bit) & 1 == 0 {
+                        allow[row * vocab + idx] = 0;
+                    }
+                }
+            }
+            Tensor::from_vec(allow, (b, vocab), vob_tensor.device())
+        }).transpose()?;
+        self.sample_with_strategy_masked(logits, sampling, mask.as_ref())
     }
 
     pub fn sample(

@@ -503,8 +503,9 @@ impl Qwen3_5MtpHead {
         embed_weight: &Tensor,
         lm_head_fn: impl Fn(&Tensor) -> Result<Tensor>,
         positions_base: usize,
-    ) -> Result<(Vec<u32>, Tensor)> {
+    ) -> Result<(Vec<u32>, Tensor, Vec<Tensor>)> {
         let mut gpu_draft_tokens: Vec<Tensor> = Vec::with_capacity(num_tokens);
+        let mut draft_logits: Vec<Tensor> = Vec::with_capacity(num_tokens);
         let mut current_hidden = if initial_hidden.dims().len() == 1 {
             initial_hidden.unsqueeze(0)?
         } else {
@@ -526,9 +527,14 @@ impl Qwen3_5MtpHead {
             } else {
                 logits
             };
-            let next_token_t = logits_last.to_dtype(DType::F32)?.argmax(D::Minus1)?;
+            // Keep the drafter's per-position distribution
+            // (the softmax input, the F32 logits) -- the `p_draft` for the
+            // rejection-sampling verify.
+            let draft_logit = logits_last.to_dtype(DType::F32)?;
+            let next_token_t = draft_logit.argmax(D::Minus1)?;
 
             gpu_draft_tokens.push(next_token_t.clone());
+            draft_logits.push(draft_logit);
             current_hidden = if hidden_out.dims().len() == 2 {
                 hidden_out.get(hidden_out.dim(0)? - 1)?.unsqueeze(0)?
             } else {
@@ -545,7 +551,7 @@ impl Qwen3_5MtpHead {
         };
 
         let final_hidden = current_hidden.squeeze(0)?;
-        Ok((draft_tokens, final_hidden))
+        Ok((draft_tokens, final_hidden, draft_logits))
     }
 
     /// Legacy draft method with CPU round-trips (kept for compatibility).

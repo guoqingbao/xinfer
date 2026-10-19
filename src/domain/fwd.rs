@@ -71,14 +71,21 @@ fn fwd_timeout_ms() -> u64 {
 pub enum FwdMessage {
     /// Run a prefill or decode step. Returns the sampled tokens.
     Run(OwnedSeqs, RpcReplyPort<Result<Vec<u32>, String>>),
-    /// Run an MTP speculative decode step.
-    RunMtp(Vec<DecodeSequence>, RpcReplyPort<Result<Vec<Vec<u32>>, String>>),
+    /// Run an MTP speculative decode step. The response carries the per-seq produced
+    /// tokens + the next-step dynamic K (the runner-computed, the no the scheduler
+    /// guessing from an empty cross-process global).
+    RunMtp(Vec<DecodeSequence>, RpcReplyPort<Result<Vec<crate::runner::SpecStepOut>, String>>),
     /// Run a DFlash speculative decode step.
-    RunDflash(Vec<DecodeSequence>, RpcReplyPort<Result<Vec<Vec<u32>>, String>>),
+RunDflash(Vec<DecodeSequence>, RpcReplyPort<Result<Vec<Vec<u32>>, String>>),
+    /// Run a spec fast-forward decode step (the grammar-forced ff run appended
+    /// after the sampled base token).
+    RunSpecFf(Vec<DecodeSequence>, RpcReplyPort<Result<Vec<Vec<u32>>, String>>),
     /// Compute embeddings for the sequences.
     Embed(Vec<Sequence>, EmbeddingStrategy, RpcReplyPort<Result<Vec<Vec<f32>>, String>>),
     /// Notify the runner that a sequence has finished (the releases its slots).
     Finished(usize),
+    /// Fetch the per-seq speculative-decode stats from rank 0 (the Process mode).
+    FetchSpecSeqStats(usize, RpcReplyPort<crate::runner::SpecSeqStatsData>),
     /// The broadcast ops (the PD cache + the mamba prefix state).
     TrySwapKvcache(HashMap<usize, usize>, bool, RpcReplyPort<bool>),
     TrySendKvcache(Sequence, u32, RpcReplyPort<bool>),
@@ -153,10 +160,19 @@ impl ractor::Actor for FwdD {
                 };
                 let _ = reply.send(result);
             }
-            RunDflash(seqs, reply) => {
+RunDflash(seqs, reply) => {
                 let resp = state.ipc_round_trip(MessageType::RunDecodeDFlash(seqs), timeout).await;
                 let result = match resp {
                     Some(MessageType::RunResponseDFlash(out)) => Ok(out),
+                    Some(other) => Err(format!("unexpected IPC response: {other:?}")),
+                    None => Err("IPC round_trip failed (timeout or actor stopped)".into()),
+                };
+                let _ = reply.send(result);
+            }
+            RunSpecFf(seqs, reply) => {
+                let resp = state.ipc_round_trip(MessageType::RunDecodeSpecFF(seqs), timeout).await;
+                let result = match resp {
+                    Some(MessageType::RunResponseSpecFF(out)) => Ok(out),
                     Some(other) => Err(format!("unexpected IPC response: {other:?}")),
                     None => Err("IPC round_trip failed (timeout or actor stopped)".into()),
                 };
@@ -264,6 +280,13 @@ impl ractor::Actor for FwdD {
             }
             Shutdown => {
                 let _ = state.ipc.send_message(IpcMessage::Fire(MessageType::Shutdown));
+            }
+            FetchSpecSeqStats(id, reply) => {
+                let resp = state.ipc_round_trip(MessageType::GetSpecSeqStats(id), timeout).await;
+                let _ = reply.send(match resp {
+                    Some(MessageType::SpecSeqStatsResponse(_, data)) => data,
+                    _ => crate::runner::SpecSeqStatsData::default(),
+                });
             }
         }
         Ok(())

@@ -53,6 +53,10 @@ async fn main() -> Result<()> {
 
     let dtype = get_dtype(args.dtype);
 
+    // The startup warning for the unsupported spec-decode env vars (the no the silent
+    // no-op -- the operator who set XINFER_SPEC_GRANULAR_MASK sees a clear message).
+    xinfer::utils::env::warn_unsupported_spec_env_vars();
+
     let (max_num_seqs, interactive) = if args.batch.is_some() {
         tracing::warn!("max_num_seqs is ignored in batch performance test.");
         if args.interactive {

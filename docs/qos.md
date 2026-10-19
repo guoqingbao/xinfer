@@ -71,7 +71,7 @@ even constructed, the scheduler takes the static plan path). The reservoir is **
   lock beyond the scheduler's existing lock).
 
 ### Data lifecycle
-- The `QosController` is owned by the scheduler (the one per engine). The gain + the
+- The `QosController` is owned by the scheduler (one per engine). The gain + the
   output-length EMA are persistent controller state (no per-request state). The
   per-seq `SchedSeqStats` (the gain start->end, the ITL vs SLO, the shrunk/prio/resv/
   preempt/swap counters) is recorded per sequence + reported at the sequence's end.
@@ -191,3 +191,114 @@ sprint inherits it:
 ### Citations / references
 - The pyo3 extension-module pattern: the pyo3 docs (the
   <https://pyo3.rs>, the `#[pyclass]` + `#[new]` constructor).
+
+## 5. Actor integration (the `SchedD` ownership)
+
+On the actor branch, the `QosController` is owned by the `Scheduler` struct, which is
+owned by the `SchedD` actor. The control loop runs inside `SchedD::handle_step`:
+
+```
+SchedD::handle_step:
+  a. scheduler.schedule()
+       // Inside schedule():
+       //   1. Measure step duration (the ITL sensor)
+       //   2. policy.record_step(step_ms)  [if QoS active]
+       //   3. policy.plan(&running, &blocks) -> StepPlan
+       //   4. Apply thePlan: chunk_size, token_budget, class partition,
+       //      reservation gates
+       //   5. KvD.allocate / KvD.may_append (block management)
+  b. fwd.run(  [GPU forward pass]
+  c. scheduler.postprocess(...)
+       // Inside postprocess:
+       //   1. Append tokens to sequences
+       //   2. policy.record_output(output_len)  [when sequence finishes]
+       //   3. Stamp SchedSeqStats (gain_start, gain_end, itl_ms, etc.)
+  d. Delivery loop (StreamD)_tokens, deliver_token, deliver_done)
+  e. scheduler.clear_finished()
+  f. check_canceled()
+```
+
+The `QosConfig` is accessed via `self.scheduler.policy` (the scheduler owns it).
+No additional actor hops are needed for the QoS control loop it
+
+The per-sequence QoS report is delivered via `SchedD::get_seq_report(seq_id)` which
+returns `Option<SeqReport>` (the cached tokens + the `SchedSeqStats`). The server
+
+calls this at the end of each sequence to emit the `[Seq N] Scheduling: ...` log line.
+
+## 6. The collection framework (the `WorkloadHistogram` + the `AdaptivePlan`)
+
+The §1 session work adds the bounded-memory workload histogram + the adaptive plan lawlaw on top of the existing self-tuning controller. This is the sensor that the
+L2-L4 layers (the unified-memory governor, the lattice router, the multi-model
+restructuring) consume to adapt the runtime to the workload.
+
+### The `WorkloadHistogram` (the per-class bounded estimators)
+
+The histogram is a matrix of bounded-memory streaming estimators, keyed by the
+(regime × class) — the bounded class set {Latency, Throughput} × {Contended,
+Uncontended}. It is O(1) in the number of conversations (the no per-conversation
+storage; the per-class key is the bounded set). The estimators:
+
+| Field | Estimator | Signal |
+|-------|-----------|--------|
+| `itl` | the P² streaming quantile (the 5-cell reservoir, the p95) | the inter-token latency per regime×class |
+| `output_len` | the 32-bucket log-spaced CDF | the output-length distribution per class |
+| `batch_size` | the EMA + counter | the decode batch size per regime |
+| `prefix_hit` | the EMA | the prefix-cache hit-rate per class |
+| `kv_pressure` | the EMA | the KV pool pressure per regime |
+| `exposed_time` | the 3×2 matrix (the work-class × the class) | the per-class exposed time (the NInfer `RequestHostTiming`) |
+| `request_states` | the 8-count lifecycle | the NInfer `EngineRequestState` counts per class |
+| `preemptions` | the 2-count | the per-class preemption count (the SGLang `retraction_count`) |
+| `turns` | the counter | the conversation warmth (the L1 `capture_seq`) |
+| `reuse_evidence` | the 256-entry ring | the NInfer real-demand signal (the `proven_frontier` + the `demand_digest` + the `adopted_count`) |
+
+The P² estimator is the Jain & Chaudhry streaming quantile (the 5-cell reservoir,
+the no full CDF storage). The `p2_p95_converges` + the `p2_p95_mixed_stream` tests
+prove the p95 tracks the high-ITL stream (the inclusive: every high sample is
+reflected; the exclusive: the low samples do not inflate the p95).
+
+### The `AdaptivePlan` (the actuator law)
+
+The `plan()` law reads the histogram + emits the actuators:
+
+| Histogram signal | Actuator | The tunable it drives |
+|------------------|----------|----------------------|
+| the `itl[Contended].p95` > the SLO | the `chunk_size` ↓ | the prefill suppression (the existing `gain`) |
+| the `batch_size[Contended].ema` high + the `itl[Contended].p95` low | the `parallelism_hint = UseSequenceParallelism` | the TP↔SP switch (the Shift result) |
+| the `batch_size[Uncontended].ema` low + the `itl[Uncontended].p95` high | the `parallelism_hint = IncreaseTp` | the TP degree (the DistServe result) |
+| the `output_len[class]` CDF median low | the `sampling.top_k` tight | the sampling width (the short-output regime) |
+| the `output_len[class]` CDF median high | the `sampling.top_p` wide | the sampling width (the long-output regime) |
+| the `kv_pressure[Contended].above_threshold` high | the `kv_demote_threshold` ↓ | the L2 demotion (the SGLang move-gate result) |
+| the `prefix_hit[class]` high + the `turns` high | the `batch_cap` ↑ | the admission (the warm conversation, the vLLM `max_num_active_reqs` result) |
+| the `preemptions[class]` high | the `batch_cap` ↓ | the admission throttle (the NInfer `retraction_count` result) |
+
+The `AdaptivePlan` wraps the existing `StepPlan` (the 6 fields) + adds the
+`batch_cap` the `sampling` override, the `parallelism_hint`, + the
+`kv_demote_threshold`. The `spec_draft_len` is added by the
+`spec-decode` branch (the stack). The `qos` branch lands the core histogram + the core plan.
+
+### The two-rate sensor (the NInfer `RequestHostTiming`)
+
+The histogram is fed by the two-rate sensor:
+- The FAST-step `record_step` updates the ITL P² + the gain (the fast rate).
+- The per-sequence `record_output` updates the output-length CDF + the batch-size
+  EMA + the prefix-hit EMA + the turns counter (the slow rate).
+- The `record_admission` (the per path) records the prefix-hit + the turns + the
+  reuse-evidence digest at the admission.
+- The `record_preemption` records the per-class preemption (the capacity signal).
+
+### The NInfer `Scheduler` template (the admission + the preemption + the resume)
+
+The three pure functions port the NInfer scheduler template:
+- The `admission_allowed(bypasses, concurrency)` — the FIFO bypass allowance (the
+  "at most C younger requests can overtake" rule).
+- The `youngest_victim(candidates, priority_ticket)` — the preemption victim
+  selection (the no materializing/finished, the `recovery_pending` + the
+  `priority_ticket` guard, the youngest-by-id).
+- The `should_restore(have_paused, resident_empty, restoration_event)` — the
+  resume gating (the `have_paused` + the `resident_empty` OR the
+  `restoration_event`).
+
+The `admission_bypass_cap` + the `preemption_victim_youngest` + the
+`resume_gating` tests prove each (the inclusive: the valid case is admitted/
+selected; the exclusive: the invalid case is rejected/skipped).

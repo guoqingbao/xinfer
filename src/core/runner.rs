@@ -265,6 +265,27 @@ impl ModelRunner {
         self.config.block_size
     }
 
+    /// The cached per-request sampling strategy (the target's post-sampling
+    /// distribution for the lossless rejection-sampling verify). The `None`
+    /// when no per-request override is cached (the model's base sampling).
+    pub(crate) fn cached_sampling(&self) -> Option<crate::core::runner::CachedSamplingParams> {
+        self.cached_sampling.read().clone()
+    }
+
+    /// Whether this runner is the rank-0 shard (the authoritative NCCL all-reduce
+    /// makes all ranks agree, so rank-0 logs are the single source of truth).
+    pub(crate) fn is_first_rank(&self) -> bool {
+        self.is_first_rank
+    }
+
+    /// The dynamic-K break-even threshold (the `QosConfig.spec_draft_break_even`, the
+    /// the runner-side access to the private `config` field, the no the mtp.rs reaching
+    /// into `self.config`). The runner uses this to compute the per-seq next-K (the
+    /// rolling prefix-curve knee).
+    pub(crate) fn spec_break_even(&self) -> f64 {
+        self.config.qos.spec_draft_break_even as f64
+    }
+
     #[cfg(feature = "flashinfer")]
     pub(crate) fn flashinfer_kv_params(&self) -> Option<crate::utils::FlashInferKvParams> {
         self.flashinfer_kv_params
@@ -1084,6 +1105,34 @@ impl ModelRunner {
             Model::Qwen3VL(model) => Ok(model.remove_mamba_prefix_state(hash)),
             _ => Ok(true),
         }
+    }
+
+    /// Speculative fast-forward decode: sample the base token (the current `run`, which
+    /// commits it to the FSM), then append the full grammar-forced (ff) run that follows.
+    /// The ff tokens are deterministic (forced by the grammar), so they are committed
+    /// directly without model sampling. Returns `[base_token, ff_run...]` per sequence;
+    /// the next draft anchors on the last ff token.
+    pub fn run_speculative_ff(&self, seqs: Seqs) -> Result<Vec<Vec<u32>>> {
+        let base_tokens = self.run(seqs, false)?;
+        let seq_ids: Vec<usize> = match &seqs {
+            Seqs::SeqRefs(seqs) => seqs.iter().map(|s| s.id()).collect(),
+            Seqs::DecodeVec(v) => v.iter().map(|s| s.id()).collect(),
+        };
+        let mut outputs: Vec<Vec<u32>> = Vec::with_capacity(seq_ids.len());
+        for (i, seq_id) in seq_ids.iter().enumerate() {
+            let mut out = vec![base_tokens[i]];
+            // The remaining grammar run (from the FSM state after the base token is committed).
+            let remaining_ff = self.guided_decoding.ff_tokens(*seq_id);
+            if !remaining_ff.is_empty() {
+                self.guided_decoding.commit_ff_sequence(*seq_id);
+                // Report the ff continuation in the per-seq speculative stats (the same
+                // optional end-of-sequence report as MTP/DFlash).
+                crate::speculative::spec_stats::spec_stats_update_ff("SpecFF", *seq_id, remaining_ff.len());
+                out.extend(remaining_ff);
+            }
+            outputs.push(out);
+        }
+        Ok(outputs)
     }
 
     #[allow(unused)]
@@ -2311,8 +2360,16 @@ impl ModelRunner {
                 } else {
                     "MTP"
                 };
+                // Capture the verify graph for the CEILING K (the mtp_num_speculative).
+                // The dynamic-K path (the per-seq K < the ceiling) falls back to the
+                // non-graph forward (the is_mtp_captured(verify_len) check returns
+                // false for an uncaptured K, the mtp.rs verify takes the forward path).
+                // Capturing the full K range in one call is not supported by the
+                // graph-capture state machine (the CUDA_ERROR_INVALID_VALUE on the
+                // second capture), so the ceiling graph + the non-graph fallback is the
+                // correct + safe design.
                 crate::log_info!(
-                    "Capturing {} verify graphs for up to {} draft tokens...",
+                    "Capturing {} verify graph for up to {} draft tokens...",
                     label,
                     self.mtp_num_speculative
                 );
@@ -2556,6 +2613,7 @@ mod tests {
             block_table_last: 0,
             block_tables: vec![0],
             sampling_params,
+            spec_k: 0,
         }
     }
 
