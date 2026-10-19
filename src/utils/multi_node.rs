@@ -257,7 +257,7 @@ pub fn worker_connect_to_master(config: &MultiNodeConfig) -> std::io::Result<Tcp
     Ok(stream)
 }
 
-/// Send a length-prefixed bincode message over a TcpStream.
+/// Send a length-prefixed MsgPack message over a TcpStream.
 pub fn send_tcp(stream: &mut TcpStream, data: &[u8]) -> std::io::Result<()> {
     let len = u32::try_from(data.len()).map_err(|_| {
         std::io::Error::new(
@@ -271,7 +271,7 @@ pub fn send_tcp(stream: &mut TcpStream, data: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Receive a length-prefixed bincode message from a TcpStream.
+/// Receive a length-prefixed MsgPack message from a TcpStream.
 pub fn recv_tcp(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf)?;
@@ -366,7 +366,7 @@ pub fn run_worker_daemon(
             }
         };
 
-        let msg: MessageType = match bincode::deserialize(&data) {
+        let msg: MessageType = match rmp_serde::from_slice(&data) {
             Ok(m) => m,
             Err(e) => {
                 crate::log_error!("[Multi-Node Worker] Failed to deserialize message: {:?}", e);
@@ -409,7 +409,7 @@ pub fn run_worker_daemon(
                 };
 
                 let response_data =
-                    bincode::serialize(&response).expect("Failed to serialize response");
+                    rmp_serde::to_vec(&response).expect("Failed to serialize response");
                 if let Err(e) = send_tcp(&mut master_stream, &response_data) {
                     crate::log_error!("[Multi-Node Worker] Failed to send response: {:?}", e);
                     break;
