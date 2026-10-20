@@ -1,4 +1,5 @@
 // src/core/sequence.rs
+use crate::core::qos::{QosClass, SchedSeqStats};
 use crate::utils::config::SamplingParams;
 use crate::utils::image::ImageData;
 use serde::{Deserialize, Serialize};
@@ -52,6 +53,21 @@ pub struct Sequence {
     pub is_tool_call_end: bool,
     pub hit_stop_sequence: bool,
     pub stop_sequence: Option<String>,
+    /// QoS class (Latency vs Throughput), set at request arrival; drives priority
+    /// admission, class-weighted chunk sizing, and reservations.
+    #[serde(default)]
+    pub qos_class: QosClass,
+    /// Per-sequence scheduling/contention stats, accumulated by the scheduler and
+    /// reported at sequence end. Owned on the sequence (no locks).
+    #[serde(default)]
+    pub sched_stats: SchedSeqStats,
+    /// The adaptive prefill chunk size stamped by the scheduler for this step
+    /// (`None` = use the static `effective_prefill_chunk_size`). Travels with the
+    /// sequence clone across the process boundary so the runner's `prepare_prefill`
+    /// and the scheduler's `filter_prefill_finished` agree on how many tokens were
+    /// processed this step.
+    #[serde(default)]
+    pub active_prefill_chunk: Option<usize>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -187,6 +203,9 @@ impl Sequence {
             is_tool_call_end: false,
             hit_stop_sequence: false,
             stop_sequence: None,
+            qos_class: QosClass::default(),
+            sched_stats: Default::default(),
+            active_prefill_chunk: None,
         }
     }
 

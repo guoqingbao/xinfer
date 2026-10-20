@@ -1,5 +1,9 @@
 #[cfg(feature = "python")]
 use pyo3::prelude::*;
+// The Rust programmatic API (EngineBuilder/Engine/EngineStream). Python builds
+// expose the engine through the pyo3 bindings (py/mod.rs) instead, so this module
+// is Rust-only. The engine logic itself (core/) compiles under every feature set.
+#[cfg(not(feature = "python"))]
 pub mod api;
 pub mod core;
 pub mod domain;

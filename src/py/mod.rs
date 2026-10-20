@@ -309,7 +309,7 @@ impl EngineConfig {
         num_nodes=1, node_rank=0, master_addr=None, master_port=29500,
         enable_tool_grammar=false, num_speculative_tokens=None,
         draft_model=None,))]
-    pub fn new(
+    pub fn from_args(
         model_id: Option<String>,
         weight_path: Option<String>,
         weight_file: Option<String>,
@@ -413,6 +413,7 @@ impl EngineConfig {
             num_speculative_tokens,
             draft_model,
             enable_tool_grammar,
+            qos: crate::core::qos::QosConfig::default(),
         }
     }
 }

@@ -1,6 +1,7 @@
 // src/core/scheduler.rs
 use super::{
     prefix_cache::PrefixCacheConfig,
+    qos::{BlockSnapshot, QosController, Regime, SchedSeqStats, SeqReport},
     sequence::{Sequence, SequenceStatus},
 };
 use crate::transfer::{PdConfig, PdRole};
@@ -26,7 +27,7 @@ async fn kv_call<T: Send + 'static>(
 use regex::Regex;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokenizers::Tokenizer;
 pub struct Scheduler {
     waiting: VecDeque<Sequence>,
@@ -38,10 +39,10 @@ pub struct Scheduler {
     /// shared block_manager).
     pub kv: ractor::ActorRef<KvMessage>,
     next_seq_id: usize,
-    /// Per-seq cached-token count retained briefly after `clear_finished()`
-    /// so response finalization can still read it. Bounded by
-    /// `FINISHED_CACHED_TOKENS_MAX`.
-    finished_cached_tokens: HashMap<usize, usize>,
+    /// Per-seq end-of-sequence report (cached-token count + QoS scheduling stats),
+    /// retained briefly after `clear_finished()` (which drops the Sequence) so the
+    /// server's report can still read it. Bounded by `FINISHED_CACHED_TOKENS_MAX`.
+    finished_reports: HashMap<usize, SeqReport>,
     eos_token_id: Vec<u32>,
     /// Token IDs that represent the end of a tool call (e.g., </tool_call> tokens)
     tool_call_end_token_ids: Vec<u32>,
@@ -59,9 +60,14 @@ pub struct Scheduler {
     /// Sequence IDs whose hybrid GDN/Mamba active slots must be released on the
     /// runner after scheduler-side abort (swap-in failure, etc.).
     pending_runner_releases: Vec<usize>,
+    /// The self-tuning QoS controller (per model). When QoS is off this is a
+    /// no-op (the static degenerate plan), so behavior is unchanged.
+    policy: QosController,
+    /// Wall-clock of the previous `schedule()` step; the delta is the ITL sensor.
+    last_step: Option<Instant>,
 }
 
-/// Cap on `Scheduler::finished_cached_tokens`. Bounded memory beats LRU
+/// Cap on `Scheduler::finished_reports`. Bounded memory beats LRU
 /// here: dropping reporting on a small population is acceptable.
 const FINISHED_CACHED_TOKENS_MAX: usize = 16_384;
 pub const KVCACHE_SWAP_THRESHOLD: f32 = 0.95f32; // over 95%
@@ -119,7 +125,20 @@ pub fn build_prefix_cache_config(econfig: &EngineConfig) -> PrefixCacheConfig {
             PREFIX_CACHE_RATIO_NORMAL
         };
 
-        ((econfig.num_blocks as f32) * ratio) as usize
+        if is_pd_server || is_pd_client {
+            ((econfig.num_blocks as f32) * ratio) as usize
+        } else {
+            // Workload-aware sizing (QoS on): hold all concurrent sequences at full
+            // context. max_model_len is resolved at engine init before Scheduler::new.
+            let qos_on = crate::utils::env::qos_enabled() || econfig.qos.enabled;
+            if qos_on {
+                let max_tokens_per_seq = econfig.max_model_len.unwrap_or(262144);
+                econfig.max_num_seqs * max_tokens_per_seq / econfig.block_size
+            } else {
+                // QoS off: fall back to the fixed fraction of the KV budget.
+                ((econfig.num_blocks as f32) * ratio) as usize
+            }
+        }
     };
 
     if max_cached_blocks > econfig.num_blocks {
@@ -159,7 +178,7 @@ impl Scheduler {
                 transferred: VecDeque::new(),
                 kv,
                 next_seq_id: 0,
-            finished_cached_tokens: HashMap::new(),
+                finished_reports: HashMap::new(),
             eos_token_id: match &config.eos_token_id {
                 Some(EosTokenId::Single(eos)) => vec![*eos],
                 Some(EosTokenId::Multiple(eos)) => eos.into_iter().map(|x| *x).collect(),
@@ -177,6 +196,8 @@ impl Scheduler {
             pd_config: econfig.pd_config.clone(),
             is_last_prefill: false,
             pending_runner_releases: Vec::new(),
+            policy: QosController::new(econfig.qos.clone()),
+            last_step: None,
         }
     }
 
@@ -219,6 +240,22 @@ impl Scheduler {
         seq.id = self.next_seq_id;
         let id = seq.id;
         self.next_seq_id += 1;
+        // Assign the QoS class from the controller's measured output-length estimate
+        // (a no-op Throughput default until outputs are observed).
+        seq.qos_class = self.policy.infer_class(&seq);
+        // The §1 two-rate sensor (the fast path): the admission records the
+        // prefix-hit EMA + the turns counter + the reuse-evidence digest (the
+        // NInfer real-demand signal). The `num_cached_tokens` is the prefix hit,
+        // the `len()` is the query.
+        if self.policy.active() {
+            let reuse_digest = seq.mamba_prefix_hash.unwrap_or(0);
+            self.policy.record_admission(
+                seq.qos_class,
+                seq.num_cached_tokens,
+                seq.len(),
+                reuse_digest,
+            );
+        }
         self.waiting.push_back(seq);
         id
     }
@@ -234,12 +271,94 @@ impl Scheduler {
         )
     }
 
+    /// Stable-partition the waiting queue so Latency-class requests are admitted ahead
+    /// of Throughput (FIFO within each class). Only called when QoS is active; when
+    /// it is not, the queue is already FIFO. O(n), no per-step HashMap.
+    fn partition_waiting_by_class(&mut self) {
+        let (latency, throughput) = self
+            .waiting
+            .drain(..)
+            .partition::<VecDeque<Sequence>, _>(|s| s.qos_class.is_latency());
+        self.waiting = latency.into_iter().chain(throughput).collect();
+    }
+
     /// Schedule sequences and return their indexes in `running` along with prefill flag
     #[allow(non_snake_case)]
     pub async fn schedule(&mut self) -> Result<(Vec<usize>, bool)> {
         let mut scheduled_ids = Vec::new();
         let mut num_tokens = 0;
-        let chunk_size = self.cfg.effective_prefill_chunk_size();
+
+        // QoS: measure the step (the ITL sensor), then ask the policy for this
+        // step's plan. When QoS is off the plan is the static degenerate one (full
+        // chunk, FIFO admission, no gates), so behavior is unchanged.
+        let now = Instant::now();
+        let step_ms = self
+            .last_step
+            .map(|t| now.duration_since(t).as_secs_f64() * 1e3)
+            .unwrap_or(0.0);
+        self.last_step = Some(now);
+        if self.policy.active() {
+            // Guard against idle gaps: the engine loop skips schedule() while idle,
+            // so a large delta means "woke from idle", not a slow step. Feeding it
+            // to the ITL sensor would falsely spike the gain.
+            let eff = self.policy.effective();
+            if step_ms <= eff.max_meaningful_step_ms {
+                self.policy.record_step(step_ms);
+            }
+        }
+
+        let blocks = BlockSnapshot {
+            free_blocks: kv_call(&self.kv, |r| KvMessage::FreeBlocks(r), 0).await,
+            total_blocks: kv_call(&self.kv, |r| KvMessage::TotalBlocks(r), 0).await,
+            max_num_seqs: self.active_sequence_limit(),
+            max_num_batched_tokens: self.cfg.max_num_batched_tokens,
+            static_chunk: self.cfg.effective_prefill_chunk_size(),
+            chunk_floor: self.policy.effective().chunk_floor,
+        };
+        // The §1: the AdaptivePlan (the base StepPlan + the QoS actuators: the
+        // batch_cap, the sampling override, the parallelism_hint, the
+        // kv_demote_threshold). The histogram is fed by the record_step (the ITL)
+        // + the record_batch_size (the regime) + the record_admission (the
+        // prefix-hit).
+        let eff = self.policy.effective();
+        let decode_pressure = self.policy.contention(&self.running, &blocks).decode_pressure;
+        let kv_pressure = 1.0 - blocks.mem_headroom() as f64;
+        let regime = Regime::classify(
+            decode_pressure,
+            kv_pressure,
+            eff.regime_decode_pressure,
+            eff.regime_kv_pressure,
+        );
+        self.policy.record_batch_size(regime, self.running.len());
+        // The online calibration: feed this step's measurements so the controller
+        // derives its `None` config values from the measured system instead of
+        // blind constants. After the calibration window this is a no-op.
+        self.policy.observe_calibration(
+            step_ms,
+            decode_pressure,
+            kv_pressure,
+            None,
+            self.running.len(),
+        );
+        let plan = self.policy.adaptive_plan(&self.running, &blocks);
+        let chunk_size = plan.base.chunk_size;
+
+        // QoS: admit Latency-class requests ahead of Throughput (stable partition),
+        // and log the live contention vector under pressure. No-op when QoS is off.
+        if self.policy.active() {
+            self.partition_waiting_by_class();
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                let c = self.policy.contention(&self.running, &blocks);
+                if c.decode_pressure > 0.0 {
+tracing::debug!(
+                         "[qos] contention={:?} chunk={} budget={}",
+                         c,
+                         plan.base.chunk_size,
+                         plan.base.token_budget
+                     );
+                }
+            }
+        }
 
         // PD server: Check for new incoming prefill requests
         if self.is_pd_server() {
@@ -277,7 +396,8 @@ impl Scheduler {
         // admitting another waiting prefill batch.
         let pre_existing_running = self.running.len();
         let max_seqs_limit = self.active_sequence_limit();
-        let token_budget = self.cfg.max_num_batched_tokens;
+        let token_budget = plan.base.token_budget;
+        let mut thr_in_use = plan.base.thr_in_use;
 
         while let Some(mut seq) = self.waiting.pop_front() {
             // Try to transfer prefill requests to PD server when applicable
@@ -287,8 +407,26 @@ impl Scheduler {
 
             let effective_tokens = seq.prefill_chunk_tokens(chunk_size);
 
+            // QoS reservation gates: a Throughput request must not consume the
+            // Latency slot / KV reserve. No-op when QoS is off (both gates false).
+            let is_thr = !seq.qos_class.is_latency();
+            let slot_blocked = is_thr
+                && plan.base.thr_slot_capacity > 0
+                && thr_in_use >= plan.base.thr_slot_capacity;
+            let kv_blocked = is_thr && plan.base.thr_kv_full;
+            if slot_blocked || kv_blocked {
+                seq.sched_stats.reservation_blocked += 1;
+                self.waiting.push_front(seq);
+                break;
+            }
+
             if self.running.len() >= max_seqs_limit
                 || scheduled_ids.len() >= max_seqs_limit
+                // The §1 batch the batch_cap admission gate (the vLLM `max_num_active_reqs`
+                // result: the no new-sequence admission beyond the QoS-computed cap,
+                // separate from the `max_num_seqs` slot count). The `batch_cap == 0`
+                // means unlimited (the QoS-off degenerate).
+                || (plan.batch_cap > 0 && self.running.len() >= plan.batch_cap)
                 || num_tokens + effective_tokens > token_budget
                 || (seq.block_table.is_empty() && !kv_call(&self.kv, |r| KvMessage::CanAllocate(seq.clone(), r), false).await)
                 // interleaved scheduling: alternate prefill/decode for fairness
@@ -310,8 +448,31 @@ impl Scheduler {
                 }
             }
             seq.status = SequenceStatus::Running;
+            // Stamp the adaptive chunk so the runner's prepare_prefill and the
+            // scheduler's filter_prefill_finished agree on what was budgeted.
+            seq.active_prefill_chunk = Some(chunk_size);
+            // QoS per-seq stats: record the adaptive adjustments that fired this step.
+            seq.sched_stats.qos_active = self.policy.active();
+            seq.sched_stats.qos_class = seq.qos_class;
+            // The §1 two-rate sensor (the fast path): the admission records the
+            // request-state transition (the `Running` → the `DecodeReady` (
+            // index 6, the NInfer `EngineRequestState`).
+            if self.policy.active() {
+                self.policy.record_request_state(seq.qos_class, 6);
+            }
+            seq.sched_stats.gain_start = self.policy.gain();
+            seq.sched_stats.prefill_steps += 1;
+            if chunk_size < blocks.static_chunk {
+                seq.sched_stats.chunk_shrunk += 1;
+            }
+            if seq.qos_class.is_latency() && self.policy.active() {
+                seq.sched_stats.priority_admitted += 1;
+            }
             num_tokens += effective_tokens;
             self.running.push(seq);
+            if is_thr {
+                thr_in_use += 1;
+            }
             scheduled_ids.push(self.running.len() - 1); // index of newly pushed seq
         }
 
@@ -330,6 +491,15 @@ impl Scheduler {
                 && seq.status != SequenceStatus::FinishSwapped
             {
                 preempt_ids.push(idx);
+            }
+        }
+        // QoS per-seq stats: count preemption pressure on each affected sequence.
+        for &idx in &preempt_ids {
+            self.running[idx].sched_stats.preempted += 1;
+            // The §1: the preemption feeds the histogram's preemptions[class]
+            // (the NInfer retraction_count, the capacity signal).
+            if self.policy.active() {
+                self.policy.record_preemption(self.running[idx].qos_class);
             }
         }
 
@@ -376,8 +546,9 @@ impl Scheduler {
                             "Trying to swap out preempt Seq {:?}",
                             self.running[idx].id
                         );
-                        self.try_swap_out(idx, true).await;
-                }
+self.try_swap_out(idx, true).await;
+                        self.running[idx].sched_stats.swapped += 1;
+                    }
                 }
             }
         }
@@ -736,22 +907,58 @@ pub async fn postprocess_speculative_extra(&mut self, ids: &[usize], extras: &[V
 
     pub async fn clear_finished(&mut self) {
         let is_pd_server = self.is_pd_server();
-        let mut finished_counts = Vec::new();
-        for seq in &self.running {
-            if seq.status == SequenceStatus::Finished {
-                if is_pd_server {
-                    self.print_free_blocks().await;
-                }
-                finished_counts.push((seq.id, seq.num_cached_tokens));
-            }
+        // Collect the finished sequences' report data (id, cached tokens, sched
+        // stats, output length) before the retain() drops them.
+        let finished: Vec<(usize, usize, SchedSeqStats, usize, Option<String>)> = self
+            .running
+            .iter()
+            .chain(self.waiting.iter())
+            .filter(|s| s.status == SequenceStatus::Finished)
+            .map(|s| {
+                (
+                    s.id,
+                    s.num_cached_tokens,
+                    s.sched_stats.clone(),
+                    s.output_ids.len(),
+                    // The model that served this sequence (the "base" when no LoRA
+                    // tenant, the tenant name when a LoRA adapter served it).
+                    // Surfaced in the per-sequence report.
+                    s.sampling_params.lora_tenant.clone(),
+                )
+            })
+            .collect();
+        if is_pd_server {
+            self.print_free_blocks().await;
         }
-        for seq in &self.waiting {
-            if seq.status == SequenceStatus::Finished {
-                finished_counts.push((seq.id, seq.num_cached_tokens));
+        for (seq_id, cached_tokens, mut sched, output_len, lora_tenant) in finished {
+            // Stamp the controller's learning trajectory at the sequence's end so the
+            // report shows whether QoS was adapting (gain) and holding the SLO (ITL).
+            sched.gain_end = self.policy.gain();
+            sched.itl_ms = self.policy.itl_ms();
+            sched.itl_slo_ms = self.policy.slo_ms();
+            sched.output_len = output_len;
+            // The model label (the "base" when no LoRA tenant served this sequence,
+            // the tenant name when a LoRA adapter did). The operator sees which
+            // model produced the output in the per-sequence report.
+            sched.model_label = lora_tenant.unwrap_or_else(|| "base".to_string());
+            self.policy.record_output(output_len);
+            // The §1 two-rate sensor (the slow path): the finish records the turn
+            // (the conversation warmth, the L1 capture_seq) + the reuse-evidence
+            // (the NInfer real-demand signal: the `proven_frontier` + the 256-entry
+            // demand digest) + the request-state transition (the `ModelFinished` lifecycle).
+            if self.policy.active() {
+                let class = sched.qos_class;
+                self.policy.record_turn();
+                self.policy.record_reuse_evidence(class, cached_tokens as u64);
+                self.policy.record_request_state(class, 7); // The ModelFinished (the 8-state index 7).
             }
-        }
-        for (seq_id, num_cached_tokens) in finished_counts {
-            self.remember_finished_cached_tokens(seq_id, num_cached_tokens);
+            self.remember_finished_report(
+                seq_id,
+                SeqReport {
+                    cached_tokens,
+                    sched,
+                },
+            );
         }
         self.running
             .retain(|seq| seq.status != SequenceStatus::Finished);
@@ -848,10 +1055,12 @@ pub async fn postprocess_speculative_extra(&mut self, ids: &[usize], extras: &[V
         for (i, id) in scheduled_ids.iter().enumerate() {
             if *id < self.running.len() {
                 let seq = &self.running[*id];
-                let chunk_tokens = seq.prefill_chunk_tokens(chunk_size);
+                // Use the adaptive chunk stamped by schedule() (fallback: static).
+                let seq_chunk = seq.active_prefill_chunk.unwrap_or(chunk_size);
+                let chunk_tokens = seq.prefill_chunk_tokens(seq_chunk);
                 if chunk_tokens == 0 || seq.num_cached_tokens + chunk_tokens >= seq.len() {
                     let _ = self.kv.call(|r| KvMessage::CaptureMambaPrefix(seq.clone(), seq.len(), r), None).await;
-                    if seq.len() > chunk_size {
+                    if seq.len() > seq_chunk {
                         chunk_finished_info.push((seq.id, seq.len()));
                     }
                     finished_seqs.push((i, seq.id));
@@ -1017,7 +1226,14 @@ pub async fn postprocess_speculative_extra(&mut self, ids: &[usize], extras: &[V
                         seq = kv_call(&self.kv, |r| KvMessage::RollbackPartialSwapInAllocation(seq.clone(), r), seq.clone()).await;
                     }
                     seq.status = SequenceStatus::Swapped;
+                    let swapped_class = seq.qos_class;
                     self.cached.push(seq);
+                    // The §1 two-rate sensor (the fast path): the swap-out
+                    // records the request-state transition (the `Swapped` → the
+                    // `Paused` lifecycle index 5, the NInfer `EngineRequestState`).
+                    if self.policy.active() {
+                        self.policy.record_request_state(swapped_class, 5);
+                    }
                     break;
                 }
             }
@@ -1287,7 +1503,7 @@ pub async fn try_receive_kvcache(&mut self) -> Result<()> {
     }
 
     /// Per-seq prefix-cache hit count for response finalization. Falls back
-    /// to `finished_cached_tokens` for seqs already swept by `clear_finished`.
+    /// to `finished_reports` for seqs already swept by `clear_finished`.
     pub fn get_num_cached_tokens_for_seq(&self, seq_id: usize) -> Option<usize> {
         self.running
             .iter()
@@ -1296,17 +1512,31 @@ pub async fn try_receive_kvcache(&mut self) -> Result<()> {
             .chain(self.transferred.iter())
             .find(|s| s.id == seq_id)
             .map(|s| s.num_cached_tokens)
-            .or_else(|| self.finished_cached_tokens.get(&seq_id).copied())
+            .or_else(|| self.finished_reports.get(&seq_id).map(|r| r.cached_tokens))
     }
 
-    fn remember_finished_cached_tokens(&mut self, seq_id: usize, num_cached_tokens: usize) {
-        self.finished_cached_tokens
-            .insert(seq_id, num_cached_tokens);
-        while self.finished_cached_tokens.len() > FINISHED_CACHED_TOKENS_MAX {
-            let Some(oldest_seq_id) = self.finished_cached_tokens.keys().min().copied() else {
+    /// The end-of-sequence report (cached tokens + QoS scheduling stats) for the
+    /// server's per-sequence display. Searches the live pools, then the retained map.
+    pub fn get_seq_report(&self, seq_id: usize) -> Option<SeqReport> {
+        self.running
+            .iter()
+            .chain(self.waiting.iter())
+            .chain(self.cached.iter())
+            .find(|s| s.id == seq_id)
+            .map(|s| SeqReport {
+                cached_tokens: s.num_cached_tokens,
+                sched: s.sched_stats.clone(),
+            })
+            .or_else(|| self.finished_reports.get(&seq_id).cloned())
+    }
+
+    fn remember_finished_report(&mut self, seq_id: usize, report: SeqReport) {
+        self.finished_reports.insert(seq_id, report);
+        while self.finished_reports.len() > FINISHED_CACHED_TOKENS_MAX {
+            let Some(oldest_seq_id) = self.finished_reports.keys().min().copied() else {
                 break;
             };
-            self.finished_cached_tokens.remove(&oldest_seq_id);
+            self.finished_reports.remove(&oldest_seq_id);
         }
     }
 

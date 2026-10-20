@@ -529,6 +529,10 @@ pub struct EngineConfig {
     #[serde(default)]
     pub lora: LoraConfig,
     pub enable_tool_grammar: bool,
+    /// QoS scheduling policy (class-aware admission, adaptive chunking, KV-aware
+    /// budgeting). Disabled by default = prior operation.
+    #[serde(default)]
+    pub qos: crate::core::qos::QosConfig,
 }
 
 fn default_num_nodes() -> usize {
@@ -650,6 +654,10 @@ pub struct EngineConfig {
     pub lora: LoraConfig,
     #[pyo3(get, set)]
     pub enable_tool_grammar: bool,
+    /// QoS scheduling policy (class-aware admission, adaptive chunking, reservations).
+    /// Disabled by default = prior operation.
+    #[serde(default)]
+    pub qos: crate::core::qos::QosConfig,
 }
 
 impl EngineConfig {
@@ -670,7 +678,6 @@ impl EngineConfig {
     }
 }
 
-#[cfg(not(feature = "python"))]
 impl EngineConfig {
     pub fn new(
         model_id: Option<String>,
@@ -777,6 +784,7 @@ impl EngineConfig {
             draft_model,
             lora,
             enable_tool_grammar,
+            qos: crate::core::qos::QosConfig::default(),
         }
     }
 }

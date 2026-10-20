@@ -3,6 +3,7 @@ use super::runner::ModelRunner;
 use super::block_manager::BlockManager;
 use super::scheduler::Scheduler;
 use super::sequence::Sequence;
+use super::qos::SeqReport;
 use crate::core::scheduler::PD_PREFILL_STATUS_CHECK_COOLING_PERIOD;
 use crate::core::sequence::SequenceStatus;
 use crate::core::lora::{DEFAULT_LORA_MAX_BYTES, DEFAULT_LORA_MAX_TENANTS};
@@ -1053,13 +1054,19 @@ impl LLMEngine {
             .cloned()
     }
 
-    pub async fn get_available_kv_tokens(&self) -> usize {
+pub async fn get_available_kv_tokens(&self) -> usize {
         rpc_value(&self.sched, |r| SchedMessage::GetAvailableKvTokens(r), 0).await
     }
 
-    pub async fn notify_runner_finished(&self, id: usize) -> Result<()> {
+pub async fn notify_runner_finished(&self, id: usize) -> Result<()> {
         let _ = self.fwd.send_message(FwdMessage::Finished(id));
         Ok(())
+    }
+
+    /// The end-of-sequence scheduling report (cached tokens + QoS stats) for the
+    /// server's per-sequence display. Delegates to the scheduler (same process).
+    pub async fn get_seq_report(&self, seq_id: usize) -> Option<SeqReport> {
+        rpc_value(&self.sched, |r| SchedMessage::GetSeqReport(seq_id, r), None).await
     }
 
     /// Release hybrid GDN/Mamba active slots queued by scheduler-side abort paths.

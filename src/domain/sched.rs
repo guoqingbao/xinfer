@@ -80,6 +80,8 @@ pub enum SchedMessage {
     BlockAllocate(Sequence, RpcReplyPort<Option<Sequence>>),
     BlockDeallocate(Sequence),
     PrintFreeBlocks,
+    /// The end-of-sequence scheduling report (the cached tokens + the QoS stats).
+    GetSeqReport(usize, RpcReplyPort<Option<crate::core::qos::SeqReport>>),
 }
 
 #[ractor::async_trait]
@@ -208,6 +210,9 @@ impl ractor::Actor for SchedD {
             }
             PrintFreeBlocks => {
                 state.scheduler.print_free_blocks().await;
+            }
+            GetSeqReport(seq_id, reply) => {
+                let _ = reply.send(state.scheduler.get_seq_report(seq_id));
             }
         }
         Ok(())
