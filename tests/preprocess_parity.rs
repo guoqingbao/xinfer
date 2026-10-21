@@ -75,6 +75,8 @@ fn build_econfig() -> EngineConfig {
         29500,                               // master_port
         false,                               // enable_tool_grammar
         None,                                // num_speculative_tokens
+        None,                                // draft_model
+        None,                                // lora_model
     )
 }
 
@@ -124,8 +126,8 @@ fn preprocess_is_byte_identical_to_apply_chat_template_plus_tokenize() {
     eprintln!("[integration] preprocess_parity: spinning up LLMEngine");
 
     let econfig = build_econfig();
-    let engine = LLMEngine::new(&econfig, DType::BF16).expect("LLMEngine::new failed");
-    let engine = engine.read();
+    let engine = xinfer::core::engine::GLOBAL_RT.block_on(LLMEngine::new(&econfig, DType::BF16)).expect("LLMEngine::new failed");
+    let engine = engine.as_ref();
 
     let (params, message_list) = sample_inputs();
     let tools: Vec<xinfer::tools::Tool> = vec![];
@@ -184,8 +186,8 @@ fn preprocess_rejects_size_mismatch() {
     }
 
     let econfig = build_econfig();
-    let engine = LLMEngine::new(&econfig, DType::BF16).expect("LLMEngine::new failed");
-    let engine = engine.read();
+    let engine = xinfer::core::engine::GLOBAL_RT.block_on(LLMEngine::new(&econfig, DType::BF16)).expect("LLMEngine::new failed");
+    let engine = engine.as_ref();
 
     let params = vec![SamplingParams::new_with_max_tokens(8)];
     let message_list: Vec<Vec<Message>> = vec![]; // intentionally mismatched

@@ -5,6 +5,7 @@ use crate::models::layers::linear::{
 use crate::models::layers::{isq_high_precision_quant, VarBuilderX};
 use crate::utils::config::QuantConfig;
 use crate::utils::gguf_helper::restore_qwen35_qkv_weight;
+use crate::core::lora::{apply_lora_delta, LoraParallelism};
 #[cfg(feature = "nccl")]
 pub use candle_core::cuda_backend::cudarc::nccl::safe::{Comm, Id};
 use candle_core::quantized::{GgmlDType, QTensor};
@@ -50,18 +51,86 @@ pub use std::rc::Rc;
 
 pub struct ReplicatedLinear {
     linear: Linear,
+    /// The module name for the LoRA lookup (the `gate_proj`/`up_proj`/`down_proj`).
+    /// The empty string means this layer is not a LoRA target (no delta, the
+    /// fast path).
+    lora_module: String,
 }
 
 pub struct TensorParallelColumnLinear {
     linear: Linear,
+    /// The module name for the LoRA lookup (the `q_proj`, etc.). The empty string
+    /// means this layer is not a LoRA target (no delta, the fast path).
+    lora_module: String,
+    /// The TP rank (the `comm.rank()`, the 0 for the single-GPU). The LoRA A/B
+    /// sharding uses this to slice the B (the Column mode).
+    tp_rank: usize,
+    /// The TP world size (the `comm.world_size()`, the 1 for the single-GPU).
+    tp_world: usize,
 }
 
 impl TensorParallelColumnLinear {
     pub fn new(linear: Linear) -> Self {
-        Self { linear }
+        Self {
+            linear,
+            lora_module: String::new(),
+            tp_rank: 0,
+            tp_world: 1,
+        }
     }
+
+    /// Set the TP rank/world (the `comm.rank()`/`comm.world_size()`). The LoRA A/B
+    /// sharding (the Column mode) uses these to slice the B on the out dim, so the
+    /// delta matches the per-rank base output. The merged/packed column linears
+    /// (the `MergedParallelColumnLinear`) must set these from the `comm` so the
+    /// LoRA delta is sharded to match the per-rank base (not the full-width
+    /// delta against the sharded base, the broadcast shape mismatch).
+    pub fn with_tp(mut self, tp_rank: usize, tp_world: usize) -> Self {
+        self.tp_rank = tp_rank;
+        self.tp_world = tp_world;
+        self
+    }
+
+    /// Mark this layer as a LoRA target module (the `q_proj`, etc.). The layer
+    /// then consults the global registry + the active tenant in its `forward`.
+    /// The TP rank/world are set by the loader (the `load_with_hints`/
+    /// `load_with_shard`, the TP sharding); this only sets the module name.
+    pub fn with_lora_module(mut self, module: String) -> Self {
+        self.lora_module = module.clone();
+        // Register the site into the global LoRA site registry.
+        // The parallelism is the Column (the q/k/v_proj, the gate/up_proj).
+        crate::core::lora::register_lora_site(&module, crate::core::lora::LoraParallelism::Column, 0, 0);
+        self
+    }
+
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        self.linear.forward_dense_dtype_compatible(x)
+        let base = self.linear.forward_dense_dtype_compatible(x)?;
+        // LoRA delta: batched multi-tenant when LoraExecution is set, single-tenant
+        // otherwise, no-op when absent. Empty module name means this layer is not
+        // a LoRA target (no lookup). Column mode shards B on the out dim (the rank's
+        // slice), A is replicated.
+        if !self.lora_module.is_empty() {
+            #[cfg(feature = "cuda")]
+            if let Some(delta) = crate::core::lora::apply_lora_delta_fused(
+                &self.lora_module,
+                x,
+                LoraParallelism::Column,
+                self.tp_rank,
+                self.tp_world,
+            )? {
+                return Ok(base.broadcast_add(&delta)?);
+            }
+            if let Some(delta) = apply_lora_delta(
+                &self.lora_module,
+                x,
+                LoraParallelism::Column,
+                self.tp_rank,
+                self.tp_world,
+            )? {
+                return Ok(base.broadcast_add(&delta)?);
+            }
+        }
+        Ok(base)
     }
 
     pub fn fp8_weight_scale(&self) -> Option<(&Tensor, &Tensor)> {
@@ -151,7 +220,7 @@ pub fn load_restored_gguf_column_linear(
     drop(weight);
     if keep_restored_gguf_dense(wdtype) {
         let linear = Linear::new(local_weight, None, &None)?;
-        return Ok(TensorParallelColumnLinear::new(linear));
+        return Ok(TensorParallelColumnLinear::new(linear).with_tp(comm.rank(), comm.world_size()));
     }
     let mut wdtype = wdtype;
     let last_dim = local_weight.dim(candle_core::D::Minus1)?;
@@ -178,6 +247,36 @@ impl MergedParallelColumnLinear {
         }
     }
 
+    /// Mark this merged linear as a LoRA target module (the fused-module
+    /// expansion). The `module` is the fused name (the `qkv_proj`, the
+    /// `gate_up_proj`); the adapter's fused A/B (the combined constituent A/B) is
+    /// looked up under this name. The inner `TensorParallelColumnLinear`s carry
+    /// the module name (no delta is applied in their `forward`).
+    pub fn with_lora_module(mut self, module: String) -> Self {
+        for linear in &mut self.linears {
+            linear.lora_module = module.clone();
+        }
+        // Register the fused site into the global LoRA site registry.
+        // The parallelism is the Column (the fused qkv/gate_up is a column-parallel
+        // output).
+        crate::core::lora::register_lora_site(&module, crate::core::lora::LoraParallelism::Column, 0, 0);
+        self
+    }
+
+    /// Set the TP rank/world on all inner column linears (the `comm.rank
+    /// rank/world). The LoRA delta (the Column mode) shards the B on the out dim
+    /// using these, so the merged/packed column linears must carry the actual TP
+    /// rank/world (not the default 0/1, which would compute the full-width
+    /// delta against the per-rank sharded base, the broadcast shape mismatch +
+    /// the garbage activations).
+    pub fn with_tp(mut self, tp_rank: usize, tp_world: usize) -> Self {
+        for linear in &mut self.linears {
+            linear.tp_rank = tp_rank;
+            linear.tp_world = tp_world;
+        }
+        self
+    }
+
     pub fn from_packed_local(
         weight: Tensor,
         bias: Option<Tensor>,
@@ -185,7 +284,7 @@ impl MergedParallelColumnLinear {
         quant: &Option<String>,
     ) -> Result<Self> {
         let linear = Linear::new(weight, None, quant)?;
-        let tp_linear = TensorParallelColumnLinear { linear };
+        let tp_linear = TensorParallelColumnLinear::new(linear);
         Ok(Self {
             linears: vec![tp_linear],
             biases: vec![bias],
@@ -198,7 +297,7 @@ impl MergedParallelColumnLinear {
         bias: Option<Tensor>,
         output_splits: Vec<usize>,
     ) -> Result<Self> {
-        let tp_linear = TensorParallelColumnLinear { linear: qlinear };
+        let tp_linear = TensorParallelColumnLinear::new(qlinear);
         Ok(Self {
             linears: vec![tp_linear],
             biases: vec![bias],
@@ -236,7 +335,7 @@ impl MergedParallelColumnLinear {
             sm_version,
             ue8m0: false,
         });
-        let tp_linear = TensorParallelColumnLinear { linear };
+        let tp_linear = TensorParallelColumnLinear::new(linear);
         Ok(Self {
             linears: vec![tp_linear],
             biases: vec![bias],
@@ -351,20 +450,22 @@ pub fn load_restored_gguf_merged_qkv_linear(
     drop(local_chunks);
     drop(weight);
     if keep_dense_weight {
-        return MergedParallelColumnLinear::from_packed_local(
+        let merged = MergedParallelColumnLinear::from_packed_local(
             local_weight,
             None,
             output_splits,
             &None,
-        );
+        )?;
+        return Ok(merged.with_tp(comm.rank(), comm.world_size()));
     }
     let qtensor = QTensor::quantize_owned(local_weight, wdtype)?;
     let qlinear = QLinear::from_qparts_x(qtensor, None, dtype)?;
-    MergedParallelColumnLinear::from_packed_local_qlinear(
+    let merged = MergedParallelColumnLinear::from_packed_local_qlinear(
         Linear::QLinear(qlinear),
         None,
         output_splits,
-    )
+    )?;
+    Ok(merged.with_tp(comm.rank(), comm.world_size()))
 }
 
 #[allow(dead_code)]
@@ -374,6 +475,14 @@ pub struct TensorParallelRowLinear {
     all_reduce: Option<AllReduce>,
     bias: Option<Tensor>,
     dtype: DType,
+    /// The LoRA module name (the `o_proj`/`down_proj`). The empty string means
+    /// this layer is not a LoRA target (the fast path, no registry lookup).
+    lora_module: String,
+    /// The TP rank (the `comm.rank()`, the 0 for the single-GPU). The LoRA A/B
+    /// sharding uses this to slice the A (the Row mode).
+    tp_rank: usize,
+    /// The TP world size (the `comm.world_size()`, the 1 for the single-GPU).
+    tp_world: usize,
 }
 
 #[derive(Clone)]
@@ -523,7 +632,7 @@ impl TensorParallelRowLinear {
     pub fn new(linear: Linear, comm: Rc<Comm>, dtype: DType) -> Self {
         #[cfg(feature = "nccl")]
         let all_reduce = if comm.world_size() > 1 {
-            Some(AllReduce { comm })
+            Some(AllReduce { comm: comm.clone() })
         } else {
             None
         };
@@ -533,6 +642,9 @@ impl TensorParallelRowLinear {
             all_reduce,
             bias: None,
             dtype,
+            lora_module: String::new(),
+            tp_rank: comm.rank(),
+            tp_world: comm.world_size(),
         }
     }
 
@@ -545,7 +657,7 @@ impl TensorParallelRowLinear {
     ) -> Self {
         #[cfg(feature = "nccl")]
         let all_reduce = if comm.world_size() > 1 {
-            Some(AllReduce { comm })
+            Some(AllReduce { comm: comm.clone() })
         } else {
             None
         };
@@ -555,7 +667,21 @@ impl TensorParallelRowLinear {
             all_reduce,
             bias,
             dtype,
+            lora_module: String::new(),
+            tp_rank: comm.rank(),
+            tp_world: comm.world_size(),
         }
+    }
+
+    /// Mark this layer as a LoRA target module (the `o_proj`/`down_proj`). The
+    /// `forward` then applies the active tenant's delta (the no-op when no
+    /// tenant is active or the tenant has no adapter for this module).
+    pub fn with_lora_module(mut self, module: String) -> Self {
+        self.lora_module = module.clone();
+        // Register the site into the global LoRA site registry.
+        // The parallelism is the Row (the o_proj/down_proj, the row-parallel).
+        crate::core::lora::register_lora_site(&module, crate::core::lora::LoraParallelism::Row, 0, 0);
+        self
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
@@ -572,6 +698,60 @@ impl TensorParallelRowLinear {
                 xs = xs.broadcast_add(bias)?;
             } else {
                 xs = xs.broadcast_add(&bias.to_dtype(xs.dtype())?)?;
+            }
+        }
+        // LoRA delta: batched multi-tenant when LoraExecution is set, single-tenant
+        // otherwise, no-op when absent. Row-parallel A is sharded on the in dim
+        // (x is the sharded input), B is replicated. The per-rank delta is a
+        // PARTIAL contribution (sum_r (x_shard_r @ A_r) @ B); like the base
+        // row-parallel output, it must be all-reduced across ranks before adding
+        // (no per-rank partial being added to the all-reduced base, which would
+        // under-count the delta by a factor of the world_size). Single-GPU case
+        // (world_size == 1) has the full A/B + no all-reduce (no-op).
+        if !self.lora_module.is_empty() {
+            #[cfg(feature = "cuda")]
+            if let Some(delta) = crate::core::lora::apply_lora_delta_fused(
+                &self.lora_module,
+                x,
+                LoraParallelism::Row,
+                self.tp_rank,
+                self.tp_world,
+            )? {
+                #[cfg(feature = "nccl")]
+                {
+                    let delta = if let Some(all_reduce) = &self.all_reduce {
+                        delta.apply_op1_no_bwd(all_reduce)?
+                    } else {
+                        delta
+                    };
+                    xs = xs.broadcast_add(&delta)?;
+                }
+                #[cfg(not(feature = "nccl"))]
+                {
+                    xs = xs.broadcast_add(&delta)?;
+                }
+                return Ok(xs);
+            }
+            if let Some(delta) = apply_lora_delta(
+                &self.lora_module,
+                x,
+                LoraParallelism::Row,
+                self.tp_rank,
+                self.tp_world,
+            )? {
+                #[cfg(feature = "nccl")]
+                {
+                    let delta = if let Some(all_reduce) = &self.all_reduce {
+                        delta.apply_op1_no_bwd(all_reduce)?
+                    } else {
+                        delta
+                    };
+                    xs = xs.broadcast_add(&delta)?;
+                }
+                #[cfg(not(feature = "nccl"))]
+                {
+                    xs = xs.broadcast_add(&delta)?;
+                }
             }
         }
         Ok(xs)
@@ -694,7 +874,10 @@ impl TensorParallelColumnLinear {
             quant,
             dtype,
         )?;
-        Ok(Self { linear })
+        let mut self_ = Self::new(linear);
+        self_.tp_rank = comm.rank();
+        self_.tp_world = comm.world_size();
+        Ok(self_)
     }
 
     pub fn load_with_shard(
@@ -708,7 +891,14 @@ impl TensorParallelColumnLinear {
         dtype: DType,
     ) -> Result<Self> {
         let linear = linear_b(in_dim, out_dim, bias, vb, shard, quant_cfg, quant, dtype)?;
-        Ok(Self { linear })
+        let mut self_ = Self::new(linear);
+        // The shard carries the rank/world (the TP layout, the TP sharding).
+        // Set the tp_rank/tp_world so the LoRA delta is sharded to match the
+        // base column-parallel output. The single-GPU path (the `shard(0, 0, 1)`)
+        // yields the tp_world of 1 (the full A/B, no sharding).
+        self_.tp_rank = shard.rank;
+        self_.tp_world = shard.world_size;
+        Ok(self_)
     }
 }
 
@@ -743,7 +933,7 @@ impl MergedParallelColumnLinear {
                 dtype,
             )?;
 
-            let ln = TensorParallelColumnLinear { linear };
+            let ln = TensorParallelColumnLinear::new(linear).with_tp(comm.rank(), comm.world_size());
             vec_linear.push(ln);
         }
         Ok(Self {
@@ -1010,7 +1200,7 @@ impl MergedParallelColumnLinear {
                         sm_version,
                         ue8m0: quant_cfg.scale_fmt.as_deref() == Some("ue8m0"),
                     });
-                    let ln = TensorParallelColumnLinear { linear };
+                    let ln = TensorParallelColumnLinear::new(linear).with_tp(comm.rank(), comm.world_size());
                     vec_linear.push(ln);
                     output_splits = Some(local_output_splits);
                 } else if is_nvfp4_quant || is_mxfp4_quant {
@@ -1256,7 +1446,7 @@ impl MergedParallelColumnLinear {
                         })
                     };
 
-                    let ln = TensorParallelColumnLinear { linear };
+                    let ln = TensorParallelColumnLinear::new(linear).with_tp(comm.rank(), comm.world_size());
                     vec_linear.push(ln);
                     output_splits = Some(local_output_splits);
                 } else {
@@ -1338,7 +1528,7 @@ impl MergedParallelColumnLinear {
                         } else {
                             LinearX::Linear(ln)
                         };
-                        let ln = TensorParallelColumnLinear { linear };
+                        let ln = TensorParallelColumnLinear::new(linear).with_tp(comm.rank(), comm.world_size());
                         vec_linear.push(ln);
                     }
                 }
@@ -1382,12 +1572,20 @@ impl TensorParallelRowLinear {
 
 impl ReplicatedLinear {
     pub fn from(linear: Linear) -> Result<Self> {
-        Ok(Self { linear })
+        Ok(Self { linear, lora_module: String::new() })
+    }
+
+    /// The base weight (the `[out_features, in_features]`, dequantized to dense).
+    /// The MLA LoRA correction reads this to compute the effective
+    /// weight (the base + the LoRA delta). The `dequantize` handles the quantized
+    /// variants (the `QLinear`/`LnFp8`/etc) by producing the dense weight.
+    pub fn weight(&self) -> Result<Tensor> {
+        self.linear.dequantize()
     }
 
     pub fn from_weight_bias(weight: Tensor, bias: Option<Tensor>) -> Result<Self> {
         let linear = Linear::new(weight, bias, &None)?;
-        Ok(Self { linear })
+        Ok(Self { linear, lora_module: String::new() })
     }
 
     pub fn load_no_bias(
@@ -1399,7 +1597,7 @@ impl ReplicatedLinear {
         dtype: DType,
     ) -> Result<Self> {
         let linear = linear(in_dim, out_dim, vb, shard(0, 0, 1), quant_cfg, quant, dtype)?;
-        Ok(Self { linear })
+        Ok(Self { linear, lora_module: String::new() })
     }
 
     pub fn load_b(
@@ -1424,12 +1622,47 @@ impl ReplicatedLinear {
                 quant,
                 dtype,
             )?;
-            Ok(Self { linear })
+            Ok(Self { linear, lora_module: String::new() })
         }
     }
 
+    /// Mark this layer as a LoRA target module (the `gate_proj`/`up_proj`/
+    /// `down_proj`). The `forward` then applies the active tenant's delta.
+    pub fn with_lora_module(mut self, module: String) -> Self {
+        self.lora_module = module.clone();
+        // Register the site into the global LoRA site registry.
+        // The parallelism is the Replicated (the single-GPU MLP, no TP).
+        crate::core::lora::register_lora_site(&module, crate::core::lora::LoraParallelism::Replicated, 0, 0);
+        self
+    }
+
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        self.linear.forward(x)
+        let base = self.linear.forward(x)?;
+        // LoRA delta: batched multi-tenant when LoraExecution is set, single-tenant
+        // otherwise, no-op when absent. Replicated mode (single-GPU MLP, no TP
+        // sharding) uses the full A/B.
+        if !self.lora_module.is_empty() {
+            #[cfg(feature = "cuda")]
+            if let Some(delta) = crate::core::lora::apply_lora_delta_fused(
+                &self.lora_module,
+                x,
+                LoraParallelism::Replicated,
+                0,
+                1,
+            )? {
+                return Ok(base.broadcast_add(&delta)?);
+            }
+            if let Some(delta) = apply_lora_delta(
+                &self.lora_module,
+                x,
+                LoraParallelism::Replicated,
+                0,
+                1,
+            )? {
+                return Ok(base.broadcast_add(&delta)?);
+            }
+        }
+        Ok(base)
     }
 }
 
@@ -1447,6 +1680,14 @@ pub struct VocabParallelLinear {
     all_gather: Option<AllGather>,
     org_vocab_size: usize,
     dtype: DType,
+    /// The LoRA module name (the `lm_head`). The empty string means this layer
+    /// is not a LoRA target (the fast path, no delta).
+    lora_module: String,
+    /// The TP rank (the `comm.rank()`, the 0 for the single-GPU). The LoRA A/B
+    /// sharding uses this to slice the B on the vocab dim.
+    tp_rank: usize,
+    /// The TP world size (the `comm.world_size()`, the 1 for the single-GPU).
+    tp_world: usize,
 }
 
 /// Return quantization metadata only when the vocabulary weight is natively
@@ -1632,6 +1873,9 @@ impl VocabParallelLinear {
                 all_gather: None,
                 org_vocab_size: out_dim,
                 dtype,
+                lora_module: String::new(),
+                tp_rank: 0,
+                tp_world: 1,
             });
         }
 
@@ -1655,13 +1899,16 @@ impl VocabParallelLinear {
                 dtype,
             )?;
             #[cfg(feature = "nccl")]
-            let all_gather = Some(AllGather::new(comm));
+            let all_gather = Some(AllGather::new(comm.clone()));
             return Ok(Self {
                 linear,
                 #[cfg(feature = "nccl")]
                 all_gather,
                 org_vocab_size: out_dim,
                 dtype,
+                lora_module: String::new(),
+                tp_rank: comm.rank(),
+                tp_world: comm.world_size(),
             });
         }
 
@@ -1700,6 +1947,9 @@ impl VocabParallelLinear {
                 all_gather: None,
                 org_vocab_size,
                 dtype,
+                lora_module: String::new(),
+                tp_rank: 0,
+                tp_world: 1,
             });
         }
 
@@ -1732,13 +1982,56 @@ impl VocabParallelLinear {
             all_gather,
             org_vocab_size,
             dtype,
+            lora_module: String::new(),
+            tp_rank: rank,
+            tp_world: world_size,
         })
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let logits = self.linear.forward(x)?;
-
+        // LoRA delta for the lm_head. The `lm` is the `[batch, seq, hidden]`
+        // (3D) or the `[batch, hidden]` (2D). The delta is the
+        // `scaling * (x @ A) @ B` where the A is the `[hidden, rank]` + the B is
+        // the `[rank, vocab]`. The lm_head is vocab-column-parallel (the
+        // out/vocab dim sharded across the ranks), so the B is sharded on the
+        // out dim (Column mode): each rank holds `vocab/world` columns of B, the
+        // A is replicated. The single-GPU case (`tp_world == 1`) uses the full B.
+        if !self.lora_module.is_empty() {
+            #[cfg(feature = "cuda")]
+            if let Some(delta) = crate::core::lora::apply_lora_delta_fused(
+                &self.lora_module,
+                x,
+                LoraParallelism::Column,
+                self.tp_rank,
+                self.tp_world,
+            )? {
+                let logits = logits.broadcast_add(&delta)?;
+                return self.finish_logits(logits, x.dims());
+            }
+            if let Some(delta) = apply_lora_delta(
+                &self.lora_module,
+                x,
+                LoraParallelism::Column,
+                self.tp_rank,
+                self.tp_world,
+            )? {
+                let logits = logits.broadcast_add(&delta)?;
+                return self.finish_logits(logits, x.dims());
+            }
+        }
         self.finish_logits(logits, x.dims())
+    }
+
+    /// Mark this layer as a LoRA target module (the `lm_head`). The `forward`
+    /// then applies the active tenant's delta (the no-op when no tenant is
+    /// active or the tenant has no adapter for this module).
+    pub fn with_lora_module(mut self, module: String) -> Self {
+        self.lora_module = module.clone();
+        // Register the site into the global LoRA site registry.
+        // The parallelism is the Column (the lm_head shards the vocab/out dim).
+        crate::core::lora::register_lora_site(&module, crate::core::lora::LoraParallelism::Column, 0, 0);
+        self
     }
 
     /// BF16 input/weight projection with FP32 accumulation and FP32 logits.

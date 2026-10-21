@@ -26,6 +26,33 @@ pub fn stream_as_reasoning_content() -> bool {
     })
 }
 
+pub const QOS_ENV: &str = "XINFER_QOS";
+static QOS: OnceLock<bool> = OnceLock::new();
+
+/// Master switch for class-aware QoS scheduling (priority admission, adaptive
+/// prefill chunking, KV-headroom budgeting). Default off = prior operation.
+pub fn qos_enabled() -> bool {
+    *QOS.get_or_init(|| {
+        env::var(QOS_ENV)
+            .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "TRUE" | "YES"))
+            .unwrap_or(false)
+    })
+}
+
+pub const STREAM_RESERVOIR_ENV: &str = "XINFER_STREAM_RESERVOIR";
+static STREAM_RESERVOIR: OnceLock<bool> = OnceLock::new();
+
+/// Master switch for the per-stream output reservoir (smooths bursty token
+/// delivery). Default on; set XINFER_STREAM_RESERVOIR=0 to restore the legacy
+/// immediate-push path.
+pub fn stream_reservoir() -> bool {
+    *STREAM_RESERVOIR.get_or_init(|| {
+        env::var(STREAM_RESERVOIR_ENV)
+            .map(|v| !matches!(v.trim().to_lowercase().as_str(), "0" | "false" | "no"))
+            .unwrap_or(true)
+    })
+}
+
 pub fn mamba_snapshot_block_stride_blocks(default: usize) -> usize {
     let default = default.max(1);
     let Ok(raw) = env::var(MAMBA_SNAPSHOT_BLOCK_STRIDE_ENV) else {
@@ -89,6 +116,19 @@ pub fn soft_mask_disabled() -> bool {
     *SOFT_MASK_DISABLED.get_or_init(|| {
         env::var(SOFT_MASK_DISABLED_ENV)
             .map(|v| !matches!(v.trim().to_lowercase().as_str(), "0" | "false" | "no"))
+            .unwrap_or(false)
+    })
+}
+/// `XINFER_DEBUG_ACTOR=1` enables verbose logging at every actor message boundary
+/// in the SchedD engine loop (schedule, forward, gate, postprocess, delivery, cleanup).
+/// Default off (zero overhead).
+pub const ACTOR_DEBUG_ENV: &str = "XINFER_DEBUG_ACTOR";
+static ACTOR_DEBUG: OnceLock<bool> = OnceLock::new();
+
+pub fn actor_debug() -> bool {
+    *ACTOR_DEBUG.get_or_init(|| {
+        env::var(ACTOR_DEBUG_ENV)
+            .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes"))
             .unwrap_or(false)
     })
 }

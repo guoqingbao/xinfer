@@ -314,7 +314,9 @@ impl MLP {
                     block_size,
                     sm_version,
                     vec![local_gate, local_up],
-                )?;
+                )?
+                .with_tp(comm.rank(), comm.world_size())
+                .with_lora_module(format!("{}.gate_up_proj", vb.module_path()));
                 return Ok(Some(GateUpProjection::Packed(merged)));
             }
 
@@ -340,7 +342,9 @@ impl MLP {
                 None,
                 vec![gate_weight.dim(0)?, up_weight.dim(0)?],
                 &None,
-            )?;
+            )?
+            .with_tp(comm.rank(), comm.world_size())
+            .with_lora_module(format!("{}.gate_up_proj", vb.module_path()));
             return Ok(Some(GateUpProjection::Packed(merged)));
         }
 
@@ -400,7 +404,9 @@ impl MLP {
                 block_size,
                 sm_version,
                 vec![local_gate, local_up],
-            )?;
+            )?
+            .with_tp(comm.rank(), comm.world_size())
+            .with_lora_module(format!("{}.gate_up_proj", vb.module_path()));
             return Ok(Some(GateUpProjection::Packed(merged)));
         }
 
@@ -426,7 +432,9 @@ impl MLP {
             None,
             vec![gate_weight.dim(0)?, up_weight.dim(0)?],
             &None,
-        )?;
+        )?
+        .with_tp(comm.rank(), comm.world_size())
+        .with_lora_module(format!("{}.gate_up_proj", vb.module_path()));
         Ok(Some(GateUpProjection::Packed(merged)))
     }
 
@@ -512,7 +520,7 @@ impl MLP {
                 quant_cfg,
                 quant,
                 dtype,
-            )?;
+            )?.with_lora_module(format!("{}.gate_proj", vb.module_path()));
 
             let up_proj = TensorParallelColumnLinear::load_with_shard(
                 hidden_size,
@@ -539,7 +547,7 @@ impl MLP {
                 quant_cfg,
                 quant,
                 dtype,
-            )?;
+            )?.with_lora_module(format!("{}.up_proj", vb.module_path()));
             Self::merge_nvfp4_gate_up(gate_proj, up_proj, gate_up_merged)
         };
 
@@ -555,7 +563,7 @@ impl MLP {
             quant_cfg,
             quant,
             dtype,
-        )?;
+        )?.with_lora_module(format!("{}.down_proj", vb.module_path()));
 
         Ok(Self {
             gate_up_proj,

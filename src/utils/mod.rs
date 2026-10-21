@@ -2626,6 +2626,64 @@ pub fn has_complete_safetensors(path: &Path) -> Result<bool> {
     Ok((1..=total).all(|i| found_indices.contains(&i)))
 }
 
+/// Check whether a LoRA adapter cache dir is complete. Mirrors
+/// `has_complete_safetensors` but for the PEFT adapter layout: a single
+/// `adapter_model.safetensors` (small adapters) or sharded
+/// `adapter_model-NNNNN-of-NNNNN.safetensors` (large adapters). The base-model
+/// `has_complete_safetensors` looks for `model.safetensors`, which an adapter
+/// dir does not contain, so using it for the adapter cache reports a complete
+/// download as incomplete (the false "Incomplete cache" warning + the
+/// unnecessary re-download).
+pub fn has_complete_adapter_safetensors(path: &Path) -> Result<bool> {
+    use regex::Regex;
+    use std::collections::HashSet;
+    use std::fs;
+
+    // Check for a single adapter_model.safetensors file (small adapters without sharding)
+    if path.join("adapter_model.safetensors").exists() {
+        return Ok(true);
+    }
+
+    // Check for sharded adapter safetensors (e.g., adapter_model-00001-of-00005.safetensors)
+    let re = Regex::new(r"^adapter_model-(\d{5})-of-(\d{5})\.safetensors$").unwrap();
+
+    let mut found_indices = HashSet::new();
+    let mut expected_total: Option<u32> = None;
+
+    for entry in fs::read_dir(path).map_err(candle_core::Error::wrap)? {
+        let entry = entry.map_err(candle_core::Error::wrap)?;
+        let filename = entry.file_name();
+        let filename = filename.to_string_lossy();
+
+        if let Some(caps) = re.captures(&filename) {
+            let idx: u32 = caps[1].parse().map_err(candle_core::Error::wrap)?;
+            let total: u32 = caps[2].parse().map_err(candle_core::Error::wrap)?;
+
+            if let Some(expected) = expected_total {
+                if expected != total {
+                    return Ok(false); // inconsistent shard count
+                }
+            } else {
+                expected_total = Some(total);
+            }
+
+            found_indices.insert(idx);
+        }
+    }
+
+    let total = match expected_total {
+        Some(t) => t,
+        None => return Ok(false), // no adapter safetensors found
+    };
+
+    crate::log_info!(
+        "Local adapter cache expect {total} safetensors, found {:?}",
+        found_indices
+    );
+    // Ensure all shards 1..=total are present
+    Ok((1..=total).all(|i| found_indices.contains(&i)))
+}
+
 pub fn log_throughput(outputs: &[GenerationOutput]) {
     use colored::Colorize;
     const EPS: f32 = 1e-6;
