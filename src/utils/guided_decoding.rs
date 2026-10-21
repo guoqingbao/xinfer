@@ -14,12 +14,13 @@ pub struct GuidedDecodingRequest<'a> {
     pub reasoning_end_ids: &'a [u32],
 }
 
+#[derive(Clone)]
 pub struct GuidedDecodingStep {
     guided_seq_ids: Option<HashSet<usize>>,
 }
 
 impl GuidedDecodingStep {
-    fn none() -> Self {
+    pub fn none() -> Self {
         Self {
             guided_seq_ids: None,
         }
@@ -225,6 +226,27 @@ impl GuidedDecoding {
                 }
             }
         }
+    }
+
+    /// The full grammar-forced (ff) run at the seq's current state (empty if none).
+    pub fn ff_tokens(&self, seq_id: usize) -> Vec<u32> {
+        let mut states = self.states.write();
+        states.get_mut(&seq_id).map(|s| s.compute_ff_tokens()).unwrap_or_default()
+    }
+
+    /// Commit the full grammar-forced (ff) sequence for a seq, one token at a time.
+    /// The ff tokens are deterministic (forced by the grammar), so they are appended
+    /// directly without model sampling. Returns the number of tokens committed.
+    pub fn commit_ff_sequence(&self, seq_id: usize) -> usize {
+        let ff = self.ff_tokens(seq_id);
+        if ff.is_empty() {
+            return 0;
+        }
+        let step = GuidedDecodingStep::new(std::collections::HashSet::from([seq_id]));
+        for &token in &ff {
+            let _ = self.commit(&[seq_id], &[token], step.clone());
+        }
+        ff.len()
     }
 
     pub fn commit(&self, seq_ids: &[usize], tokens: &[u32], step: GuidedDecodingStep) {

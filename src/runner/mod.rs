@@ -171,6 +171,45 @@ pub struct InitAck {
     pub ok: bool,
 }
 
+/// Per-sequence speculative-decode stats, fetched across the process boundary
+/// at sequence end for the server's performance report.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct SpecSeqStatsData {
+    /// The spec mechanism that produced this seq's stats (the "MTP" / the "DFlash" /
+    /// the "SpecFF"). The empty string when no spec mechanism ran (the plain decode).
+    pub mechanism: String,
+    pub steps: usize,
+    pub proposed: usize,
+    pub accepted: usize,
+    pub rejected: usize,
+    pub grammar_bound: usize,
+    pub target_bound: usize,
+    pub ff_continuations: usize,
+    /// The per-position acceptance vector (the K-th position's acceptance count).
+    pub accepted_per_pos: Vec<usize>,
+    /// The rolling draft-acceptance rate (the `accepted / proposed`).
+    pub acceptance_rate: f64,
+    /// The per-batch acceptance ( (the MTP-vs-DFlash distinction).
+    pub per_batch: Vec<(usize, f64)>,
+    /// The rolling per-position acceptance curve (the last W verify steps, the
+    /// per-position acceptance fraction). The runner populates this so the
+    /// scheduler's dynamic-K law reads the real per-seq signal (the no the empty
+    /// main-process global).
+    pub rolling_curve: Vec<f64>,
+}
+
+/// The per-step speculative-decode result (the produced tokens + the next-step K).
+/// The `next_k` is the runner-computed per-seq dynamic K (the rolling prefix-curve
+/// knee, the no the scheduler guessing from an empty cross-process global). The
+/// scheduler uses it for the next step's pre-alloc (the no the K stuck at the ceiling).
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct SpecStepOut {
+    /// The produced tokens (the anchor + the accepted drafts + the continuation).
+    pub tokens: Vec<u32>,
+    /// The next-step draft length K (the runner-computed, the no the fixed ceiling).
+    pub next_k: usize,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum MessageType {
     /// Sent by main process to initialize the runner.
@@ -193,12 +232,18 @@ pub enum MessageType {
     /// Sent by runner in response to `Run` with generated token IDs.
     RunResponse(Vec<u32>),
 
-    /// Sent by runner in response to `RunDecodeMTP` with multiple tokens per sequence.
-    RunResponseMTP(Vec<Vec<u32>>),
+    /// Sent by runner in response to `RunDecodeMTP` with multiple tokens per sequence
+    /// + the next-step dynamic K (the runner-computed, the no the scheduler guessing).
+    RunResponseMTP(Vec<SpecStepOut>),
     /// Sent by the main process to request external DFlash speculative decode.
     RunDecodeDFlash(Vec<DecodeSequence>),
     /// Sent by a runner in response to `RunDecodeDFlash`.
     RunResponseDFlash(Vec<Vec<u32>>),
+    /// Sent by the main process to request speculative fast-forward decode (the grammar-forced
+    /// ff run appended after the sampled base token).
+    RunDecodeSpecFF(Vec<DecodeSequence>),
+    /// Sent by a runner in response to `RunDecodeSpecFF`.
+    RunResponseSpecFF(Vec<Vec<u32>>),
 
     /// Sent by main process to request embedding on sequences.
     RunEmbed((Vec<Sequence>, EmbeddingStrategy)),
@@ -265,6 +310,11 @@ pub enum MessageType {
     UsableMemoryLeft(EngineConfig),
     /// shutdown subprocesses
     Shutdown,
+
+    /// Fetch per-seq speculative decoding stats from rank 0.
+    GetSpecSeqStats(usize),
+    /// Response to GetSpecSeqStats.
+    SpecSeqStatsResponse(usize, SpecSeqStatsData),
 }
 
 //inter-node communication
@@ -276,7 +326,7 @@ pub fn send_local(
     let serialized = if use_json {
         serde_json::to_vec(message).expect("JSON serialization failed")
     } else {
-        bincode::serialize(message).expect("Bincode serialization failed")
+        rmp_serde::to_vec(message).expect("MsgPack serialization failed")
     };
 
     for stream in streams.iter_mut() {
@@ -313,10 +363,10 @@ pub fn receive_local(stream: &mut LocalStream, use_json: bool) -> std::io::Resul
             )
         })?
     } else {
-        bincode::deserialize(&serialized).map_err(|err| {
+        rmp_serde::from_slice(&serialized).map_err(|err| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("Bincode deserialization failed: {err}"),
+                format!("MsgPack deserialization failed: {err}"),
             )
         })?
     };
@@ -344,144 +394,6 @@ pub fn send_and_expect_ack(
     }
 }
 
-///
-/// Defines a function that broadcasts an operation to all runners and expects a `Result<T>`.
-/// It handles both `Thread` (direct call) and `Process` (IPC message) runners.
-///
-/// In Process mode, it expects the response variant to contain the value `T`.
-/// It collects all values and verifies they are identical before returning one.
-///
-#[macro_export]
-macro_rules! def_broadcast_message_to_runners {
-    (
-        // The visibility (e.g., `pub`)
-        $vis:vis,
-        // The name of the function to create (e.g., `try_receive_kv_cache`)
-        $fn_name:ident,
-        // The name of the method on the thread-mode runner (e.g., `receive_kv_cache`)
-        $thread_fn_name:ident,
-        // The arguments for the function (e.g., `(seq: Sequence)`)
-        ($($arg_name:ident: $arg_type:ty),*),
-        // The MessageType variant to send (e.g., `MessageType::KvCacheReceive`)
-        $msg_variant:path,
-        // The expression to build the message payload (e.g., `(seq.clone())`)
-        ($($msg_arg:expr),*),
-        // The MessageType response variant to match (e.g., `MessageType::KvCacheReceiveResponse`)
-        $resp_variant:path,
-        // The inner return type (e.g., `u32`)
-        $return_ty:ty
-    ) => {
-        $vis fn $fn_name(&self, $($arg_name: $arg_type),*) -> Result<$return_ty>
-        where
-            $return_ty: std::fmt::Debug + Send,
-        {
-            match &mut *self.runners.write() {
-                RunnerType::Thread(model_runner) => {
-                    // Thread Mode: Call the method directly.
-                    model_runner.$thread_fn_name($($arg_name),*)
-                }
-                RunnerType::Process(ref mut runner_streams) => {
-                    // Process Mode: Broadcast to all subprocess runners.
-                    let cloned_streams: Vec<LocalStream> = runner_streams
-                        .iter_mut()
-                        .map(|s| s.try_clone().expect("Failed to clone runner stream"))
-                        .collect();
-
-                    // Use Rayon for parallel broadcast
-                    let all_results: Result<Vec<$return_ty>> = cloned_streams
-                        .into_par_iter()
-                        .map(|mut stream| {
-                            // Send the message
-                            send_local(
-                                &mut vec![stream.try_clone()?],
-                                &$msg_variant($($msg_arg),*),
-                                false,
-                            )?;
-
-                            // Wait for the response
-                            let response = receive_local(&mut stream, false)?;
-                            match response {
-                                // Match on the expected response containing the value
-                                $resp_variant(value) => {
-                                    Ok(value)
-                                }
-                                other => {
-                                    candle_core::bail!("Unexpected response for {}: {:?}", stringify!($fn_name), other)
-                                }
-                            }
-                        })
-                        .collect(); // Collects into a Result<Vec<T>>
-
-                    // Check that all ranks returned the same value
-                    match all_results {
-                        Ok(mut values) => {
-                            if values.is_empty() {
-                                candle_core::bail!("No values received from runners for {}", stringify!($fn_name));
-                            }
-                            // Pop first element to return, then check rest for consistency
-                            let first_val = values.pop().unwrap();
-                            Ok(first_val)
-                        }
-                        Err(e) => Err(e),
-                    }
-                }
-                RunnerType::MultiNodeMaster {
-                    local_streams: ref mut runner_streams,
-                    remote_streams: ref mut remote_streams,
-                } => {
-                    let request = $msg_variant($($msg_arg),*);
-                    let cloned_streams: Vec<LocalStream> = runner_streams
-                        .iter_mut()
-                        .map(|s| s.try_clone().expect("Failed to clone runner stream"))
-                        .collect();
-
-                    let local_results: Result<Vec<$return_ty>> = cloned_streams
-                        .into_par_iter()
-                        .map(|mut stream| {
-                            let msg = request.clone();
-                            send_local(&mut vec![stream.try_clone()?], &msg, false)?;
-
-                            let response = receive_local(&mut stream, false)?;
-                            match response {
-                                $resp_variant(value) => Ok(value),
-                                other => {
-                                    candle_core::bail!("Unexpected local response for {}: {:?}", stringify!($fn_name), other)
-                                }
-                            }
-                        })
-                        .collect();
-
-                    let mut values = local_results?;
-                    let serialized = bincode::serialize(&request).expect("Bincode serialization failed");
-
-                    for tcp_stream in remote_streams.iter_mut() {
-                        crate::utils::multi_node::send_tcp(tcp_stream, &serialized)?;
-                    }
-
-                    for tcp_stream in remote_streams.iter_mut() {
-                        let data = crate::utils::multi_node::recv_tcp(tcp_stream)?;
-                        let response: MessageType = bincode::deserialize(&data)
-                            .expect("Bincode deserialization failed");
-                        match response {
-                            $resp_variant(value) => values.push(value),
-                            MessageType::Error(err) => {
-                                candle_core::bail!("Remote worker failed for {}: {}", stringify!($fn_name), err)
-                            }
-                            other => {
-                                candle_core::bail!("Unexpected remote response for {}: {:?}", stringify!($fn_name), other)
-                            }
-                        }
-                    }
-
-                    if values.is_empty() {
-                        candle_core::bail!("No values received from runners for {}", stringify!($fn_name));
-                    }
-                    Ok(values.remove(0))
-                }
-            }
-        }
-    };
-}
 
 pub fn run_runner_process(args: Vec<String>) -> anyhow::Result<()> {
     use interprocess::local_socket::traits::Stream;
@@ -777,6 +689,17 @@ pub fn run_runner_process(args: Vec<String>) -> anyhow::Result<()> {
                     false,
                 )?;
             }
+            Ok(MessageType::RunDecodeSpecFF(sequences)) => {
+                let outputs = runner.run_speculative_ff(Seqs::DecodeVec(&sequences));
+                if outputs.is_err() {
+                    crate::log_error!("Runner spec-ff decode error: {:?}", outputs);
+                }
+                send_local(
+                    &mut vec![stream.try_clone()?],
+                    &MessageType::RunResponseSpecFF(outputs.unwrap_or_default()),
+                    false,
+                )?;
+            }
             Ok(MessageType::RunEmbed((sequences, strategy))) => {
                 use crate::core::sequence::Sequence;
                 let refs: Vec<&Sequence> = sequences.iter().collect();
@@ -812,6 +735,16 @@ pub fn run_runner_process(args: Vec<String>) -> anyhow::Result<()> {
             }
             Ok(MessageType::FinishDecode(id)) => {
                 runner.finished(id);
+                // Drop the per-seq spec stats window now that the sequence is done.
+                crate::speculative::spec_stats::spec_seq_report(id);
+            }
+            Ok(MessageType::GetSpecSeqStats(id)) => {
+                let data = crate::speculative::spec_stats::spec_seq_stats_data(id);
+                send_local(
+                    &mut vec![stream.try_clone()?],
+                    &MessageType::SpecSeqStatsResponse(id, data),
+                    false,
+                )?;
             }
             Ok(MessageType::CaptureMambaPrefixState((seq_id, hash, preserve))) => {
                 let ret = runner.capture_mamba_prefix_state(seq_id, hash, preserve);

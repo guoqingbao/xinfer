@@ -9,7 +9,6 @@ use crate::utils::config::ReasoningEffort;
 use crate::utils::config::{EngineConfig, GenerationConfig, SamplingParams};
 use crate::utils::get_dtype;
 use llguidance::api::TopLevelGrammar;
-use parking_lot::RwLock;
 use pyo3::exceptions::PyStopIteration;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -19,7 +18,7 @@ use tokio::sync::mpsc;
 /// Python wrapper
 #[pyclass]
 pub struct Engine {
-    engine: Arc<RwLock<LLMEngine>>,
+    engine: Arc<LLMEngine>,
     #[pyo3(get, set)]
     econfig: EngineConfig,
 }
@@ -38,7 +37,7 @@ impl Engine {
             }
         };
 
-        match LLMEngine::new(&econfig, dtype_parsed) {
+        match crate::core::engine::GLOBAL_RT.block_on(LLMEngine::new(&econfig, dtype_parsed)) {
             Ok(engine) => Ok(Self { engine, econfig }),
             Err(e) => Err(PyValueError::new_err(format!("Engine init failed: {e:?}"))),
         }
@@ -78,7 +77,7 @@ impl Engine {
         tokio::task::block_in_place(|| {
             GLOBAL_RT.block_on(async {
                 let (preprocessed, tokenizer) = {
-                    let engine = self.engine.read();
+                    let engine = self.engine.as_ref();
                     (
                         engine
                             .preprocess(&params, &message_list, &Vec::new(), false)
@@ -89,7 +88,7 @@ impl Engine {
                     )
                 };
                 let receivers = {
-                    let mut engine = self.engine.write();
+                    let engine = self.engine.as_ref();
                     engine
                         .generate_sync(preprocessed, None, &None)
                         .map_err(|e| {
@@ -118,7 +117,7 @@ impl Engine {
         messages: Vec<Message>,
     ) -> PyResult<(usize, usize, EngineStream)> {
         let preprocessed = {
-            let engine = self.engine.read();
+            let engine = self.engine.as_ref();
             let mut p = engine
                 .preprocess(
                     std::slice::from_ref(&params),
@@ -131,7 +130,7 @@ impl Engine {
                 .ok_or_else(|| PyValueError::new_err("preprocess returned 0 items"))?
         };
         let (seq_id, prompt_length, _prefilled_reasoning_end, stream) = {
-            let mut engine = self.engine.write();
+            let engine = self.engine.as_ref();
             engine
                 .generate_stream(preprocessed, None, &None)
                 .map_err(|e| PyValueError::new_err(format!("stream error: {:?}", e)))?
@@ -153,7 +152,7 @@ impl Engine {
 
     #[pyo3(name = "get_num_cached_tokens", text_signature = "($self)")]
     pub fn get_num_cached_tokens(&mut self) -> PyResult<usize> {
-        let engine = self.engine.read();
+        let engine = self.engine.as_ref();
         Ok(engine.get_num_cached_tokens())
     }
 
@@ -164,13 +163,13 @@ impl Engine {
         text_signature = "($self, seq_id)"
     )]
     pub fn get_num_cached_tokens_for_seq(&mut self, seq_id: usize) -> PyResult<Option<usize>> {
-        let engine = self.engine.read();
+        let engine = self.engine.as_ref();
         Ok(engine.get_num_cached_tokens_for_seq(seq_id))
     }
 
     #[pyo3(name = "get_available_kv_tokens", text_signature = "($self)")]
     pub fn get_available_kv_tokens(&mut self) -> PyResult<usize> {
-        let engine = self.engine.read();
+        let engine = self.engine.as_ref();
         Ok(engine.get_available_kv_tokens())
     }
 }
@@ -223,7 +222,7 @@ impl PyStreamItem {
 #[pyclass]
 #[allow(unused_variables)]
 pub struct EngineStream {
-    engine: Arc<RwLock<LLMEngine>>,
+    engine: Arc<LLMEngine>,
     rx: std::sync::Mutex<mpsc::Receiver<StreamItem>>,
     #[pyo3(get, set)]
     finished: bool,
@@ -243,7 +242,7 @@ impl EngineStream {
 
     fn cancel(mut slf: PyRefMut<Self>) {
         slf.cancelled = true;
-        let mut engine_guard = slf.engine.write();
+        let mut engine_guard = slf.engine.as_ref();
         engine_guard.cancel(slf.seq_id);
     }
 
@@ -310,7 +309,7 @@ impl EngineConfig {
         num_nodes=1, node_rank=0, master_addr=None, master_port=29500,
         enable_tool_grammar=false, num_speculative_tokens=None,
         draft_model=None,))]
-    pub fn new(
+    pub fn from_args(
         model_id: Option<String>,
         weight_path: Option<String>,
         weight_file: Option<String>,
@@ -414,6 +413,7 @@ impl EngineConfig {
             num_speculative_tokens,
             draft_model,
             enable_tool_grammar,
+            qos: crate::core::qos::QosConfig::default(),
         }
     }
 }

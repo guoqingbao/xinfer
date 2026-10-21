@@ -4,6 +4,7 @@ use crate::models::layers::linear::{linear_no_bias_x as linear_no_bias, LinearX 
 use crate::models::layers::{isq_high_precision_dtype, VarBuilderX};
 use crate::utils::config::Config;
 use crate::utils::config::QuantConfig;
+use crate::core::lora::{active_tenant, global_moe_lora, lora_execution, MoeLoraState};
 use attention_rs::moe;
 use attention_rs::moe::moe_gemm_fp8;
 use attention_rs::silu_and_mul::silu_and_mul;
@@ -342,6 +343,11 @@ pub struct FusedMoe {
     world_size: usize,
     dtype: DType,
     gate_dtype: DType,
+    /// The MoE expert LoRA state (the #1.8, the per-expert gate_up/down A/B).
+    /// The `None` when no MoE LoRA adapter is loaded (the fused `moe_gemm`
+    /// kernel path, the prior behavior). When set + a tenant is active, the
+    /// per-expert dense path applies the LoRA delta.
+    moe_lora: Option<MoeLoraState>,
 }
 
 impl FusedMoe {
@@ -557,6 +563,7 @@ This usually means packed down_proj / gate_up_proj layout was interpreted incorr
             world_size,
             dtype,
             gate_dtype,
+            moe_lora: None,
         })
     }
 
@@ -580,6 +587,27 @@ This usually means packed down_proj / gate_up_proj layout was interpreted incorr
         is_prefill: bool,
     ) -> Result<Tensor> {
         let (num_tokens, hidden_dim) = xs.dims2()?;
+
+        // The MoE expert LoRA path (the #1.8): when a LoRA tenant is active + the
+        // MoE LoRA state is loaded (the struct field OR the global, the set at
+        // startup), use the per-expert dense path (the no the fused `moe_gemm`
+        // kernel, which cannot take a delta). The per-expert dense path computes
+        // the base expert output + the LoRA delta (the `gate_up_delta` + the
+        // `down_delta`) for each expert, then combines.
+        let global_moe_lora = global_moe_lora();
+        let moe_lora_state = self.moe_lora.as_ref().or(global_moe_lora.as_ref());
+        // The MoE LoRA path activates when a tenant is active (the single-tenant
+        // thread-local) OR the batched execution has exactly one distinct tenant
+        // (the common batched case, the all rows the same tenant). The no-op when
+        // no tenant is active (the base model). The multi-distinct-tenant MoE case
+        // (the each row a different MoE adapter) is the next increment (the per-
+        // tenant MooeLoraState bank); for now the single-tenant + the uniform-
+        // batch cases are correct.
+        let tenant_active = active_tenant().is_some()
+            || lora_execution().is_some_and(|exec| exec.distinct_tenants() == 1);
+        if moe_lora_state.is_some() && tenant_active {
+            return self.forward_with_routing_moe_lora(xs, &topk_weights, &topk_ids, is_prefill);
+        }
 
         let (expert_ids, sorted_token_ids) = sort_expert_assignments(&topk_ids, is_prefill)?;
 
@@ -612,6 +640,214 @@ This usually means packed down_proj / gate_up_proj layout was interpreted incorr
             ys = self.all_reduce.apply(&ys)?;
         }
         Ok(ys)
+    }
+
+    /// The per-expert dense MoE forward with the LoRA delta (the #1.8). The
+    /// `moe_gemm` fused kernel cannot take a delta, so this path computes each
+    /// expert's output densely (the `x @ expert_gate_up^T` + the activation +
+    /// the `x @ expert_down^T`) + adds the LoRA delta (the `gate_up_delta` +
+    /// the `down_delta`). The per-expert loop is the no the fused kernel (the
+    /// slower, but correct for the LoRA case).
+    fn forward_with_routing_moe_lora(
+        &self,
+        xs: &Tensor,
+        topk_weights: &Tensor,
+        topk_ids: &Tensor,
+        _is_prefill: bool,
+    ) -> Result<Tensor> {
+        let (num_tokens, hidden_dim) = xs.dims2()?;
+        // The per-tenant MoE state (the #1.8, the mixed-tenant batch). The
+        // `self.moe_lora` is the instance-level state (the single-tenant case);
+        // the `global_moe_lora_for(tenant)` resolves the per-tenant state for the
+        // batched case. When no tenant-specific state is available, fall back to
+        // the instance kernel (the no LoRA, the base model).
+        let topk = self.routing.num_experts_per_tok;
+        let num_experts = self.gate_up_w.dim(0)?;
+        // The gather the per-token expert ids (the `topk_ids` is the
+        // `[num_tokens, topk]`).
+        let expert_ids: Vec<Vec<i64>> = topk_ids.to_vec2::<i64>()?;
+        // The per-token tenant (the `LoraExecution` per-row mapping, the batched
+        // multi-tenant case). The `None` when no execution context is set (the
+        // single-tenant case, the `self.moe_lora` is used for all tokens).
+        let row_tenants: Vec<Option<String>> = match crate::core::lora::lora_execution() {
+            Some(exec) if exec.distinct_tenants() > 1 => exec
+                .row_tenants
+                .iter()
+                .take(num_tokens)
+                .cloned()
+                .collect(),
+            _ => vec![None; num_tokens],
+        };
+        // The top-expert token groups (the which tokens route to each expert).
+        let mut expert_tokens: Vec<Vec<usize>> = vec![Vec::new(); num_experts];
+        for (t, experts) in expert_ids.iter().enumerate() {
+            for &e in experts.iter().take(topk) {
+                if (0..num_experts).contains(&(e as usize)) {
+                    expert_tokens[e as usize].push(t);
+                }
+            }
+        }
+        // The topk weights (the `[num_tokens, topk]` f32), for the per-expert
+        // routing weight lookup.
+        let topk_weights_f32 = topk_weights.to_vec2::<f32>()?;
+        // The per-expert dense compute + the LoRA delta. The delta uses the
+        // token's tenant's MoE state (the mixed-tenant batch, the #1.8); when no
+        // per-rowtenant state is available (the single-tenant case), the
+        // `self.moe_lora` is used for all tokens.
+        let mut ys = Tensor::zeros((num_tokens, hidden_dim), xs.dtype(), xs.device())?;
+        for (e, tokens) in expert_tokens.iter().enumerate() {
+            if tokens.is_empty() {
+                continue;
+            }
+            // The gather this expert's tokens (the `[num_tokens_for_e, hidden]`).
+            let idx = Tensor::from_vec(
+                tokens.iter().map(|&t| t as i64).collect::<Vec<_>>(),
+                (tokens.len(),),
+                xs.device(),
+            )?;
+            let x_e = xs.index_select(&idx, 0)?;
+            // The base expert gate_up (the `x_e @ gate_up_w[e]^T`, the
+            // `[num_tokens_for_e, 2*intermediate]`). The `gate_up_w[e]` is the
+            // `[hidden, 2*intermediate]`.
+            let gate_up_e_w = self.gate_up_w.narrow(0, e, 1)?.squeeze(0)?;
+            let gate_up_e = x_e.matmul(&gate_up_e_w.t()?)?;
+            // The LoRA gate_up delta, per-token- (the mixed-tenant batch).
+            // The group this expert's tokens by tenant; each tenant group uses
+            // its own MoMoeLoraState`. The no-tenant tokens (the base model) get
+            // no delta.
+            let gate_up_delta = self.moe_gate_up_delta_for_tokens(
+                &x_e,
+                tokens,
+                &row_tenants,
+                e,
+            )?;
+            let gate_up = gate_up_e.broadcast_add(&gate_up_delta)?;
+            // The activation (the gated, the `silu(gate) * up`).
+            let down_inputs = gated_activation(&gate_up, self.w_size_n, &self.act)?;
+            // The base expert down (the `down_inputs @ down_w[e]^T`, the
+            // `[num_tokens_for_e, hidden]`). The `down_w[e]` is the
+            // `[intermediate, hidden]`.
+            let down_e_w = self.down_w.narrow(0, e, 1)?.squeeze(0)?;
+            let down_e = down_inputs.matmul(&down_e_w.t()?)?;
+            // The LoRA down delta, per-token tenant.
+            let down_delta = self.moe_down_delta_for_tokens(
+                &down_inputs,
+                tokens,
+                &row_tenants,
+                e,
+            )?;
+            let expert_out = down_e.broadcast_add(&down_delta)?;
+            // The weight by the topk weight (the routing weight for this expert).
+            // The `topk_weights_f32[t][pos]` is the weight for token `t`'s
+            // expert at position `pos` (the `pos` where the `topk_ids[t][pos] == e`).
+            let weights_e: Vec<f32> = tokens
+                .iter()
+                .map(|&t| {
+                    let topk_ids_row = &expert_ids[t];
+                    let pos = topk_ids_row
+                        .iter()
+                        .take(topk)
+                        .position(|&x| x == e as i64)
+                        .unwrap_or(0);
+                    topk_weights_f32[t][pos]
+                })
+                .collect();
+            let weight_tensor = Tensor::from_vec(weights_e, (tokens.len(),), xs.device())?
+                .to_dtype(xs.dtype())?
+                .reshape((tokens.len(), 1))?;
+            let weighted = expert_out.broadcast_mul(&weight_tensor)?;
+            // The scatter back into the output (the `index_add`).
+            ys = ys.index_add(&idx, &weighted, 0)?;
+        }
+        if self.world_size > 1 {
+            ys = self.all_reduce.apply(&ys)?;
+        }
+        Ok(ys)
+    }
+
+    /// The per-token-tenant MoE gate_up delta (the #1.8, the mixed-tenant batch).
+    /// The group the expert's tokens by tenant; each tenant group uses its own
+    /// `MoeLoraState` (the `global_moe_lora_for(tenant)`). The no-tenant tokens
+    /// (the base model) get the zero delta. The result is the `[num_tokens_for_e,
+    /// 2*intermediate]` delta to add to the base gate_up.
+    fn moe_gate_up_delta_for_tokens(
+        &self,
+        x_e: &Tensor,
+        tokens: &[usize],
+        row_tenants: &[Option<String>],
+        expert: usize,
+    ) -> Result<Tensor> {
+        // The group the tokens by tenant (the `None` tenant = the base model, the
+        // no delta).
+        let mut by_tenant: std::collections::HashMap<Option<String>, Vec<usize>> =
+            std::collections::HashMap::new();
+        for (i, &t) in tokens.iter().enumerate() {
+            let tenant = row_tenants.get(t).cloned().flatten();
+            by_tenant.entry(tenant).or_default().push(i);
+        }
+        let mut delta = Tensor::zeros_like(x_e)?;
+        for (tenant, locals) in by_tenant.iter() {
+            // The resolve this tenant's MoE state (the `self.moe_lora` for the
+            // single-tenant case, the `global_moe_lora_for` for the batched case).
+            let state = match tenant {
+                Some(t) => crate::core::lora::global_moe_lora_for(t).or_else(|| self.moe_lora.clone()),
+                None => self.moe_lora.clone(),
+            };
+            let Some(state) = state else {
+                continue; // the no state for this tenant (the no delta, the base model)
+            };
+            let idx = Tensor::from_vec(
+                locals.iter().map(|&i| i as i64).collect::<Vec<_>>(),
+                (locals.len(),),
+                x_e.device(),
+            )?;
+            let x_t = x_e.index_select(&idx, 0)?;
+            let d_t = state.gate_up_delta(&x_t, expert)?;
+            // The scatter this tenant's delta back into the full delta (the
+            // `index_add`).
+            delta = delta.index_add(&idx, &d_t, 0)?;
+        }
+        Ok(delta)
+    }
+
+    /// The per-token-tenant MoE down delta (the #1.8, the mixed-tenant batch).
+    /// The same grouping as the `moe_gate_up_delta_for_tokens`, applied to the
+    /// down projection.
+    fn moe_down_delta_for_tokens(
+        &self,
+        down_inputs: &Tensor,
+        tokens: &[usize],
+        row_tenants: &[Option<String>],
+        expert: usize,
+    ) -> Result<Tensor> {
+        let mut by_tenant: std::collections::HashMap<Option<String>, Vec<usize>> =
+            std::collections::HashMap::new();
+        for (i, &t) in tokens.iter().enumerate() {
+            by_tenant
+                .entry(row_tenants.get(t).cloned().flatten())
+                .or_default()
+                .push(i);
+        }
+        let mut delta = Tensor::zeros_like(down_inputs)?;
+        for (tenant, idxs) in by_tenant.iter() {
+            let state = match tenant {
+                Some(t) => crate::core::lora::global_moe_lora_for(t)
+                    .or_else(|| self.moe_lora.clone()),
+                None => self.moe_lora.clone(),
+            };
+            let Some(state) = state else {
+                continue;
+            };
+            let idx = Tensor::from_vec(
+                idxs.iter().map(|&i| i as i64).collect::<Vec<_>>(),
+                (idxs.len(),),
+                down_inputs.device(),
+            )?;
+            let x_t = down_inputs.index_select(&idx, 0)?;
+            let d_t = state.down_delta(&x_t, expert)?;
+            delta = delta.index_add(&idx, &d_t, 0)?;
+        }
+        Ok(delta)
     }
 }
 

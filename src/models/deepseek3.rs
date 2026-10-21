@@ -1,4 +1,5 @@
 use crate::models::layers::distributed::{Comm, VocabParallelLinear};
+use crate::core::lora::apply_embedding_lora;
 use crate::models::layers::mask::get_attention_causal_mask;
 use crate::models::layers::mla_attention::{MlaAttention, MlaConfig};
 use crate::models::layers::mlp::MLP;
@@ -351,7 +352,7 @@ impl DeepSeekForCausalLM {
             &config.quantization_config,
             &None,
             dtype,
-        )?;
+        )?.with_lora_module("lm_head".to_string());
 
         Ok(Self {
             embed_tokens,
@@ -368,6 +369,8 @@ impl DeepSeekForCausalLM {
 
     pub fn embed_forward(&self, xs: &Tensor) -> Result<Tensor> {
         let xs = self.embed_tokens.forward(xs)?;
+        // The embedding LoRA (the #1.11): the active tenant's embedding delta.
+        let xs = apply_embedding_lora(&xs)?;
         if (self.is_qvar_builder || self.config.quant.is_some()) && xs.dtype() != DType::F32 {
             xs.to_dtype(DType::F32)
         } else {

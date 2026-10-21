@@ -5,6 +5,12 @@ use crate::models::layers::distributed::Comm;
 use crate::models::layers::linear::set_linear_is_prefill;
 use crate::models::layers::VarBuilderX;
 use crate::models::qwen3_5_mtp::Qwen3_5MtpHead;
+use crate::core::lora::{
+    activate_tenant, active_tenant, deactivate_tenant, ensure_tenant_loaded,
+    global_adapter_count, global_adapter_modules, init_global_site_registry, init_lora_registry,
+    lora_execution, set_active_tenant, set_global_registry, set_lora_execution, LoraExecution,
+    LoraRegistry,
+};
 use crate::server::EmbeddingStrategy;
 use crate::transfer::Transfer;
 #[cfg(all(feature = "cuda", feature = "graph"))]
@@ -163,16 +169,6 @@ impl Model {
     }
 }
 
-pub enum RunnerType {
-    Thread(ModelRunner),
-    Process(Vec<LocalStream>),
-    /// Master node in multi-node inference: local IPC streams + TCP streams to worker nodes.
-    MultiNodeMaster {
-        local_streams: Vec<LocalStream>,
-        remote_streams: Vec<std::net::TcpStream>,
-    },
-}
-
 pub struct CpuTqLayerCache {
     pub k_absmax: Option<Tensor>,
     pub k_quant: Option<Tensor>,
@@ -207,6 +203,31 @@ pub struct ModelRunner {
     pub(crate) mtp_num_speculative: usize,
     /// Optional external DFlash2 drafter.
     pub(crate) dflash_drafter: Option<crate::speculative::DFlashDrafter>,
+    /// The per-instance LoRA registry (the multi-tenant adapter set, the Punica
+    /// shared-base + per-tenant delta). Empty when no adapter is configured.
+    /// The `Mutex` allows the on-demand load (the `ensure_tenant_loaded`, the
+    /// write path) to mutate the registry; the read path (the `apply_lora_delta`)
+    /// locks it briefly.
+    pub(crate) lora_registry: Arc<Mutex<LoraRegistry>>,
+    /// The per-tenant decode graph capturers (the LoRA + the CUDA graph). Each
+    /// loaded LoRA tenant gets its own captured decode graph (the base model +
+    /// that tenant's delta baked in at capture time), so a graph-replayed decode
+    /// for that tenant is fast + correct. The base model (no tenant) uses the
+    /// `decode_capturer`. The empty when no LoRA tenant is loaded (the prior
+    /// single-graph behavior).
+    #[cfg(all(feature = "cuda", feature = "graph"))]
+    pub tenant_decode_capturers: HashMap<String, GraphCapturer<CudaGraphWrapper<CudaGraphFn>>>,
+    /// The max number of sequences for the graph capture (the `graph_capture_max_num_seqs`
+    /// from the constructor). Stored so the per-tenant graph capture (the
+    /// `warmup_capture`) can build per-tenant `GraphCapturer`s with the same batch
+    /// sizing as the base capturer.
+    #[cfg(all(feature = "cuda", feature = "graph"))]
+    graph_capture_max_num_seqs: usize,
+    /// The model's hidden size (the `Config.hidden_size`), stored for the per-tenant
+    /// graph capture (the `GraphCapturer::new` needs it). The `EngineConfig` does not
+    /// carry the hidden size, so it is stored separately from the model `.
+    #[cfg(all(feature = "cuda", feature = "graph"))]
+    graph_hidden_size: usize,
 }
 
 impl ModelRunner {
@@ -242,6 +263,27 @@ impl ModelRunner {
 
     pub(crate) fn block_size(&self) -> usize {
         self.config.block_size
+    }
+
+    /// The cached per-request sampling strategy (the target's post-sampling
+    /// distribution for the lossless rejection-sampling verify). The `None`
+    /// when no per-request override is cached (the model's base sampling).
+    pub(crate) fn cached_sampling(&self) -> Option<crate::core::runner::CachedSamplingParams> {
+        self.cached_sampling.read().clone()
+    }
+
+    /// Whether this runner is the rank-0 shard (the authoritative NCCL all-reduce
+    /// makes all ranks agree, so rank-0 logs are the single source of truth).
+    pub(crate) fn is_first_rank(&self) -> bool {
+        self.is_first_rank
+    }
+
+    /// The dynamic-K break-even threshold (the `QosConfig.spec_draft_break_even`, the
+    /// the runner-side access to the private `config` field, the no the mtp.rs reaching
+    /// into `self.config`). The runner uses this to compute the per-seq next-K (the
+    /// rolling prefix-curve knee).
+    pub(crate) fn spec_break_even(&self) -> f64 {
+        self.config.qos.spec_draft_break_even as f64
     }
 
     #[cfg(feature = "flashinfer")]
@@ -366,6 +408,14 @@ impl ModelRunner {
             let max_seqs = econfig.max_num_parallel_reqs.max(1);
             config.mtp_max_verify_tokens = max_seqs.saturating_mul(spec_tokens.saturating_add(1));
         }
+
+        // Initialize the global LoRA site registry (the centralized
+        // site registration) before the model is built. The model constructors
+        // register their LoRA sites into this registry via the
+        // register_lora_site (called from each wrapped linear's
+        // with_lora_module). The registry is a OnceLock (set once, no
+        // re-set), so this is a no-op if already set.
+        init_global_site_registry();
 
         let model = crate::build_model!(
             model_type,
@@ -544,6 +594,24 @@ impl ModelRunner {
                 }
             }
         }
+
+        // The LoRA + the CUDA graph interaction: the LoRA delta is applied inside the
+        // wrapped linears' forward (the `if let Some(delta)` branch), which is a
+        // runtime data-dependent branch the CUDA graph cannot capture. The graph
+        // is captured with the base model (no tenant active), so a graph-
+        // replayed decode runs the base-model path. For a LoRA tenant, that
+        // tenant's decode must run on a per-tenant captured graph (the base model
+        // + that tenant's delta baked in at capture time), not the base graph.
+        //
+        // The strategy: the graph capture stays enabled (not the global disable
+        // that killed the base-model throughput). At capture time (the
+        // `warmup_capture`), after the base graph is captured, a per-tenant graph
+        // is captured for each loaded LoRA tenant (the tenant set active during
+        // that capture, so the delta is baked in). At replay time (the `run`),
+        // the runner selects the graph matching the active tenant (the base graph
+        // when no tenant, the tenant's graph when that tenant is active). A tenant
+        // with no captured graph (e.g. loaded after capture) falls back to the
+        // eager path for that tenant only.
 
         let prefix_cache_enabled = econfig.prefix_cache.unwrap_or(false);
         let mut mamba_prefix_capacity =
@@ -838,6 +906,22 @@ impl ModelRunner {
             }
         }
 
+        // The per-instance LoRA registry (the multi-tenant adapter set, the Punica
+        // shared-base + per-tenant delta). Computed before the struct (the device is
+        // still available). Empty when no adapter is configured (the prior operation).
+        // The `Mutex` allows the on-demand load (the ensure_tenant_loaded) to mutate
+        // the registry; the read path locks it briefly.
+        let lora_registry = std::sync::Arc::new(std::sync::Mutex::new(
+            init_lora_registry(econfig, &device, dtype)?,
+        ));
+        // Set the process-wide registry (the wrapped linears consult it during
+        // the forward pass). The same `Arc<Mutex>` is stored in the runner (no
+        // a second copy). When the registry is empty (no LoRA configured), the
+        // global is not set (the layers take the fast path, no lookup).
+        if !lora_registry.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
+            set_global_registry(lora_registry.clone());
+        }
+
         Ok(Self {
             model,
             gpu_kv_cache: Arc::new(Mutex::new(gpu_kv_cache)),
@@ -888,11 +972,24 @@ impl ModelRunner {
             mtp_head,
             mtp_num_speculative,
             dflash_drafter,
+            lora_registry,
+            #[cfg(all(feature = "cuda", feature = "graph"))]
+            tenant_decode_capturers: HashMap::new(),
+            #[cfg(all(feature = "cuda", feature = "graph"))]
+            graph_capture_max_num_seqs,
+            #[cfg(all(feature = "cuda", feature = "graph"))]
+            graph_hidden_size: config.hidden_size,
         })
     }
 
     pub fn has_dflash_drafter(&self) -> bool {
         self.dflash_drafter.is_some()
+    }
+
+    /// Whether the instance has a LoRA registry (the multi-tenant adapters loaded).
+    /// The `true` when at least one tenant is registered (the `--lora` set).
+    pub fn has_lora(&self) -> bool {
+        !self.lora_registry.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
     }
 
     /// Initialize MTP head for speculative decoding.
@@ -1010,6 +1107,34 @@ impl ModelRunner {
         }
     }
 
+    /// Speculative fast-forward decode: sample the base token (the current `run`, which
+    /// commits it to the FSM), then append the full grammar-forced (ff) run that follows.
+    /// The ff tokens are deterministic (forced by the grammar), so they are committed
+    /// directly without model sampling. Returns `[base_token, ff_run...]` per sequence;
+    /// the next draft anchors on the last ff token.
+    pub fn run_speculative_ff(&self, seqs: Seqs) -> Result<Vec<Vec<u32>>> {
+        let base_tokens = self.run(seqs, false)?;
+        let seq_ids: Vec<usize> = match &seqs {
+            Seqs::SeqRefs(seqs) => seqs.iter().map(|s| s.id()).collect(),
+            Seqs::DecodeVec(v) => v.iter().map(|s| s.id()).collect(),
+        };
+        let mut outputs: Vec<Vec<u32>> = Vec::with_capacity(seq_ids.len());
+        for (i, seq_id) in seq_ids.iter().enumerate() {
+            let mut out = vec![base_tokens[i]];
+            // The remaining grammar run (from the FSM state after the base token is committed).
+            let remaining_ff = self.guided_decoding.ff_tokens(*seq_id);
+            if !remaining_ff.is_empty() {
+                self.guided_decoding.commit_ff_sequence(*seq_id);
+                // Report the ff continuation in the per-seq speculative stats (the same
+                // optional end-of-sequence report as MTP/DFlash).
+                crate::speculative::spec_stats::spec_stats_update_ff("SpecFF", *seq_id, remaining_ff.len());
+                out.extend(remaining_ff);
+            }
+            outputs.push(out);
+        }
+        Ok(outputs)
+    }
+
     #[allow(unused)]
     pub fn run(&self, seqs: Seqs, is_prefill: bool) -> Result<Vec<u32>> {
         #[cfg(feature = "nvtx")]
@@ -1036,44 +1161,174 @@ impl ModelRunner {
             }
         }
 
+        // LoRA tenant selection (the per-request adapter, the Punica shared-base +
+        // per-tenant delta). Each sequence in the batch carries its own `lora_tenant`
+        // (the `SamplingParams.lora_tenant`), so one forward pass can serve rows from
+        // different tenants (the batched multi-tenant). The `LoraExecution`
+        // carries the per-row tenant ids; the wrapped linears consult it via
+        // `apply_lora_delta` (the batched delta when set, the single-tenant
+        // `active_tenant` otherwise). The `None` row (no tenant) uses the base
+        // model. This is set BEFORE the graph-replay block so the decode path can
+        // select the per-tenant captured graph (the tenant's delta baked in).
+        let (row_tenants, row_stacks): (Vec<Option<String>>, Vec<Vec<String>>) = match &seqs {
+            Seqs::SeqRefs(seqs) => (
+                seqs.iter().map(|s| s.sampling_params.lora_tenant.clone()).collect(),
+                seqs.iter().map(|s| s.sampling_params.lora_tenants.clone()).collect(),
+            ),
+            Seqs::DecodeVec(seqs) => (
+                seqs.iter().map(|s| s.sampling_params.lora_tenant.clone()).collect(),
+                seqs.iter().map(|s| s.sampling_params.lora_tenants.clone()).collect(),
+            ),
+        };
+        // The distinct tenants across both the single-tenant + the stacked paths
+        // (the on-demand load + the activate cover all of them).
+        let mut distinct_tenants: Vec<String> = row_tenants
+            .iter()
+            .filter_map(|t| t.clone())
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+        for stack in &row_stacks {
+            for t in stack {
+                if !distinct_tenants.contains(t) {
+                    distinct_tenants.push(t.clone());
+                }
+            }
+        }
+        // On-demand load: ensure each distinct tenant's adapter is
+        // resident before the forward. No-op when the tenant is already resident
+        // or the source is unknown (base model fallback).
+        for tenant in &distinct_tenants {
+            ensure_tenant_loaded(tenant);
+        }
+        // Two-tier LRU: activate each distinct tenant for this
+        // batch (the in-batch bank slot). The active set is capped by the
+        // max_active; the over-cap LRU active tenant is deactivated
+        // (the bank slot freed, the weights stay registered).
+        for tenant in &distinct_tenants {
+            activate_tenant(tenant);
+        }
+        // Reject the request if any active tenant loaded 0 adapter modules (the
+        // adapter was configured but its modules did not map to this model's
+        // LoRA sites, or the tensor discovery failed). Running the base model
+        // silently would mask the misconfiguration; the operator must fix the
+        // adapter or remove it. The `allow_base_fallback` (the server-side)
+        // governs UNKNOWN adapter names (the 404 vs the fallback); a KNOWN
+        // adapter that loaded 0 modules is a hard error (no silent base).
+        for tenant in &distinct_tenants {
+            let count = global_adapter_count(tenant);
+            if count == 0 {
+                crate::log_error!(
+                    "[LoRA] tenant '{tenant}' has 0 adapter modules resident; rejecting the request (the adapter loaded no modules — check the startup checkpoint layout + the model's LoRA sites)"
+                );
+                candle_core::bail!(
+                    "LoRA tenant '{tenant}' loaded 0 adapter modules; the request cannot run with the adapter. Fix the adapter checkpoint (the tensor naming) or the model's LoRA site registration, then restart."
+                );
+            }
+        }
+        // The concise residency proof (the count + the distinct layer count, not
+        // the full module dump). Logged ONCE per (seq_id, tenant) pair,
+        // process-wide (the static proven set, not the thread_local which
+        // re-proves per thread). So the per-decode-step tenant activation does
+        // not spam the log. The full module list is logged once at startup (the
+        // init_lora_registry). Gated to rank-0 only (not the 4× per-rank spam
+        // in a TP run — all ranks see the same tenant, so rank-0's log is the
+        // representative one).
+        if self.is_first_rank {
+            static PROVEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<(usize, String)>>> =
+                std::sync::OnceLock::new();
+            let proven = PROVEN.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+            let seq_ids: Vec<usize> = match &seqs {
+                Seqs::SeqRefs(seqs) => seqs.iter().map(|s| s.id()).collect(),
+                Seqs::DecodeVec(seqs) => seqs.iter().map(|s| s.id).collect(),
+            };
+            for &seq_id in &seq_ids {
+                let tenant = match &seqs {
+                    Seqs::SeqRefs(seqs) => seqs.iter().find(|s| s.id() == seq_id).and_then(|s| s.sampling_params.lora_tenant.clone()),
+                    Seqs::DecodeVec(seqs) => seqs.iter().find(|s| s.id == seq_id).and_then(|s| s.sampling_params.lora_tenant.clone()),
+                };
+                let Some(tenant) = tenant else { continue }; // no tenant for this seq (the base model)
+                let first_proof = proven.lock().unwrap().insert((seq_id, tenant.clone()));
+                if first_proof {
+                    let count = global_adapter_count(&tenant);
+                    let modules = global_adapter_modules(&tenant);
+                    let layer_count = modules.iter()
+                        .filter_map(|m| m.strip_prefix("layers.").and_then(|rest| rest.split('.').next()))
+                        .collect::<std::collections::HashSet<_>>()
+                        .len();
+                    crate::log_info!(
+                        "[LoRA] seq {seq_id} tenant '{tenant}' active: {count} adapter module(s) across {layer_count} layer(s), delta will be applied"
+                    );
+                }
+            }
+        }
+        let any_stack = row_stacks.iter().any(|s| !s.is_empty());
+        if distinct_tenants.len() <= 1 && !any_stack {
+            // The single tenant (or no tenant): the thread-local fast path.
+            set_active_tenant(distinct_tenants.first().cloned());
+            set_lora_execution(None);
+        } else {
+            // The multi-tenant batch OR the stacked (additive multi-adapter) case:
+            // the per-row mapping (the LoraExecution). The stacked path is used
+            // when any row carries a non-empty tenant stack.
+            set_active_tenant(None);
+            set_lora_execution(Some(LoraExecution {
+                row_tenants,
+                row_stacks,
+            }));
+        }
+
         #[cfg(all(feature = "cuda", feature = "graph"))]
         {
             let input_batch = input_ids.dim(0)?;
             let require_exact_graph = input_metadata.mamba_slot_mapping.is_some();
-            let can_replay = if require_exact_graph {
-                self.decode_capturer.is_exact_captured(input_batch)
+            // The decode capturer: the per-tenant capturer when a single
+            // tenant is active + a graph was captured for it (the tenant's delta
+            // baked in), otherwise the base capturer (no tenant, or a tenant
+            // with no captured graph). The per-tenant graph is the fast base model
+            // + that tenant's LoRA delta (captured with the tenant active), so
+            // the replay is fast + correct for that tenant.
+            let active_tenant = active_tenant();
+            let use_tenant_capturer = active_tenant
+                .as_ref()
+                .and_then(|t| self.tenant_decode_capturers.get(t))
+                .is_some();
+            let capturer = if use_tenant_capturer {
+                // The active_tenant is guaranteed Some here (the use_tenant_capturer
+                // check passed, which requires the tenant to be in the map).
+                self.tenant_decode_capturers
+                    .get(active_tenant.as_ref().unwrap())
+                    .unwrap()
             } else {
-                self.decode_capturer.is_captured(input_batch)
+                &self.decode_capturer
+            };
+            let can_replay = if require_exact_graph {
+                capturer.is_exact_captured(input_batch)
+            } else {
+                capturer.is_captured(input_batch)
             };
             if !is_prefill && can_replay {
                 let logits = match &self.model {
                     Model::Qwen3_5(model) => {
                         let _guard = model.lock_mamba_cache_for_graph();
-                        self.decode_capturer
-                            .replay(&input_ids, &positions, &input_metadata)?
+                        capturer.replay(&input_ids, &positions, &input_metadata)?
                     }
                     Model::Qwen3_5MoE(model) => {
                         let _guard = model.lock_mamba_cache_for_graph();
-                        self.decode_capturer
-                            .replay(&input_ids, &positions, &input_metadata)?
+                        capturer.replay(&input_ids, &positions, &input_metadata)?
                     }
                     Model::Qwen4(model) => {
                         let _guard = model.lock_mamba_cache_for_graph();
-                        self.decode_capturer
-                            .replay(&input_ids, &positions, &input_metadata)?
+                        capturer.replay(&input_ids, &positions, &input_metadata)?
                     }
                     Model::Qwen3VL(model) => {
                         if let Some(_guard) = model.lock_mamba_cache_for_graph() {
-                            self.decode_capturer
-                                .replay(&input_ids, &positions, &input_metadata)?
+                            capturer.replay(&input_ids, &positions, &input_metadata)?
                         } else {
-                            self.decode_capturer
-                                .replay(&input_ids, &positions, &input_metadata)?
+                            capturer.replay(&input_ids, &positions, &input_metadata)?
                         }
                     }
-                    _ => self
-                        .decode_capturer
-                        .replay(&input_ids, &positions, &input_metadata)?,
+                    _ => capturer.replay(&input_ids, &positions, &input_metadata)?,
                 };
                 let output_ids = self.sample(&logits, seqs, is_prefill)?;
                 return Ok(output_ids);
@@ -1144,7 +1399,16 @@ impl ModelRunner {
         let _prefill_guard = set_linear_is_prefill(is_prefill);
         let kv_guard = self.get_kv_cache();
         let kv_pairs = kv_guard.as_pairs();
-        let logits = if let Some(drafter) = self.dflash_drafter.as_ref() {
+        // The DFlash drafter is a separate base model (not the LoRA target). When a
+        // LoRA tenant is active, the DFlash draft would not match the LoRA-applied
+        // target (the verify would reject the drafts), so the DFlash path is disabled
+        // for LoRA tenants (fall to the MTP/plain path, which DOES get the
+        // LoRA delta via the wrapped target linears).
+        let dflash_active = self.dflash_drafter.is_some()
+            && active_tenant().is_none()
+            && lora_execution().map_or(true, |exec| exec.distinct_tenants() == 0);
+        let logits = if dflash_active {
+            let drafter = self.dflash_drafter.as_ref().unwrap();
             let target_layer_ids = drafter.target_layer_ids();
             let (logits, hidden_states) = self.model.forward_collecting_layers(
                 &input_ids,
@@ -1209,6 +1473,12 @@ impl ModelRunner {
         let output_ids = self.sample(&logits, seqs, is_prefill)?;
         #[cfg(feature = "nvtx")]
         nvtx::range_pop!();
+        // Two-tier LRU: deactivate the batch's tenants after the
+        // forward (the bank slots freed, the weights stay registered). No-op
+        // when no tenant was activated (the base model, the empty distinct set).
+        for tenant in &distinct_tenants {
+            deactivate_tenant(tenant);
+        }
         Ok(output_ids)
     }
 
@@ -2018,6 +2288,70 @@ impl ModelRunner {
         let kv_pairs = kv_cache_lock.as_pairs();
         self.decode_capturer.capture(&self.device, kv_pairs)?;
 
+        // The per-tenant decode graphs (the LoRA + the CUDA graph): for each
+        // loaded LoRA tenant, capture a dedicated decode graph with that tenant's
+        // delta baked in (the tenant set active during the capture, so the
+        // wrapped linears' `apply_lora_delta` branch is taken + frozen into the
+        // graph). The base graph (captured above, no tenant active) serves
+        // the no-tenant requests. Each tenant graph is stored in
+        // `tenant_decode_capturers`, keyed by the tenant id, so the decode path
+        // can select the matching graph at replay time.
+        #[cfg(all(feature = "cuda", feature = "graph"))]
+        {
+            let tenant_names = {
+                let reg = self.lora_registry.lock().unwrap_or_else(|e| e.into_inner());
+                reg.tenant_names()
+            };
+            for tenant in &tenant_names {
+                set_active_tenant(Some(tenant.clone()));
+                let wrapper = crate::graph_wrapper!(
+                    &self.model,
+                    &self.device,
+                    {
+                        Qwen3 => EmbedInputs,
+                        Qwen3MoE => EmbedInputs,
+                        Qwen3_5 => EmbedInputs,
+                        Qwen3_5MoE => EmbedInputs,
+                        Qwen4 => EmbedInputs,
+                        LLaMa => EmbedInputs,
+                        LLaMa4 => NoneArg,
+                        Phi4 => EmbedInputs,
+                        GLM4 => EmbedInputs,
+                        GLM4MoE => EmbedInputs,
+                        GLM4MoeLite => EmbedInputs,
+                        DeepSeek => EmbedInputs,
+                        DeepSeekV4 => EmbedInputs,
+                        GLM5 => EmbedInputs,
+                        Mistral3VL => NoneArg,
+                        Gemma3 => NoneArg,
+                        Gemma4 => EmbedInputs,
+                        Qwen3VL => NoneArg,
+                        MiniMax => EmbedInputs,
+                    }
+                );
+                let mut capturer = GraphCapturer::new(
+                    wrapper,
+                    self.graph_capture_max_num_seqs,
+                    self.config.max_model_len.unwrap_or(32768),
+                    self.config.block_size,
+                    self.graph_hidden_size,
+                    #[cfg(feature = "flashinfer")]
+                    &self.flashinfer_kv_params,
+                    matches!(
+                        self.model_type,
+                        ModelType::GLM4MoeLite | ModelType::DeepSeek | ModelType::GLM5
+                    ),
+                );
+                if capturer.capture(&self.device, kv_pairs).is_ok() {
+                    crate::log_info!(
+                        "Captured the per-tenant decode graph for LoRA tenant '{tenant}'"
+                    );
+                    self.tenant_decode_capturers.insert(tenant.clone(), capturer);
+                }
+            }
+            set_active_tenant(None);
+        }
+
         if self.mtp_num_speculative > 0 {
             // self.decode_capturer.model.sync()?;
             if let Some(mtp_cap) = &mut self.mtp_capturer {
@@ -2026,8 +2360,16 @@ impl ModelRunner {
                 } else {
                     "MTP"
                 };
+                // Capture the verify graph for the CEILING K (the mtp_num_speculative).
+                // The dynamic-K path (the per-seq K < the ceiling) falls back to the
+                // non-graph forward (the is_mtp_captured(verify_len) check returns
+                // false for an uncaptured K, the mtp.rs verify takes the forward path).
+                // Capturing the full K range in one call is not supported by the
+                // graph-capture state machine (the CUDA_ERROR_INVALID_VALUE on the
+                // second capture), so the ceiling graph + the non-graph fallback is the
+                // correct + safe design.
                 crate::log_info!(
-                    "Capturing {} verify graphs for up to {} draft tokens...",
+                    "Capturing {} verify graph for up to {} draft tokens...",
                     label,
                     self.mtp_num_speculative
                 );
@@ -2271,6 +2613,7 @@ mod tests {
             block_table_last: 0,
             block_tables: vec![0],
             sampling_params,
+            spec_k: 0,
         }
     }
 

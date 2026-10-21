@@ -8,6 +8,7 @@ use crate::models::layers::rotary_emb::{ApplyRotaryEmbedding, ScalingRotaryEmbed
 use crate::models::layers::VarBuilderX;
 use crate::utils::config::Config;
 use crate::utils::progress::ProgressLike;
+use crate::core::lora::apply_embedding_lora;
 use attention_rs::InputMetadata;
 use candle_core::{DType, Device, Result, Tensor};
 use candle_nn::Module;
@@ -254,7 +255,7 @@ impl LLaMaForCausalLM {
             &config.quantization_config,
             &None,
             dtype,
-        )?;
+        )?.with_lora_module("lm_head".to_string());
 
         Ok(Self {
             embed_tokens,
@@ -271,6 +272,8 @@ impl LLaMaForCausalLM {
 
     pub fn embed_forward(&self, xs: &Tensor) -> Result<Tensor> {
         let xs = self.embed_tokens.forward(xs)?;
+        // The embedding LoRA (the #1.11): the active tenant's embedding delta.
+        let xs = apply_embedding_lora(&xs)?;
         if (self.is_qvar_builder || self.config.quant.is_some()) && xs.dtype() != DType::F32 {
             xs.to_dtype(DType::F32)
         } else {

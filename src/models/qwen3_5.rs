@@ -3,6 +3,7 @@
 use crate::models::layers::attention::Attention;
 use crate::models::layers::deltanet::GatedDeltaNet;
 use crate::models::layers::distributed::{Comm, VocabParallelLinear};
+use crate::core::lora::apply_embedding_lora;
 use crate::models::layers::mask::get_attention_causal_mask;
 use crate::models::layers::mlp::MLP;
 use crate::models::layers::others::{embedding, rms_norm, NormX};
@@ -413,7 +414,7 @@ impl Qwen3_5ForCausalLM {
                 comm.clone(),
                 vocab_size,
                 dtype,
-            )?
+            )?.with_lora_module("lm_head".to_string())
         } else {
             let lm_head_vb = if tie_word_embeddings.is_some_and(|x| x) {
                 if is_qvar_builder {
@@ -434,7 +435,7 @@ impl Qwen3_5ForCausalLM {
                 &config.quantization_config,
                 &None,
                 dtype,
-            )?
+            )?.with_lora_module("lm_head".to_string())
         };
 
         // Initialize MambaCache for GDN layers
@@ -495,6 +496,8 @@ impl Qwen3_5ForCausalLM {
 
     pub fn embed_forward(&self, xs: &Tensor) -> Result<Tensor> {
         let xs = self.embed_tokens.forward(xs)?;
+        // The embedding LoRA (the #1.11): the active tenant's embedding delta.
+        let xs = apply_embedding_lora(&xs)?;
         if (self.is_qvar_builder || self.config.quant.is_some()) && xs.dtype() != DType::F32 {
             xs.to_dtype(DType::F32)
         } else {

@@ -417,6 +417,40 @@ pub fn normalize_prefill_chunk_size(size: usize) -> usize {
     rounded.clamp(MIN_PREFILL_CHUNK_SIZE, MAX_PREFILL_CHUNK_SIZE)
 }
 
+/// The LoRA multi-tenant serving config (the operator surface). The
+/// `adapters` is the list of (name, source) pairs (the `--lora NAME=SOURCE`
+/// CLI, repeatable). The source is a Hugging Face id or a local dir (the
+/// common model loader resolves it). The `max_tenants`/`max_bytes` are the
+/// residency budgets. The `eviction_policy` is the LRU/FIFO selection. The
+/// `pinned` are the SLA-guaranteed tenants. The `allow_base_fallback`
+/// controls the unknown-adapter behavior (the 404 vs the base-model fallback).
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct LoraConfig {
+    /// The (name, source) pairs (the `--lora NAME=SOURCE`, repeatable).
+    pub adapters: Vec<(String, String)>,
+    /// The max concurrent resident tenants (the registered-tier cap, the
+    /// weights on GPU).
+    #[serde(default)]
+    pub max_tenants: Option<usize>,
+    /// The max distinct tenants in one batch (the active-tier cap, the bank
+    /// slots). The `0` means unlimited (no active cap).
+    #[serde(default)]
+    pub max_active: Option<usize>,
+    /// The max resident adapter bytes (the GPU memory bound).
+    #[serde(default)]
+    pub max_bytes: Option<u64>,
+    /// The eviction policy (the "lru"/"fifo").
+    #[serde(default)]
+    pub eviction_policy: Option<String>,
+    /// The pinned tenants (the SLA guarantee, never evicted).
+    #[serde(default)]
+    pub pinned: Vec<String>,
+    /// The unknown-adapter behavior: the `true` falls back to the
+    /// base model, the `false` returns a 404.
+    #[serde(default)]
+    pub allow_base_fallback: bool,
+}
+
 #[cfg(not(feature = "python"))]
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct EngineConfig {
@@ -488,7 +522,17 @@ pub struct EngineConfig {
     /// External DFlash2 draft model (HuggingFace id or local directory).
     #[serde(default)]
     pub draft_model: Option<String>,
+    /// The LoRA multi-tenant serving config (the operator surface). The
+    /// `adapters` is the (name, source) list (the `--lora NAME=SOURCE`), the
+    /// budgets + the policy + the pinned tenants. The empty config = no LoRA
+    /// (the prior operation, the zero overhead).
+    #[serde(default)]
+    pub lora: LoraConfig,
     pub enable_tool_grammar: bool,
+    /// QoS scheduling policy (class-aware admission, adaptive chunking, KV-aware
+    /// budgeting). Disabled by default = prior operation.
+    #[serde(default)]
+    pub qos: crate::core::qos::QosConfig,
 }
 
 fn default_num_nodes() -> usize {
@@ -606,7 +650,14 @@ pub struct EngineConfig {
     #[serde(default)]
     pub draft_model: Option<String>,
     #[pyo3(get, set)]
+    #[serde(default)]
+    pub lora: LoraConfig,
+    #[pyo3(get, set)]
     pub enable_tool_grammar: bool,
+    /// QoS scheduling policy (class-aware admission, adaptive chunking, reservations).
+    /// Disabled by default = prior operation.
+    #[serde(default)]
+    pub qos: crate::core::qos::QosConfig,
 }
 
 impl EngineConfig {
@@ -627,7 +678,6 @@ impl EngineConfig {
     }
 }
 
-#[cfg(not(feature = "python"))]
 impl EngineConfig {
     pub fn new(
         model_id: Option<String>,
@@ -670,6 +720,7 @@ impl EngineConfig {
         enable_tool_grammar: bool,
         num_speculative_tokens: Option<usize>,
         draft_model: Option<String>,
+        lora: LoraConfig,
     ) -> Self {
         let mut device_ids = device_ids.unwrap_or_default();
         if device_ids.is_empty() {
@@ -731,7 +782,9 @@ impl EngineConfig {
             master_port,
             num_speculative_tokens,
             draft_model,
+            lora,
             enable_tool_grammar,
+            qos: crate::core::qos::QosConfig::default(),
         }
     }
 }
@@ -825,6 +878,18 @@ pub struct SamplingParams {
     /// When set, grammar constraints are deferred until after reasoning ends.
     #[serde(default)]
     pub guidance_reasoning_end_ids: Vec<u32>,
+    /// The LoRA tenant id (the per-request adapter selection). When set, the
+    /// runner activates this tenant's LoRA adapters for the forward pass (the
+    /// `set_active_tenant`). The `None` means the base model (no adapter).
+    #[serde(default)]
+    pub lora_tenant: Option<String>,
+    /// The LoRA tenant stack (the additive multi-adapter composition). When
+    /// non-empty, the runner composes all listed tenants' deltas additively:
+    /// `base + sum_j scaling_j * (x @ A_j) @ B_j`. This takes precedence over
+    /// the single `lora_tenant` (the prior behavior). The empty means no stack
+    /// (the single-tenant or base-model path).
+    #[serde(default)]
+    pub lora_tenants: Vec<String>,
 }
 
 #[cfg(feature = "python")]
@@ -908,6 +973,8 @@ impl SamplingParams {
             grammar_json: None,
             reasoning_effort,
             guidance_reasoning_end_ids: Vec::new(),
+            lora_tenant: None,
+            lora_tenants: Vec::new(),
         }
     }
 
@@ -929,6 +996,8 @@ impl SamplingParams {
             grammar_json: None,
             reasoning_effort: None,
             guidance_reasoning_end_ids: Vec::new(),
+            lora_tenant: None,
+            lora_tenants: Vec::new(),
         }
     }
 }
@@ -952,6 +1021,8 @@ impl Default for SamplingParams {
             grammar_json: None,
             reasoning_effort: None,
             guidance_reasoning_end_ids: Vec::new(),
+            lora_tenant: None,
+            lora_tenants: Vec::new(),
         }
     }
 }

@@ -1,12 +1,15 @@
 //! Speculative decoding: built-in MTP heads and external DFlash2 draft models.
 
 pub mod dflash;
+pub mod dynamic_sd;
 pub mod mamba;
 pub mod metadata;
 pub mod mtp;
+pub mod spec_stats;
 pub mod verify;
 
 pub use dflash::DFlashDrafter;
+pub use dynamic_sd::DynamicSdLookup;
 pub use metadata::SpecSeqInfo;
 pub use verify::{
     dflash_stats_reset, dflash_stats_summary, mtp_stats_acceptance_rate,
