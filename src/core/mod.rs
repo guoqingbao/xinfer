@@ -125,7 +125,7 @@ where
     }
 }
 
-type DecodeStreamType = Box<dyn DecodeStreamTrait + Send + Sync>;
+pub type DecodeStreamType = Box<dyn DecodeStreamTrait + Send + Sync>;
 
 #[macro_export]
 macro_rules! build_model {

@@ -2230,7 +2230,7 @@ pub async fn messages(
     let _tool_choice = tool_choice_to_openai(&request.tool_choice);
 
     let (model_type, tool_config, engine_config) = {
-        let e = data.engine.read();
+        let e = data.engine.as_ref();
         (
             e.model_type.clone(),
             e.tool_config.clone(),
@@ -2247,12 +2247,12 @@ pub async fn messages(
     };
 
     let img_cfg = {
-        let e = data.engine.read();
+        let e = data.engine.as_ref();
         e.img_cfg.clone()
     };
 
     if engine_config.enable_tool_grammar && !resolved_tools.is_empty() {
-        let engine = data.engine.read();
+        let engine = data.engine.as_ref();
         let model_type = engine.model_type.clone();
         let model_id = model_id.clone();
         let chat_template = Some(engine.get_chat_template());
@@ -2311,7 +2311,7 @@ pub async fn messages(
 
     if use_stream {
         let preprocessed = {
-            let e = data.engine.read();
+            let e = data.engine.as_ref();
             match e.preprocess(
                 std::slice::from_ref(&params),
                 std::slice::from_ref(&messages),
@@ -2334,8 +2334,8 @@ pub async fn messages(
             }
         };
         let (seq_id, prompt_length, prefilled_reasoning_end, stream) = {
-            let mut e = data.engine.write();
-            match e.generate_stream(preprocessed, image_data, &logger) {
+            let e = data.engine.as_ref();
+            match e.generate_stream(preprocessed, image_data, &logger).await {
                 Ok((seq_id, prompt_length, prefilled_reasoning_end, stream)) => {
                     (seq_id, prompt_length, prefilled_reasoning_end, stream)
                 }
@@ -2419,7 +2419,7 @@ pub async fn messages(
                                         );
                                     }
                                 }
-                                let mut e = keepalive_engine.write();
+                                let e = keepalive_engine.as_ref();
                                 e.cancel(seq_id);
                                 break;
                             }
@@ -2465,7 +2465,7 @@ pub async fn messages(
 
             if let Err(err) = stream_ctx.send_json_event("message_start", &message_start) {
                 crate::log_warn!("[Seq {}] Failed to send message_start: {:?}", seq_id, err);
-                let mut e = engine_clone.write();
+                let e = engine_clone.as_ref();
                 e.cancel(seq_id);
                 return;
             }
@@ -2503,7 +2503,7 @@ pub async fn messages(
                                 "[Seq {}] Stream idle timeout reached, cancelling request",
                                 seq_id
                             );
-                            let mut e = engine_clone.write();
+                            let e = engine_clone.as_ref();
                             e.cancel(seq_id);
                             break;
                         }
@@ -2589,7 +2589,7 @@ pub async fn messages(
                                             true,
                                         )
                                         .await;
-                                        let mut e = engine_clone.write();
+                                        let e = engine_clone.as_ref();
                                         e.cancel(seq_id);
                                         stream_finished = true;
                                         break 'stream;
@@ -2630,7 +2630,7 @@ pub async fn messages(
                                             seq_id,
                                             tool_buffer_timeout
                                         );
-                                        let mut e = engine_clone.write();
+                                        let e = engine_clone.as_ref();
                                         e.cancel(seq_id);
                                         buffering_cancel_requested = true;
                                     }
@@ -2704,7 +2704,7 @@ pub async fn messages(
                                             true,
                                         )
                                         .await;
-                                        let mut e = engine_clone.write();
+                                        let e = engine_clone.as_ref();
                                         e.cancel(seq_id);
                                         stream_finished = true;
                                         break 'stream;
@@ -2752,7 +2752,7 @@ pub async fn messages(
                                     true,
                                 )
                                 .await;
-                                let mut e = engine_clone.write();
+                                let e = engine_clone.as_ref();
                                 e.cancel(seq_id);
                                 stream_finished = true;
                                 break 'stream;
@@ -3016,7 +3016,7 @@ pub async fn messages(
                                         true,
                                     )
                                     .await;
-                                    let mut e = engine_clone.write();
+                                    let e = engine_clone.as_ref();
                                     e.cancel(seq_id);
                                     stream_finished = true;
                                     break 'stream;
@@ -3045,7 +3045,7 @@ pub async fn messages(
                                         true,
                                     )
                                     .await;
-                                    let mut e = engine_clone.write();
+                                    let e = engine_clone.as_ref();
                                     e.cancel(seq_id);
                                     stream_finished = true;
                                     break 'stream;
@@ -3071,7 +3071,7 @@ pub async fn messages(
                                         true,
                                     )
                                     .await;
-                                    let mut e = engine_clone.write();
+                                    let e = engine_clone.as_ref();
                                     e.cancel(seq_id);
                                     stream_finished = true;
                                     break 'stream;
@@ -3115,7 +3115,7 @@ pub async fn messages(
                                         true,
                                     )
                                     .await;
-                                    let mut e = engine_clone.write();
+                                    let e = engine_clone.as_ref();
                                     e.cancel(seq_id);
                                     stream_finished = true;
                                     break 'stream;
@@ -3158,7 +3158,7 @@ pub async fn messages(
                                 true,
                             )
                             .await;
-                            let mut e = engine_clone.write();
+                            let e = engine_clone.as_ref();
                             e.cancel(seq_id);
                             stream_finished = true;
                             break 'stream;
@@ -3175,7 +3175,7 @@ pub async fn messages(
                                 false,
                             )
                             .await;
-                            let mut e = engine_clone.write();
+                            let e = engine_clone.as_ref();
                             e.cancel(seq_id);
                             stream_finished = true;
                             break 'stream;
@@ -3256,12 +3256,12 @@ pub async fn messages(
         )
     } else {
         let tokenizer = {
-            let e = data.engine.read();
+            let e = data.engine.as_ref();
             Arc::new(e.tokenizer.clone())
         };
 
         let preprocessed = {
-            let e = data.engine.read();
+            let e = data.engine.as_ref();
             match e.preprocess(
                 std::slice::from_ref(&params),
                 std::slice::from_ref(&messages),
@@ -3284,8 +3284,8 @@ pub async fn messages(
             }
         };
         let receivers = {
-            let mut e = data.engine.write();
-            match e.generate_sync(preprocessed, image_data, &logger) {
+            let e = data.engine.as_ref();
+            match e.generate_sync(preprocessed, image_data, &logger).await {
                 Ok(receivers) => receivers,
                 Err(err) => {
                     return ClaudeResponder::Error(
@@ -3531,7 +3531,7 @@ pub async fn count_tokens(
     };
 
     let img_cfg = {
-        let e = data.engine.read();
+        let e = data.engine.as_ref();
         e.img_cfg.clone()
     };
     let (messages, _) = match build_messages_and_images(&chat_messages, img_cfg.as_ref()) {
@@ -3550,7 +3550,7 @@ pub async fn count_tokens(
         }
     };
 
-    let engine = data.engine.read();
+    let engine = data.engine.as_ref();
     let mut template = engine.get_chat_template();
     template.set_messages(&messages);
     let prompt = match template.apply_chat_template(&Vec::new(), false) {

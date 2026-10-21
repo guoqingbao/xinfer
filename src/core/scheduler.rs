@@ -1,14 +1,28 @@
 // src/core/scheduler.rs
-use super::runner::RunnerType;
 use super::{
-    block_manager::BlockManager,
     prefix_cache::PrefixCacheConfig,
     sequence::{Sequence, SequenceStatus},
 };
 use crate::transfer::{PdConfig, PdRole};
 use crate::utils::config::{Config, EngineConfig, EosTokenId};
+use crate::domain::kv::KvMessage;
 use candle_core::Result;
-use parking_lot::RwLock;
+use ractor::rpc::CallResult;
+use ractor::RpcReplyPort;
+
+/// Extract the success value from a Ractor RPC call on the `KvD` actor, or a
+/// default. Wraps the `Actor::call` + `CallResult` extraction so call sites
+/// stay concise.
+async fn kv_call<T: Send + 'static>(
+    kv: &ractor::ActorRef<KvMessage>,
+    builder: impl FnOnce(RpcReplyPort<T>) -> KvMessage,
+    default: T,
+) -> T {
+    match kv.call(builder, None).await {
+        Ok(CallResult::Success(v)) => v,
+        _ => default,
+    }
+}
 use regex::Regex;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -19,7 +33,10 @@ pub struct Scheduler {
     running: Vec<Sequence>,
     cached: Vec<Sequence>,
     transferred: VecDeque<Sequence>,
-    pub block_manager: BlockManager,
+    /// The KV-cache actor (the block pool, the prefix cache, the mamba slots, the
+    /// tier ladder). Reached only through the `ActorRef<KvMessage>` proxy (the no
+    /// shared block_manager).
+    pub kv: ractor::ActorRef<KvMessage>,
     next_seq_id: usize,
     /// Per-seq cached-token count retained briefly after `clear_finished()`
     /// so response finalization can still read it. Bounded by
@@ -67,7 +84,7 @@ fn active_sequence_limit(max_num_seqs: usize, mamba_cache_capacity: Option<usize
     .max(1)
 }
 
-fn build_prefix_cache_config(econfig: &EngineConfig) -> PrefixCacheConfig {
+pub fn build_prefix_cache_config(econfig: &EngineConfig) -> PrefixCacheConfig {
     let enabled = econfig.prefix_cache.unwrap_or(false);
     if !enabled {
         return PrefixCacheConfig {
@@ -130,32 +147,18 @@ fn build_prefix_cache_config(econfig: &EngineConfig) -> PrefixCacheConfig {
 }
 
 impl Scheduler {
-    pub fn new(runners: Arc<RwLock<RunnerType>>, econfig: &EngineConfig, config: &Config) -> Self {
-        let prefix_cache_cfg = build_prefix_cache_config(econfig);
-        let mamba_snapshot_default_stride_blocks = econfig
-            .effective_prefill_chunk_size()
-            .div_ceil(econfig.block_size)
-            .max(1);
-        Self {
-            waiting: VecDeque::new(),
-            running: Vec::new(),
-            cached: Vec::new(),
-            transferred: VecDeque::new(),
-            block_manager: BlockManager::new(
-                runners,
-                econfig.num_blocks,
-                (econfig.cpu_mem_fold.unwrap_or(0.5f32) * econfig.num_blocks as f32) as usize,
-                econfig.block_size,
-                prefix_cache_cfg,
-                config
-                    .architectures
-                    .as_ref()
-                    .and_then(|arches| arches.first())
-                    .map(|arch| crate::utils::is_qwen3_hybrid_arch_name(arch))
-                    .unwrap_or(false),
-                mamba_snapshot_default_stride_blocks,
-            ),
-            next_seq_id: 0,
+    pub fn new(
+            kv: ractor::ActorRef<KvMessage>,
+            econfig: &EngineConfig,
+            config: &Config,
+        ) -> Self {
+            Self {
+                waiting: VecDeque::new(),
+                running: Vec::new(),
+                cached: Vec::new(),
+                transferred: VecDeque::new(),
+                kv,
+                next_seq_id: 0,
             finished_cached_tokens: HashMap::new(),
             eos_token_id: match &config.eos_token_id {
                 Some(EosTokenId::Single(eos)) => vec![*eos],
@@ -233,24 +236,26 @@ impl Scheduler {
 
     /// Schedule sequences and return their indexes in `running` along with prefill flag
     #[allow(non_snake_case)]
-    pub fn schedule(&mut self) -> Result<(Vec<usize>, bool)> {
+    pub async fn schedule(&mut self) -> Result<(Vec<usize>, bool)> {
         let mut scheduled_ids = Vec::new();
         let mut num_tokens = 0;
         let chunk_size = self.cfg.effective_prefill_chunk_size();
 
         // PD server: Check for new incoming prefill requests
         if self.is_pd_server() {
-            if let Ok((fit, Some(seq))) = self
-                .block_manager
-                .try_receive_prefill(self.get_available_kv_tokens())
-            {
+            let available_tokens = self.get_available_kv_tokens().await;
+            let recv = match self.kv.call(|r| KvMessage::TryReceivePrefill(available_tokens, r), None).await {
+                Ok(CallResult::Success(v)) => v,
+                _ => (false, None),
+            };
+            if let (fit, Some(seq)) = recv {
                 let seq_id = seq.id;
                 if !fit {
                     crate::log_warn!(
                         "Prefill request (Seq {}) enter pending status because it require {} KvCache tokens (left {}).",
                         seq_id,
                         seq.len() + 1,
-                        self.get_available_kv_tokens(),
+                        self.get_available_kv_tokens().await,
                     );
                 } else {
                     crate::log_warn!(
@@ -276,7 +281,7 @@ impl Scheduler {
 
         while let Some(mut seq) = self.waiting.pop_front() {
             // Try to transfer prefill requests to PD server when applicable
-            if self.is_pd_mode() && !self.is_pd_server() && self.try_transfer(&mut seq) {
+            if self.is_pd_mode() && !self.is_pd_server() && self.try_transfer(&mut seq).await {
                 break;
             }
 
@@ -285,7 +290,7 @@ impl Scheduler {
             if self.running.len() >= max_seqs_limit
                 || scheduled_ids.len() >= max_seqs_limit
                 || num_tokens + effective_tokens > token_budget
-                || (seq.block_table.is_empty() && !self.block_manager.can_allocate(&seq))
+                || (seq.block_table.is_empty() && !kv_call(&self.kv, |r| KvMessage::CanAllocate(seq.clone(), r), false).await)
                 // interleaved scheduling: alternate prefill/decode for fairness
                 // only block when there are pre-existing decode sequences
                 || (self.is_last_prefill && pre_existing_running > 0)
@@ -296,7 +301,13 @@ impl Scheduler {
             }
 
             if seq.block_table.is_empty() {
-                self.block_manager.allocate(&mut seq)?;
+                match kv_call(&self.kv, |r| KvMessage::Allocate(seq.clone(), r), Err("RPC failed".to_string())).await {
+                    Ok(updated) => { seq = updated; }
+                    Err(e) => {
+                        crate::log_error!("block allocation failed: {e}");
+                        return Err(candle_core::Error::msg(format!("block allocation failed: {e}")));
+                    }
+                }
             }
             seq.status = SequenceStatus::Running;
             num_tokens += effective_tokens;
@@ -314,7 +325,7 @@ impl Scheduler {
         let mut preempt_ids = Vec::new();
 
         for (idx, seq) in self.running.iter().enumerate() {
-            if !self.block_manager.can_append(seq)
+            if !kv_call(&self.kv, |r| KvMessage::CanAppend(seq.clone(), r), false).await
                 && seq.status != SequenceStatus::Swapped
                 && seq.status != SequenceStatus::FinishSwapped
             {
@@ -324,7 +335,7 @@ impl Scheduler {
 
         // Client: Check for finished prefills
         if self.is_pd_mode() && !self.is_pd_server() {
-            self.try_receive_kvcache()?;
+            self.try_receive_kvcache().await?;
         }
 
         // Swap back seq from cpu memory if possible. Aggregate KV usage can stay high
@@ -338,18 +349,18 @@ impl Scheduler {
         let should_try_swap_in = cfg!(feature = "cuda")
             && preempt_ids.is_empty()
             && (has_swapped_seq
-                || self.kv_cache_usage_percent() < KVCACHE_SWAP_THRESHOLD * 0.9
-                || (self.running.is_empty() && self.kv_cache_usage_percent() <= 0.3f32));
+                || self.kv_cache_usage_percent().await < KVCACHE_SWAP_THRESHOLD * 0.9
+                || (self.running.is_empty() && self.kv_cache_usage_percent().await <= 0.3f32));
         if should_try_swap_in {
             #[cfg(feature = "cuda")]
-            self.try_swap_in();
-        } else if !preempt_ids.is_empty() || self.kv_cache_usage_percent() > KVCACHE_SWAP_THRESHOLD
+            self.try_swap_in().await;
+        } else if !preempt_ids.is_empty() || self.kv_cache_usage_percent().await > KVCACHE_SWAP_THRESHOLD
         {
             // Requests unable to be processed at the current moment
             // If we only have one sequence running and it has been preempt,
             // swap out to cpu memory make non-sense
             // in such case, the only option is either waiting resources or abort it
-            let evicted = self.evict_prefix_cache_under_pressure();
+            let evicted = self.evict_prefix_cache_under_pressure().await;
             if evicted > 0 {
                 crate::log_warn!("Evicted {} prefix cache block(s) under pressure.", evicted);
             } else {
@@ -365,8 +376,8 @@ impl Scheduler {
                             "Trying to swap out preempt Seq {:?}",
                             self.running[idx].id
                         );
-                        self.try_swap_out(idx, true);
-                    }
+                        self.try_swap_out(idx, true).await;
+                }
                 }
             }
         }
@@ -381,22 +392,27 @@ impl Scheduler {
             if seq.status == SequenceStatus::Finished {
                 continue;
             }
-            if !self.block_manager.can_append(&seq) {
+            if !kv_call(&self.kv, |r| KvMessage::CanAppend(seq.clone(), r), false).await {
                 // filter out seq that unable to acquire resources
                 continue;
             }
             if is_pd_server && seq.status == SequenceStatus::Cached {
-                if let Ok(success) = self.block_manager.try_check_kvcache_release(seq.id) {
-                    if success {
-                        crate::log_warn!("PD Server: release prefilled kvcache for Seq {} (prefix cache retained)", seq.id);
-                        seq.status = SequenceStatus::Finished;
-                        self.block_manager.deallocate(seq);
-                        pd_finished_ids.push(seq.id);
-                    }
+                let success = kv_call(&self.kv, |r| KvMessage::TryCheckKvcacheRelease(seq.id, r), false).await;
+                if success {
+                    crate::log_warn!("PD Server: release prefilled kvcache for Seq {} (prefix cache retained)", seq.id);
+                    seq.status = SequenceStatus::Finished;
+                    let _ = self.kv.send_message(KvMessage::Deallocate(seq.clone()));
+                    pd_finished_ids.push(seq.id);
                 }
                 continue;
             }
-            self.block_manager.may_append(seq)?;
+            match kv_call(&self.kv, |r| KvMessage::MayAppend(seq.clone(), r), Err("RPC failed".to_string())).await {
+                    Ok(updated) => { *seq = updated; }
+                    Err(e) => {
+                        crate::log_error!("may_append failed: {e}");
+                        return Err(candle_core::Error::msg(format!("may_append failed: {e}")));
+                    }
+                }
             decode_ids.push(idx);
         }
         if !pd_finished_ids.is_empty() {
@@ -414,11 +430,11 @@ impl Scheduler {
 
     /// For prefill sequences that rely on cached prefix tokens, verify mamba state snapshots
     /// still exist. If a snapshot is missing/evicted, downgrade that sequence to full prefill.
-    pub fn fallback_missing_mamba_prefix_snapshots(
+pub async fn fallback_missing_mamba_prefix_snapshots(
         &mut self,
         scheduled_ids: &[usize],
     ) -> Result<usize> {
-        let (running, block_manager) = (&mut self.running, &mut self.block_manager);
+        let (running, block_manager) = (&mut self.running, &mut self.kv);
         let mut downgraded = 0usize;
 
         for &idx in scheduled_ids {
@@ -433,18 +449,7 @@ impl Scheduler {
                 continue;
             };
 
-            let has_snapshot = match block_manager.try_has_mamba_prefix_state(hash) {
-                Ok(v) => v,
-                Err(e) => {
-                    crate::log_warn!(
-                        "Seq {}: failed to query mamba prefix snapshot hash {}: {}. Falling back to full prefill.",
-                        seq.id,
-                        hash,
-                        e
-                    );
-                    false
-                }
-            };
+            let has_snapshot = kv_call(block_manager, |r| KvMessage::HasMambaPrefix(hash, r), false).await;
             if has_snapshot {
                 continue;
             }
@@ -453,11 +458,11 @@ impl Scheduler {
             let required_blocks = seq.num_blocks();
 
             // Drop current block refs (including any shared prefix refs), then rebuild from scratch.
-            block_manager.deallocate(seq);
+            let _ = block_manager.send_message(KvMessage::Deallocate(seq.clone()));
             seq.clear_block_table();
 
-            if !block_manager.can_allocate_without_prefix(seq) {
-                let evicted = block_manager.evict_prefix_cache_until_free(required_blocks);
+            if !kv_call(block_manager, |r| KvMessage::CanAllocateWithoutPrefix(seq.clone(), r), false).await {
+                let evicted = kv_call(block_manager, |r| KvMessage::EvictPrefixUntilFree(required_blocks, r), 0).await;
                 if evicted > 0 {
                     crate::log_warn!(
                         "Seq {}: evicted {} prefix cache block(s) before mamba fallback reallocation.",
@@ -466,7 +471,13 @@ impl Scheduler {
                     );
                 }
             }
-            block_manager.allocate_without_prefix(seq)?;
+            match kv_call(block_manager, |r| KvMessage::AllocateWithoutPrefix(seq.clone(), r), Err("RPC failed".to_string())).await {
+                Ok(updated) => { *seq = updated; }
+                Err(e) => {
+                    crate::log_error!("allocate_without_prefix failed: {e}");
+                    return Err(candle_core::Error::msg(format!("allocate_without_prefix failed: {e}")));
+                }
+            }
             downgraded += 1;
             crate::log_warn!(
                 "Seq {}: missing mamba snapshot hash {} (cached {} tokens). Downgraded to full prefill.",
@@ -526,7 +537,7 @@ impl Scheduler {
 
     /// Postprocess output tokens for each sequence. Handles both single-token (normal decode)
     /// and multi-token (MTP speculative decode) outputs uniformly.
-    pub fn postprocess(&mut self, ids: &[usize], multi_output_ids: &[Vec<u32>]) {
+pub async fn postprocess(&mut self, ids: &[usize], multi_output_ids: &[Vec<u32>]) {
         for (i, &idx) in ids.iter().enumerate() {
             if idx >= self.running.len() {
                 continue;
@@ -537,53 +548,35 @@ impl Scheduler {
             // PD server: transfer KV cache on first token, then move to next sequence.
             if self.is_pd_server() {
                 if let Some(&first_token) = tokens.first() {
-                    match self
-                        .block_manager
-                        .try_send_kvcache(&self.running[idx], first_token)
-                    {
-                        Ok(success) => {
-                            crate::log_warn!(
-                                "PD Server: transferred KV cache for seq {} ({})",
+                    let success = kv_call(&self.kv, |r| KvMessage::TrySendKvcache(self.running[idx].clone(), first_token, r), false).await;
+                    crate::log_warn!(
+                        "PD Server: transferred KV cache for seq {} ({})",
+                        seq_id,
+                        if success { "success" } else { "faild" }
+                    );
+                    let seq = &mut self.running[idx];
+                    if success {
+                        let _ = kv_call(&self.kv, |r| KvMessage::CaptureMambaPrefix(seq.clone(), seq.len(), r), false).await;
+                        let _ = self.kv.send_message(KvMessage::CacheSequence(seq.clone()));
+                        seq.status = SequenceStatus::Cached;
+                        let cur_time = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .expect("Time went backwards")
+                            .as_millis()
+                            as usize;
+                        let time_costs = cur_time - seq.created_time();
+                        if time_costs / 100 > 0 && seq.len() > 0 {
+                            crate::log_info!(
+                                "PD Prefilling [seq_id {}]: {} tokens in {:.2}s ({:.2} tokens/s)",
                                 seq_id,
-                                if success { "success" } else { "faild" }
-                            );
-                            let seq = &mut self.running[idx];
-                            if success {
-                                let _ = self
-                                    .block_manager
-                                    .capture_mamba_prefix_state(seq, seq.len());
-                                self.block_manager.cache_sequence(seq);
-                                seq.status = SequenceStatus::Cached;
-                                let cur_time = SystemTime::now()
-                                    .duration_since(UNIX_EPOCH)
-                                    .expect("Time went backwards")
-                                    .as_millis()
-                                    as usize;
-                                let time_costs = cur_time - seq.created_time();
-                                if time_costs / 100 > 0 && seq.len() > 0 {
-                                    crate::log_info!(
-                                        "PD Prefilling [seq_id {}]: {} tokens in {:.2}s ({:.2} tokens/s)",
-                                        seq_id,
-                                        seq.len(),
-                                        time_costs as f32 / 1000f32,
-                                        seq.len() as f32 / (time_costs as f32 * 1.0f32 / 1000f32),
-                                    )
-                                }
-                            } else {
-                                seq.status = SequenceStatus::Finished;
-                                self.block_manager.deallocate(seq);
-                            }
+                                seq.len(),
+                                time_costs as f32 / 1000f32,
+                                seq.len() as f32 / (time_costs as f32 * 1.0f32 / 1000f32),
+                            )
                         }
-                        Err(e) => {
-                            crate::log_error!(
-                                "PD Server: failed to transfer KV cache for seq {}: {}",
-                                seq_id,
-                                e
-                            );
-                            let seq = &mut self.running[idx];
+                    } else {
                             seq.status = SequenceStatus::Finished;
-                            self.block_manager.deallocate(seq);
-                        }
+                            let _ = self.kv.send_message(KvMessage::Deallocate(seq.clone()));
                     }
                 }
                 continue;
@@ -602,13 +595,11 @@ impl Scheduler {
                         seq.append_token(token);
                         seq.is_tool_call_end = true;
                         seq.status = SequenceStatus::Finished;
-                        let _ = self
-                            .block_manager
-                            .capture_mamba_prefix_state(seq, seq.len());
-                        self.block_manager.cache_sequence(seq);
-                        self.block_manager.deallocate(seq);
+                        let _ = kv_call(&self.kv, |r| KvMessage::CaptureMambaPrefix(seq.clone(), seq.len(), r), false).await;
+                        let _ = self.kv.send_message(KvMessage::CacheSequence(seq.clone()));
+                        let _ = self.kv.send_message(KvMessage::Deallocate(seq.clone()));
                         break;
-                    }
+                }
                 }
 
                 let matched_stop_sequence_idx =
@@ -639,23 +630,24 @@ impl Scheduler {
                                 .and_then(|stops| stops.get(stop_idx))
                                 .cloned()
                         });
-                    }
+                }
                     seq.status = SequenceStatus::Finished;
-                    let _ = self
-                        .block_manager
-                        .capture_mamba_prefix_state(seq, seq.len());
-                    self.block_manager.cache_sequence(seq);
-                    self.block_manager.deallocate(seq);
-                    break;
+                    let _ = kv_call(&self.kv, |r| KvMessage::CaptureMambaPrefix(seq.clone(), seq.len(), r), false).await;
+                    let _ = self.kv.send_message(KvMessage::CacheSequence(seq.clone()));
+                    let _ = self.kv.send_message(KvMessage::Deallocate(seq.clone()));
+                break;
                 } else {
                     seq.append_token(token);
                     if seq.len() % self.cfg.block_size == 1 && seq.len() > 1 {
-                        let _ = self.block_manager.may_append(seq);
+                        match kv_call(&self.kv, |r| KvMessage::MayAppend(seq.clone(), r), Err("RPC failed".to_string())).await {
+                            Ok(updated) => { *seq = updated; }
+                            Err(e) => {
+                                crate::log_error!("may_append failed: {e}");
+                            }
+                        }
                     }
                     if seq.len() % self.cfg.block_size == 0 {
-                        let _ = self
-                            .block_manager
-                            .capture_mamba_prefix_state(seq, seq.len());
+                        let _ = kv_call(&self.kv, |r| KvMessage::CaptureMambaPrefix(seq.clone(), seq.len(), r), false).await;
                     }
                 }
             }
@@ -665,7 +657,7 @@ impl Scheduler {
     /// Pre-allocate KV cache blocks for MTP speculative tokens.
     /// Called before MTP runs to ensure the verification forward has room
     /// to write KV for speculative positions.
-    pub fn pre_allocate_mtp_blocks(&mut self, ids: &[usize], extra_tokens: usize) {
+pub async fn pre_allocate_mtp_blocks(&mut self, ids: &[usize], extra_tokens: usize) {
         for &idx in ids {
             if idx >= self.running.len() {
                 continue;
@@ -674,7 +666,7 @@ impl Scheduler {
             let needed_len = seq.len() + extra_tokens;
             let needed_blocks = needed_len.div_ceil(self.cfg.block_size);
             while seq.block_table.len() < needed_blocks {
-                if let Some(block_id) = self.block_manager.alloc_free_block() {
+                if let Some(block_id) = kv_call(&self.kv, |r| KvMessage::AllocFreeBlock(r), None).await {
                     seq.block_table.push(block_id as u32);
                 } else {
                     break;
@@ -683,7 +675,30 @@ impl Scheduler {
         }
     }
 
-    pub fn postprocess_speculative_extra(&mut self, ids: &[usize], extras: &[Vec<u32>]) {
+    /// The single-writer step view (the Option 5, the no write-after-snapshot): the Scheduler is
+    /// the sole writer of the block_table. This function does ALL the writes (the speculative
+    /// pre-alloc) + the freeze (the Sequence snapshot) in ONE atomic call. No caller can
+    /// interleave a write between the snapshot and the forward (the write + the freeze are one
+    /// function). The gate is the origin/main pattern (the speculative decode ENABLED + the
+    /// decode step, NOT the single-sequence check).
+    pub async fn prepare_step_view(&mut self, ids: &[usize], is_prefill: bool) -> Vec<Sequence> {
+        // The write (the speculative pre-alloc, the origin/main gate, the decode only).
+        if !is_prefill
+            && self.cfg.num_speculative_tokens.unwrap_or(0) > 0
+            && (crate::speculative::uses_builtin_mtp(&self.cfg)
+                || crate::speculative::uses_dflash(&self.cfg))
+        {
+            let spec_tokens = self.cfg.num_speculative_tokens.unwrap_or(0);
+            self.pre_allocate_mtp_blocks(ids, spec_tokens + 1).await;
+        }
+        // The freeze (the Sequence snapshot, AFTER the write).
+        self.get_sequences(ids)
+            .iter()
+            .map(|s| if is_prefill { s.clone_for_prefill_forward() } else { (*s).clone() })
+            .collect()
+    }
+
+pub async fn postprocess_speculative_extra(&mut self, ids: &[usize], extras: &[Vec<u32>]) {
         for (i, extra_tokens) in extras.iter().enumerate() {
             if i >= ids.len() {
                 break;
@@ -700,28 +715,32 @@ impl Scheduler {
                 if self.eos_token_id.contains(&tok) {
                     self.running[idx].append_token(tok);
                     self.running[idx].status = SequenceStatus::Finished;
-                    self.block_manager
-                        .capture_mamba_prefix_state(&self.running[idx], self.running[idx].len());
-                    self.block_manager.cache_sequence(&self.running[idx]);
-                    self.block_manager.deallocate(&mut self.running[idx]);
+                    let _ = kv_call(&self.kv, |r| KvMessage::CaptureMambaPrefix(self.running[idx].clone(), self.running[idx].len(), r), false).await;
+                    let _ = self.kv.send_message(KvMessage::CacheSequence(self.running[idx].clone()));
+                    let _ = self.kv.send_message(KvMessage::Deallocate(self.running[idx].clone()));
                     finished = true;
                     break;
                 }
                 self.running[idx].append_token(tok);
             }
             if !finished {
-                let _ = self.block_manager.ensure_allocate(&mut self.running[idx]);
+                match kv_call(&self.kv, |r| KvMessage::EnsureAllocate(self.running[idx].clone(), r), Err("RPC failed".to_string())).await {
+                    Ok(updated) => { self.running[idx] = updated; }
+                    Err(e) => {
+                        crate::log_error!("ensure_allocate failed: {e}");
+                    }
+                }
             }
         }
     }
 
-    pub fn clear_finished(&mut self) {
+    pub async fn clear_finished(&mut self) {
         let is_pd_server = self.is_pd_server();
         let mut finished_counts = Vec::new();
         for seq in &self.running {
             if seq.status == SequenceStatus::Finished {
                 if is_pd_server {
-                    self.print_free_blocks();
+                    self.print_free_blocks().await;
                 }
                 finished_counts.push((seq.id, seq.num_cached_tokens));
             }
@@ -740,43 +759,43 @@ impl Scheduler {
             .retain(|seq| seq.status != SequenceStatus::Finished);
     }
 
-    pub fn release_waitings(&mut self) -> Vec<usize> {
+    pub async fn release_waitings(&mut self) -> Vec<usize> {
         // Release all waiting sequences since there are no more resources (kv cache)
         let mut released_ids = Vec::with_capacity(self.waiting.len() + self.cached.len());
         for i in 0..self.waiting.len() {
             let seq = &mut self.waiting[i];
             released_ids.push(seq.id);
             seq.status = SequenceStatus::Finished;
-            self.block_manager.deallocate(seq);
+            let _ = self.kv.send_message(KvMessage::Deallocate(seq.clone()));
         }
         self.waiting.clear();
         for i in 0..self.cached.len() {
             let seq = &mut self.cached[i];
             released_ids.push(seq.id);
             seq.status = SequenceStatus::Finished;
-            self.block_manager.deallocate(seq);
+            let _ = self.kv.send_message(KvMessage::Deallocate(seq.clone()));
             // free gpu blocks and also free any CPU swap space
-            self.block_manager.free_cpu_swap_for_seq(seq.id);
+            let _ = self.kv.send_message(KvMessage::FreeCpuSwapForSeq(seq.id));
         }
         self.cached.clear();
-        self.block_manager.clear_prefix_cache();
+        let _ = self.kv.send_message(KvMessage::ClearPrefixCache);
         released_ids
     }
 
-    pub fn release_cache(&mut self, seq_id: usize) {
+    pub async fn release_cache(&mut self, seq_id: usize) {
         if let Some(pos) = self.cached.iter().position(|seq| seq.id == seq_id) {
             let mut seq = self.cached.remove(pos);
             // also free cpu swap
             if seq.status == SequenceStatus::Swapped || seq.status == SequenceStatus::FinishSwapped
             {
-                self.block_manager.free_cpu_swap_for_seq(seq_id);
+                let _ = self.kv.send_message(KvMessage::FreeCpuSwapForSeq(seq_id));
             }
             seq.status = SequenceStatus::Finished;
-            self.block_manager.deallocate(&seq);
+            let _ = self.kv.send_message(KvMessage::Deallocate(seq.clone()));
         }
     }
 
-    pub fn cancel(&mut self, seq_id: usize) {
+    pub async fn cancel(&mut self, seq_id: usize) {
         // A normal cancellation will release the runner slot itself. Do not
         // leave a scheduler-side release queued for the same sequence.
         self.pending_runner_releases.retain(|&id| id != seq_id);
@@ -785,7 +804,7 @@ impl Scheduler {
             if seq.id == seq_id {
                 crate::log_warn!("Seq {} - cancel requested (status {})", seq.id, seq.status);
                 seq.status = SequenceStatus::Finished;
-                self.block_manager.deallocate(seq);
+                let _ = self.kv.send_message(KvMessage::Deallocate(seq.clone()));
                 break;
             }
         }
@@ -802,7 +821,7 @@ impl Scheduler {
                 crate::log_warn!("Seq {} - cancel requested (status {})", seq.id, seq.status);
             }
             seq.status = SequenceStatus::Finished;
-            self.block_manager.deallocate(&seq);
+            let _ = self.kv.send_message(KvMessage::Deallocate(seq.clone()));
         }
         if let Some(pos) = self.transferred.iter().position(|seq| seq.id == seq_id) {
             let seq = self.transferred.remove(pos).unwrap();
@@ -810,14 +829,14 @@ impl Scheduler {
                 "Seq {} - cancel requested while awaiting PD transfer",
                 seq.id
             );
-            let _ = self.block_manager.try_release_remote_kvcache(seq.id);
+            let _ = kv_call(&self.kv, |r| KvMessage::TryReleaseRemoteKvcache(seq.id, r), false).await;
         }
-        self.release_cache(seq_id);
+        self.release_cache(seq_id).await;
         self.running.retain(|seq| seq.id != seq_id);
     }
 
     #[allow(non_snake_case)]
-    pub fn filter_prefill_finished(
+    pub async fn filter_prefill_finished(
         &mut self,
         scheduled_ids: &Vec<usize>,
     ) -> (Vec<usize>, Vec<usize>) {
@@ -831,17 +850,13 @@ impl Scheduler {
                 let seq = &self.running[*id];
                 let chunk_tokens = seq.prefill_chunk_tokens(chunk_size);
                 if chunk_tokens == 0 || seq.num_cached_tokens + chunk_tokens >= seq.len() {
-                    let _ = self
-                        .block_manager
-                        .capture_mamba_prefix_state(seq, seq.len());
+                    let _ = self.kv.call(|r| KvMessage::CaptureMambaPrefix(seq.clone(), seq.len(), r), None).await;
                     if seq.len() > chunk_size {
                         chunk_finished_info.push((seq.id, seq.len()));
                     }
                     finished_seqs.push((i, seq.id));
                 } else {
-                    let _ = self
-                        .block_manager
-                        .capture_mamba_prefix_state(seq, seq.num_cached_tokens + chunk_tokens);
+                    let _ = self.kv.call(|r| KvMessage::CaptureMambaPrefix(seq.clone(), seq.num_cached_tokens + chunk_tokens, r), None).await;
                     remove_ids.push(seq.id);
                     let mut seq = seq.clone();
                     seq.num_cached_tokens += chunk_tokens;
@@ -852,7 +867,7 @@ impl Scheduler {
                     seq.mamba_prefix_hash = None;
                     if seq.active_mamba_prefix_warmup_target().is_none() {
                         seq.clear_mamba_prefix_warmup();
-                    }
+                }
                     seq.status = SequenceStatus::Waiting;
                     chunked_info.push((
                         seq.id,
@@ -897,8 +912,8 @@ impl Scheduler {
         (indices, finished_indices)
     }
 
-    pub fn try_transfer(&mut self, seq: &mut Sequence) -> bool {
-        if !self.is_suitable_for_transfer(&seq) {
+    pub async fn try_transfer(&mut self, seq: &mut Sequence) -> bool {
+        if !self.is_suitable_for_transfer(&seq).await {
             return false;
         }
         let cur_time = SystemTime::now()
@@ -911,7 +926,8 @@ impl Scheduler {
                 return false;
             }
         }
-        if let Ok(success) = self.block_manager.try_transfer_prefill(&seq) {
+        let success = kv_call(&self.kv, |r| KvMessage::TryTransferPrefill(seq.clone(), r), false).await;
+        if success {
             // Client: Offload prefill request to PD server
             seq.swapped_time = Some(
                 SystemTime::now()
@@ -919,28 +935,24 @@ impl Scheduler {
                     .expect("Time went backwards")
                     .as_millis() as usize,
             );
-            if success {
-                crate::log_warn!(
-                    "Prefill request (Seq {}, {} tokens) transfered to PD server.",
-                    seq.id,
-                    seq.len(),
-                );
-                seq.pd_first_token = None;
-                self.transferred.push_back(seq.clone());
-            } else {
-                crate::log_warn!(
-                    "Unable transfer prefill request (Seq {}) to PD server. Retry later...",
-                    seq.id
-                );
-                self.waiting.push_front(seq.clone()); // push back, retry later
-            }
-            success
+            crate::log_warn!(
+                "Prefill request (Seq {}, {} tokens) transfered to PD server.",
+                seq.id,
+                seq.len(),
+            );
+            seq.pd_first_token = None;
+            self.transferred.push_back(seq.clone());
         } else {
-            false
+            crate::log_warn!(
+                "Unable transfer prefill request (Seq {}) to PD server. Retry later...",
+                seq.id
+            );
+            self.waiting.push_front(seq.clone()); // push back, retry later
         }
+        success
     }
 
-    pub fn try_swap_in(&mut self) {
+    pub async fn try_swap_in(&mut self) {
         let cur_time = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("Time went backwards")
@@ -955,12 +967,10 @@ impl Scheduler {
                 continue;
             }
 
-            let available_kvcache_tokens = self.get_available_kv_tokens();
-            let swap_in_required_tokens = self
-                .block_manager
-                .swap_in_required_blocks(&self.cached[i])
+            let available_kvcache_tokens = self.get_available_kv_tokens().await;
+            let swap_in_required_tokens = kv_call(&self.kv, |r| KvMessage::SwapInRequiredBlocks(self.cached[i].clone(), r), 0).await
                 .saturating_mul(self.cfg.block_size);
-            if !self.block_manager.can_swap_in(&self.cached[i])
+            if !kv_call(&self.kv, |r| KvMessage::CanSwapIn(self.cached[i].clone(), r), false).await
                 || (available_kvcache_tokens.saturating_sub(swap_in_required_tokens)
                     < MIN_KVCACHE_TOKENS_LEFT_FOR_SWAP)
             {
@@ -969,20 +979,16 @@ impl Scheduler {
                     continue;
                 }
 
-                let required_blocks = self
-                    .block_manager
-                    .swap_in_required_blocks(&self.cached[i])
+                let required_blocks = kv_call(&self.kv, |r| KvMessage::SwapInRequiredBlocks(self.cached[i].clone(), r), 0).await
                     .saturating_add(1);
-                let evicted = self
-                    .block_manager
-                    .evict_prefix_cache_until_free(required_blocks);
+                let evicted = kv_call(&self.kv, |r| KvMessage::EvictPrefixUntilFree(required_blocks, r), 0).await;
                 if evicted > 0 {
                     crate::log_warn!(
                         "Evicted {} prefix cache block(s) for swap-in Seq {}.",
                         evicted,
                         seq_id
                     );
-                    break;
+                break;
                 }
 
                 let seq_id = self.cached[i].id;
@@ -990,50 +996,53 @@ impl Scheduler {
                     "No KvCache left for swap in Seq {} — cancelling request.",
                     seq_id
                 );
-                self.cancel(seq_id);
+                self.cancel(seq_id).await;
                 break;
             }
 
             let mut seq = self.cached.remove(i);
             seq.swapped_time = Some(cur_time);
-            let partial_swap = self.block_manager.has_partial_cpu_swap(seq.id);
+            let partial_swap = kv_call(&self.kv, |r| KvMessage::HasPartialCpuSwap(seq.id, r), false).await;
             if !partial_swap {
                 seq.clear_block_table(); // reallocate block table since previous gpu blocks were freed
             }
 
-            if let Err(_) = self.block_manager.ensure_allocate(&mut seq) {
-                // Transient: GPU blocks may be available on the next schedule pass.
-                // Keep the swapped CPU KV and GDN slot so swap-in can retry.
-                if partial_swap {
-                    self.block_manager
-                        .rollback_partial_swap_in_allocation(&mut seq);
+            match kv_call(&self.kv, |r| KvMessage::EnsureAllocate(seq.clone(), r), Err("RPC failed".to_string())).await {
+                Ok(updated) => { seq = updated; }
+                Err(e) => {
+                    crate::log_error!("ensure_allocate failed: {e}");
+                    // Transient: GPU blocks may be available on the next schedule pass.
+                    // Keep the swapped CPU KV and GDN slot so swap-in can retry.
+                    if partial_swap {
+                        seq = kv_call(&self.kv, |r| KvMessage::RollbackPartialSwapInAllocation(seq.clone(), r), seq.clone()).await;
+                    }
+                    seq.status = SequenceStatus::Swapped;
+                    self.cached.push(seq);
+                    break;
                 }
-                seq.status = SequenceStatus::Swapped;
-                self.cached.push(seq);
-                break;
             }
 
             // Swap in data from CPU (if swapped out previously)
-            match self.block_manager.swap_in(&mut seq) {
-                Ok(_) => {
+            match kv_call(&self.kv, |r| KvMessage::SwapIn(seq.clone(), r), Err("RPC failed".to_string())).await {
+                Ok(updated) => {
+                    seq = updated;
                     seq.status = SequenceStatus::Running;
                     crate::log_warn!("Seq {} is swapped in for execution!", seq.id);
                 }
                 Err(e) => {
-                    crate::log_error!("Seq {} swap in failed: {:?}!", seq.id, e);
+                    crate::log_error!("Seq {} swap in failed: {e}", seq.id);
                     if partial_swap {
-                        self.block_manager
-                            .rollback_partial_swap_in_allocation(&mut seq);
+                        seq = kv_call(&self.kv, |r| KvMessage::RollbackPartialSwapInAllocation(seq.clone(), r), seq.clone()).await;
                     } else {
-                        self.block_manager.deallocate(&seq);
+                        let _ = self.kv.send_message(KvMessage::Deallocate(seq.clone()));
                         seq.clear_block_table();
                     }
-                    if self.block_manager.has_cpu_swap(seq.id) {
-                        // CPU swap data intact — retry on a later schedule pass.
+                    if kv_call(&self.kv, |r| KvMessage::HasCpuSwap(seq.id, r), false).await {
+                        // CPU swap data intact - retry on a later schedule pass.
                         seq.status = SequenceStatus::Swapped;
                         self.cached.push(seq);
                     } else {
-                        // CPU swap state lost — abort and release the GDN slot.
+                        // CPU swap state lost - abort and release the GDN slot.
                         self.request_runner_release(seq.id);
                     }
                     break;
@@ -1045,14 +1054,14 @@ impl Scheduler {
     }
 
     // swap out one sequence a time
-    pub fn try_swap_out(&mut self, idx: usize, is_running: bool) -> bool {
+    pub async fn try_swap_out(&mut self, idx: usize, is_running: bool) -> bool {
         if (cfg!(feature = "metal") || is_running && idx >= self.running.len())
             || (!is_running && idx >= self.cached.len())
         {
             return false;
         }
 
-        let mut seq = if is_running {
+        let seq = if is_running {
             &mut self.running[idx]
         } else {
             &mut self.cached[idx]
@@ -1062,18 +1071,23 @@ impl Scheduler {
         // If cannot swap, fallback.
         if !seq.block_table.is_empty()
             && (seq.status == SequenceStatus::Running || seq.status == SequenceStatus::Cached)
-            && self.block_manager.can_swap_out(&seq)
+            && kv_call(&self.kv, |r| KvMessage::CanSwapOut(seq.clone(), r), false).await
         {
-            let prefix_mode = self.block_manager.prefix_cache_enabled();
+            let prefix_mode = kv_call(&self.kv, |r| KvMessage::PrefixCacheEnabled(r), false).await;
             if !prefix_mode {
                 // make sure we have identical number of blocks when swapping in
                 // for decoding
-                if let Err(_) = self.block_manager.ensure_allocate(&mut seq) {
-                    return false;
+                match kv_call(&self.kv, |r| KvMessage::EnsureAllocate(seq.clone(), r), Err("RPC failed".to_string())).await {
+                    Ok(updated) => { *seq = updated; }
+                    Err(e) => {
+                        crate::log_error!("ensure_allocate failed: {e}");
+                        return false;
+                    }
                 }
             }
-            match self.block_manager.swap_out(&mut seq) {
-                Ok(_) => {
+            match kv_call(&self.kv, |r| KvMessage::SwapOut(seq.clone(), r), Err("RPC failed".to_string())).await {
+                Ok(updated) => {
+                    *seq = updated;
                     let mut seq = if is_running {
                         self.running.remove(idx)
                     } else {
@@ -1088,28 +1102,28 @@ impl Scheduler {
                     }
                     // seq.num_cached_tokens = seq.len();
                     if !prefix_mode {
-                        self.block_manager.deallocate(&seq);
+                        let _ = self.kv.send_message(KvMessage::Deallocate(seq.clone()));
                     }
                     // block table need to be reallocated when swapping in
                     self.cached.push(seq.clone());
                     return true;
                 }
                 Err(e) => {
-                    crate::log_warn!("Swap out failed for seq {}: {:?}", seq.id, e);
+                    crate::log_warn!("Swap out failed for seq {}: {e}", seq.id);
                 }
             }
         }
         return false;
     }
 
-    pub fn try_swap_out_by_id(&mut self, seq_id: usize, is_running: bool) -> bool {
+    pub async fn try_swap_out_by_id(&mut self, seq_id: usize, is_running: bool) -> bool {
         if is_running {
             if let Some(pos) = self.running.iter().position(|seq| seq.id == seq_id) {
-                return self.try_swap_out(pos, true);
+                return self.try_swap_out(pos, true).await;
             }
         } else {
             if let Some(pos) = self.cached.iter().position(|seq| seq.id == seq_id) {
-                return self.try_swap_out(pos, false);
+                return self.try_swap_out(pos, false).await;
             }
         }
         false
@@ -1127,7 +1141,7 @@ impl Scheduler {
         }
     }
 
-    pub fn is_suitable_for_transfer(&mut self, seq: &Sequence) -> bool {
+    pub async fn is_suitable_for_transfer(&mut self, seq: &Sequence) -> bool {
         if seq.status == SequenceStatus::Swapped // swapped out sequence
             || seq.status == SequenceStatus::FinishSwapped // swapped out and finished sequence
             || seq.len() < PD_PREFILL_TRANSFER_NUM_TOKEN_THRESHOLD
@@ -1137,7 +1151,7 @@ impl Scheduler {
         }
 
         // Check prefix cache: if most tokens are already cached, do local prefill
-        let cached_tokens = self.block_manager.get_prefix_cache_match_tokens(seq);
+        let cached_tokens = kv_call(&self.kv, |r| KvMessage::GetPrefixCacheMatchTokens(seq.clone(), r), 0).await;
         let new_tokens = seq.len().saturating_sub(cached_tokens);
         if cached_tokens > 0 && new_tokens < PD_LOCAL_PREFILL_NEW_TOKEN_THRESHOLD {
             crate::log_info!(
@@ -1153,7 +1167,7 @@ impl Scheduler {
     }
 
     /// Client: Check for finished prefills and move them to the running queue.
-    pub fn try_receive_kvcache(&mut self) -> Result<()> {
+pub async fn try_receive_kvcache(&mut self) -> Result<()> {
         let mut finished_seq_ids = Vec::new();
         let cur_time = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1168,19 +1182,15 @@ impl Scheduler {
             }
 
             self.transferred[idx].swapped_time = Some(cur_time);
-            let status = self.block_manager.try_check_prefill_status(seq_id);
-            if status.is_err() || !status.unwrap_or(false) {
+            let status = kv_call(&self.kv, |r| KvMessage::TryCheckPrefillStatus(seq_id, r), false).await;
+            if !status {
                 continue;
             }
             // We have the data. Can we allocate space for it?
-            if !self
-                .block_manager
-                .can_allocate_without_prefix(&self.transferred[idx])
+            if !kv_call(&self.kv, |r| KvMessage::CanAllocateWithoutPrefix(self.transferred[idx].clone(), r), false).await
             {
                 // Not enough memory right now. Put data back and try later.
-                let evicted = self
-                    .block_manager
-                    .evict_prefix_cache_until_free(self.transferred[idx].num_blocks());
+                let evicted = kv_call(&self.kv, |r| KvMessage::EvictPrefixUntilFree(self.transferred[idx].num_blocks(), r), 0).await;
                 if evicted > 0 {
                     crate::log_warn!(
                         "Evicted {} prefix cache block(s) for Seq {} KvCache receiving!",
@@ -1199,65 +1209,59 @@ impl Scheduler {
             }
 
             // Allocate GPU blocks for the sequence
-            self.block_manager
-                .allocate_without_prefix(&mut self.transferred[idx])?;
+            match kv_call(&self.kv, |r| KvMessage::AllocateWithoutPrefix(self.transferred[idx].clone(), r), Err("RPC failed".to_string())).await {
+                Ok(updated) => { self.transferred[idx] = updated; }
+                Err(e) => {
+                    crate::log_error!("allocate_without_prefix failed: {e}");
+                    break;
+                }
+            }
 
             // Perform the actual KV cache data transfer
-            let mut success = false;
-            match self
-                .block_manager
-                .try_receive_kvcache(&self.transferred[idx])
+            let (ret, first_token, sending_time, num_cached_tokens) = kv_call(&self.kv, |r| KvMessage::TryReceiveKvcache(self.transferred[idx].clone(), r), (false, 0, 0, 0)).await;
+            let success = ret;
             {
-                Ok((ret, first_token, sending_time, num_cached_tokens)) => {
-                    let seq = &mut self.transferred[idx];
-                    success = ret;
-                    if success {
-                        seq.num_cached_tokens = num_cached_tokens;
-                        // Update sequence and move to running
-                        // The first token is generated on PD server,
-                        // it has been transfered to client, but haven't been send to user
-                        seq.append_token(first_token);
-                        seq.pd_first_token = Some(first_token);
-                        seq.status = SequenceStatus::Running;
-                        self.running.push(seq.clone());
-                        let now = SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .expect("Time went backwards")
-                            .as_millis() as usize;
-                        let transfer_duration = now - sending_time;
+                let seq = &mut self.transferred[idx];
+                if success {
+                    seq.num_cached_tokens = num_cached_tokens;
+                    // Update sequence and move to running
+                    // The first token is generated on PD server,
+                    // it has been transfered to client, but haven't been send to user
+                    seq.append_token(first_token);
+                    seq.pd_first_token = Some(first_token);
+                    seq.status = SequenceStatus::Running;
+                    self.running.push(seq.clone());
+                    let now = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .expect("Time went backwards")
+                        .as_millis() as usize;
+                    let transfer_duration = now - sending_time;
 
-                        if transfer_duration > 10000 {
-                            // Log a warning when a sequence takes an unusually long time to receive and swap-in.
-                            // Possible causes: insufficient KV cache on server or client, or low communication bandwidth.
-                            crate::log_warn!(
-                                "KvCache Transfer: Seq {} prefill finished, but receive (with swap-in) time was unexpectedly long ({} s).",
-                                seq.id,
-                                transfer_duration / 1000
-                            );
-                        } else {
-                            crate::log_info!(
-                                "KvCache Transfer: Seq {} prefill finished and received in {} ms!",
-                                seq.id,
-                                transfer_duration
-                            );
-                        };
-
-                        // Since KVCache Transfer involved here, the prefill speed might not accurate
-                        // since receive remote kvcache requires sufficient local cache memory (sometime pending for kvcache)
-                        // The actual prefill speed need to exclude the transfer time, for simplicity we didn't do that
-
-                        self.block_manager.try_release_remote_kvcache(seq.id)?;
-                    } else {
-                        crate::log_error!(
-                            "KvCache Transfer: Seq {} prefill finished but failed to receive. Aborting seq.",
+                    if transfer_duration > 10000 {
+                        // Log a warning when a sequence takes an unusually long time to receive and swap-in.
+                        // Possible causes: insufficient KV cache on server or client, or low communication bandwidth.
+                        crate::log_warn!(
+                            "KvCache Transfer: Seq {} prefill finished, but receive (with swap-in) time was unexpectedly long ({} s).",
                             seq.id,
+                            transfer_duration / 1000
                         );
-                    }
-                }
-                Err(e) => {
+                    } else {
+                        crate::log_info!(
+                            "KvCache Transfer: Seq {} prefill finished and received in {} ms!",
+                            seq.id,
+                            transfer_duration
+                        );
+                    };
+
+                    // Since KVCache Transfer involved here, the prefill speed might not accurate
+                    // since receive remote kvcache requires sufficient local cache memory (sometime pending for kvcache)
+                    // The actual prefill speed need to exclude the transfer time, for simplicity we didn't do that
+
+                    let _ = kv_call(&self.kv, |r| KvMessage::TryReleaseRemoteKvcache(seq.id, r), false).await;
+                } else {
                     crate::log_error!(
-                        "KvCache Transfer: Failed to receive KV cache for seq {}: {}. Aborting seq.",
-                        seq_id, e
+                        "KvCache Transfer: Seq {} prefill finished but failed to receive. Aborting seq.",
+                        seq.id,
                     );
                 }
             }
@@ -1276,8 +1280,10 @@ impl Scheduler {
         Ok(())
     }
 
-    pub fn get_num_cached_tokens(&self) -> usize {
-        self.block_manager.prefix_cache_blocks() * self.block_manager.get_block_size()
+    pub async fn get_num_cached_tokens(&self) -> usize {
+        let cached_blocks = kv_call(&self.kv, |r| KvMessage::PrefixCacheBlocks(r), 0).await;
+        let block_size = kv_call(&self.kv, |r| KvMessage::BlockSize(r), 0).await;
+        cached_blocks * block_size
     }
 
     /// Per-seq prefix-cache hit count for response finalization. Falls back
@@ -1304,36 +1310,37 @@ impl Scheduler {
         }
     }
 
-    pub fn evict_prefix_cache_until_free(&mut self, min_free_blocks: usize) -> usize {
-        self.block_manager
-            .evict_prefix_cache_until_free(min_free_blocks)
+    pub async fn evict_prefix_until_free(&mut self, min_free_blocks: usize) -> usize {
+        kv_call(&self.kv, |r| KvMessage::EvictPrefixUntilFree(min_free_blocks, r), 0).await
     }
 
-    pub fn evict_prefix_cache_blocks(&mut self, blocks: usize) -> usize {
-        self.block_manager.evict_prefix_cache_blocks(blocks)
+    pub async fn evict_prefix_cache_blocks(&mut self, blocks: usize) -> usize {
+        kv_call(&self.kv, |r| KvMessage::EvictPrefixBlocks(blocks, r), 0).await
     }
 
-    fn evict_prefix_cache_under_pressure(&mut self) -> usize {
-        let cached_blocks = self.block_manager.prefix_cache_blocks();
+    async fn evict_prefix_cache_under_pressure(&mut self) -> usize {
+        let cached_blocks = kv_call(&self.kv, |r| KvMessage::PrefixCacheBlocks(r), 0).await;
         if cached_blocks == 0 {
             return 0;
         }
         let blocks = ((cached_blocks as f32) * PREFIX_CACHE_PRESSURE_EVICT_PERCENT).ceil() as usize;
         let blocks = blocks.max(1);
-        self.block_manager.evict_prefix_cache_blocks(blocks)
+        kv_call(&self.kv, |r| KvMessage::EvictPrefixBlocks(blocks, r), 0).await
     }
 
-    pub fn get_available_kv_tokens(&self) -> usize {
-        let free_blocks = self.block_manager.get_num_free_blocks();
-        free_blocks * self.block_manager.get_block_size()
+    pub async fn get_available_kv_tokens(&self) -> usize {
+        let free_blocks = kv_call(&self.kv, |r| KvMessage::FreeBlocks(r), 0).await;
+        let block_size = kv_call(&self.kv, |r| KvMessage::BlockSize(r), 0).await;
+        free_blocks * block_size
     }
 
-    pub fn get_total_kv_tokens(&self) -> usize {
-        let total_blocks = self.block_manager.get_num_total_blocks();
-        total_blocks * self.block_manager.get_block_size()
+    pub async fn get_total_kv_tokens(&self) -> usize {
+        let total_blocks = kv_call(&self.kv, |r| KvMessage::TotalBlocks(r), 0).await;
+        let block_size = kv_call(&self.kv, |r| KvMessage::BlockSize(r), 0).await;
+        total_blocks * block_size
     }
 
-    pub fn get_cpu_swap_usage(&self) -> (f32, f32) {
+    pub async fn get_cpu_swap_usage(&self) -> (f32, f32) {
         const SIZE_IN_GB: usize = 1024 * 1024 * 1024;
         let kvcache_memory_gb = self.cfg.kvcache_memory_bytes as f32 / SIZE_IN_GB as f32;
         if cfg!(feature = "metal") {
@@ -1341,37 +1348,40 @@ impl Scheduler {
             (0f32, 0f32)
         } else {
             let cpu_kvcache_memory_gb = kvcache_memory_gb * self.cfg.cpu_mem_fold.unwrap_or(0.5f32);
+            let usage = kv_call(&self.kv, |r| KvMessage::CpuSwapUsage(r), 0.0).await;
             (
-                self.block_manager.get_cpu_swap_usage() * cpu_kvcache_memory_gb,
+                usage * cpu_kvcache_memory_gb,
                 cpu_kvcache_memory_gb,
             )
         }
     }
 
-    pub fn print_free_blocks(&self) {
+    pub async fn print_free_blocks(&self) {
         const SIZE_IN_GB: usize = 1024 * 1024 * 1024;
-        let total_blocks = self.block_manager.get_num_total_blocks();
-        let free_blocks = self.block_manager.get_num_free_blocks();
+        let total_blocks = kv_call(&self.kv, |r| KvMessage::TotalBlocks(r), 0).await;
+        let free_blocks = kv_call(&self.kv, |r| KvMessage::FreeBlocks(r), 0).await;
         let used_percent =
             100.0f32 - (free_blocks as f32 * 1.0f32 / total_blocks as f32) * 100.0f32;
         let kvcache_memory_gb = self.cfg.kvcache_memory_bytes as f32 / SIZE_IN_GB as f32;
         #[cfg(feature = "cuda")]
         let cpu_swap_log = {
             let cpu_kvcache_memory_gb = kvcache_memory_gb * self.cfg.cpu_mem_fold.unwrap_or(0.5f32);
+            let cpu_swap_usage = kv_call(&self.kv, |r| KvMessage::CpuSwapUsage(r), 0.0).await;
             format!(
                 "CPU swap used {:.1}% ({:.2}GB/{:.2}GB)",
-                self.block_manager.get_cpu_swap_usage() * 100.0f32,
-                self.block_manager.get_cpu_swap_usage() * cpu_kvcache_memory_gb,
+                cpu_swap_usage * 100.0f32,
+                cpu_swap_usage * cpu_kvcache_memory_gb,
                 cpu_kvcache_memory_gb,
             )
         };
         #[cfg(not(feature = "cuda"))]
         let cpu_swap_log = "".to_string();
 
+        let block_size = kv_call(&self.kv, |r| KvMessage::BlockSize(r), 0).await;
         crate::log_info!(
             "GPU Kvcache: {} blocks ({} tokens) free, used {:.1}% ({:.2}GB/{:.2}GB); {}",
             free_blocks,
-            free_blocks * self.block_manager.get_block_size(),
+            free_blocks * block_size,
             used_percent,
             used_percent / 100.0f32 * kvcache_memory_gb,
             kvcache_memory_gb,
@@ -1401,9 +1411,9 @@ impl Scheduler {
         }
     }
 
-    pub fn kv_cache_usage_percent(&self) -> f32 {
-        let total_blocks = self.block_manager.get_num_total_blocks();
-        let free_blocks = self.block_manager.get_num_free_blocks();
+    pub async fn kv_cache_usage_percent(&self) -> f32 {
+        let total_blocks = kv_call(&self.kv, |r| KvMessage::TotalBlocks(r), 0).await;
+        let free_blocks = kv_call(&self.kv, |r| KvMessage::FreeBlocks(r), 0).await;
         1.0f32 - (free_blocks as f32 * 1.0f32 / total_blocks as f32)
     }
 
@@ -1447,7 +1457,7 @@ impl Scheduler {
                 if let Ok(decoded) = tokenizer.decode(&temp_output, true) {
                     if self.tool_call_regex.is_match(&decoded) {
                         return true;
-                    }
+                }
                 }
             }
         }

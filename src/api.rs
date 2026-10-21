@@ -6,7 +6,6 @@ use crate::utils::chat_template::Message;
 use crate::utils::config::{EngineConfig, SamplingParams};
 use crate::utils::get_dtype;
 use candle_core::{DType, Result};
-use parking_lot::RwLock;
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -180,13 +179,13 @@ impl EngineBuilder {
         let dtype = self.dtype.clone().map(dtype_to_str);
         let dtype = get_dtype(dtype);
 
-        let engine = LLMEngine::new(&econfig, dtype)?;
+        let engine = crate::core::engine::GLOBAL_RT.block_on(LLMEngine::new(&econfig, dtype))?;
         Ok(Engine { engine, econfig })
     }
 }
 
 pub struct Engine {
-    engine: Arc<RwLock<LLMEngine>>,
+    engine: Arc<LLMEngine>,
     econfig: EngineConfig,
 }
 
@@ -211,7 +210,7 @@ impl Engine {
         messages: Vec<ChatMessage>,
         tools: Vec<Tool>,
     ) -> Result<GenerationOutput> {
-        let img_cfg = { self.engine.read().img_cfg.clone() };
+        let img_cfg = self.engine.img_cfg.clone();
         let (messages, image_data) = build_messages_and_images(&messages, img_cfg.as_ref())?;
         self.generate_messages(params, messages, image_data, tools)
     }
@@ -224,7 +223,7 @@ impl Engine {
         tools: Vec<Tool>,
     ) -> Result<GenerationOutput> {
         let (preprocessed, tokenizer) = {
-            let engine = self.engine.read();
+            let engine = self.engine.as_ref();
             (
                 engine.preprocess(
                     std::slice::from_ref(&params),
@@ -235,10 +234,10 @@ impl Engine {
                 Arc::new(engine.tokenizer.clone()),
             )
         };
-        let receivers = {
-            let mut engine = self.engine.write();
-            engine.generate_sync(preprocessed, images, &None)?
-        };
+        let receivers = GLOBAL_RT.block_on(async {
+            let engine = self.engine.as_ref();
+            engine.generate_sync(preprocessed, images, &None).await
+        })?;
 
         let results = GLOBAL_RT.block_on(async {
             LLMEngine::collect_sync_results(receivers, tokenizer, None).await
@@ -258,11 +257,11 @@ impl Engine {
         messages: Vec<ChatMessage>,
         tools: Vec<Tool>,
     ) -> Result<EngineStream> {
-        let img_cfg = { self.engine.read().img_cfg.clone() };
+        let img_cfg = self.engine.img_cfg.clone();
         let (messages, image_data) = build_messages_and_images(&messages, img_cfg.as_ref())?;
 
         let preprocessed = {
-            let engine = self.engine.read();
+            let engine = self.engine.as_ref();
             let mut p = engine.preprocess(
                 std::slice::from_ref(&params),
                 std::slice::from_ref(&messages),
@@ -271,10 +270,10 @@ impl Engine {
             )?;
             p.pop().expect("preprocess returned 0 items for 1 input")
         };
-        let (seq_id, prompt_length, _prefilled_reasoning_end, stream) = {
-            let mut engine = self.engine.write();
-            engine.generate_stream(preprocessed, image_data, &None)?
-        };
+        let (seq_id, prompt_length, _prefilled_reasoning_end, stream) = GLOBAL_RT.block_on(async {
+            let engine = self.engine.as_ref();
+            engine.generate_stream(preprocessed, image_data, &None).await
+        })?;
 
         Ok(EngineStream {
             engine: self.engine.clone(),
@@ -287,18 +286,20 @@ impl Engine {
     }
 
     pub fn get_num_cached_tokens(&self) -> usize {
-        let engine = self.engine.read();
-        engine.get_num_cached_tokens()
+        GLOBAL_RT.block_on(async {
+            self.engine.get_num_cached_tokens().await
+        })
     }
 
     pub fn get_available_kv_tokens(&self) -> usize {
-        let engine = self.engine.read();
-        engine.get_available_kv_tokens()
+        GLOBAL_RT.block_on(async {
+            self.engine.get_available_kv_tokens().await
+        })
     }
 }
 
 pub struct EngineStream {
-    engine: Arc<RwLock<LLMEngine>>,
+    engine: Arc<LLMEngine>,
     rx: mpsc::Receiver<StreamItem>,
     finished: bool,
     pub seq_id: usize,
@@ -309,8 +310,7 @@ pub struct EngineStream {
 impl EngineStream {
     pub fn cancel(&mut self) {
         self.cancelled = true;
-        let mut engine_guard = self.engine.write();
-        engine_guard.cancel(self.seq_id);
+        self.engine.cancel(self.seq_id);
     }
 
     pub async fn recv(&mut self) -> Option<StreamItem> {
