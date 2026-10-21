@@ -14,6 +14,7 @@ use super::{
     Usage, UsageQuery, UsageResponse,
 };
 use crate::core::engine::{LLMEngine, StreamItem};
+use crate::core::lora::global_registry;
 use crate::server::parser::{BufferedFinalizeResult, StreamResult, StreamToolParser};
 use crate::tools::helpers::{
     build_invalid_tool_call_feedback, build_tool_schema_map, filter_tool_calls, log_tool_calls,
@@ -26,6 +27,7 @@ use crate::utils::guidance_grammar::{
     GrammarRequestDispatcher,
 };
 use axum::extract::{Json, Query, State};
+use axum::http::StatusCode;
 use axum::response::{sse::KeepAlive, Sse};
 use base64::Engine;
 use std::collections::HashSet;
@@ -400,6 +402,71 @@ pub async fn chat_completion(
     params.session_id = request.session_id.clone();
     params.thinking = request.thinking.clone();
     params.stop_sequences = request.stop.clone();
+    // LoRA adapter selection (the request `model` field). The
+    // `model` is the `base:adapter` composite (the `/v1/models` listing form).
+    // The left of the `:` is the base model id (validated against the exposed
+    // model); the right is the adapter name (the `lora_tenant`). The there is
+    // no `:` (the bare base id), there is no adapter (the base model). When the
+    // adapter is unknown + the `allow_base_fallback` is set, the base model is
+    // used (no 404); otherwise the unknown adapter is a 404.
+    //
+    // Stacking: the right of the `:` may be a `+`-separated list of adapters
+    // (e.g. `base:style+domain`). All listed adapters are composed additively:
+    // `base + sum_j scaling_j * (x @ A_j) @ B_j`. A single adapter (no `+`) is
+    // the prior behavior.
+    let exposed_id = super::resolve_engine_model_id(&data.econfig)
+        .unwrap_or_else(|| "default".to_string());
+    let (base_id, adapter_names) = match request.model.as_ref().and_then(|m| m.split_once(':')) {
+        Some((base, adapters)) => {
+            let names: Vec<String> = adapters
+                .split('+')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            (base.to_string(), Some(names))
+        }
+        None => (
+            request.model.clone().unwrap_or(exposed_id.clone()),
+            None,
+        ),
+    };
+    if let Some(names) = &adapter_names {
+        // Validate the base matches the exposed model (no cross-model routing).
+        if !base_id.is_empty() && base_id != exposed_id {
+            return ChatResponder::ValidationError(
+                format!("unknown base model '{base_id}' (the exposed model is '{exposed_id}')"),
+            );
+        }
+        // Validate each adapter is known (no unknown adapter).
+        let all_known = names
+            .iter()
+            .all(|n| data.econfig.lora.adapters.iter().any(|(name, _)| name == n));
+        if all_known {
+            // The single-adapter fast path keeps the prior `lora_tenant` field;
+            // the multi-adapter path uses the `lora_tenants` stack.
+            if names.len() == 1 {
+                params.lora_tenant = Some(names[0].clone());
+            } else {
+                params.lora_tenants = names.clone();
+            }
+            let session = request.session_id.as_deref().unwrap_or("-");
+            crate::log_info!(
+                "[LoRA] model={model_id} adapters={names:?} session={session} tenant set"
+            );
+        } else if data.econfig.lora.allow_base_fallback {
+            crate::log_warn!(
+                "[LoRA] model={model_id} unknown adapter(s) {names:?}, falling back to base model (allow_base_fallback)"
+            );
+            // No tenant (the base model, not the unknown adapter).
+        } else {
+            return ChatResponder::ValidationError(
+                format!(
+                    "unknown LoRA adapter(s) {names:?} (the loaded adapters: {:?})",
+                    data.econfig.lora.adapters.iter().map(|(n, _)| n).collect::<Vec<_>>()
+                ),
+            );
+        }
+    }
     // `reasoning_effort` is the control sent by the built-in UI and by
     // OpenAI-compatible clients.  Preserve an explicit `none`: dropping it
     // would make the engine fall back to its reasoning-enabled default.
@@ -1595,6 +1662,116 @@ pub async fn get_usage(
         total_swap_memory: stats.total_swap_memory,
         session_status: stats.session_status,
     })
+}
+
+/// The request body for the `/v1/lora/load` endpoint (the hot adapter
+/// load). The `name` is the tenant key, the `source` is the HF id or local dir
+/// (the model loader resolves it).
+#[derive(serde::Deserialize)]
+pub struct LoraLoadRequest {
+    pub name: String,
+    pub source: String,
+}
+
+/// The request body for the `/v1/lora/unload` endpoint (the hot
+/// adapter unload). The `name` is the tenant key.
+#[derive(serde::Deserialize)]
+pub struct LoraUnloadRequest {
+    pub name: String,
+}
+
+/// The `/v1/lora` endpoint (the adapter list RPC): list the
+/// loaded LoRA adapters (the tenant names + the resident byte count). The
+/// operator sees what is loaded + the memory usage.
+pub async fn list_lora_adapters(
+    State(state): State<Arc<ServerData>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let registry = global_registry();
+    let data = match registry {
+        Some(reg) => {
+            let reg = reg.lock().unwrap_or_else(|e| e.into_inner());
+            serde_json::json!({
+                "object": "list",
+                "data": reg.tenant_names().iter().map(|t| serde_json::json!({
+                    "name": t,
+                    "resident_bytes": reg.tenant_bytes(t),
+                })).collect::<Vec<_>>(),
+                "total_tenants": reg.tenant_count(),
+                "resident_bytes": reg.resident_bytes(),
+                "max_tenants": reg.max_tenants(),
+                "max_bytes": reg.max_bytes(),
+            })
+        }
+        None => serde_json::json!({
+            "object": "list",
+            "data": [],
+            "total_tenants": 0,
+            "note": "no LoRA registry (the --lora not configured)"
+        }),
+    };
+    let _ = state; // the state is unused (the registry is process-wide)
+    Ok(Json(data))
+}
+
+/// The `/v1/lora/load` endpoint (the hot adapter load): load a new
+/// adapter at runtime (no restart). The `name` is the tenant key, the
+/// `source` is the HF id or local dir. The adapter is loaded into the global
+/// registry (the on-demand load).
+pub async fn load_lora_adapter(
+    State(_state): State<Arc<ServerData>>,
+    Json(request): Json<LoraLoadRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let Some(registry) = global_registry() else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "no LoRA registry (the --lora not configured)"})),
+        ));
+    };
+    let mut reg = registry.lock().unwrap_or_else(|e| e.into_inner());
+    // Register the source (the on-demand load input) + load the adapter.
+    // The device/dtype are the registry's stored values (set at startup via
+    // with_device, the model's compute device + dtype).
+    reg.add_source(&request.name, &request.source);
+    match reg.ensure_loaded(&request.name) {
+        Ok(()) => {
+            Ok(Json(serde_json::json!({
+                "status": "loaded",
+                "name": request.name,
+                "source": request.source,
+            })))
+        }
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("failed to load LoRA adapter: {e}") })),
+        )),
+    }
+}
+
+/// The `/v1/lora/unload` endpoint (the hot adapter unload): unload an
+/// adapter at runtime (no restart). The `name` is the tenant key. The
+/// adapter's weights are freed (the GPU memory released).
+pub async fn unload_lora_adapter(
+    State(_state): State<Arc<ServerData>>,
+    Json(request): Json<LoraUnloadRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let Some(registry) = global_registry() else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "no LoRA registry (the --lora not configured)"})),
+        ));
+    };
+    let mut reg = registry.lock().unwrap_or_else(|e| e.into_inner());
+    if reg.unregister(&request.name) {
+        Ok(Json(serde_json::json!({
+            "status": "unloaded",
+            "name": request.name,
+        })))
+    } else {
+        Err((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": format!("LoRA adapter '{}' not found", request.name)})),
+        ))
+    }
 }
 
 #[utoipa::path(

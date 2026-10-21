@@ -176,7 +176,8 @@ impl GatedDeltaNet {
             &qc_qkvz,
             &q_qkvz,
             dtype,
-        );
+        )
+        .map(|l| l.with_lora_module(format!("{}.in_proj_qkvz", vb.module_path())));
 
         let vb_ba = vb.pp("in_proj_ba");
         let (qc_ba, q_ba) = Self::resolve_quant_for_weight(&vb_ba, &quantization_config, &quant);
@@ -189,7 +190,8 @@ impl GatedDeltaNet {
             &qc_ba,
             &q_ba,
             dtype,
-        );
+        )
+        .map(|l| l.with_lora_module(format!("{}.in_proj_ba", vb.module_path())));
 
         match (fused_qkvz, fused_ba) {
             (Ok(in_proj_qkvz), Ok(in_proj_ba)) => {
@@ -226,6 +228,7 @@ impl GatedDeltaNet {
                     )
                 },
             )
+            .map(|l| l.with_lora_module(format!("{}.in_proj_z", vb.module_path())))
         } else {
             let vb_z = vb.pp(projection_key_map["in_proj_z"]);
             let (qc_z, q_z) = Self::resolve_quant_for_weight(&vb_z, &quantization_config, &quant);
@@ -239,6 +242,7 @@ impl GatedDeltaNet {
                 &q_z,
                 dtype,
             )
+            .map(|l| l.with_lora_module(format!("{}.in_proj_z", vb.module_path())))
         };
 
         let split_b = if vb.is_qvar_builder() && num_k_heads_global != num_v_heads_global {
@@ -251,6 +255,7 @@ impl GatedDeltaNet {
                 DType::F32,
                 |w| undo_tiled_v_heads_first_dim(&w, num_k_heads_global, num_v_heads_global, 1),
             )
+            .map(|l| l.with_lora_module(format!("{}.in_proj_b", vb.module_path())))
         } else {
             let vb_b = vb.pp(projection_key_map["in_proj_b"]);
             let (qc_b, q_b) = Self::resolve_quant_for_weight(&vb_b, &quantization_config, &quant);
@@ -264,6 +269,7 @@ impl GatedDeltaNet {
                 &q_b,
                 dtype,
             )
+            .map(|l| l.with_lora_module(format!("{}.in_proj_b", vb.module_path())))
         };
         let split_a = if vb.is_qvar_builder() && num_k_heads_global != num_v_heads_global {
             load_restored_gguf_column_linear(
@@ -275,6 +281,7 @@ impl GatedDeltaNet {
                 DType::F32,
                 |w| undo_tiled_v_heads_first_dim(&w, num_k_heads_global, num_v_heads_global, 1),
             )
+            .map(|l| l.with_lora_module(format!("{}.in_proj_a", vb.module_path())))
         } else {
             let vb_a = vb.pp(projection_key_map["in_proj_a"]);
             let (qc_a, q_a) = Self::resolve_quant_for_weight(&vb_a, &quantization_config, &quant);
@@ -288,6 +295,7 @@ impl GatedDeltaNet {
                 &q_a,
                 dtype,
             )
+            .map(|l| l.with_lora_module(format!("{}.in_proj_a", vb.module_path())))
         };
 
         match (split_z, split_b, split_a) {
@@ -310,6 +318,7 @@ impl GatedDeltaNet {
                             comm.clone(),
                             DType::F32,
                         )
+                        .map(|l| l.with_lora_module(format!("{}.in_proj_qkv", vb.module_path())))
                     } else {
                         let vb_qkv = vb.pp(projection_key_map["in_proj_qkv"]);
                         let (qc_qkv, q_qkv) =
@@ -326,6 +335,7 @@ impl GatedDeltaNet {
                             &q_qkv,
                             dtype,
                         )
+                        .map(|l| l.with_lora_module(format!("{}.in_proj_qkv", vb.module_path())))
                     };
 
                     match split_qkv_merged {
@@ -368,6 +378,7 @@ impl GatedDeltaNet {
                                 )
                             },
                         )
+                        .map(|l| l.with_lora_module(format!("{}.in_proj_qkv", vb.module_path())))
                     } else {
                         let vb_qkv = vb.pp(projection_key_map["in_proj_qkv"]);
                         let (qc_qkv, q_qkv) =
@@ -382,6 +393,7 @@ impl GatedDeltaNet {
                             &q_qkv,
                             dtype,
                         )
+                        .map(|l| l.with_lora_module(format!("{}.in_proj_qkv", vb.module_path())))
                     };
 
                 if let Ok(in_proj_qkv) = split_qkv_legacy {
@@ -690,6 +702,7 @@ impl GatedDeltaNet {
                     )
                 },
             )?
+            .with_lora_module(format!("{}.out_proj", vb.module_path()))
         } else {
             let vb_out = vb.pp(gdn_key_map["out_proj"]);
             let (qc_out, q_out) = if is_quantized {
@@ -706,6 +719,7 @@ impl GatedDeltaNet {
                 &q_out,
                 dtype,
             )?
+            .with_lora_module(format!("{}.out_proj", vb.module_path()))
         };
 
         // GDN output norm (gated RMSNorm): both Qwen3.5 and Qwen3Next use per-head params.

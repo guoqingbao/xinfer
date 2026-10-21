@@ -551,6 +551,189 @@ impl Downloader {
         })
     }
 
+    /// Load a LoRA adapter's weights — the PEFT `adapter_config.json` + the
+    /// `adapter_model.safetensors`/`adapter_model.gguf`. Mirrors
+    /// `prepare_draft_model_weights` (the same HF download + the cache + the local-dir
+    /// flow) but reads the adapter-specific filenames. The adapter is a PEFT
+    /// checkpoint (the `lora_A`/`lora_B` tensors + the `adapter_config.json`),
+    /// not a full model, so the tokenizer/generation_config are not fetched.
+    pub fn prepare_lora_adapter_weights(
+        &self,
+        hf_token: Option<String>,
+        hf_token_path: Option<String>,
+    ) -> Result<(ModelPaths, bool)> {
+        match (&self.model_id, &self.weight_path) {
+            // The local adapter dir (the `--lora /path/to/adapter`).
+            (_, Some(path)) => {
+                if !Path::new(path).is_dir() {
+                    candle_core::bail!("LoRA adapter path must be a directory: {}", path);
+                }
+                // The PEFT adapter config is `adapter_config.json` (not the base
+                // model's `config.json`). Fall back to `config.json` for the
+                // non-PEFT adapter layouts.
+                let config_path = Path::new(path).join("adapter_config.json");
+                let config_path = if config_path.exists() {
+                    config_path
+                } else {
+                    Path::new(path).join("config.json")
+                };
+                if !config_path.exists() {
+                    candle_core::bail!(
+                        "LoRA adapter directory missing adapter_config.json: {}",
+                        path
+                    );
+                }
+                // The adapter weights: the `adapter_model.safetensors` (the
+                // sharded via the `adapter_model.safetensors.index.json`) or the
+                // `adapter_model.gguf`
+                let is_gguf = Path::new(path)
+                    .join("adapter_model.gguf")
+                    .exists();
+                let filenames = if is_gguf {
+                    vec![Path::new(path).join("adapter_model.gguf")]
+                } else if Path::new(path)
+                    .join("adapter_model.safetensors.index.json")
+                    .exists()
+                {
+                    super::hub_load_local_safetensors(
+                        path,
+                        "adapter_model.safetensors.index.json",
+                    )?
+                } else {
+                    vec![Path::new(path).join("adapter_model.safetensors")]
+                };
+                Ok((
+                    ModelPaths {
+                        tokenizer_filename: PathBuf::new(),
+                        tokenizer_config_filename: PathBuf::new(),
+                        config_filename: config_path,
+                        generation_config_filename: PathBuf::new(),
+                        filenames,
+                        auxiliary_filenames: Vec::new(),
+                        chat_template_filename: None,
+                    },
+                    is_gguf,
+                ))
+            }
+            // The HF adapter id (the `--lora <hf-id>`): download via the existing
+            // hf-hub machinery (the cache + the token auth + the retry).
+            (Some(_model_id), None) => {
+                let paths = self.download_lora_adapter(hf_token, hf_token_path)?;
+                Ok((paths, false))
+            }
+            _ => {
+                candle_core::bail!(
+                    "LoRA adapter requires --lora <hf-id> or a local adapter directory"
+                );
+            }
+        }
+    }
+
+    /// Download a LoRA adapter from Hugging Face (the `adapter_config.json` + the
+    /// `adapter_model.*` weights). Reuses the existing `check_cache` + the
+    /// `hf_get_with_retry` + the `get_token` machinery (the no a new download
+    /// path). The adapter repo is a PEFT checkpoint (the safetensors or the
+    /// gguf weights + the adapter config).
+    fn download_lora_adapter(
+        &self,
+        hf_token: Option<String>,
+        hf_token_path: Option<String>,
+    ) -> Result<ModelPaths> {
+        assert!(self.model_id.is_some(), "No LoRA adapter id provided!");
+        // The cache check (the adapter layout, the `adapter_model.safetensors`
+        // naming — not the base-model `model.safetensors` check, which would
+        // report a complete adapter download as incomplete).
+        if let Some(cache_path) = self.check_adapter_cache() {
+            let config_filename = cache_path.join("adapter_config.json");
+            let config_filename = if config_filename.exists() {
+                config_filename
+            } else {
+                cache_path.join("config.json")
+            };
+            let mut filenames = Vec::new();
+            for entry in std::fs::read_dir(&cache_path)? {
+                let path = entry?.path();
+                if let Some(ext) = path.extension() {
+                    if ext == "safetensors"
+                        && path
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .is_some_and(|n| n.starts_with("adapter_model"))
+                    {
+                        filenames.push(path);
+                    }
+                }
+            }
+            if !filenames.is_empty() {
+                return Ok(ModelPaths {
+                    tokenizer_filename: PathBuf::new(),
+                    tokenizer_config_filename: PathBuf::new(),
+                    config_filename,
+                    generation_config_filename: PathBuf::new(),
+                    filenames,
+                    auxiliary_filenames: Vec::new(),
+                    chat_template_filename: None,
+                });
+            }
+        }
+        // The download (the hf-hub Api, the token auth, the retry).
+        let api = ApiBuilder::new()
+            .with_progress(true)
+            .with_token(Some(get_token(hf_token.clone(), hf_token_path.clone())?))
+            .build()
+            .map_err(candle_core::Error::wrap)?;
+        let api = api.repo(Repo::with_revision(
+            self.model_id.clone().unwrap(),
+            RepoType::Model,
+            "main".to_string(),
+        ));
+        // The adapter config (the `adapter_config.json`, the PEFT layout; the
+        // `config.json` for the non-PEFT layout).
+        let config_filename = match api.get("adapter_config.json") {
+            Ok(p) => p,
+            Err(_) => api.get("config.json").map_err(candle_core::Error::wrap)?,
+        };
+        // The adapter weights (the `adapter_model.safetensors`, the sharded via
+        // the `adapter_model.safetensors.index.json`).
+        let mut filenames = Vec::new();
+        if let Ok(index) = api.get("adapter_model.safetensors.index.json") {
+            let index_path = index;
+            let index_data = std::fs::read_to_string(&index_path)
+                .map_err(|e| candle_core::Error::Msg(format!("failed to read adapter index: {e}")))?;
+            let index_json: serde_json::Value = serde_json::from_str(&index_data)
+                .map_err(|e| candle_core::Error::Msg(format!("failed to parse adapter index: {e}")))?;
+            if let Some(weight_map) = index_json.get("weight_map") {
+                let mut seen = std::collections::HashSet::new();
+                for file in weight_map
+                    .as_object()
+                    .unwrap()
+                    .values()
+                    .filter_map(|v| v.as_str())
+                {
+                    if seen.insert(file.to_string()) {
+                        if let Ok(p) = api.get(file) {
+                            filenames.push(p);
+                        }
+                    }
+                }
+            }
+        } else if let Ok(p) = api.get("adapter_model.safetensors") {
+            filenames.push(p);
+        }
+        if filenames.is_empty() {
+            candle_core::bail!("LoRA adapter has no weight files (the adapter_model.safetensors)");
+        }
+        Ok(ModelPaths {
+            tokenizer_filename: PathBuf::new(),
+            tokenizer_config_filename: PathBuf::new(),
+            config_filename,
+            generation_config_filename: PathBuf::new(),
+            filenames,
+            auxiliary_filenames: Vec::new(),
+            chat_template_filename: None,
+        })
+    }
+
     pub fn check_cache(&self) -> Option<PathBuf> {
         use crate::utils::{contains_gguf, has_complete_safetensors};
         let sanitized_id = std::path::Path::new(self.model_id.as_ref().unwrap())
@@ -592,6 +775,59 @@ impl Downloader {
                 return Some(cache_path);
             } else {
                 crate::log_warn!("Incomplete cache {:?}", cache_path);
+            }
+        }
+        None
+    }
+
+    /// The cache check for a LoRA adapter repo (the PEFT layout). Mirrors
+    /// `check_cache` but uses `has_complete_adapter_safetensors` (the
+    /// `adapter_model.safetensors` / the `adapter_model-NNNNN-of-NNNNN.
+    /// safetensors` naming), since an adapter cache dir does not contain the
+    /// base model's `model.safetensors`. Using the base-model check for an
+    /// adapter dir reports a complete download as incomplete (the false
+    /// "Incomplete cache" warning + the unnecessary re-download).
+    pub fn check_adapter_cache(&self) -> Option<PathBuf> {
+        use crate::utils::{contains_gguf, has_complete_adapter_safetensors};
+        let sanitized_id = std::path::Path::new(self.model_id.as_ref().unwrap())
+            .display()
+            .to_string()
+            .replace("/", "--");
+
+        let home_folder = if dirs::home_dir().is_some() {
+            let mut path = dirs::home_dir().unwrap();
+            path.push(".cache/huggingface/hub/");
+            if !path.exists() {
+                let _ = std::fs::create_dir_all(&path);
+            }
+            path
+        } else {
+            "./".into()
+        };
+
+        let cache_dir: std::path::PathBuf = std::env::var("HF_HUB_CACHE")
+            .map(std::path::PathBuf::from)
+            .unwrap_or(home_folder.into());
+        let cache_path = cache_dir.join(format!("models--{sanitized_id}/"));
+        if !cache_path.join("refs/main").exists() {
+            return None;
+        }
+        let cache_id = std::fs::read_to_string(&cache_path.join("refs/main")).ok()?;
+        let cache_path = cache_path.join(format!("snapshots/{}/", cache_id));
+
+        if !cache_path.exists() {
+            return None;
+        }
+        if contains_gguf(&cache_path) {
+            crate::log_info!("Adapter cache found {:?}", cache_path);
+            return Some(cache_path);
+        }
+        if let Ok(v) = has_complete_adapter_safetensors(&cache_path) {
+            if v {
+                crate::log_info!("Adapter cache found {:?}", cache_path);
+                return Some(cache_path);
+            } else {
+                crate::log_warn!("Incomplete adapter cache {:?}", cache_path);
             }
         }
         None

@@ -170,6 +170,7 @@ impl EngineBuilder {
             false,
             None, // num_speculative_tokens
             None, // draft_model
+            crate::utils::config::LoraConfig::default(), // lora
         );
 
         if let Some(kv_dtype) = self.kvcache_dtype {

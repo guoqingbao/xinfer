@@ -11,6 +11,7 @@ use crate::models::layers::moe::{
 use crate::models::layers::others::{embedding, rms_norm, NormX};
 use crate::models::layers::rotary_emb::{ApplyRotaryEmbedding, ScalingRotaryEmbedding};
 use crate::models::layers::VarBuilderX;
+use crate::core::lora::apply_embedding_lora;
 use crate::utils::config::{Config, MoEConfig};
 use crate::utils::image::ImageData;
 use crate::utils::progress::ProgressLike;
@@ -477,7 +478,7 @@ impl LLama4ForConditionalGeneration {
             &config.quantization_config,
             &None,
             dtype,
-        )?;
+        )?.with_lora_module("lm_head".to_string());
 
         // Vision model (optional — gracefully skip if weights missing)
         let vision_model = match Llama4VisionModel::new(
@@ -532,6 +533,7 @@ impl LLama4ForConditionalGeneration {
 
     fn embed_forward(&self, xs: &Tensor) -> Result<Tensor> {
         let xs = self.embed_tokens.forward(xs)?;
+        let xs = apply_embedding_lora(&xs)?;
         if (self.is_qvar_builder || self.config.quant.is_some()) && xs.dtype() != DType::F32 {
             xs.to_dtype(DType::F32)
         } else {

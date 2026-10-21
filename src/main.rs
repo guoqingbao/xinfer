@@ -250,6 +250,25 @@ async fn main() -> Result<()> {
         args.enable_tool_grammar,
         args.num_speculative_tokens,
         args.draft_model.clone(),
+        xinfer::utils::config::LoraConfig {
+            adapters: args
+                .lora
+                .iter()
+                .filter_map(|spec| {
+                    let (name, source) = spec
+                        .split_once('=')
+                        .map(|(n, s)| (n.to_string(), s.to_string()))
+                        .unwrap_or_else(|| (spec.clone(), spec.clone()));
+                    Some((name, source))
+                })
+                .collect(),
+            max_tenants: args.lora_max_tenants,
+            max_active: args.lora_max_active,
+            max_bytes: args.lora_max_bytes,
+            eviction_policy: args.lora_eviction_policy.clone(),
+            pinned: args.lora_pin.clone(),
+            allow_base_fallback: args.lora_allow_base_fallback,
+        },
     );
 
     // Multi-node worker nodes run a daemon loop instead of the full engine

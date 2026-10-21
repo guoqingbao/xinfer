@@ -5,6 +5,7 @@ use super::scheduler::Scheduler;
 use super::sequence::Sequence;
 use crate::core::scheduler::PD_PREFILL_STATUS_CHECK_COOLING_PERIOD;
 use crate::core::sequence::SequenceStatus;
+use crate::core::lora::{DEFAULT_LORA_MAX_BYTES, DEFAULT_LORA_MAX_TENANTS};
 use crate::core::GenerationOutput;
 use crate::models::layers::distributed::Comm;
 #[cfg(feature = "nccl")]
@@ -618,6 +619,21 @@ impl LLMEngine {
         };
 
         log_warn!("Model loaded.\n");
+
+        // The LoRA startup log (the #4, the operator visibility): the loaded
+        // adapters + the residency budget. The no-op when no adapter is loaded
+        // (the base model only, the zero overhead).
+        if !econfig.lora.adapters.is_empty() {
+            crate::log_info!(
+                "LoRA: {} adapter(s) loaded ({:?}), budget {} tenants / {} bytes, policy {:?}, pinned {:?}",
+                econfig.lora.adapters.len(),
+                econfig.lora.adapters.iter().map(|(n, _)| n).collect::<Vec<_>>(),
+                econfig.lora.max_tenants.unwrap_or(DEFAULT_LORA_MAX_TENANTS),
+                econfig.lora.max_bytes.unwrap_or(DEFAULT_LORA_MAX_BYTES),
+                econfig.lora.eviction_policy,
+                econfig.lora.pinned
+            );
+        }
 
         // The stream delivery actor (the per-request channels, the token delivery).
         let stream = start_stream_actor().await;

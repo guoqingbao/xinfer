@@ -9,6 +9,7 @@ use crate::models::layers::mlp::MLP;
 use crate::models::layers::others::{embedding, rms_norm, NormX};
 use crate::models::layers::rotary_emb::{ApplyRotaryEmbedding, RotaryEmbedding};
 use crate::models::layers::VarBuilderX;
+use crate::core::lora::apply_embedding_lora;
 use crate::utils::config::{Config, RopeScalingValue};
 use crate::utils::progress::ProgressLike;
 use attention_rs::{InputMetadata, PagedAttention};
@@ -589,7 +590,7 @@ impl Phi4ForCausalLM {
             &config.quantization_config,
             &None,
             dtype,
-        )?;
+        )?.with_lora_module("lm_head".to_string());
 
         Ok(Self {
             embed_tokens,
@@ -606,6 +607,8 @@ impl Phi4ForCausalLM {
 
     pub fn embed_forward(&self, xs: &Tensor) -> Result<Tensor> {
         let xs = self.embed_tokens.forward(xs)?;
+        // The embedding LoRA (the #1.11): the active tenant's embedding delta.
+        let xs = apply_embedding_lora(&xs)?;
         if (self.is_qvar_builder || self.config.quant.is_some()) && xs.dtype() != DType::F32 {
             xs.to_dtype(DType::F32)
         } else {

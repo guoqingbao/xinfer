@@ -137,6 +137,7 @@ mod graph_tests {
             false, // 38 enable_tool_grammar
             None, // 39 num_speculative_tokens
             None, // 40 draft_model
+            crate::utils::config::LoraConfig::default(), // 41 lora
         )
     }
 
