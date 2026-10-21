@@ -76,7 +76,7 @@ pub enum FwdMessage {
     /// guessing from an empty cross-process global).
     RunMtp(Vec<DecodeSequence>, RpcReplyPort<Result<Vec<crate::runner::SpecStepOut>, String>>),
     /// Run a DFlash speculative decode step.
-RunDflash(Vec<DecodeSequence>, RpcReplyPort<Result<Vec<Vec<u32>>, String>>),
+    RunDflash(Vec<DecodeSequence>, RpcReplyPort<Result<Vec<Vec<u32>>, String>>),
     /// Run a spec fast-forward decode step (the grammar-forced ff run appended
     /// after the sampled base token).
     RunSpecFf(Vec<DecodeSequence>, RpcReplyPort<Result<Vec<Vec<u32>>, String>>),
@@ -86,6 +86,18 @@ RunDflash(Vec<DecodeSequence>, RpcReplyPort<Result<Vec<Vec<u32>>, String>>),
     Finished(usize),
     /// Fetch the per-seq speculative-decode stats from rank 0 (the Process mode).
     FetchSpecSeqStats(usize, RpcReplyPort<crate::runner::SpecSeqStatsData>),
+    /// The single matcher-gated ingress (the llg sprint): commit each produced run to
+    /// the grammar FSM + return only the FSM-passing prefix. `ff` selects the spec-FF
+    /// ordered-queue writer. For IPC/multi-node transports the gate runs on the remote
+    /// runner (which owns the FSM), so this is a pass-through.
+    GateCommit(Vec<usize>, Vec<Vec<u32>>, bool, RpcReplyPort<Vec<Vec<u32>>>),
+    /// Bridge the anti-loop kick to the runner's sampler (the full repeating
+    /// UNIT + the seed + the period). The unit is the whole cycle (the no single
+    /// forbid token -- a period-P loop needs all P tokens excluded to break).
+    /// Fire-and-forget.
+    SetLoopKick(usize, Vec<u32>, Vec<u32>, u32),
+    /// Clear the anti-loop kick for a sequence (the loop cleared). Fire-and-forget.
+    ClearLoopKick(usize),
     /// The broadcast ops (the PD cache + the mamba prefix state).
     TrySwapKvcache(HashMap<usize, usize>, bool, RpcReplyPort<bool>),
     TrySendKvcache(Sequence, u32, RpcReplyPort<bool>),
@@ -160,7 +172,7 @@ impl ractor::Actor for FwdD {
                 };
                 let _ = reply.send(result);
             }
-RunDflash(seqs, reply) => {
+            RunDflash(seqs, reply) => {
                 let resp = state.ipc_round_trip(MessageType::RunDecodeDFlash(seqs), timeout).await;
                 let result = match resp {
                     Some(MessageType::RunResponseDFlash(out)) => Ok(out),
@@ -287,6 +299,19 @@ RunDflash(seqs, reply) => {
                     Some(MessageType::SpecSeqStatsResponse(_, data)) => data,
                     _ => crate::runner::SpecSeqStatsData::default(),
                 });
+            }
+            GateCommit(scheduled_ids, runs, ff, reply) => {
+                let resp = state.ipc_round_trip(MessageType::GateCommit((scheduled_ids.clone(), runs.clone(), ff)), timeout).await;
+                let _ = reply.send(match resp {
+                    Some(MessageType::GateCommitResponse(gated)) => gated,
+                    _ => runs, // the gate unavailable: pass through (the no FSM filtering)
+                });
+            }
+            SetLoopKick(seq_id, unit, seed, period) => {
+                let _ = state.ipc.send_message(IpcMessage::Fire(MessageType::SetLoopKick((seq_id, unit, seed, period))));
+            }
+            ClearLoopKick(seq_id) => {
+                let _ = state.ipc.send_message(IpcMessage::Fire(MessageType::ClearLoopKick(seq_id)));
             }
         }
         Ok(())

@@ -315,6 +315,17 @@ pub enum MessageType {
     GetSpecSeqStats(usize),
     /// Response to GetSpecSeqStats.
     SpecSeqStatsResponse(usize, SpecSeqStatsData),
+
+    // The anti-loop kick bridge (the llg sprint): the engine's loop detector bridges
+    // the kick to the runner's sampler (the full repeating UNIT + the seed
+    // + the period -- the no single forbid token, the whole cycle must be excluded).
+    SetLoopKick((usize, Vec<u32>, Vec<u32>, u32)),
+    ClearLoopKick(usize),
+    /// The single matcher-gated ingress (the llg sprint): commit each produced run to
+    /// the grammar FSM + return only the FSM-passing prefix. The `ff` flag selects the
+    /// spec-FF ordered-queue writer.
+    GateCommit((Vec<usize>, Vec<Vec<u32>>, bool)),
+    GateCommitResponse(Vec<Vec<u32>>),
 }
 
 //inter-node communication
@@ -743,6 +754,23 @@ pub fn run_runner_process(args: Vec<String>) -> anyhow::Result<()> {
                 send_local(
                     &mut vec![stream.try_clone()?],
                     &MessageType::SpecSeqStatsResponse(id, data),
+                    false,
+                )?;
+            }
+            // The anti-loop kick bridge (the llg sprint): the engine's loop detector
+            // bridges the kick to the runner's sampler. Fire-and-forget (the no
+            // response; the receive_local above already acked the read).
+            Ok(MessageType::SetLoopKick((seq_id, unit, seed, period))) => {
+                runner.set_loop_kick(seq_id, unit, seed, period);
+            }
+            Ok(MessageType::ClearLoopKick(seq_id)) => {
+                runner.clear_loop_kick(seq_id);
+            }
+            Ok(MessageType::GateCommit((seq_ids, runs, ff))) => {
+                let gated = runner.gate_commit(&seq_ids, &runs, ff);
+                send_local(
+                    &mut vec![stream.try_clone()?],
+                    &MessageType::GateCommitResponse(gated),
                     false,
                 )?;
             }

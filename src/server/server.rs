@@ -11,6 +11,7 @@ use super::{
     ChatChoice, ChatChoiceChunk, ChatCompletionChunk, ChatCompletionRequest,
     ChatCompletionResponse, ChatMessage, ChatResponseMessage, CompletionTokensDetails, Delta,
     EmbeddingData, EmbeddingOutput, EmbeddingUsage, ErrorMsg, PromptTokensDetails, ServerData,
+    StructuredOutputs,
     Usage, UsageQuery, UsageResponse,
 };
 use crate::core::engine::{LLMEngine, StreamItem};
@@ -493,6 +494,10 @@ pub async fn chat_completion(
         params.thinking = Some(effort.is_enabled());
         params.reasoning_effort = Some(effort);
     }
+    // The reasoning token budget (the `thinking_budget` alias). When set, the
+    // runner applies a sampling bias to the end-of-reasoning token that ramps
+    // up as the reasoning count approaches the budget (the smooth transition).
+    params.reasoning_budget = request.reasoning_budget;
     let (
         img_cfg,
         model_type,
@@ -518,6 +523,7 @@ pub async fn chat_completion(
 
     let grammar = if request_has_structured_constraint(&request)
         || request_has_tool_grammar(&request, engine_config.enable_tool_grammar)
+        || crate::utils::env::llg_full_enabled()
     {
         let enforce_parser = engine_config.enforce_parser.clone();
         let tool_parser_name = if let Some(ref enforced) = enforce_parser {
@@ -1411,7 +1417,20 @@ total_decoded_tokens as f32 / decode_time_taken.max(0.001)
                             }
                         }
 
-                        break;
+// Loop-defense report: shown only when a guard fired (the no
+                          // noise for clean sequences). The [llg] prefix + the warn level
+                          // make it visible to the admins (the no grammar-digging).
+                         if let Some(loop_stats) = engine_clone.get_seq_loop_stats(current_seq_id).await {
+                             if loop_stats.guards > 0 {
+                                 crate::log_warn!(
+                                     "[llg] [Seq {}] {}",
+                                     current_seq_id,
+                                     loop_stats.report()
+                                 );
+                             }
+                         }
+
+                         break;
                     }
                     StreamItem::Error(e) => {
                         crate::log_error!("[Seq {}] Stream error: {}", current_seq_id, e);
@@ -2064,6 +2083,32 @@ mod tests {
         deltas
     }
 
+    // The /v1/grammar grammar_type -> StructuredOutputs mapping (the pure function,
+    // the end-to-end mapping test without a live model).
+    #[test]
+    fn grammar_type_maps_to_structured_outputs() {
+        // json_schema -> the json field (the parsed schema).
+        let so = map_grammar_type_to_structured_outputs("json_schema", "{\"a\":1}");
+        assert!(so.json.is_some(), "json_schema maps to the json field");
+        assert!(so.regex.is_none() && so.choice.is_none() && so.grammar.is_none());
+
+        // regex -> the regex field (the raw pattern).
+        let so = map_grammar_type_to_structured_outputs("regex", "^[a-z]+$");
+        assert_eq!(so.regex.as_deref(), Some("^[a-z]+$"));
+        assert!(so.json.is_none() && so.choice.is_none() && so.grammar.is_none());
+
+        // choice -> the choice field (the parsed list).
+        let so = map_grammar_type_to_structured_outputs("choice", "[\"a\",\"b\"]");
+        assert!(so.choice.is_some(), "choice maps to the choice field");
+        assert!(so.json.is_none() && so.regex.is_none() && so.grammar.is_none());
+
+        // lark (the default) + any unknown type -> the grammar field (the raw Lark).
+        let so = map_grammar_type_to_structured_outputs("lark", "start: \"hi\"");
+        assert_eq!(so.grammar.as_deref(), Some("start: \"hi\""));
+        let so = map_grammar_type_to_structured_outputs("unknown_type", "x");
+        assert_eq!(so.grammar.as_deref(), Some("x"), "unknown types fall back to the grammar field");
+    }
+
     #[test]
     fn reasoning_router_disabled_sends_all_as_content() {
         let (ctx, mut rx) = make_test_ctx();
@@ -2310,6 +2355,46 @@ mod tests {
     request_body = GrammarRequest,
     responses((status = 200, description = "Grammar-based completion"))
 )]
+/// Map the `grammar_type` to the `StructuredOutputs` field (the pure mapping the
+/// `/v1/grammar` endpoint uses). `json_schema` -> the json, `regex` -> the regex,
+/// `choice` -> the choice, + anything else (the `lark` default) -> the grammar.
+fn map_grammar_type_to_structured_outputs(
+    grammar_type: &str,
+    grammar: &str,
+) -> StructuredOutputs {
+    match grammar_type {
+        "json_schema" => StructuredOutputs {
+            choice: None,
+            regex: None,
+            json: serde_json::from_str(grammar).ok(),
+            grammar: None,
+            structural_tag: None,
+        },
+        "regex" => StructuredOutputs {
+            choice: None,
+            regex: Some(grammar.to_string()),
+            json: None,
+            grammar: None,
+            structural_tag: None,
+        },
+        "choice" => StructuredOutputs {
+            choice: serde_json::from_str(grammar).ok(),
+            regex: None,
+            json: None,
+            grammar: None,
+            structural_tag: None,
+        },
+        // "lark" (the default) + any other type -> the grammar field.
+        _ => StructuredOutputs {
+            choice: None,
+            regex: None,
+            json: None,
+            grammar: Some(grammar.to_string()),
+            structural_tag: None,
+        },
+    }
+}
+
 pub async fn grammar_completion(
     State(data): State<Arc<ServerData>>,
     request: Json<GrammarRequest>,
@@ -2326,8 +2411,40 @@ pub async fn grammar_completion(
         Err(e) => return ChatResponder::ValidationError(e.to_string()),
     };
 
-    // TODO: Wire grammar endpoint to chat_completion inference path
-    ChatResponder::ValidationError(
-        "/v1/grammar endpoint is not yet fully implemented. Use /v1/chat/completions with structured_outputs instead.".to_string()
-    )
+    // Map the grammar_type to the StructuredOutputs field (the pure mapping, the
+    // unit-testable without a live model).
+    let structured_outputs = map_grammar_type_to_structured_outputs(
+        &request.grammar_type,
+        &request.grammar,
+    );
+
+    // Convert the GrammarRequest to a ChatCompletionRequest + delegate to the
+    // chat_completion inference path (the shared streaming/tool/usage logic).
+    let chat_request = ChatCompletionRequest {
+        messages: request.messages.clone(),
+        model: None,
+        temperature: request.temperature,
+        max_tokens: request.max_tokens,
+        top_k: request.top_k,
+        top_p: request.top_p,
+        frequency_penalty: request.frequency_penalty,
+        presence_penalty: request.presence_penalty,
+        thinking: request.thinking,
+        stop: request.stop.clone(),
+        stream: Some(request.stream),
+        stream_options: None,
+        session_id: request.session_id.clone(),
+        tools: None,
+        tool_choice: None,
+        response_format: None,
+        extra_body: None,
+        structured_outputs: Some(structured_outputs),
+        constraint: None,
+        constraint_type: Some(request.grammar_type.clone()),
+        reasoning_effort: None,
+        reasoning_budget: None,
+    };
+
+    // Delegate to the shared chat path (the streaming, the tool parsing, the usage).
+    chat_completion(State(data), Json(chat_request)).await
 }

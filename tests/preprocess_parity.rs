@@ -37,6 +37,7 @@ fn build_econfig() -> EngineConfig {
         .unwrap_or(0);
     EngineConfig::new(
         Some("Qwen/Qwen3-0.6B".to_string()), // model_id
+        None,                                // reasoning_grammars
         None,                                // weight_path
         None,                                // weight_file
         None,                                // hf_token

@@ -43,7 +43,7 @@ pub struct SchedState {
     /// Set after both actors are created (the circular dependency resolution).
     http: Mutex<Option<ActorRef<HttpMessage>>>,
     /// Whether the model uses the builtin MTP (the speculative decode).
-    mtp_enabled: bool,
+mtp_enabled: bool,
     /// Whether the model uses DFlash (the speculative decode).
     dflash_enabled: bool,
     /// The per-seq speculative-decode stats captured at finish (the capture-
@@ -51,6 +51,15 @@ pub struct SchedState {
     /// message drops them runner-side, so the server's end-of-sequence report reads
     /// a surviving in-process copy). Keyed by seq id; dropped on `GetSpecStats`.
     spec_stats: Mutex<HashMap<usize, SpecSeqStatsData>>,
+    /// The anti-loop detector (the per-seq bounded tail). Only active when
+    /// XINFER_ANTI_LOOP is on (the zero-overhead default).
+    loop_detector: crate::utils::loop_detect::LoopDetector,
+    /// The per-seq anti-loop kicks (held until the periodicity clears).
+    kick_store: crate::utils::loop_detect::KickStore,
+    /// Per-sequence loop-defense stats (the guards + the durations, the admins' report).
+    seq_loop_stats: std::collections::HashMap<usize, crate::utils::loop_detect::LoopSeqStats>,
+    /// The transient per-seq guard-held-step counter (the duration tracking, not serialized).
+    guard_step_counts: std::collections::HashMap<usize, usize>,
 }
 
 /// The `SchedD` actor's message enum (the explicit form).
@@ -88,13 +97,15 @@ pub enum SchedMessage {
     BlockDeallocate(Sequence),
     PrintFreeBlocks,
     /// The end-of-sequence scheduling report (the cached tokens + the QoS stats).
-    GetSeqReport(usize, RpcReplyPort<Option<crate::core::qos::SeqReport>>),
+GetSeqReport(usize, RpcReplyPort<Option<crate::core::qos::SeqReport>>),
     /// The per-seq speculative-decode stats captured at finish (the capture-
     /// before-drop: read from the `SchedD`-owned map, the no runner-side drop race).
     /// Returns `None` once taken (the map entry is removed on read).
     GetSpecStats(usize, RpcReplyPort<Option<SpecSeqStatsData>>),
     /// The active (running) sequence indices (for the periodic decode throughput log).
     GetActiveIndices(RpcReplyPort<Vec<usize>>),
+    /// The cached per-seq loop-defense stats (for the server's end-of-sequence report).
+    GetSeqLoopStats(usize, RpcReplyPort<Option<crate::utils::loop_detect::LoopSeqStats>>),
 }
 
 #[ractor::async_trait]
@@ -127,8 +138,12 @@ impl ractor::Actor for SchedD {
             stream,
             http: Mutex::new(None),
             mtp_enabled,
-            dflash_enabled,
+dflash_enabled,
             spec_stats: Mutex::new(HashMap::new()),
+            loop_detector: crate::utils::loop_detect::LoopDetector::new(),
+            kick_store: crate::utils::loop_detect::KickStore::new(),
+            seq_loop_stats: std::collections::HashMap::new(),
+            guard_step_counts: std::collections::HashMap::new(),
         })
     }
 
@@ -228,14 +243,17 @@ impl ractor::Actor for SchedD {
             GetSeqReport(seq_id, reply) => {
                 let _ = reply.send(state.scheduler.get_seq_report(seq_id));
             }
-            GetActiveIndices(reply) => {
+GetActiveIndices(reply) => {
                 let _ = reply.send(state.scheduler.get_active_indices());
-            }
+}
             GetSpecStats(seq_id, reply) => {
                 // Take the captured per-seq spec stats (the no runner-side
                 // drop race). Removed on read so a seq's stats are surfaced once.
                 let data = state.spec_stats.lock().unwrap().remove(&seq_id);
                 let _ = reply.send(data);
+            }
+            GetSeqLoopStats(seq_id, reply) => {
+                let _ = reply.send(state.seq_loop_stats.get(&seq_id).cloned());
             }
         }
         Ok(())
@@ -285,17 +303,23 @@ impl SchedState {
             && scheduled_ids.len() <= crate::utils::env::dflash_parallel_slots().max(1);
         let use_dflash = self.dflash_enabled && !is_prefill && dflash_ok;
         let use_mtp = self.mtp_enabled && !use_dflash && !is_prefill && parallel_ok;
-        // Speculative fast-forward: append the full grammar-forced (ff) run after the sampled base
-        // token (the lowest-priority decode path, the fallback). The spec-FF commit (c9aa0ff4),
-        // folded into the Option 1 order (computed BEFORE the snapshot, like use_mtp/use_dflash).
-        let use_spec_ff = !use_mtp && !use_dflash && crate::utils::env::spec_ff() && !is_prefill;
+        // Speculative fast-forward: append the full grammar-forced (ff) run after the
+        // produced tokens (the MTP/DFlash draft, the spec-FF base, or the plain
+        // decode). The ff is the deterministic continuation (the tool-call XML, the
+        // forced literals), so it is appended regardless of which decode path
+        // produced the base tokens. Gated on the XINFER_SPEC_FF env (default off)
+        // + the decode step (not the prefill).
+        let use_spec_ff = crate::utils::env::spec_ff() && !is_prefill;
 
-        // The single-writer step view (the Option 5, the no write-after-snapshot): the Scheduler does
+// The single-writer step view (the Option 5, the no write-after-snapshot): the Scheduler does
         // ALL the writes (the speculative pre-alloc) + the freeze (the Sequence snapshot) in ONE
         // atomic call. No caller can interleave a write between the snapshot and the forward. The
         // gate is the origin/main pattern (the speculative decode ENABLED + the decode step, NOT
         // the single-sequence check).
         let owned_seqs = self.scheduler.prepare_step_view(&scheduled_ids, is_prefill).await;
+        // Resolve the actual sequence IDs (the gate_commit + the delivery need the
+        // sequence ID, not the running position).
+        let seq_ids: Vec<usize> = owned_seqs.iter().map(|s| s.id).collect();
 
         // The MTP per-seq next-step K feedback (the runner-computed dynamic-K, the no the
         // scheduler guessing from an empty cross-process global). The no-MTP paths leave it
@@ -343,7 +367,44 @@ self.fwd_call_run_dflash(&sequences).await
                 if !mtp_next_k.is_empty() {
                     self.scheduler.record_spec_k_feedback(&scheduled_ids, &mtp_next_k);
                 }
+
+if crate::utils::env::actor_debug() {
+                    crate::log_info!(
+                        "[SchedD] forward ok: {} seq(s), is_prefill={}, outputs={:?}",
+                        multi_output_ids.len(), is_prefill,
+                        multi_output_ids.iter().map(|v| v.len()).collect::<Vec<_>>()
+                    );
+                }
+                // Single matcher-gated ingress: commit each produced run to the FSM
+                // and keep only the FSM-passing prefix, just before the sequence
+                // append. `ff` selects the spec-FF ordered-queue writer (the ff
+                // continuation is appended after the produced tokens, regardless
+                // of which decode path produced them).
+                let use_spec_ff = crate::utils::env::spec_ff() && !is_prefill;
+                let gated = match self.fwd.call(|r| FwdMessage::GateCommit(seq_ids.clone(), multi_output_ids.clone(), use_spec_ff, r), None).await {
+                    Ok(CallResult::Success(v)) => v,
+                    _ => multi_output_ids.clone(), // the gate unavailable: pass through (the no FSM filtering)
+                };
+                if crate::utils::env::actor_debug() {
+                    crate::log_info!(
+                        "[SchedD] gate_commit: seq_ids={:?}, gated={:?}",
+                        seq_ids, gated.iter().map(|v| v.len()).collect::<Vec<_>>()
+                    );
+                }
+                // The anti-loop OBSERVE: check the accepted tokens for a closed loop.
+                // Zero-overhead when XINFER_ANTI_LOOP is off (the default).
+                if crate::utils::env::anti_loop_enabled() {
+                    for (i, &seq_id) in seq_ids.iter().enumerate() {
+                        if i < gated.len() {
+                            self.observe_loop(seq_id, &gated[i]);
+                        }
+                    }
+                }
                 // Prefill: filter sequences still chunking from those done.
+                // The SEAL: the append consumes the `gated` (the FSM-legal prefix from the
+                // single `gate_commit`), never the raw `multi_output_ids`. When guidance is
+                // inactive the `gated` == the raw (the fail-open), so this is a no-op for
+                // unguided sequences.
                 let (indices, output_by_running_index) = if is_prefill {
                     let (indices, finished_indices) =
                         self.scheduler.filter_prefill_finished(&scheduled_ids).await;
@@ -354,7 +415,7 @@ self.fwd_call_run_dflash(&sequences).await
                     let wrapped: Vec<Vec<u32>> = indices
                         .iter()
                         .map(|&output_idx| {
-                            multi_output_ids.get(output_idx).cloned().unwrap_or_default()
+                            gated.get(output_idx).cloned().unwrap_or_default()
                         })
                         .collect();
                     self.scheduler.postprocess(&finished_indices, &wrapped).await;
@@ -365,11 +426,11 @@ self.fwd_call_run_dflash(&sequences).await
                         .collect::<std::collections::HashMap<_, _>>();
                     (finished_indices, output_map)
                 } else {
-                    self.scheduler.postprocess(&scheduled_ids, &multi_output_ids).await;
+                    self.scheduler.postprocess(&scheduled_ids, &gated).await;
                     let output_map = scheduled_ids
                         .iter()
                         .copied()
-                        .zip(multi_output_ids)
+                        .zip(gated.iter().cloned())
                         .collect::<std::collections::HashMap<_, _>>();
                     (scheduled_ids, output_map)
                 };
@@ -515,8 +576,7 @@ self.fwd_call_run_dflash(&sequences).await
                         }
                     }
                 }
-
-                // Prefill batch log.
+// Prefill batch log.
                 if !prefill_batch.is_empty() {
                     let total_tokens: usize = prefill_batch.iter().map(|(_, t, _, _)| *t).sum();
                     let max_time: f32 = prefill_batch.iter().map(|(_, _, t, _)| *t).fold(0.0f32, f32::max);
@@ -714,6 +774,49 @@ async fn fwd_call_run_spec_ff(&self, sequences: &[crate::core::sequence::DecodeS
         let releases = self.scheduler.take_pending_runner_releases();
         for seq_id in releases {
             self.fwd_finished(seq_id).await;
+        }
+    }
+
+    /// The anti-loop OBSERVE: after the accepted tokens are known, check for a closed
+    /// loop. On a hit, apply the kick (the mitigation) + record the per-seq stats + emit
+    /// the [llg] event log. On a miss (the loop cleared), remove the kick + log it.
+    /// Zero-overhead when XINFER_ANTI_LOOP is off (the default).
+    fn observe_loop(&mut self, seq_id: usize, accepted: &[u32]) {
+        use crate::utils::loop_detect::LoopSeqStats;
+        let probe_depth = crate::utils::env::repetition_probe_depth();
+        let was_active = self.kick_store.is_active(seq_id);
+        // The guard duration tracking: while a kick is held, count the steps.
+        if was_active {
+            *self.guard_step_counts.entry(seq_id).or_insert(0) += 1;
+            if let Some(stats) = self.seq_loop_stats.get_mut(&seq_id) {
+                stats.guard_steps += 1;
+            }
+        }
+        match self.loop_detector.observe(seq_id, accepted, probe_depth) {
+            Some(span) => {
+                self.kick_store.apply(seq_id, &span);
+                let kick = self.kick_store.get(seq_id).expect("just applied");
+                let stats = self.seq_loop_stats.entry(seq_id).or_insert_with(LoopSeqStats::default);
+                stats.guards += 1;
+                if !stats.periods.contains(&span.period) {
+                    stats.periods.push(span.period);
+                }
+                crate::log_warn!(
+                    "[llg] [Seq {}] loop detected: period={} unit={:?} -> mitigation applied (exclude {} tokens)",
+                    seq_id, span.period, kick.unit, kick.unit.len()
+                );
+                // Bridge the kick to the runner (the sampling constraint) via the FwdD actor.
+                // The FULL unit (the no single forbid token) -- the whole
+                // period-P cycle is excluded at the trigger position to break the loop.
+                let _ = self.fwd.send_message(FwdMessage::SetLoopKick(seq_id, kick.unit.clone(), kick.seed.clone(), span.period));
+            }
+            None => {
+                if was_active {
+                    self.kick_store.remove(seq_id);
+                    crate::log_info!("[llg] [Seq {}] loop cleared; kick removed", seq_id);
+                    let _ = self.fwd.send_message(FwdMessage::ClearLoopKick(seq_id));
+                }
+            }
         }
     }
 

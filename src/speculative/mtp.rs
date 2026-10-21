@@ -393,21 +393,27 @@ impl ModelRunner {
         };
         let all_logits = all_logits_result?;
 
+// The P3 fix: mask the verify logits with the PDA projection (the draft-position
+        // guidance). A grammar-illegal draft token is rejected by the verify (the
+        // masked distribution doesn't favor it).
+        let masked_all_logits = self.mask_verify_logits(&all_logits, &draft_tokens, seq_info.id)?;
         // The verify: the greedy argmax accept (the default) OR the lossless
         // rejection sampling (the XINFER_SPEC_REJECTION_SAMPLING, the target's
         // sampled distribution honored, the no biased output at temperature > 0).
+        // The rejection path uses the MASKED target logits (the PDA constraint is
+        // honored in the p_target, the no grammar-illegal draft accepted).
         let verify_result = if crate::utils::env::spec_rejection_sampling() {
-            // The lossless rejection sampling (the target's sampled distribution
-            // honored, the no biased output at temperature > 0). The `p_target` is
-            // the target's post-sampling distribution per verify position (the
-            // sampler's transform, the exact distribution the normal decode would
-            // sample from); the `p_draft` is the drafter's per-position softmax.
+            // The lossless rejection sampling. The `p_target` is the target's
+            // post-sampling distribution per verify position (the sampler's
+            // transform over the MASKED logits, the exact distribution the normal
+            // decode would sample from); the `p_draft` is the drafter's per-position
+            // softmax.
             let sampling = self
                 .cached_sampling()
                 .map(|c| c.sampling)
                 .unwrap_or(crate::utils::logits_processor::Sampling::ArgMax);
             let processor = LogitsProcessor::from_sampling(0, sampling);
-            let vflat: Vec<f32> = all_logits
+            let vflat: Vec<f32> = masked_all_logits
                 .to_dtype(candle_core::DType::F32)?
                 .flatten_all()?
                 .to_vec1()?;
@@ -442,7 +448,7 @@ impl ModelRunner {
                 Tensor::from_vec(draft_probs_flat, (drows, vocab), self.device())?;
             verify_draft_rejection(&target_probs_tensor, &draft_probs_tensor, &draft_tokens, 0)?
         } else {
-            verify_draft_greedy(&all_logits, &draft_tokens)?
+            verify_draft_greedy(&masked_all_logits, &draft_tokens)?
         };
 
         if verify_result.num_accepted < verify_result.num_proposed {
@@ -620,7 +626,9 @@ impl ModelRunner {
         for (index, (seq_info, draft)) in seq_infos.iter().zip(&draft_tokens).enumerate() {
             let offset = index * verify_len;
             let logits = all_logits.narrow(0, offset, verify_len)?;
-            let verify_result = verify_draft_greedy(&logits, draft)?;
+            // The P3 fix: mask the per-seq verify logits with the PDA projection (the draft-position guidance).
+            let masked_logits = self.mask_verify_logits(&logits, draft, seq_info.id)?;
+            let verify_result = verify_draft_greedy(&masked_logits, draft)?;
             if verify_result.num_accepted < verify_result.num_proposed {
                 let keep_tokens = 1 + verify_result.num_accepted;
                 if !self.rollback_mamba_at(seq_info.id, keep_tokens, offset)? {

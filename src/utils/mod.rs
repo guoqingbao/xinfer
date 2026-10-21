@@ -17,6 +17,7 @@ pub mod kv_backend;
 pub mod kvcache_allocator;
 pub use kv_backend::{CpuKvCache, GpuKvCache, KvCacheBackend};
 pub mod logits_processor;
+pub mod loop_detect;
 pub mod multi_node;
 pub mod progress;
 pub mod special_tokens;

@@ -215,6 +215,7 @@ async fn main() -> Result<()> {
 
     let econfig = EngineConfig::new(
         args.model_id,
+        args.reasoning_grammars.clone(),
         args.weight_path,
         args.weight_file,
         args.hf_token,
@@ -274,6 +275,14 @@ async fn main() -> Result<()> {
             allow_base_fallback: args.lora_allow_base_fallback,
         },
     );
+
+    // Load user-defined reasoning grammars if provided
+    if let Some(ref path) = econfig.reasoning_grammars {
+        match xinfer::utils::guidance_grammar::load_grammar_file(path) {
+            Ok(()) => xinfer::log_info!("Loaded user-defined reasoning grammars from {}", path),
+            Err(e) => xinfer::log_warn!("Failed to load reasoning grammars from {}: {}", path, e),
+        }
+    }
 
     // Multi-node worker nodes run a daemon loop instead of the full engine
     if econfig.num_nodes > 1 && econfig.node_rank > 0 {

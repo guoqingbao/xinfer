@@ -1,0 +1,216 @@
+# xinfer grammar definitions.
+#
+# Top-level keys: text, tool, reasoning.
+# The system loads this file at startup (via --reasoning-grammars or the
+# default path /etc/xinfer/grammars.yml).
+#
+# SECURITY: The "reasoning" section provides the INNER Lark expression for
+# each reasoning level. The system (Rust code) controls:
+#   - The framing template (start:, reasoning_block header)
+#   - The reasoning_text rule (special token injection: <[END_ID]>)
+#   - The negation mask for "medium" level (model-specific, not overridable)
+# You provide ONLY the content rules. No <[N]> references. No start rule.
+#
+# If a level is not present here, the built-in default from the code is used.
+
+text:
+  # (reserved for future text-con grammar overrides)
+
+tool:
+  # (reserved for future tool-level grammar overrides)
+
+reasoning:
+  # Low: simple printable text.
+  # The system wraps this with:
+  #   start: reasoning_block "\n" <[END_ID]>
+  #   reasoning_block[max_tokens=512]: {THIS_VALUE}
+  #
+  # DAG:
+  #   [start] --> reasoning_block (free text, max 512 tokens) --> "\n" --> <[END_ID]> --> [DONE]
+  #
+  # The model generates free text (any printable ASCII) for up to 512 tokens,
+  # then a newline, then the end-of-reasoning token. No branching. No checkpoints.
+  # The "slide out of constraint" is immediate: the entire reasoning block is
+  # unconstrained text, terminated by the EOR token.
+  low: /[\x20-\x7E\x0A\x0D]+?/
+
+  # High: scientific method with validation checkpoints.
+  # The system wraps this with:
+  #   start: reasoning_block
+  #   reasoning_block: {FIRST_LINE_OF_THIS_VALUE}
+  #   {REST_OF_THIS_VALUE}
+  #   reasoning_text: text_inner <[END_ID]>
+  #
+  # DAG (the branching logic):
+  #
+  #   [START]
+  #     |
+  #     v
+  #   preamble (fixed text: "I will apply the scientific method...")
+  #     |
+#     v
+  #   scientific_flow
+  #     |
+  #     +--> observation_setup (fixed prompts + free text)
+  #     |       |
+  #     |       v
+  #     +--> hypothesis_formulation (fixed prompts + free text)
+  #     |       |
+  #     |       v
+  #     +--> validation_checkpoint_1
+  #     |       |
+  #     |       +-- "Yes, sound" --> [continue]
+  #     |       +-- "No, reconsider" --> free text (slide out) --> [continue]
+  #     |       |
+  #     |       v
+  #     +--> test_design (fixed prompts + free text)
+  #     |       |
+  #     |       v
+  #     +--> result_analysis (fixed prompts + "supports"|"refutes" branch + free text)
+  #     |       |
+  #     |       v
+  #     +--> validation_checkpoint_2
+  #     |       |
+  #     |       +-- "yes, sufficient" --> [continue]
+  #     |       +-- "no, gather more" --> free text (slide out) --> [continue]
+  #     |       |
+  #     |       v
+  #     +--> conclusion_derivation (fixed prompts + free text)
+  #     |       |
+  #     |       v
+  #     +--> validation_checkpoint_3
+  #     |       |
+  #     |       +-- "yes, valid" --> [continue]
+  #     |       +-- "no, evaluate further" --> free text (slide out) --> [continue]
+  #     |       |
+  #     v
+  #   reasoning_text: text_inner <[END_ID]>
+  #     |
+  #     v
+  #   [DONE]
+  #
+  # The "slide out of constraint" happens at each checkpoint's "no" branch:
+  # the model generates free text (text_inner) to reconsider, then re-enters
+  # the structured flow. The final reasoning_text is free text until the
+  # EOR token terminates the block.
+  high: |
+    preamble scientific_flow
+    preamble: "\nI will apply the scientific method with systematic observation, hypothesis testing, and evidence-based conclusion derivation to contextualize the concern:" text_inner
+    scientific_flow: observation_setup hypothesis_formulation validation_checkpoint_1 test_design result_analysis validation_checkpoint_2 conclusion_derivation validation_checkpoint_3
+    observation_setup: "First, I observe the following facts:" text_inner "This raises the question:" text_inner
+    hypothesis_formulation: "Based on these observations, my working hypothesis is:" text_inner "If true, we would expect to see:" text_inner
+    validation_checkpoint_1: "Checkpoint: Is this hypothesis logically sound and testable? " hypothesis_validation
+    hypothesis_validation: "Yes, the hypothesis is sound and testable\n\n" | "No, i must reconsider my position:\n" text_inner
+    test_design: "To test this hypothesis, I need to examine:" text_inner "The key methodology involves:" text_inner
+    result_analysis: "Upon analysis, the data shows:" text_inner "This " ("supports" | "refutes") " my hypothesis because:" text_inner
+    validation_checkpoint_2: "Checkpoint: Is the evidence sufficient and reliable? " evidence_validation
+    evidence_validation: "yes, the evidence is sufficient and reliable\n\n" | "no, i must gather more data:\n" text_inner
+    conclusion_derivation: "Therefore, based on this systematic analysis, I conclude:" text_inner "My confidence in this conclusion is:" text_inner "The evidence supporting this includes:" text_inner
+    validation_checkpoint_3: "Checkpoint: Does this conclusion follow logically from the analysis? " conclusion_validation
+    conclusion_validation: "yes, the conclusion is logically valid\n\n" | "no, i must evaluate the concern further:\n" text_inner
+    text_inner[suffix="\n\n", temperature=0.0, max_tokens=512]: /.+/
+
+  # Chain of thought: multi-lens critical analysis with validation checkpoints.
+  # The system wraps this with:
+  #   start: reasoning_block
+  #   reasoning_block: {FIRST_LINE_OF_THIS_VALUE}
+  #   {REST_OF_THIS_VALUE}
+  #   reasoning_text: text_inner <[END_ID]>
+  #
+  # DAG (the branching logic):
+  #
+  #   [START]
+  #     |
+  #     v
+  #   preamble (fixed text: "To ensure maximum rigor...")
+  #     |
+  #     v
+  #   multi_lens_analysis
+  #     |
+  #     +--> claim_examination (Dimension 1: fixed prompts + free text)
+  #     |       |
+  #     |       v
+  #     +--> claim_validation (checkpoint: "Is this position sound?")
+  #     |       |
+  #     |       +-- "yes, sound" --> [continue]
+  #     |       +-- "no, refine" --> free text (slide out) --> [continue]
+  #     |       |
+  #     |       v
+  #     +--> evidence_assumption_evaluation (Dimension 2: fixed prompts + free text)
+  #     |       |
+  #     |       v
+  #     +--> evidence_validation (Checkpoint: "Is the evidence reliable?")
+  #     |       |
+  #     |       +-- "yes, reliable" --> [continue]
+  #     |       +-- "no, evaluate further" --> free text (slide out) --> [continue]
+  #     |       |
+  #     |       v
+  #     +--> implication_mapping (Dimension 3: fixed prompts + free text)
+  #     |       |
+  #     |       v
+  #     +--> implication_validation (Checkpoint: "Do implications follow?")
+  #     |       |
+  #     |       +-- "yes, necessarily" --> [continue]
+  #     |       +-- "no, reconsider" --> free text (slide out) --> [continue]
+  #     |       |
+  #     |       v
+  #     +--> alternative_consideration (Dimension 4: fixed prompts + free text)
+  #     |       |
+  #     |       v
+  #     +--> alternative_validation (Checkpoint: "Fairly evaluated?")
+  #     |       |
+  #     |       +-- "yes, fairly" --> [continue]
+  #     |       +-- "no, explore more" --> free text (slide out) --> [continue]
+  #     |       |
+  #     |       v
+  #     +--> integration_process (Synthesis: fixed prompts + free text)
+  #     |       |
+  #     |       v
+  #     +--> integration_validation (Checkpoint: "Converge logically?")
+  #     |       |
+  #     |       +-- "yes, converges" --> [continue]
+  #     |       +-- "no, reconcile" --> free text (slide out) --> [continue]
+  #     |       |
+  #     v
+  #   synthesis_derivation (Final Conclusion: fixed prompts + free text)
+  #     |
+  #     v
+  #   reasoning_text: text_inner <[END_ID]>
+  #     |
+  #     v
+  #   [DONE]
+  #
+  # The "slide out of constraint" happens at each checkpoint's "no" branch:
+  # the model generates free text (text_inner, max 1024 tokens) to reconsider,
+  # then re-enters the structured flow. The final reasoning_text is free text
+  # until the EOR token terminates the block.
+  #
+  # Key difference from "high": 4 dimensions (vs 3 phases), 1024-token
+  # text_inner (vs 512), and the multi_lens_analysis is a single rule that
+  # sequences all 4 dimensions + their checkpoints.
+  chain_of_thought: |
+    preamble multi_lens_analysis synthesis_derivation
+    preamble: "\nTo ensure maximum rigor, I will apply a multi-lens critical analysis framework examining claims, evidence, assumptions, implications, alternatives, and synthesis:" text_inner
+    multi_lens_analysis: claim_examination claim_validation evidence_assumption_evaluation evidence_validation implication_mapping implication_validation alternative_consideration alternative_validation integration_process integration_validation
+    claim_examination: "Dimension 1 - The Core Claim:\nMy starting position is:" text_inner "The boundaries and scope of this claim are:" text_inner "I recognize this claim rests on certain premises that must be validated:" text_inner
+    claim_validation: "Checkpoint: Is this position logically sound and well-defined?" claim_check
+    claim_check: "yes, the position is sound and well-defined\n\n" | "no, i must refine my understanding:\n" text_inner "\n\n"
+    evidence_assumption_evaluation: "Dimension 2 - Evidence and Assumptions:\nThe supporting evidence for this claim consists of:" text_inner "However, I must critically examine whether this evidence is:" text_inner "Additionally, there are hidden assumptions embedded in my reasoning:" text_inner "I need to determine if these are:" text_inner
+    evidence_validation: "Checkpoint: Is the evidence reliable and assumptions valid?" evidence_check
+    evidence_check: "yes, the evidence is reliable and assumptions are valid\n\n" | "no, i must evaluate the evidence further:\n" text_inner "\n\n"
+    implication_mapping: "Dimension 3 - Logical Consequences:\nIf my claim holds, then the necessary implications are:" text_inner "These implications create further obligations for:" text_inner "I must verify that these consequences are:" text_inner
+    implication_validation: "Checkpoint: Do these implications follow necessarily?" implication_check
+    implication_check: "yes, the implications follow necessarily\n\n" | "no, i must reconsider the consequences:\n" text_inner "\n\n"
+    alternative_consideration: "Dimension 4 - Competing Perspectives:\nAn equally valid alternative interpretation would be:" text_inner "The strengths of this alternative are:" text_inner "However, the weaknesses include:" text_inner "Comparing the two frameworks, I find that:" text_inner
+    alternative_validation: "Checkpoint: Have alternatives been fairly evaluated?" alternative_check
+    alternative_check: "yes, alternatives have been fairly evaluated\n\n" | "no, i must explore other perspectives:\n" text_inner "\n\n"
+    integration_process: "Synthesis Across All Dimensions:\nBringing together the claim examination, evidence assessment, implication mapping, and alternative consideration, I arrive at:" text_inner "The key insights that emerge from this multi-lens analysis are:" text_inner "These insights converge on a single logical conclusion:" text_inner
+    integration_validation: "Checkpoint: Does the synthesis converge logically?" integration_check
+    integration_check: "yes, the synthesis converges logically\n\n" | "no, i must reconcile the dimensions:\n" text_inner "\n\n"
+    synthesis_derivation: "Final Conclusion:\nTherefore, after systematic critical analysis, my logically justified position is:" text_inner "I am confident in this conclusion because:" text_inner "The limitations of this analysis include:" text_inner
+    text_inner[suffix="\n\n", temperature=0.0, max_tokens=1024]: /.+/
+
+# NOTE: "medium" is NOT overridable via YAML. The medium level uses the
+# system-computed negation mask (guidance_tokens.reasoning_grammar_mask()),
+# which depends on the model's specific token IDs. If you need a custom
+# medium behavior, use "low" or "high" instead.

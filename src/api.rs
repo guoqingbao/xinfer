@@ -131,6 +131,7 @@ impl EngineBuilder {
 
         let mut econfig = EngineConfig::new(
             model_id,
+            None, // reasoning_grammars
             weight_path,
             weight_file,
             None,

@@ -273,7 +273,7 @@ impl Scheduler {
         // Assign the QoS class from the controller's measured output-length estimate
         // (a no-op Throughput default until outputs are observed).
         seq.qos_class = self.policy.infer_class(&seq);
-        // The §1 two-rate sensor (the fast path): the admission records the
+// The §1 two-rate sensor (the fast path): the admission records the
         // prefix-hit EMA + the turns counter + the reuse-evidence digest (the
         // NInfer real-demand signal). The `num_cached_tokens` is the prefix hit,
         // the `len()` is the query.
@@ -285,6 +285,15 @@ impl Scheduler {
                 seq.len(),
                 reuse_digest,
             );
+        }
+        if crate::utils::env::debug_llg() {
+            if let Some(gram) = &seq.sampling_params.grammar {
+                crate::log_info!(
+                    "[llg] Seq {}: TopLevelGrammar:\n{}\n",
+                    seq.id,
+                    crate::utils::guidance_grammar::get_lark_from_top_level_grammar(gram)
+                );
+            }
         }
         self.waiting.push_back(seq);
         id
@@ -1972,6 +1981,7 @@ mod tests {
     fn make_econfig(num_spec: Option<usize>, spec_draft_max: usize) -> EngineConfig {
         let mut econfig = EngineConfig::new(
             None, // model_id
+            None, // reasoning_grammars
             None, // weight_path
             None, // weight_file
             None, // hf_token

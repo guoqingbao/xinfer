@@ -231,6 +231,42 @@ fn forward_collecting_target(
 }
 
 impl ModelRunner {
+    /// The P3 fix: mask the verify logits with the PDA projection (the draft-position guidance).
+    /// A grammar-illegal draft token is rejected by the verify (the masked argmax doesn't favor
+    /// it). The cuda-gated PDA masking (the pda_project_masks + the mask_draft_logits); the
+    /// no-cuda / no-PDA-table / unguided fallback is the unmasked verify_logits.
+    pub(crate) fn mask_verify_logits(&self, verify_logits: &Tensor, draft_tokens: &[u32], seq_id: usize) -> Result<Tensor> {
+        #[cfg(feature = "cuda")]
+        {
+            if self.guided_decoding().has_pda_table() && self.guided_decoding().is_guided(seq_id) {
+                let draft_tensor = Tensor::from_vec(draft_tokens.to_vec(), (1, draft_tokens.len()), self.device())?;
+                // The exactness gate (the RC1 fix): the GPU settled projection is exact
+                // only for a deterministic machine with a bounded closure. When it is
+                // inexact, fallpda_project_masks` bails; fall back to the unmasked verify
+                // (the origin/main behavior) — the verify still rejects grammar-illegal
+                // drafts via the target-logits comparison, so correctness holds (the
+                // drafts are just less accurate, the perf hit not the bug).
+                match self.guided_decoding().pda_project_masks(&[seq_id], &draft_tensor) {
+                    Ok(projected_masks) => {
+                        let words_per_vob = self.guided_decoding().pda_table().as_ref().unwrap().words_per_vob as usize;
+                        return crate::utils::guided_decoding::mask_draft_logits(
+                            self.guided_decoding().pda_table().as_ref(),
+                            verify_logits,
+                            &projected_masks,
+                            words_per_vob,
+                        );
+                    }
+                    Err(_) => {
+                        crate::log_warn!(
+                            "[llg] PDA draft projection inexact for seq {seq_id} (the is_deterministic / the max_closure_width gate); falling back to the unmasked verify"
+                        );
+                    }
+                }
+            }
+        }
+        Ok(verify_logits.clone())
+    }
+
     /// One DFlash2 speculative decode step (anchor + draft + verify).
     pub fn run_dflash_decode(&self, seqs: Seqs) -> Result<Vec<Vec<u32>>> {
         let batch_size = match seqs {
@@ -444,7 +480,10 @@ impl ModelRunner {
             )
         };
 
-        let verify_result = verify_draft_greedy(&verify_logits, &draft_tokens)?;
+        // The P3 fix: mask the verify logits with the PDA projection (the draft-position guidance).
+        // A grammar-illegal draft token is rejected by the verify (the masked argmax doesn't favor it).
+        let masked_verify_logits = self.mask_verify_logits(&verify_logits, &draft_tokens, seq_info.id)?;
+        let verify_result = verify_draft_greedy(&masked_verify_logits, &draft_tokens)?;
         let commit_len = 1 + verify_result.num_accepted;
         if verify_result.num_accepted < verify_result.num_proposed
             && !self.rollback_mamba(seq_info.id, commit_len)?
@@ -662,7 +701,9 @@ impl ModelRunner {
         {
             let offset = index * verify_len;
             let per_seq_logits = verify_logits.narrow(0, offset, verify_len)?;
-            let verify_result = verify_draft_greedy(&per_seq_logits, drafts)?;
+            // The P3 fix: mask the per-seq verify logits with the PDA projection (the draft-position guidance).
+            let masked_per_seq_logits = self.mask_verify_logits(&per_seq_logits, drafts, seq_info.id)?;
+            let verify_result = verify_draft_greedy(&masked_per_seq_logits, drafts)?;
             let commit_len = 1 + verify_result.num_accepted;
             if verify_result.num_accepted < verify_result.num_proposed
                 && !self.rollback_mamba_at(seq_info.id, commit_len, offset)?

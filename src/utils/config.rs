@@ -455,6 +455,10 @@ pub struct LoraConfig {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct EngineConfig {
     pub model_id: Option<String>,
+    /// Path to a user-defined reasoning-grammar YAML file (the levels map to inner
+    /// Lark expressions). Loaded into the global registry at startup.
+    #[serde(default)]
+    pub reasoning_grammars: Option<String>,
     pub weight_path: Option<String>,
     pub weight_file: Option<String>,
     pub enforce_parser: Option<String>,
@@ -549,6 +553,10 @@ fn default_master_port() -> u16 {
 pub struct EngineConfig {
     #[pyo3(get, set)]
     pub model_id: Option<String>,
+    /// Path to a user-defined reasoning-grammar YAML file.
+    #[pyo3(get, set)]
+    #[serde(default)]
+    pub reasoning_grammars: Option<String>,
     #[pyo3(get, set)]
     pub weight_path: Option<String>,
     #[pyo3(get, set)]
@@ -681,6 +689,7 @@ impl EngineConfig {
 impl EngineConfig {
     pub fn new(
         model_id: Option<String>,
+        reasoning_grammars: Option<String>,
         weight_path: Option<String>,
         weight_file: Option<String>,
         hf_token: Option<String>,
@@ -729,6 +738,7 @@ impl EngineConfig {
 
         Self {
             model_id,
+            reasoning_grammars,
             weight_path,
             weight_file,
             hf_token,
@@ -878,6 +888,15 @@ pub struct SamplingParams {
     /// When set, grammar constraints are deferred until after reasoning ends.
     #[serde(default)]
     pub guidance_reasoning_end_ids: Vec<u32>,
+    /// The reasoning token budget (the max reasoning tokens before the model is
+    /// steered to the end-of-reasoning token). When set, the runner applies a
+    /// sampling bias to the end-of-reasoning token that ramps up as the
+    /// reasoning count approaches this budget (the smooth transition, not the
+    /// hard grammar cutoff). The `None` means no budget (the unbounded
+    /// reasoning, the prior behavior). This works with or without a grammar
+    /// (the bias is a sampling intervention, not a mask).
+    #[serde(default)]
+    pub reasoning_budget: Option<usize>,
     /// The LoRA tenant id (the per-request adapter selection). When set, the
     /// runner activates this tenant's LoRA adapters for the forward pass (the
     /// `set_active_tenant`). The `None` means the base model (no adapter).
@@ -973,6 +992,7 @@ impl SamplingParams {
             grammar_json: None,
             reasoning_effort,
             guidance_reasoning_end_ids: Vec::new(),
+            reasoning_budget: None,
             lora_tenant: None,
             lora_tenants: Vec::new(),
         }
@@ -996,6 +1016,7 @@ impl SamplingParams {
             grammar_json: None,
             reasoning_effort: None,
             guidance_reasoning_end_ids: Vec::new(),
+            reasoning_budget: None,
             lora_tenant: None,
             lora_tenants: Vec::new(),
         }
@@ -1021,6 +1042,7 @@ impl Default for SamplingParams {
             grammar_json: None,
             reasoning_effort: None,
             guidance_reasoning_end_ids: Vec::new(),
+            reasoning_budget: None,
             lora_tenant: None,
             lora_tenants: Vec::new(),
         }

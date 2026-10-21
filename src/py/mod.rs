@@ -308,7 +308,7 @@ impl EngineConfig {
         disable_reasoning=false, disable_cuda_graph=false, prefill_chunk_size=Some(8192),
         num_nodes=1, node_rank=0, master_addr=None, master_port=29500,
         enable_tool_grammar=false, num_speculative_tokens=None,
-        draft_model=None,))]
+        draft_model=None, reasoning_grammars=None,))]
     pub fn from_args(
         model_id: Option<String>,
         weight_path: Option<String>,
@@ -350,6 +350,7 @@ impl EngineConfig {
         enable_tool_grammar: bool,
         num_speculative_tokens: Option<usize>,
         draft_model: Option<String>,
+        reasoning_grammars: Option<String>,
     ) -> Self {
         let mut device_ids = device_ids.unwrap_or_default();
         if device_ids.is_empty() {
@@ -414,6 +415,7 @@ impl EngineConfig {
             draft_model,
             enable_tool_grammar,
             qos: crate::core::qos::QosConfig::default(),
+            reasoning_grammars,
         }
     }
 }

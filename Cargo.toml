@@ -22,9 +22,10 @@ itertools = "0.13.0"
 akin = "0.4.0"
 indicatif = "0.17.11"
 serde_json = "1.0.108"
-llguidance = { git = "https://github.com/guidance-ai/llguidance", rev = "2887ddb", default-features = false, features = ["lark", "referencing", "jsonschema_validation", "dpda", "rayon"] }
-    toktrie_hf_tokenizers = { git = "https://github.com/guidance-ai/llguidance", rev = "2887ddb" }
-    toktrie = { git = "https://github.com/guidance-ai/llguidance", rev = "2887ddb" }
+serde_yaml = "0.9"
+llguidance = { git = "https://github.com/guidance-ai/llguidance", rev = "790b34f", default-features = false, features = ["lark", "referencing", "jsonschema_validation", "dpda", "rayon"] }
+    toktrie_hf_tokenizers = { git = "https://github.com/guidance-ai/llguidance", rev = "790b34f" }
+    toktrie = { git = "https://github.com/guidance-ai/llguidance", rev = "790b34f" }
     pushdown-rs = { git = "https://github.com/sempervictus/pushdown-rs", rev = "988980c" }
 half = { version = "2.5.0", features = ["num-traits", "use-intrinsics", "rand_distr"] }
 tokio = { version = "1.38.0", features = ["sync"] }

@@ -30,7 +30,7 @@ use crate::transfer::Transfer;
 use crate::utils::chat_template::Message;
 use crate::utils::config::{EngineConfig, EosTokenId, ModelType, SamplingParams};
 use crate::utils::guidance::{build_llg_factory, extract_guidance_tokens, GuidanceTokens};
-use crate::utils::guidance_grammar::{get_reasoning_token_strings, is_reasoning_grammar};
+use crate::utils::guidance_grammar::is_reasoning_grammar;
 use crate::utils::heartbeat::heartbeat_worker;
 use crate::utils::image::{get_image_config, ImageData, ImageProcessConfig};
 use crate::utils::kvcache_allocator::KVCacheAllocator;
@@ -135,7 +135,7 @@ pub struct LLMEngine {
     pub tool_config: ToolConfig,
     pub img_cfg: Option<ImageProcessConfig>,
     pub guidance_tokens: GuidanceTokens,
-    seq_spec_stats: std::sync::Mutex<HashMap<usize, SpecSeqStatsData>>,
+seq_spec_stats: std::sync::Mutex<HashMap<usize, SpecSeqStatsData>>,
 }
 
 impl LLMEngine {
@@ -677,7 +677,7 @@ impl LLMEngine {
             model_name,
             guidance_tokens,
             seq_spec_stats: std::sync::Mutex::new(HashMap::new()),
-        });
+            });
 
         Self::start_engine(engine.clone());
         Ok(engine)
@@ -1081,6 +1081,15 @@ pub async fn notify_runner_finished(&self, id: usize) -> Result<()> {
         rpc_value(&self.sched, |r| SchedMessage::GetSeqReport(seq_id, r), None).await
     }
 
+// The llg anti-loop methods (the get_seq_loop_stats + the observe_loop). The
+    // fetch_spec_seq_stats is dropped (the §7.3 capture-before-drop: the per-seq spec
+    // stats now come from the SchedD-owned map via GetSpecStats, the no runner fetch).
+    /// The cached per-seq loop-defense stats (for the server's end-of-sequence report).
+    /// Routed through the SchedD actor (which owns the loop-defense state).
+    pub async fn get_seq_loop_stats(&self, seq_id: usize) -> Option<crate::utils::loop_detect::LoopSeqStats> {
+        rpc_value(&self.sched, |r| SchedMessage::GetSeqLoopStats(seq_id, r), None).await
+    }
+
     /// The cached per-seq spec stats (for the server's end-of-sequence report).
     pub fn get_seq_spec_stats(&self, seq_id: usize) -> Option<SpecSeqStatsData> {
         self.seq_spec_stats.lock().unwrap().get(&seq_id).cloned()
@@ -1249,7 +1258,8 @@ pub async fn notify_runner_finished(&self, id: usize) -> Result<()> {
         }
         // Generation alignment and open/close parity enforcement
         if let Some(grammar) = &params.grammar {
-            if self.guidance_tokens.add_bos_token {
+            let lark = crate::utils::guidance_grammar::get_lark_from_top_level_grammar(grammar);
+            if lark.contains("start: bos ") {
                 // BOS-based trimming: trim the last BOS token from the prompt tail.
                 // Only trim if the prompt actually ends with the BOS string to avoid
                 // splitting in the middle of a multi-turn conversation.
@@ -1272,33 +1282,9 @@ pub async fn notify_runner_finished(&self, id: usize) -> Result<()> {
                         }
                     }
                 }
-            } else {
-                // Reasoning tag-based trimming: check for reasoning start/end tokens
-                if let Some((start_str, end_str)) =
-                    get_reasoning_token_strings(&self.guidance_tokens, &self.tokenizer)
-                {
-                    if is_reasoning_grammar(&grammar) {
-                        // Control entire reasoning block via guidance
-                        if prompt.trim().ends_with(&start_str) || prompt.trim().ends_with(&end_str)
-                        {
-                            if let Some((prompt, _trimmed)) = prompt.rsplit_once(&start_str) {
-                                return (prompt.to_string(), image_idx);
-                            }
-                        }
-                    } else if params.guidance_reasoning_end_ids.is_empty() {
-                        // Only trim <think> when NOT using two-phase reasoning.
-                        // With two-phase reasoning, the model needs the <think> prefix
-                        // to generate reasoning freely before grammar constraints kick in.
-                        if prompt.trim().ends_with(&start_str) {
-                            if let Some((prompt, _trimmed)) = prompt.rsplit_once(&start_str) {
-                                return (prompt.to_string(), image_idx);
-                            }
-                        }
-                    }
-                }
             }
         }
-        (prompt, image_idx)
+(prompt, image_idx)
     }
 
     pub async fn is_idle(&self) -> bool {
@@ -1749,6 +1735,7 @@ mod tests {
             tool_call_start_ids: Vec::new(),
             tool_call_end_ids: Vec::new(),
             add_bos_token: false,
+            add_eos_token: false,
         };
 
         assert_eq!(
@@ -1767,6 +1754,7 @@ mod tests {
             tool_call_start_ids: Vec::new(),
             tool_call_end_ids: Vec::new(),
             add_bos_token: false,
+            add_eos_token: false,
         };
 
         assert_eq!(
@@ -1785,6 +1773,7 @@ mod tests {
             tool_call_start_ids: Vec::new(),
             tool_call_end_ids: Vec::new(),
             add_bos_token: false,
+            add_eos_token: false,
         };
 
         assert_eq!(
@@ -1803,6 +1792,7 @@ mod tests {
             tool_call_start_ids: Vec::new(),
             tool_call_end_ids: Vec::new(),
             add_bos_token: false,
+            add_eos_token: false,
         };
 
         assert_eq!(
@@ -1821,6 +1811,7 @@ mod tests {
             tool_call_start_ids: Vec::new(),
             tool_call_end_ids: Vec::new(),
             add_bos_token: false,
+            add_eos_token: false,
         };
 
         assert_eq!(
@@ -1828,4 +1819,5 @@ mod tests {
             None
         );
     }
-}
+
+    }

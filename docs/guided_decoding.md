@@ -114,15 +114,14 @@ Reasoning effort is separate from ordinary structured outputs.
 
 The OpenAI path maps `reasoning_effort` into grammar composition.
 
-Accepted values come from `ReasoningEffort::from_str`:
+Accepted values come from `ReasoningEffort::from_str` (case-insensitive):
 - `none`
+- `model_default` / `default`
 - `low`
-- `medium`
-- `normal`
+- `medium` / `normal`
 - `high`
-- `chain_of_thought`
-- `cot`
-- `cove`
+- `xhigh` / `x_high` / `very_high` / `maximum` / `max` (all normalize to `high`)
+- `chain_of_thought` / `cot` / `cove`
 
 Non-Python builds also support:
 - `custom:<template>`

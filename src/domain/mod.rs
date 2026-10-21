@@ -98,46 +98,47 @@ mod graph_tests {
     fn minimal_econfig() -> EngineConfig {
         EngineConfig::new(
             Some("test-model".to_string()), // 1 model_id
-            None, // 2 weight_path
-            None, // 3 weight_file
-            None, // 4 hf_token
-            None, // 5 hf_token_path
-            None, // 6 enforce_parser
-            Some(1), // 7 max_num_seqs
-            None, // 8 config_model_len
-            Some(128), // 9 max_model_len
-            Some(8), // 10 max_tokens
-            None, // 11 isq
-            Some(1), // 12 num_shards
-            Some(vec![0]), // 13 device_ids
-            None, // 14 generation_cfg
-            None, // 15 seed
-            false, // 16 disable_prefix_cache
-            None, // 17 prefix_cache_max_tokens
-            None, // 18 kvcache_dtype
-            Some(false), // 19 server_mode
-            None, // 20 cpu_mem_fold
-            None, // 21 kv_fraction
-            None, // 22 mamba_fraction
-            None, // 23 pd_config
-            None, // 24 mcp_command
-            None, // 25 mcp_config
-            None, // 26 mcp_args
-            None, // 27 tool_prompt_template
-            None, // 28 pd_server_prefix_cache_ratio
-            None, // 29 pd_client_prefix_cache_ratio
-            None, // 30 yarn_scaling_factor
-            true, // 31 disable_reasoning
-            true, // 32 disable_cuda_graph
-            None, // 33 prefill_chunk_size
-            1, // 34 num_nodes
-            0, // 35 node_rank
-            None, // 36 master_addr
-            29500, // 37 master_port
-            false, // 38 enable_tool_grammar
-            None, // 39 num_speculative_tokens
-            None, // 40 draft_model
-            crate::utils::config::LoraConfig::default(), // 41 lora
+            None, // 2 reasoning_grammars
+            None, // 3 weight_path
+            None, // 4 weight_file
+            None, // 5 hf_token
+            None, // 6 hf_token_path
+            None, // 7 enforce_parser
+            Some(1), // 8 max_num_seqs
+            None, // 9 config_model_len
+            Some(128), // 10 max_model_len
+            Some(8), // 11 max_tokens
+            None, // 12 isq
+            Some(1), // 13 num_shards
+            Some(vec![0]), // 14 device_ids
+            None, // 15 generation_cfg
+            None, // 16 seed
+            false, // 17 disable_prefix_cache
+            None, // 18 prefix_cache_max_tokens
+            None, // 19 kvcache_dtype
+            Some(false), // 20 server_mode
+            None, // 21 cpu_mem_fold
+            None, // 22 kv_fraction
+            None, // 23 mamba_fraction
+            None, // 24 pd_config
+            None, // 25 mcp_command
+            None, // 26 mcp_config
+            None, // 27 mcp_args
+            None, // 28 tool_prompt_template
+            None, // 29 pd_server_prefix_cache_ratio
+            None, // 30 pd_client_prefix_cache_ratio
+            None, // 31 yarn_scaling_factor
+            true, // 32 disable_reasoning
+            true, // 33 disable_cuda_graph
+            None, // 34 prefill_chunk_size
+            1, // 35 num_nodes
+            0, // 36 node_rank
+            None, // 37 master_addr
+            29500, // 38 master_port
+            false, // 39 enable_tool_grammar
+            None, // 40 num_speculative_tokens
+            None, // 41 draft_model
+            crate::utils::config::LoraConfig::default(), // 42 lora
         )
     }
 
@@ -240,6 +241,8 @@ mod graph_tests {
 
         // Clean up (the fire-and-forget Shutdown breaks the runner loop).
         let _ = fwd.send_message(FwdMessage::Shutdown);
-        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 1, "the runner processed the prefill (one step = one forward pass)");
+        // One step() drives: the prefill forward (1) + the matcher-gated ingress
+        // (the gate_commit, 1) = 2 runner requests.
+        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 2, "the runner processed the prefill + the gate_commit");
     }
 }
