@@ -6,9 +6,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Mutex;
-
-/// DFlash2 drafts attend to a bounded projected-context window (matches reference training).
-const DEFAULT_CONTEXT_WINDOW: usize = 512;
+use crate::utils::apply_static_rope_scaling;
 
 pub struct DFlashDrafter {
     pub draft_model: DFlashDraftModel,
@@ -30,12 +28,9 @@ impl DFlashDrafter {
         device: &Device,
         num_speculative_tokens: Option<usize>,
     ) -> Result<Self> {
-        if !draft_config.is_dflash2() {
-            candle_core::bail!(
-                "Only DFlash2 draft models are supported (architecture DFlash2* or dflash_config.selector_top_k). \
-                 For Qwen3.5 built-in speculative decoding, use --num-speculative-tokens without --draft-model."
-            );
-        }
+        // DFlash1 and DFlash2 are both supported. DFlash2 checkpoints carry the
+        // candidate selector + grouped conv; DFlash1 has neither and uses the
+        // plain-argmax draft path (see DFlashDraftModel::select_from_logits).
 
         let draft_vb = unsafe {
             candle_nn::var_builder::ShardedSafeTensors::var_builder(
@@ -59,13 +54,14 @@ impl DFlashDrafter {
         let block_size =
             num_speculative_tokens.unwrap_or_else(|| draft_config.block_size().saturating_sub(1));
         let mask_token_id = draft_config.mask_token_id().unwrap_or(0);
-        let context_window = std::cmp::min(
-            DEFAULT_CONTEXT_WINDOW,
-            draft_config.max_position_embeddings.max(1),
-        );
+        let context_window = match crate::utils::env::spec_context_window() {
+            // 0 = unbounded full history (the original DFlash behavior).
+            0 => draft_config.max_position_embeddings.max(1),
+            n => std::cmp::min(n, draft_config.max_position_embeddings.max(1)),
+        };
 
         crate::log_info!(
-            "DFlash2 drafter initialized: {} layers, num_speculative_tokens={}, target_layer_ids={:?}, mask_token_id={}, context_window={}",
+            "DFlash drafter initialized: {} layers, num_speculative_tokens={}, target_layer_ids={:?}, mask_token_id={}, context_window={}",
             draft_config.num_hidden_layers,
             block_size,
             target_layer_ids,
@@ -95,14 +91,25 @@ impl DFlashDrafter {
     }
 
     /// Run the DFlash2 draft block and select tokens via the top-k candidate lattice.
+    /// `max_draft` bounds the draft length to the per-seq dynamic K (the `SpecSeqInfo.k`,
+    /// the no the fixed `num_speculative_tokens` ceiling). The drafter always produces
+    /// `min(num_speculative_tokens, max_draft)` tokens; a `max_draft` of 0 (the SD off for
+    /// this seq, the plain decode) yields an empty draft (the caller falls back to the
+    /// anchor-only verify, mirroring the MTP `num_draft == 0` path). This keeps the
+    /// verify length (`1 + k`) in lockstep with the scheduler's `k.max(1)` KV pre-alloc,
+    /// so `compute_slot_mappings` never runs past the block_table.
     pub fn draft_tokens(
         &self,
         target_hidden: &Tensor,
         embed_fn: &dyn Fn(&Tensor) -> Result<Tensor>,
         lm_head_fn: &dyn Fn(&Tensor) -> Result<Tensor>,
         anchor_token: u32,
+        max_draft: usize,
     ) -> Result<Vec<u32>> {
-        let n = self.num_speculative_tokens;
+        let n = std::cmp::min(self.num_speculative_tokens, max_draft);
+        if n == 0 {
+            return Ok(Vec::new());
+        }
         let mut block_ids = vec![self.mask_token_id; n + 1];
         block_ids[0] = anchor_token;
 
@@ -199,6 +206,7 @@ impl DFlashDrafter {
 use crate::core::runner::{Model, ModelRunner, Seqs};
 use crate::models::layers::linear::set_linear_is_prefill;
 use crate::speculative::metadata::SpecSeqInfo;
+use crate::speculative::spec_stats::spec_stats_update;
 use crate::speculative::verify::{dflash_stats_summary, dflash_stats_update, verify_draft_greedy};
 use crate::utils::config::EngineConfig;
 use attention_rs::InputMetadata;
@@ -223,6 +231,42 @@ fn forward_collecting_target(
 }
 
 impl ModelRunner {
+    /// The P3 fix: mask the verify logits with the PDA projection (the draft-position guidance).
+    /// A grammar-illegal draft token is rejected by the verify (the masked argmax doesn't favor
+    /// it). The cuda-gated PDA masking (the pda_project_masks + the mask_draft_logits); the
+    /// no-cuda / no-PDA-table / unguided fallback is the unmasked verify_logits.
+    pub(crate) fn mask_verify_logits(&self, verify_logits: &Tensor, draft_tokens: &[u32], seq_id: usize) -> Result<Tensor> {
+        #[cfg(feature = "cuda")]
+        {
+            if self.guided_decoding().has_pda_table() && self.guided_decoding().is_guided(seq_id) {
+                let draft_tensor = Tensor::from_vec(draft_tokens.to_vec(), (1, draft_tokens.len()), self.device())?;
+                // The exactness gate (the RC1 fix): the GPU settled projection is exact
+                // only for a deterministic machine with a bounded closure. When it is
+                // inexact, fallpda_project_masks` bails; fall back to the unmasked verify
+                // (the origin/main behavior) — the verify still rejects grammar-illegal
+                // drafts via the target-logits comparison, so correctness holds (the
+                // drafts are just less accurate, the perf hit not the bug).
+                match self.guided_decoding().pda_project_masks(&[seq_id], &draft_tensor) {
+                    Ok(projected_masks) => {
+                        let words_per_vob = self.guided_decoding().pda_table().as_ref().unwrap().words_per_vob as usize;
+                        return crate::utils::guided_decoding::mask_draft_logits(
+                            self.guided_decoding().pda_table().as_ref(),
+                            verify_logits,
+                            &projected_masks,
+                            words_per_vob,
+                        );
+                    }
+                    Err(_) => {
+                        crate::log_warn!(
+                            "[llg] PDA draft projection inexact for seq {seq_id} (the is_deterministic / the max_closure_width gate); falling back to the unmasked verify"
+                        );
+                    }
+                }
+            }
+        }
+        Ok(verify_logits.clone())
+    }
+
     /// One DFlash2 speculative decode step (anchor + draft + verify).
     pub fn run_dflash_decode(&self, seqs: Seqs) -> Result<Vec<Vec<u32>>> {
         let batch_size = match seqs {
@@ -242,11 +286,13 @@ impl ModelRunner {
                 id: refs[0].id,
                 len: refs[0].len(),
                 block_table: refs[0].block_table.clone(),
+                k: refs[0].spec_k,
             },
             Seqs::DecodeVec(ref decoded) if decoded.len() == 1 => SpecSeqInfo {
                 id: decoded[0].id,
                 len: decoded[0].len,
                 block_table: decoded[0].block_tables.clone(),
+                k: decoded[0].spec_k,
             },
             _ => {
                 let output = self.run(seqs, false)?;
@@ -328,7 +374,7 @@ impl ModelRunner {
             }
         };
         let draft_tokens =
-            drafter.draft_tokens(&target_hidden, &embed_fn, &lm_head_fn, anchor_token)?;
+            drafter.draft_tokens(&target_hidden, &embed_fn, &lm_head_fn, anchor_token, seq_info.k)?;
         if draft_tokens.is_empty() {
             return Ok(vec![vec![anchor_token]]);
         }
@@ -350,10 +396,11 @@ impl ModelRunner {
         let _verify_guard = set_linear_is_prefill(true);
 
         #[cfg(all(feature = "cuda", feature = "graph"))]
-        let use_verify_graph = self
-            .mtp_capturer
-            .as_ref()
-            .map_or(false, |c| c.is_mtp_captured(verify_len));
+        let use_verify_graph = crate::utils::env::spec_graph()
+            && self
+                .mtp_capturer
+                .as_ref()
+                .map_or(false, |c| c.is_mtp_captured(verify_len));
         #[cfg(not(all(feature = "cuda", feature = "graph")))]
         let use_verify_graph = false;
 
@@ -433,7 +480,10 @@ impl ModelRunner {
             )
         };
 
-        let verify_result = verify_draft_greedy(&verify_logits, &draft_tokens)?;
+        // The P3 fix: mask the verify logits with the PDA projection (the draft-position guidance).
+        // A grammar-illegal draft token is rejected by the verify (the masked argmax doesn't favor it).
+        let masked_verify_logits = self.mask_verify_logits(&verify_logits, &draft_tokens, seq_info.id)?;
+        let verify_result = verify_draft_greedy(&masked_verify_logits, &draft_tokens)?;
         let commit_len = 1 + verify_result.num_accepted;
         if verify_result.num_accepted < verify_result.num_proposed
             && !self.rollback_mamba(seq_info.id, commit_len)?
@@ -457,6 +507,7 @@ impl ModelRunner {
         if dflash_stats_update(verify_result.num_proposed, verify_result.num_accepted) {
             crate::log_info!("{}", dflash_stats_summary());
         }
+        spec_stats_update("DFlash", seq_info.id, &verify_result);
         Ok(vec![result_tokens])
     }
 
@@ -472,6 +523,7 @@ impl ModelRunner {
                     id: seq.id,
                     len: seq.len(),
                     block_table: seq.block_table.clone(),
+                    k: seq.spec_k,
                 })
                 .collect::<Vec<_>>(),
             Seqs::DecodeVec(ref decoded) => decoded
@@ -480,6 +532,7 @@ impl ModelRunner {
                     id: seq.id,
                     len: seq.len,
                     block_table: seq.block_tables.clone(),
+                    k: seq.spec_k,
                 })
                 .collect::<Vec<_>>(),
         };
@@ -554,24 +607,45 @@ impl ModelRunner {
             let target_hidden = drafter
                 .build_draft_context(seq_info.id)?
                 .ok_or_else(|| candle_core::Error::Msg("DFlash2 context cache is empty".into()))?;
+            // The per-seq dynamic K: draft `seq_info.k` tokens (the no the fixed
+            // num_speculative_tokens ceiling). The batch verify below uses the
+            // batch-max K (the uniform q_len for the one attention pass), but each
+            // seq drafts its own dynamic length (mirroring the MTP batch pattern).
             draft_tokens.push(drafter.draft_tokens(
                 &target_hidden,
                 &embed_fn,
                 &lm_head_fn,
                 anchor_token,
+                seq_info.k,
             )?);
         }
-        let verify_len = 1 + drafter.num_speculative_tokens;
-        if draft_tokens
-            .iter()
-            .any(|tokens| tokens.len() != drafter.num_speculative_tokens)
-        {
-            candle_core::bail!("DFlash2 batch produced an unexpected draft length");
+        // The batch verify length: the MAX per-seq K across the batch (the uniform
+        // q_len for the one attention pass). A seq with a smaller K drafts fewer
+        // tokens; its verify positions beyond its draft are the anchor-only (the no
+        // over-verify past the seq's own K). The scheduler pre-allocates the
+        // batch-max K for every seq in the speculative batch (the no the per-seq k,
+        // which would under-alloc the shorter-draft seqs' verify positions).
+        let max_k = seq_infos.iter().map(|s| s.k).max().unwrap_or(0);
+        let verify_len = 1 + max_k;
+        if draft_tokens.iter().any(|tokens| tokens.is_empty() && max_k > 0) {
+            // The no draft produced for some seq (the empty-draft bail): the anchor only,
+            // the no speculative K (the next_k = 0, the no verify).
+            return Ok(anchor_tokens
+                .into_iter()
+                .map(|anchor| vec![anchor])
+                .collect());
         }
         let mut verify_tokens = Vec::with_capacity(seq_infos.len() * verify_len);
         for (anchor, drafts) in anchor_tokens.iter().zip(&draft_tokens) {
             verify_tokens.push(*anchor);
             verify_tokens.extend_from_slice(drafts);
+            // The pad the shorter drafts to the batch-max (the uniform verify tensor).
+            // The padding tokens are the anchor (the no-op verify position, the
+            // verify_draft_greedy compares up to the draft length, the padding is
+            // never accepted).
+            for _ in drafts.len()..max_k {
+                verify_tokens.push(*anchor);
+            }
         }
         let q_lens = vec![verify_len; seq_infos.len()];
         let slot_mappings = seq_infos
@@ -627,7 +701,9 @@ impl ModelRunner {
         {
             let offset = index * verify_len;
             let per_seq_logits = verify_logits.narrow(0, offset, verify_len)?;
-            let verify_result = verify_draft_greedy(&per_seq_logits, drafts)?;
+            // The P3 fix: mask the per-seq verify logits with the PDA projection (the draft-position guidance).
+            let masked_per_seq_logits = self.mask_verify_logits(&per_seq_logits, drafts, seq_info.id)?;
+            let verify_result = verify_draft_greedy(&masked_per_seq_logits, drafts)?;
             let commit_len = 1 + verify_result.num_accepted;
             if verify_result.num_accepted < verify_result.num_proposed
                 && !self.rollback_mamba_at(seq_info.id, commit_len, offset)?
@@ -649,6 +725,7 @@ impl ModelRunner {
             if dflash_stats_update(verify_result.num_proposed, verify_result.num_accepted) {
                 crate::log_info!("{}", dflash_stats_summary());
             }
+            spec_stats_update("DFlash", seq_info.id, &verify_result);
             result.push(output);
         }
         Ok(result)
@@ -667,7 +744,7 @@ pub fn init_dflash_drafter(
         return Ok(None);
     }
 
-    crate::log_info!("Loading external DFlash2 draft model...");
+    crate::log_info!("Loading external DFlash draft model...");
     let (model_id, weight_path) = crate::speculative::resolve_draft_model(draft_model);
     let loader = crate::utils::downloader::Downloader::new(model_id, weight_path, None);
     let (draft_paths, is_gguf) = loader
@@ -678,8 +755,15 @@ pub fn init_dflash_drafter(
 
     let config_data = std::fs::read(draft_paths.get_config_filename())
         .map_err(|e| candle_core::Error::Msg(format!("Failed to read DFlash2 config: {e}")))?;
-    let draft_config: DFlashModelConfig = serde_json::from_slice(&config_data)
+    let mut draft_config: DFlashModelConfig = serde_json::from_slice(&config_data)
         .map_err(|e| candle_core::Error::Msg(format!("Failed to parse DFlash2 config: {e}")))?;
+    // Reuse the CLI-driven dynamic YARN machinery so the drafter's rope matches
+    // the base model (same derive_yarn_parameters theta adjustment + mscale).
+    if let Some(map) =
+        apply_static_rope_scaling(econfig.yarn_scaling_factor, draft_config.max_position_embeddings)
+    {
+        draft_config.rope_scaling = Some(map);
+    }
     let draft_dtype = crate::utils::get_dtype(None);
     let drafter = DFlashDrafter::new(
         &draft_config,
@@ -689,6 +773,6 @@ pub fn init_dflash_drafter(
         device,
         econfig.num_speculative_tokens,
     )?;
-    crate::log_info!("External DFlash2 draft model loaded successfully");
+    crate::log_info!("External DFlash draft model loaded successfully");
     Ok(Some(drafter))
 }

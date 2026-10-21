@@ -10,6 +10,7 @@ use crate::models::layers::rotary_emb::{
     ApplyRotaryEmbedding, RotaryEmbedding, ScalingRotaryEmbedding,
 };
 use crate::models::layers::{mlp::MLP as TextMLP, VarBuilderX};
+use crate::core::lora::apply_embedding_lora;
 use crate::utils::config::Config;
 use crate::utils::image::ImageData;
 use crate::utils::progress::ProgressLike;
@@ -686,7 +687,7 @@ impl Gemma3ForConditionalGeneration {
             &text_cfg.quantization_config,
             &None,
             dtype,
-        )?;
+        )?.with_lora_module("lm_head".to_string());
 
         Ok(Self {
             vision_tower,
@@ -707,6 +708,7 @@ impl Gemma3ForConditionalGeneration {
 
     fn embed_forward(&self, input_ids: &Tensor) -> Result<Tensor> {
         let xs = self.embed_tokens.forward(input_ids)?;
+        let xs = apply_embedding_lora(&xs)?;
         let xs = if (self.is_qvar_builder || self.g_cfg.quant.is_some()) && xs.dtype() != DType::F32
         {
             xs.to_dtype(DType::F32)?

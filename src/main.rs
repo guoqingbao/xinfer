@@ -53,6 +53,10 @@ async fn main() -> Result<()> {
 
     let dtype = get_dtype(args.dtype);
 
+    // The startup warning for the unsupported spec-decode env vars (the no the silent
+    // no-op -- the operator who set XINFER_SPEC_GRANULAR_MASK sees a clear message).
+    xinfer::utils::env::warn_unsupported_spec_env_vars();
+
     let (max_num_seqs, interactive) = if args.batch.is_some() {
         tracing::warn!("max_num_seqs is ignored in batch performance test.");
         if args.interactive {
@@ -211,6 +215,7 @@ async fn main() -> Result<()> {
 
     let econfig = EngineConfig::new(
         args.model_id,
+        args.reasoning_grammars.clone(),
         args.weight_path,
         args.weight_file,
         args.hf_token,
@@ -250,7 +255,34 @@ async fn main() -> Result<()> {
         args.enable_tool_grammar,
         args.num_speculative_tokens,
         args.draft_model.clone(),
+        xinfer::utils::config::LoraConfig {
+            adapters: args
+                .lora
+                .iter()
+                .filter_map(|spec| {
+                    let (name, source) = spec
+                        .split_once('=')
+                        .map(|(n, s)| (n.to_string(), s.to_string()))
+                        .unwrap_or_else(|| (spec.clone(), spec.clone()));
+                    Some((name, source))
+                })
+                .collect(),
+            max_tenants: args.lora_max_tenants,
+            max_active: args.lora_max_active,
+            max_bytes: args.lora_max_bytes,
+            eviction_policy: args.lora_eviction_policy.clone(),
+            pinned: args.lora_pin.clone(),
+            allow_base_fallback: args.lora_allow_base_fallback,
+        },
     );
+
+    // Load user-defined reasoning grammars if provided
+    if let Some(ref path) = econfig.reasoning_grammars {
+        match xinfer::utils::guidance_grammar::load_grammar_file(path) {
+            Ok(()) => xinfer::log_info!("Loaded user-defined reasoning grammars from {}", path),
+            Err(e) => xinfer::log_warn!("Failed to load reasoning grammars from {}: {}", path, e),
+        }
+    }
 
     // Multi-node worker nodes run a daemon loop instead of the full engine
     if econfig.num_nodes > 1 && econfig.node_rank > 0 {
@@ -263,7 +295,7 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    let engine = LLMEngine::new(&econfig, dtype)?;
+    let engine = LLMEngine::new(&econfig, dtype).await?;
     if let Some(addr) = server_addr {
         run_server(engine.clone(), econfig.clone(), addr, args.ui_server).await?;
         return Ok(());
@@ -295,7 +327,7 @@ async fn main() -> Result<()> {
     }
 
     let (resolved_max_model_len, resolved_max_num_seqs) = {
-        let e = engine.read();
+        let e = engine.as_ref();
         let (_, _, mml) = e.get_model_info();
         (mml.unwrap_or(32768usize), e.econfig.max_num_seqs)
     };
@@ -359,9 +391,9 @@ async fn main() -> Result<()> {
                         print!("\n🌀 Chat history cleared. Start a new conversation.\n");
                         chat_history.clear(); //start a new chat
                         if prefix_cache {
-                            let e = engine.read();
+                            let e = engine.as_ref();
                             chat_context_left =
-                                total_available_tokens - e.get_num_cached_tokens() as i64;
+                                total_available_tokens - e.get_num_cached_tokens().await as i64;
                         } else {
                             chat_context_left = total_available_tokens;
                         }
@@ -379,7 +411,7 @@ async fn main() -> Result<()> {
         let mut outputs = {
             if interactive {
                 let preprocessed = {
-                    let e = engine.read();
+                    let e = engine.as_ref();
                     let mut p = e
                         .preprocess(
                             std::slice::from_ref(&request_params),
@@ -391,8 +423,8 @@ async fn main() -> Result<()> {
                     p.pop().expect("preprocess returned 0 items for 1 input")
                 };
                 let (seq_id, prompt_length, _prefilled_reasoning_end, stream) = {
-                    let mut e = engine.write();
-                    match e.generate_stream(preprocessed, None, &None) {
+                    let e = engine.as_ref();
+                    match e.generate_stream(preprocessed, None, &None).await {
                         Ok((seq_id, prompt_length, prefilled_reasoning_end, stream)) => {
                             (seq_id, prompt_length, prefilled_reasoning_end, stream)
                         }
@@ -456,8 +488,8 @@ async fn main() -> Result<()> {
                     decode_output,
                 ) = handle.await.map_err(candle_core::Error::wrap)?;
                 if prefix_cache {
-                    let e = engine.read();
-                    chat_context_left = total_available_tokens - e.get_num_cached_tokens() as i64;
+                    let e = engine.as_ref();
+                    chat_context_left = total_available_tokens - e.get_num_cached_tokens().await as i64;
                 } else {
                     chat_context_left =
                         total_available_tokens - prompt_length as i64 - decoded_length as i64;
@@ -478,15 +510,15 @@ async fn main() -> Result<()> {
                 xinfer::log_warn!("Starting the inference...");
 
                 let (preprocessed, tokenizer) = {
-                    let e = engine.read();
+                    let e = engine.as_ref();
                     (
                         e.preprocess(&params, &message_list, &Vec::new(), false)?,
                         Arc::new(e.tokenizer.clone()),
                     )
                 };
                 let receivers = {
-                    let mut e = engine.write();
-                    e.generate_sync(preprocessed, None, &None)?
+                    let e = engine.as_ref();
+                    e.generate_sync(preprocessed, None, &None).await?
                 };
                 let results = LLMEngine::collect_sync_results(receivers, tokenizer, None).await?;
                 // GenerationOutput is returned directly

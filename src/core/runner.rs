@@ -5,6 +5,12 @@ use crate::models::layers::distributed::Comm;
 use crate::models::layers::linear::set_linear_is_prefill;
 use crate::models::layers::VarBuilderX;
 use crate::models::qwen3_5_mtp::Qwen3_5MtpHead;
+use crate::core::lora::{
+    activate_tenant, active_tenant, deactivate_tenant, ensure_tenant_loaded,
+    global_adapter_count, global_adapter_modules, init_global_site_registry, init_lora_registry,
+    lora_execution, set_active_tenant, set_global_registry, set_lora_execution, LoraExecution,
+    LoraRegistry,
+};
 use crate::server::EmbeddingStrategy;
 use crate::transfer::Transfer;
 #[cfg(all(feature = "cuda", feature = "graph"))]
@@ -90,6 +96,63 @@ fn guided_decoding_requests<'a>(
         .collect()
 }
 
+/// Map the xinfer Sampling strategy to the attention-rs PdaSampling (the PDA
+/// current-position sampling strategy).
+fn pda_sampling_from(sampling: &crate::utils::logits_processor::Sampling) -> attention_rs::pda::PdaSampling {
+    use crate::utils::logits_processor::Sampling as S;
+    match sampling {
+        S::ArgMax => attention_rs::pda::PdaSampling::Greedy,
+        S::All { temperature } if *temperature <= 1e-6 => attention_rs::pda::PdaSampling::Greedy,
+        S::All { temperature } => attention_rs::pda::PdaSampling::TopKTopP {
+            temperature: *temperature,
+            top_k: -1,
+            top_p: 1.0,
+        },
+        S::TopK { k, temperature } => attention_rs::pda::PdaSampling::TopKTopP {
+            temperature: *temperature,
+            top_k: *k as i32,
+            top_p: 1.0,
+        },
+        S::TopP { p, temperature } => attention_rs::pda::PdaSampling::TopKTopP {
+            temperature: *temperature,
+            top_k: -1,
+            top_p: *p,
+        },
+        S::TopKThenTopP { k, p, temperature } => attention_rs::pda::PdaSampling::TopKTopP {
+            temperature: *temperature,
+            top_k: *k as i32,
+            top_p: *p,
+        },
+    }
+}
+
+/// The reasoning-budget promotion bias (the pure ramp function, the noable
+/// core of the `apply_reasoning_bias`). Given the reasoning token `count` + the
+/// `budget`, returns the logit addend for the end-of-reasoning token:
+/// - 0.0 when `count > budget / 4` (the budget is far, no steering)
+/// - a quadratic ramp from 0 to 10.0 as `count` goes from `budget - budget/4`
+///   to `budget` (the smooth transition)
+/// - 10.0 when `count >= budget` (the budget exhausted, force the end token)
+/// The `10.0` is a strong but not infinite push (the model can still override
+/// with a sufficiently high logit for a non-end token); the `budget / 4`
+/// threshold means the ramp starts at the last quarter of the budget.
+fn reasoning_bias_value(count: usize, budget: usize) -> f32 {
+    if budget == 0 {
+        return 0.0; // no budget (no steering)
+    }
+    let remaining = budget.saturating_sub(count);
+    let threshold = budget / 4; // the ramp starts at the last quarter of the budget
+    if remaining == 0 {
+        10.0 // the budget exhausted, force the end token
+    } else if remaining <= threshold {
+        // The quadratic ramp: 0 at `remaining == threshold`, 10.0 at `remaining == 1`.
+        let t = (threshold - remaining) as f32 / (threshold - 1).max(1) as f32;
+        10.0 * t * t
+    } else {
+        0.0 // the budget is far, no steering
+    }
+}
+
 pub enum Model {
     Qwen3(Arc<Qwen3ForCausalLM>),
     Qwen3MoE(Arc<Qwen3MoEForCausalLM>),
@@ -163,16 +226,6 @@ impl Model {
     }
 }
 
-pub enum RunnerType {
-    Thread(ModelRunner),
-    Process(Vec<LocalStream>),
-    /// Master node in multi-node inference: local IPC streams + TCP streams to worker nodes.
-    MultiNodeMaster {
-        local_streams: Vec<LocalStream>,
-        remote_streams: Vec<std::net::TcpStream>,
-    },
-}
-
 pub struct CpuTqLayerCache {
     pub k_absmax: Option<Tensor>,
     pub k_quant: Option<Tensor>,
@@ -207,10 +260,45 @@ pub struct ModelRunner {
     pub(crate) mtp_num_speculative: usize,
     /// Optional external DFlash2 drafter.
     pub(crate) dflash_drafter: Option<crate::speculative::DFlashDrafter>,
+    /// The per-instance LoRA registry (the multi-tenant adapter set, the Punica
+    /// shared-base + per-tenant delta). Empty when no adapter is configured.
+    /// The `Mutex` allows the on-demand load (the `ensure_tenant_loaded`, the
+    /// write path) to mutate the registry; the read path (the `apply_lora_delta`)
+    /// locks it briefly.
+pub(crate) lora_registry: Arc<Mutex<LoraRegistry>>,
+    /// The per-tenant decode graph capturers (the LoRA + the CUDA graph). Each
+    /// loaded LoRA tenant gets its own captured decode graph (the base model +
+    /// that tenant's delta baked in at capture time), so a graph-replayed decode
+    /// for that tenant is fast + correct. The base model (no tenant) uses the
+    /// `decode_capturer`. The empty when no LoRA tenant is loaded (the prior
+    /// single-graph behavior).
+    #[cfg(all(feature = "cuda", feature = "graph"))]
+    pub tenant_decode_capturers: HashMap<String, GraphCapturer<CudaGraphWrapper<CudaGraphFn>>>,
+    /// The max number of sequences for the graph capture (the `graph_capture_max_num_seqs`
+    /// from the constructor). Stored so the per-tenant graph capture (the
+    /// `warmup_capture`) can build per-tenant `GraphCapturer`s with the same batch
+    /// sizing as the base capturer.
+    #[cfg(all(feature = "cuda", feature = "graph"))]
+    graph_capture_max_num_seqs: usize,
+    /// The model's hidden size (the `Config.hidden_size`), stored for the per-tenant
+    /// graph capture (the `GraphCapturer::new` needs it). The `EngineConfig` does not
+    /// carry the hidden size, so it is stored separately from the model config.
+    #[cfg(all(feature = "cuda", feature = "graph"))]
+    graph_hidden_size: usize,
+    /// The per-seq anti-loop kicks (the sampling constraint, bridged from the engine).
+    kick_store: parking_lot::RwLock<crate::utils::loop_detect::KickStore>,
+    /// PDA projected masks for MTP verify (set by the runner before each MTP step).
+    #[cfg(feature = "cuda")]
+    pub(crate) pda_projected_masks: Option<Tensor>,
 }
 
 impl ModelRunner {
     // Mamba slots track concurrent sequence states (not KV token blocks).
+
+    /// The guidance state (the PDA mask + the draft-position projection, the P3 fix).
+    pub(crate) fn guided_decoding(&self) -> &GuidedDecoding {
+        &self.guided_decoding
+    }
 
     pub(crate) fn is_mla_model(&self) -> bool {
         // Classical MLA only (FlashInfer MLA plans). DeepSeek V4 is a separate
@@ -242,6 +330,27 @@ impl ModelRunner {
 
     pub(crate) fn block_size(&self) -> usize {
         self.config.block_size
+    }
+
+    /// The cached per-request sampling strategy (the target's post-sampling
+    /// distribution for the lossless rejection-sampling verify). The `None`
+    /// when no per-request override is cached (the model's base sampling).
+    pub(crate) fn cached_sampling(&self) -> Option<crate::core::runner::CachedSamplingParams> {
+        self.cached_sampling.read().clone()
+    }
+
+    /// Whether this runner is the rank-0 shard (the authoritative NCCL all-reduce
+    /// makes all ranks agree, so rank-0 logs are the single source of truth).
+    pub(crate) fn is_first_rank(&self) -> bool {
+        self.is_first_rank
+    }
+
+    /// The dynamic-K break-even threshold (the `QosConfig.spec_draft_break_even`, the
+    /// the runner-side access to the private `config` field, the no the mtp.rs reaching
+    /// into `self.config`). The runner uses this to compute the per-seq next-K (the
+    /// rolling prefix-curve knee).
+    pub(crate) fn spec_break_even(&self) -> f64 {
+        self.config.qos.spec_draft_break_even as f64
     }
 
     #[cfg(feature = "flashinfer")]
@@ -366,6 +475,14 @@ impl ModelRunner {
             let max_seqs = econfig.max_num_parallel_reqs.max(1);
             config.mtp_max_verify_tokens = max_seqs.saturating_mul(spec_tokens.saturating_add(1));
         }
+
+        // Initialize the global LoRA site registry (the centralized
+        // site registration) before the model is built. The model constructors
+        // register their LoRA sites into this registry via the
+        // register_lora_site (called from each wrapped linear's
+        // with_lora_module). The registry is a OnceLock (set once, no
+        // re-set), so this is a no-op if already set.
+        init_global_site_registry();
 
         let model = crate::build_model!(
             model_type,
@@ -544,6 +661,24 @@ impl ModelRunner {
                 }
             }
         }
+
+        // The LoRA + the CUDA graph interaction: the LoRA delta is applied inside the
+        // wrapped linears' forward (the `if let Some(delta)` branch), which is a
+        // runtime data-dependent branch the CUDA graph cannot capture. The graph
+        // is captured with the base model (no tenant active), so a graph-
+        // replayed decode runs the base-model path. For a LoRA tenant, that
+        // tenant's decode must run on a per-tenant captured graph (the base model
+        // + that tenant's delta baked in at capture time), not the base graph.
+        //
+        // The strategy: the graph capture stays enabled (not the global disable
+        // that killed the base-model throughput). At capture time (the
+        // `warmup_capture`), after the base graph is captured, a per-tenant graph
+        // is captured for each loaded LoRA tenant (the tenant set active during
+        // that capture, so the delta is baked in). At replay time (the `run`),
+        // the runner selects the graph matching the active tenant (the base graph
+        // when no tenant, the tenant's graph when that tenant is active). A tenant
+        // with no captured graph (e.g. loaded after capture) falls back to the
+        // eager path for that tenant only.
 
         let prefix_cache_enabled = econfig.prefix_cache.unwrap_or(false);
         let mut mamba_prefix_capacity =
@@ -838,6 +973,22 @@ impl ModelRunner {
             }
         }
 
+        // The per-instance LoRA registry (the multi-tenant adapter set, the Punica
+        // shared-base + per-tenant delta). Computed before the struct (the device is
+        // still available). Empty when no adapter is configured (the prior operation).
+        // The `Mutex` allows the on-demand load (the ensure_tenant_loaded) to mutate
+        // the registry; the read path locks it briefly.
+        let lora_registry = std::sync::Arc::new(std::sync::Mutex::new(
+            init_lora_registry(econfig, &device, dtype)?,
+        ));
+        // Set the process-wide registry (the wrapped linears consult it during
+        // the forward pass). The same `Arc<Mutex>` is stored in the runner (no
+        // a second copy). When the registry is empty (no LoRA configured), the
+        // global is not set (the layers take the fast path, no lookup).
+        if !lora_registry.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
+            set_global_registry(lora_registry.clone());
+        }
+
         Ok(Self {
             model,
             gpu_kv_cache: Arc::new(Mutex::new(gpu_kv_cache)),
@@ -881,18 +1032,34 @@ impl ModelRunner {
             cached_sampling: RwLock::new(None),
             seq_tokens: RwLock::new(HashMap::new()),
             restored_prefix_sequences: RwLock::new(HashSet::new()),
-            guided_decoding: GuidedDecoding::new(llg_factory),
+            guided_decoding: GuidedDecoding::new(llg_factory, comm.rank() == 0),
             transfer,
             is_first_rank: comm.rank() == 0,
             model_type,
             mtp_head,
             mtp_num_speculative,
             dflash_drafter,
+            lora_registry,
+            #[cfg(all(feature = "cuda", feature = "graph"))]
+            tenant_decode_capturers: HashMap::new(),
+            #[cfg(all(feature = "cuda", feature = "graph"))]
+            graph_capture_max_num_seqs,
+            #[cfg(all(feature = "cuda", feature = "graph"))]
+            graph_hidden_size: config.hidden_size,
+            kick_store: parking_lot::RwLock::new(crate::utils::loop_detect::KickStore::new()),
+            #[cfg(feature = "cuda")]
+            pda_projected_masks: None,
         })
     }
 
     pub fn has_dflash_drafter(&self) -> bool {
         self.dflash_drafter.is_some()
+    }
+
+    /// Whether the instance has a LoRA registry (the multi-tenant adapters loaded).
+    /// The `true` when at least one tenant is registered (the `--lora` set).
+    pub fn has_lora(&self) -> bool {
+        !self.lora_registry.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
     }
 
     /// Initialize MTP head for speculative decoding.
@@ -1010,6 +1177,234 @@ impl ModelRunner {
         }
     }
 
+/// Speculative fast-forward decode: sample the base token (the current `run`,
+    /// which does NOT commit it — the single `gate_commit` is the only FSM
+    /// advance). Returns `[base_token]` per sequence; the grammar-forced
+    /// continuation (the ff run) is appended by the `gate_commit` (the `ff=true`
+    /// ordered-queue writer, the seal), which commits the base, reads the ff from
+    /// the post-base settled state, + commits the ff — all in acquisition order.
+    pub fn run_speculative_ff(&self, seqs: Seqs) -> Result<Vec<Vec<u32>>> {
+        let base_tokens = self.run(seqs, false)?;
+        // The base token only. The grammar-forced continuation (the ff run) is
+        // appended by the single `gate_commit` (the `ff=true` ordered-queue writer,
+        // the seal), which commits the base, reads the ff from the post-base settled
+        // state, + commits the ff — all in acquisition order. Doing it here would
+        // double-commit (the ff committed twice: once here, once in the gate).
+        let outputs: Vec<Vec<u32>> = base_tokens.iter().map(|t| vec![*t]).collect();
+        Ok(outputs)
+    }
+
+/// The single ordered-queue writer: every token-production path funnels through
+    /// here, just before the sequence append, so the sequence can never hold a token
+    /// the FSM rejected.
+    ///
+    /// `ff` selects the ordered-queue writer: when true (the spec-FF path) the base
+    /// run is committed, the grammar-forced continuation is read from the settled
+    /// state, and the continuation is committed - all in acquisition order, so the
+    /// queue [base, ff...] is appended as one serialized stream. When false (the
+    /// plain/MTP/DFlash paths) the whole run is committed as-is.
+    pub fn gate_commit(&self, seq_ids: &[usize], runs: &[Vec<u32>], ff: bool) -> Vec<Vec<u32>> {
+        runs.iter()
+            .enumerate()
+            .map(|(i, run)| {
+                let sid = seq_ids[i];
+                // The single FSM advance (the seal): commit the run, keep only the
+                // legal prefix. The `commit_run` advances the prefix count (the tokens
+                // after the first rejection are not committed).
+                let n_base = self.guided_decoding.commit_run(sid, run);
+                let mut queue = run[..n_base].to_vec();
+                // The resync: roll the FSM back to the committed boundary (no rejected
+                // suffix lingering in the matcher). This is the P2 fix — the
+                // constraints stay active; the next step restarts from the last accepted.
+                if n_base < run.len() {
+                    self.guided_decoding.resync(sid);
+                }
+                if ff {
+                    // The read-only ff (the non-advancing): the forced continuation from the
+                    // post-commit settled state. The ff tokens are grammar-forced (infallible),
+                    // so they are committed directly (the ordered-queue writer).
+                    let ff_run = self.guided_decoding.ff_tokens_immut(sid);
+                    if !ff_run.is_empty() {
+                        let n_ff = self.guided_decoding.commit_run(sid, &ff_run);
+                        queue.extend(ff_run[..n_ff].to_vec());
+                        // Report the ff continuation in the per-seq speculative stats
+                        // (the same optional end-of-sequence report as MTP/DFlash).
+                        crate::speculative::spec_stats::spec_stats_update_ff("SpecFF", sid, n_ff);
+                    }
+                }
+                queue
+            })
+            .collect()
+    }
+
+    /// Bridge the anti-loop kick from the engine (the FULL repeating unit +
+    /// the seed + the period). The kick is applied at the next sampling step (the
+    /// LogitsProcessor consults the kick_store). The unit is the whole cycle --
+    /// excluding all P tokens at the trigger position is what breaks the loop (the
+    /// no single-forbid-token whack-a-mole).
+    pub fn set_loop_kick(&self, seq_id: usize, unit: Vec<u32>, seed: Vec<u32>, period: u32) {
+        use crate::utils::loop_detect::LoopSpan;
+        self.kick_store.write().apply(
+            seq_id,
+            &LoopSpan {
+                period,
+                unit,
+                seed,
+            },
+        );
+    }
+
+    /// Clear the anti-loop kick for a sequence (the loop cleared).
+    pub fn clear_loop_kick(&self, seq_id: usize) {
+        self.kick_store.write().remove(seq_id);
+    }
+
+    /// Apply the active anti-loop kicks as a sampling constraint (the per-row
+    /// exclusion of the loop's tokens, before sampling). The FULL
+    /// repeating unit (all P tokens) is set to -inf at the trigger position (the
+    /// no single forbid token -- a period-P loop needs the whole cycle excluded to
+    /// break); the seed tokens (the first ~20%) get an ADDITIONAL penalty scaled by
+    /// the period (the longer the loop, the harder the kick). This is a sampling
+    /// intervention, not a grammar-mask perturbation, so the mask stays a pure
+    /// function of the settled FSM state. No-op when no kick is active for the batch.
+    fn apply_loop_kicks(&self, logits: &Tensor, seq_ids: &[usize]) -> Tensor {
+        // The kick applies REGARDLESS of the full-envelope grammar (the
+        // prior llg_full skip assumed the grammar breaks the loop -- falsified by
+        // the 20261013 log, where a period-24 loop ran 50+ steps under
+        // XINFER_LLG_FULL=1). The repetition defense is orthogonal to the grammar
+        // constraint (the loop tokens are all grammar-legal).
+        let kicks = self.kick_store.read();
+        let any_kick = seq_ids.iter().any(|&sid| kicks.is_active(sid));
+        if !any_kick {
+            return logits.clone();
+        }
+        let (b, v) = logits.dims2().expect("logits is 2-D");
+        let device = logits.device();
+        let mut flat: Vec<f32> = vec![0.0f32; b * v];
+        for (i, &sid) in seq_ids.iter().enumerate() {
+            if let Some(kick) = kicks.get(sid) {
+                // Exclude the WHOLE repeating unit (the no single token).
+                for &unit_tok in &kick.unit {
+                    if (unit_tok as usize) < v {
+                        flat[i * v + unit_tok as usize] = f32::NEG_INFINITY;
+                    }
+                }
+                // The seed penalty (the scaling-by-caught-length, the additive
+                // hardening on the unit's trigger tokens).
+                let penalty = -(kick.period as f32) * 2.0;
+                for &seed_tok in &kick.seed {
+                    if (seed_tok as usize) < v {
+                        let cell = &mut flat[i * v + seed_tok as usize];
+                        if *cell > penalty {
+                            *cell = penalty;
+                        }
+                    }
+                }
+            }
+        }
+        drop(kicks);
+        let penalty_tensor = Tensor::from_vec(flat, (b, v), device).expect("penalty tensor");
+        logits.add(&penalty_tensor).expect("add penalty to logits")
+}
+
+    /// The reasoning-budget promotion (the sampling bias, the no the grammar mask).
+    /// For each sequence with a `reasoning_budget` set + a non end token,
+    /// adds a positive logit bias to the end-of-reasoning token that ramps up as
+    /// the reasoning count approaches the budget. This steers the model to
+    /// transition from reasoning to the smoothly (the no the hard grammar
+    /// cutoff). The bias is:
+    /// - `0.0 when `remaining > threshold` (the budget is far, no steering)
+    /// - ramping from 0 to `max_bias` as `remaining` goes from `threshold` to 0
+    ///   (the quadratic ramp, the smooth transition)
+    /// - `max_bias` when `remaining <= 0` (the budget exhausted, force the end token)
+    /// The `threshold` is `budget / 4` (the ramp starts at the last quarter of
+    /// the budget). The `max_bias` is 10.0 (a strong but not infinite push; the
+    /// model can still override with a sufficiently high logit for a non-end token).
+    /// No-op when no sequence has a budget + a reasoning end token.
+    fn apply_reasoning_bias(&self, logits: &Tensor, seqs: &Seqs, seq_ids: &[usize]) -> Tensor {
+        // The per-seq budget + the reasoning end token (the `guidance_reasoning_end_ids`).
+        let has_bias = seq_ids.iter().any(|&sid| {
+            let sp = match seqs {
+                Seqs::SeqRefs(refs) => refs.iter().find(|s| s.id() == sid).map(|s| &s.sampling_params),
+                Seqs::DecodeVec(v) => v.iter().find(|s| s.id == sid).map(|s| &s.sampling_params),
+            };
+            sp.and_then(|p| p.reasoning_budget)
+                .zip(sp.and_then(|p| p.guidance_reasoning_end_ids.first().copied()))
+                .is_some()
+        });
+        if !has_bias {
+            return logits.clone();
+        }
+        let (b, v) = logits.dims2().expect("logits is 2-D");
+        let device = logits.device();
+        let mut flat: Vec<f32> = vec![0.0f32; b * v];
+        for (i, &sid) in seq_ids.iter().enumerate() {
+            let sp = match seqs {
+                Seqs::SeqRefs(refs) => refs.iter().find(|s| s.id() == sid).map(|s| &s.sampling_params),
+                Seqs::DecodeVec(v) => v.iter().find(|s| s.id == sid).map(|s| &s.sampling_params),
+            };
+            let Some(sp) = sp else { continue };
+            let Some(budget) = sp.reasoning_budget else { continue };
+            let Some(&end_token) = sp.guidance_reasoning_end_ids.first() else { continue };
+            if (end_token as usize) >= v {
+                continue; // the end token is out of vocab range (the no-op)
+            }
+            // The reasoning count (the two-phase mode; the 0 in the single-phase).
+            let count = self.guided_decoding.reasoning_token_count(sid);
+            let bias = reasoning_bias_value(count, budget);
+            if bias > 0.0 {
+                flat[i * v + end_token as usize] = bias;
+            }
+        }
+        let bias_tensor = Tensor::from_vec(flat, (b, v), device).expect("bias tensor");
+        logits.add(&bias_tensor).expect("add reasoning bias to logits")
+    }
+
+    /// Set the PDA projected masks for the next MTP verify step.
+    /// Called by the engine before `run_mtp_decode` when a grammar is active.
+    #[cfg(feature = "cuda")]
+    pub fn set_pda_projected_masks(&mut self, masks: Option<Tensor>) {
+        self.pda_projected_masks = masks;
+    }
+
+    /// Resolve the per-sequence sampling strategy (the Q / top_p / top_k per
+    /// batch row) for the QoS-gated per-seq sampling.
+    fn resolve_perseq_sampling(
+        seqs: &Seqs,
+        logits: &Tensor,
+    ) -> Result<(Tensor, Tensor, Tensor)> {
+        let b = match seqs {
+            Seqs::SeqRefs(s) => s.len(),
+            Seqs::DecodeVec(v) => v.len(),
+        };
+        let device = logits.device();
+        let mut temps = Vec::with_capacity(b);
+        let mut top_ps = Vec::with_capacity(b);
+        let mut top_ks = Vec::with_capacity(b);
+        match seqs {
+            Seqs::SeqRefs(s) => {
+                for seq in *s {
+                    let sp = &seq.sampling_params;
+                    temps.push(sp.temperature.unwrap_or(0.7));
+                    top_ps.push(sp.top_p.unwrap_or(0.95));
+                    top_ks.push(sp.top_k.unwrap_or(32) as u32);
+                }
+            }
+            Seqs::DecodeVec(v) => {
+                for seq in v.iter() {
+                    let sp = &seq.sampling_params;
+                    temps.push(sp.temperature.unwrap_or(0.7));
+                    top_ps.push(sp.top_p.unwrap_or(0.95));
+                    top_ks.push(sp.top_k.unwrap_or(32) as u32);
+                }
+            }
+        }
+        let temperature_d = Tensor::from_vec(temps, (b,), device)?;
+        let top_p_d = Tensor::from_vec(top_ps, (b,), device)?;
+        let top_k_d = Tensor::from_vec(top_ks, (b,), device)?;
+        Ok((temperature_d, top_p_d, top_k_d))
+    }
+
     #[allow(unused)]
     pub fn run(&self, seqs: Seqs, is_prefill: bool) -> Result<Vec<u32>> {
         #[cfg(feature = "nvtx")]
@@ -1036,44 +1431,174 @@ impl ModelRunner {
             }
         }
 
+        // LoRA tenant selection (the per-request adapter, the Punica shared-base +
+        // per-tenant delta). Each sequence in the batch carries its own `lora_tenant`
+        // (the `SamplingParams.lora_tenant`), so one forward pass can serve rows from
+        // different tenants (the batched multi-tenant). The `LoraExecution`
+        // carries the per-row tenant ids; the wrapped linears consult it via
+        // `apply_lora_delta` (the batched delta when set, the single-tenant
+        // `active_tenant` otherwise). The `None` row (no tenant) uses the base
+        // model. This is set BEFORE the graph-replay block so the decode path can
+        // select the per-tenant captured graph (the tenant's delta baked in).
+        let (row_tenants, row_stacks): (Vec<Option<String>>, Vec<Vec<String>>) = match &seqs {
+            Seqs::SeqRefs(seqs) => (
+                seqs.iter().map(|s| s.sampling_params.lora_tenant.clone()).collect(),
+                seqs.iter().map(|s| s.sampling_params.lora_tenants.clone()).collect(),
+            ),
+            Seqs::DecodeVec(seqs) => (
+                seqs.iter().map(|s| s.sampling_params.lora_tenant.clone()).collect(),
+                seqs.iter().map(|s| s.sampling_params.lora_tenants.clone()).collect(),
+            ),
+        };
+        // The distinct tenants across both the single-tenant + the stacked paths
+        // (the on-demand load + the activate cover all of them).
+        let mut distinct_tenants: Vec<String> = row_tenants
+            .iter()
+            .filter_map(|t| t.clone())
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+        for stack in &row_stacks {
+            for t in stack {
+                if !distinct_tenants.contains(t) {
+                    distinct_tenants.push(t.clone());
+                }
+            }
+        }
+        // On-demand load: ensure each distinct tenant's adapter is
+        // resident before the forward. No-op when the tenant is already resident
+        // or the source is unknown (base model fallback).
+        for tenant in &distinct_tenants {
+            ensure_tenant_loaded(tenant);
+        }
+        // Two-tier LRU: activate each distinct tenant for this
+        // batch (the in-batch bank slot). The active set is capped by the
+        // max_active; the over-cap LRU active tenant is deactivated
+        // (the bank slot freed, the weights stay registered).
+        for tenant in &distinct_tenants {
+            activate_tenant(tenant);
+        }
+        // Reject the request if any active tenant loaded 0 adapter modules (the
+        // adapter was configured but its modules did not map to this model's
+        // LoRA sites, or the tensor discovery failed). Running the base model
+        // silently would mask the misconfiguration; the operator must fix the
+        // adapter or remove it. The `allow_base_fallback` (the server-side)
+        // governs UNKNOWN adapter names (the 404 vs the fallback); a KNOWN
+        // adapter that loaded 0 modules is a hard error (no silent base).
+        for tenant in &distinct_tenants {
+            let count = global_adapter_count(tenant);
+            if count == 0 {
+                crate::log_error!(
+                    "[LoRA] tenant '{tenant}' has 0 adapter modules resident; rejecting the request (the adapter loaded no modules — check the startup checkpoint layout + the model's LoRA sites)"
+                );
+                candle_core::bail!(
+                    "LoRA tenant '{tenant}' loaded 0 adapter modules; the request cannot run with the adapter. Fix the adapter checkpoint (the tensor naming) or the model's LoRA site registration, then restart."
+                );
+            }
+        }
+        // The concise residency proof (the count + the distinct layer count, not
+        // the full module dump). Logged ONCE per (seq_id, tenant) pair,
+        // process-wide (the static proven set, not the thread_local which
+        // re-proves per thread). So the per-decode-step tenant activation does
+        // not spam the log. The full module list is logged once at startup (the
+        // init_lora_registry). Gated to rank-0 only (not the 4× per-rank spam
+        // in a TP run — all ranks see the same tenant, so rank-0's log is the
+        // representative one).
+        if self.is_first_rank {
+            static PROVEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<(usize, String)>>> =
+                std::sync::OnceLock::new();
+            let proven = PROVEN.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+            let seq_ids: Vec<usize> = match &seqs {
+                Seqs::SeqRefs(seqs) => seqs.iter().map(|s| s.id()).collect(),
+                Seqs::DecodeVec(seqs) => seqs.iter().map(|s| s.id).collect(),
+            };
+            for &seq_id in &seq_ids {
+                let tenant = match &seqs {
+                    Seqs::SeqRefs(seqs) => seqs.iter().find(|s| s.id() == seq_id).and_then(|s| s.sampling_params.lora_tenant.clone()),
+                    Seqs::DecodeVec(seqs) => seqs.iter().find(|s| s.id == seq_id).and_then(|s| s.sampling_params.lora_tenant.clone()),
+                };
+                let Some(tenant) = tenant else { continue }; // no tenant for this seq (the base model)
+                let first_proof = proven.lock().unwrap().insert((seq_id, tenant.clone()));
+                if first_proof {
+                    let count = global_adapter_count(&tenant);
+                    let modules = global_adapter_modules(&tenant);
+                    let layer_count = modules.iter()
+                        .filter_map(|m| m.strip_prefix("layers.").and_then(|rest| rest.split('.').next()))
+                        .collect::<std::collections::HashSet<_>>()
+                        .len();
+                    crate::log_info!(
+                        "[LoRA] seq {seq_id} tenant '{tenant}' active: {count} adapter module(s) across {layer_count} layer(s), delta will be applied"
+                    );
+                }
+            }
+        }
+        let any_stack = row_stacks.iter().any(|s| !s.is_empty());
+        if distinct_tenants.len() <= 1 && !any_stack {
+            // The single tenant (or no tenant): the thread-local fast path.
+            set_active_tenant(distinct_tenants.first().cloned());
+            set_lora_execution(None);
+        } else {
+            // The multi-tenant batch OR the stacked (additive multi-adapter) case:
+            // the per-row mapping (the LoraExecution). The stacked path is used
+            // when any row carries a non-empty tenant stack.
+            set_active_tenant(None);
+            set_lora_execution(Some(LoraExecution {
+                row_tenants,
+                row_stacks,
+            }));
+        }
+
         #[cfg(all(feature = "cuda", feature = "graph"))]
         {
             let input_batch = input_ids.dim(0)?;
             let require_exact_graph = input_metadata.mamba_slot_mapping.is_some();
-            let can_replay = if require_exact_graph {
-                self.decode_capturer.is_exact_captured(input_batch)
+            // The decode capturer: the per-tenant capturer when a single
+            // tenant is active + a graph was captured for it (the tenant's delta
+            // baked in), otherwise the base capturer (no tenant, or a tenant
+            // with no captured graph). The per-tenant graph is the fast base model
+            // + that tenant's LoRA delta (captured with the tenant active), so
+            // the replay is fast + correct for that tenant.
+            let active_tenant = active_tenant();
+            let use_tenant_capturer = active_tenant
+                .as_ref()
+                .and_then(|t| self.tenant_decode_capturers.get(t))
+                .is_some();
+            let capturer = if use_tenant_capturer {
+                // The active_tenant is guaranteed Some here (the use_tenant_capturer
+                // check passed, which requires the tenant to be in the map).
+                self.tenant_decode_capturers
+                    .get(active_tenant.as_ref().unwrap())
+                    .unwrap()
             } else {
-                self.decode_capturer.is_captured(input_batch)
+                &self.decode_capturer
+            };
+            let can_replay = if require_exact_graph {
+                capturer.is_exact_captured(input_batch)
+            } else {
+                capturer.is_captured(input_batch)
             };
             if !is_prefill && can_replay {
                 let logits = match &self.model {
                     Model::Qwen3_5(model) => {
                         let _guard = model.lock_mamba_cache_for_graph();
-                        self.decode_capturer
-                            .replay(&input_ids, &positions, &input_metadata)?
+                        capturer.replay(&input_ids, &positions, &input_metadata)?
                     }
                     Model::Qwen3_5MoE(model) => {
                         let _guard = model.lock_mamba_cache_for_graph();
-                        self.decode_capturer
-                            .replay(&input_ids, &positions, &input_metadata)?
+                        capturer.replay(&input_ids, &positions, &input_metadata)?
                     }
                     Model::Qwen4(model) => {
                         let _guard = model.lock_mamba_cache_for_graph();
-                        self.decode_capturer
-                            .replay(&input_ids, &positions, &input_metadata)?
+                        capturer.replay(&input_ids, &positions, &input_metadata)?
                     }
                     Model::Qwen3VL(model) => {
                         if let Some(_guard) = model.lock_mamba_cache_for_graph() {
-                            self.decode_capturer
-                                .replay(&input_ids, &positions, &input_metadata)?
+                            capturer.replay(&input_ids, &positions, &input_metadata)?
                         } else {
-                            self.decode_capturer
-                                .replay(&input_ids, &positions, &input_metadata)?
+                            capturer.replay(&input_ids, &positions, &input_metadata)?
                         }
                     }
-                    _ => self
-                        .decode_capturer
-                        .replay(&input_ids, &positions, &input_metadata)?,
+                    _ => capturer.replay(&input_ids, &positions, &input_metadata)?,
                 };
                 let output_ids = self.sample(&logits, seqs, is_prefill)?;
                 return Ok(output_ids);
@@ -1144,7 +1669,16 @@ impl ModelRunner {
         let _prefill_guard = set_linear_is_prefill(is_prefill);
         let kv_guard = self.get_kv_cache();
         let kv_pairs = kv_guard.as_pairs();
-        let logits = if let Some(drafter) = self.dflash_drafter.as_ref() {
+        // The DFlash drafter is a separate base model (not the LoRA target). When a
+        // LoRA tenant is active, the DFlash draft would not match the LoRA-applied
+        // target (the verify would reject the drafts), so the DFlash path is disabled
+        // for LoRA tenants (fall to the MTP/plain path, which DOES get the
+        // LoRA delta via the wrapped target linears).
+        let dflash_active = self.dflash_drafter.is_some()
+            && active_tenant().is_none()
+            && lora_execution().map_or(true, |exec| exec.distinct_tenants() == 0);
+        let logits = if dflash_active {
+            let drafter = self.dflash_drafter.as_ref().unwrap();
             let target_layer_ids = drafter.target_layer_ids();
             let (logits, hidden_states) = self.model.forward_collecting_layers(
                 &input_ids,
@@ -1209,6 +1743,12 @@ impl ModelRunner {
         let output_ids = self.sample(&logits, seqs, is_prefill)?;
         #[cfg(feature = "nvtx")]
         nvtx::range_pop!();
+        // Two-tier LRU: deactivate the batch's tenants after the
+        // forward (the bank slots freed, the weights stay registered). No-op
+        // when no tenant was activated (the base model, the empty distinct set).
+        for tenant in &distinct_tenants {
+            deactivate_tenant(tenant);
+        }
         Ok(output_ids)
     }
 
@@ -1907,14 +2447,51 @@ impl ModelRunner {
             logits.to_owned()
         };
 
-        let guided_requests = guided_decoding_requests(&seqs, &seq_ids);
-        let guided_positions: Vec<usize> = guided_requests
+        // Apply the active anti-loop kicks (the sampling constraint, the per-row
+        // penalty on the logits before sampling). No-op when no kick is active.
+        let logits = self.apply_loop_kicks(&logits, &seq_ids);
+
+        // Apply the reasoning-budget promotion (the sampling bias on the
+        // end-of-reasoning token, not the grammar mask). No-op when no
+        // sequence has a budget + a reasoning end token.
+        let logits = self.apply_reasoning_bias(&logits, &seqs, &seq_ids);
+
+        let all_requests = guided_decoding_requests(&seqs, &seq_ids);
+        let guided_positions: Vec<usize> = all_requests
             .iter()
             .enumerate()
             .filter_map(|(index, request)| request.grammar.is_some().then_some(index))
             .collect();
         let tokens = if guided_positions.is_empty() {
-            self.sample_processed_logits(&logits, &cached_params.sampling)?
+            if crate::utils::env::qos_enabled() && !is_prefill {
+                // The QoS-gated per-sequence sampling (the §2.4, the additive path): each
+                // sequence samples with its own strategy (the per-batch temperature / top_p /
+                // top_k), instead of the single shared cached_params strategy.
+                let (temperature_d, top_p_d, top_k_d) =
+                    Self::resolve_perseq_sampling(&seqs, &logits)?;
+                self.logit_processor
+                    .sample_with_strategy_perseq(&logits, &temperature_d, &top_p_d, &top_k_d)?
+            } else {
+                self.sample_processed_logits(&logits, &cached_params.sampling)?
+            }
+        } else if crate::utils::env::vob_sampling() {
+            // The §2.3 VOB-bitset sampling path (the 8× less data than the F32 mask).
+            // The `build_vob_words` computes the per-seq VOB bitset (the compact allowed-token
+            // set), the `sample_with_vob` runs it via the fused bitwise-AND sampler (the no
+            // F32 mask round-trip). The VOB path is selected when the grammar is active (the
+            // `guided_positions` is non-empty) + the `XINFER_VOB_SAMPLING` env is set.
+            let vob_words = self
+                .guided_decoding
+                .build_vob_words(&all_requests, logits.dim(1)?, logits.device())?;
+            let mut tokens = self.logit_processor.sample_with_vob(
+                &logits,
+                &cached_params.sampling,
+                vob_words.as_ref(),
+            )?;
+            self.guided_decoding.apply_fast_forward(&seq_ids, &mut tokens);
+            // The single FSM advance happens in the gate (the `gate_commit`, the seal).
+            // The sample site does NOT commit (no double-advance desync).
+            tokens
         } else {
             let guided_indices = Tensor::from_vec(
                 guided_positions.iter().map(|&index| index as u32).collect(),
@@ -1924,23 +2501,113 @@ impl ModelRunner {
             let original_guided_logits = logits.index_select(&guided_indices, 0)?;
             let guided_requests: Vec<_> = guided_positions
                 .iter()
-                .map(|&index| guided_requests[index])
+                .map(|&index| all_requests[index])
                 .collect();
-            let (guided_logits, guided_step) = self
-                .guided_decoding
-                .apply(&original_guided_logits, &guided_requests)?;
-            let sample_logits = if guided_positions.len() == seq_ids.len() {
-                guided_logits
+            let guided_tokens: Vec<u32> = if crate::utils::env::pda_current() && self.guided_decoding.has_pda_table() && self.guided_decoding.pda_is_exact() {
+                // On-GPU current-position PDA masking: compute mask from the per-seq
+                // PDA control state, sample, advance. Exact only when the table is
+                // deterministic + the closure is bounded (the `pda_is_exact`); otherwise
+                // fall through to the CPU frontier mask (the `spec_mask_offload` / the VOB path).
+                let guided_logits = logits.index_select(&guided_indices, 0)?;
+                let guided_seq_ids: Vec<usize> = guided_positions
+                    .iter()
+                    .map(|&i| all_requests[i].seq_id)
+                    .collect();
+                let pda_sampling = pda_sampling_from(&cached_params.sampling);
+                let g_tokens = self
+                    .guided_decoding
+                    .pda_current_step(&guided_logits, &guided_seq_ids, &pda_sampling)?;
+                let g_tokens: Vec<u32> = g_tokens.flatten_all().unwrap().to_vec1::<u32>().unwrap();
+                let mut full = vec![0u32; seq_ids.len()];
+                for (j, &pos) in guided_positions.iter().enumerate() {
+                    full[pos] = g_tokens.get(j).copied().unwrap_or(0);
+                }
+                let non_guided: Vec<usize> = (0..seq_ids.len())
+                    .filter(|i| !guided_positions.contains(i))
+                    .collect();
+                if !non_guided.is_empty() {
+                    let ng_idx = Tensor::from_vec(
+                        non_guided.iter().map(|&i| i as u32).collect(),
+                        (non_guided.len(),),
+                        logits.device(),
+                    )?;
+                    let ng_logits = logits.index_select(&ng_idx, 0)?;
+                    let ng_tokens = self.sample_processed_logits(&ng_logits, &cached_params.sampling)?;
+                    for (j, &pos) in non_guided.iter().enumerate() {
+                        full[pos] = ng_tokens[j];
+                    }
+                }
+                full
+            } else if crate::utils::env::spec_mask_offload() {
+                // GPU offload: build mask directly (single compute_mask_or_eos call).
+                // Do NOT call apply() here - it consumes ff_tokens_cache as a side effect,
+                // causing the second compute_mask_or_eos in build_allow_mask to see a
+                // different parser state. The FSM commit for the produced token is done
+                // once, at the terminal ingress (gate_commit), just before the append.
+                if crate::utils::env::vob_sampling() {
+                    // VOB bitset path: 8x less data than F32 mask.
+                    let vob_words = self
+                        .guided_decoding
+                        .build_vob_words_flat(&all_requests, logits.dim(1)?)
+                        .map(|words| {
+                            candle_core::Tensor::from_vec(
+                                words,
+                                (all_requests.len(), logits.dim(1)? / 32),
+                                logits.device(),
+                            )
+                        })
+                        .transpose()?;
+                    let mut tokens = self.logit_processor.sample_with_vob(
+                        &logits,
+                        &cached_params.sampling,
+                        vob_words.as_ref(),
+                    )?;
+                    self.guided_decoding.apply_fast_forward(&seq_ids, &mut tokens);
+                    tokens
+                } else {
+                    let mask = self
+                        .guided_decoding
+                        .build_allow_mask(&all_requests, logits.dim(1)?, logits.device())?;
+                    let mut tokens = if crate::utils::env::qos_enabled() {
+                        // the QoS-gated per-sequence strategy (the additive path): each row
+                        // samples with its own temperature / top_p / top_k.
+                        let (temperature_d, top_p_d, top_k_d) =
+                            Self::resolve_perseq_sampling(&seqs, &logits)?;
+                        match mask.as_ref() {
+                            Some(m) => self.logit_processor.sample_with_strategy_perseq_masked(
+                                &logits, m, &temperature_d, &top_p_d, &top_k_d,
+                            )?,
+                            None => self.logit_processor.sample_with_strategy_perseq(
+                                &logits, &temperature_d, &top_p_d, &top_k_d,
+                            )?,
+                        }
+                    } else {
+                        self.logit_processor.sample_with_strategy_masked(
+                            &logits,
+                            &cached_params.sampling,
+                            mask.as_ref(),
+                        )?
+                    };
+                    self.guided_decoding.apply_fast_forward(&seq_ids, &mut tokens);
+                    tokens
+                }
             } else {
-                let guided_delta = (&guided_logits - &original_guided_logits)?;
-                logits.index_add(&guided_indices, &guided_delta, 0)?
+                // Original path: apply() computes masked logits via index_add.
+                let (guided_logits, _guided_step) = self
+                    .guided_decoding
+                    .apply(&original_guided_logits, &guided_requests)?;
+                let sample_logits = if guided_positions.len() == seq_ids.len() {
+                    guided_logits
+                } else {
+                    let guided_delta = (&guided_logits - &original_guided_logits)?;
+                    logits.index_add(&guided_indices, &guided_delta, 0)?
+                };
+                let mut tokens =
+                    self.sample_processed_logits(&sample_logits, &cached_params.sampling)?;
+                self.guided_decoding.apply_fast_forward(&seq_ids, &mut tokens);
+                tokens
             };
-            let mut tokens =
-                self.sample_processed_logits(&sample_logits, &cached_params.sampling)?;
-            self.guided_decoding
-                .apply_fast_forward(&seq_ids, &mut tokens);
-            self.guided_decoding.commit(&seq_ids, &tokens, guided_step);
-            tokens
+            guided_tokens
         };
 
         // Track tokens for sequences when penalties are enabled
@@ -2018,6 +2685,70 @@ impl ModelRunner {
         let kv_pairs = kv_cache_lock.as_pairs();
         self.decode_capturer.capture(&self.device, kv_pairs)?;
 
+        // The per-tenant decode graphs (the LoRA + the CUDA graph): for each
+        // loaded LoRA tenant, capture a dedicated decode graph with that tenant's
+        // delta baked in (the tenant set active during the capture, so the
+        // wrapped linears' `apply_lora_delta` branch is taken + frozen into the
+        // graph). The base graph (captured above, no tenant active) serves
+        // the no-tenant requests. Each tenant graph is stored in
+        // `tenant_decode_capturers`, keyed by the tenant id, so the decode path
+        // can select the matching graph at replay time.
+        #[cfg(all(feature = "cuda", feature = "graph"))]
+        {
+            let tenant_names = {
+                let reg = self.lora_registry.lock().unwrap_or_else(|e| e.into_inner());
+                reg.tenant_names()
+            };
+            for tenant in &tenant_names {
+                set_active_tenant(Some(tenant.clone()));
+                let wrapper = crate::graph_wrapper!(
+                    &self.model,
+                    &self.device,
+                    {
+                        Qwen3 => EmbedInputs,
+                        Qwen3MoE => EmbedInputs,
+                        Qwen3_5 => EmbedInputs,
+                        Qwen3_5MoE => EmbedInputs,
+                        Qwen4 => EmbedInputs,
+                        LLaMa => EmbedInputs,
+                        LLaMa4 => NoneArg,
+                        Phi4 => EmbedInputs,
+                        GLM4 => EmbedInputs,
+                        GLM4MoE => EmbedInputs,
+                        GLM4MoeLite => EmbedInputs,
+                        DeepSeek => EmbedInputs,
+                        DeepSeekV4 => EmbedInputs,
+                        GLM5 => EmbedInputs,
+                        Mistral3VL => NoneArg,
+                        Gemma3 => NoneArg,
+                        Gemma4 => EmbedInputs,
+                        Qwen3VL => NoneArg,
+                        MiniMax => EmbedInputs,
+                    }
+                );
+                let mut capturer = GraphCapturer::new(
+                    wrapper,
+                    self.graph_capture_max_num_seqs,
+                    self.config.max_model_len.unwrap_or(32768),
+                    self.config.block_size,
+                    self.graph_hidden_size,
+                    #[cfg(feature = "flashinfer")]
+                    &self.flashinfer_kv_params,
+                    matches!(
+                        self.model_type,
+                        ModelType::GLM4MoeLite | ModelType::DeepSeek | ModelType::GLM5
+                    ),
+                );
+                if capturer.capture(&self.device, kv_pairs).is_ok() {
+                    crate::log_info!(
+                        "Captured the per-tenant decode graph for LoRA tenant '{tenant}'"
+                    );
+                    self.tenant_decode_capturers.insert(tenant.clone(), capturer);
+                }
+            }
+            set_active_tenant(None);
+        }
+
         if self.mtp_num_speculative > 0 {
             // self.decode_capturer.model.sync()?;
             if let Some(mtp_cap) = &mut self.mtp_capturer {
@@ -2026,8 +2757,16 @@ impl ModelRunner {
                 } else {
                     "MTP"
                 };
+                // Capture the verify graph for the CEILING K (the mtp_num_speculative).
+                // The dynamic-K path (the per-seq K < the ceiling) falls back to the
+                // non-graph forward (the is_mtp_captured(verify_len) check returns
+                // false for an uncaptured K, the mtp.rs verify takes the forward path).
+                // Capturing the full K range in one call is not supported by the
+                // graph-capture state machine (the CUDA_ERROR_INVALID_VALUE on the
+                // second capture), so the ceiling graph + the non-graph fallback is the
+                // correct + safe design.
                 crate::log_info!(
-                    "Capturing {} verify graphs for up to {} draft tokens...",
+                    "Capturing {} verify graph for up to {} draft tokens...",
                     label,
                     self.mtp_num_speculative
                 );
@@ -2250,7 +2989,7 @@ impl ModelRunner {
 
 #[cfg(test)]
 mod tests {
-    use super::{guided_decoding_requests, Seqs};
+    use super::{guided_decoding_requests, reasoning_bias_value, Seqs};
     use crate::core::sequence::DecodeSequence;
     use crate::utils::config::SamplingParams;
     use llguidance::api::TopLevelGrammar;
@@ -2271,6 +3010,7 @@ mod tests {
             block_table_last: 0,
             block_tables: vec![0],
             sampling_params,
+            spec_k: 0,
         }
     }
 
@@ -2296,5 +3036,30 @@ mod tests {
         assert_eq!(requests[3].seq_id, 13);
         assert!(requests[3].grammar.is_some());
         assert_eq!(requests[3].reasoning_end_ids, &[7, 8]);
+    }
+
+    /// The reasoning-budget promotion ramp (the pure function, the no the runner
+    /// setup). The inclusive: the bias is 0 when the budget is far, ramps up
+    /// quadratically in the last quarter, + is 10.0 when the budget is
+    /// exhausted. The exclusive: a zero budget is always 0 (no steering).
+    #[test]
+    fn reasoning_bias_value_ramp() {
+        // The zero budget: no steering.
+        assert_eq!(reasoning_bias_value(0, 0), 0.0);
+        assert_eq!(reasoning_bias_value(5, 0), 0.0);
+        // The budget far (the count well under the threshold): no steering.
+        // The budget=100, the threshold=25, the count=0 → the remaining=100 > 25 → 0.0.
+        assert_eq!(reasoning_bias_value(0, 100), 0.0);
+        assert_eq!(reasoning_bias_value(50, 100), 0.0); // the remaining=50 > 25
+        // The ramp zone (the count in the last quarter): the quadratic ramp.
+        // The budget=100, the threshold=25. The count=75 → the remaining=25 → threshold → t=0 → 0.0.
+        assert_eq!(reasoning_bias_value(75, 100), 0.0);
+        // The count=87 → the remaining=13, the t=(25-13)/(25-1)=12/24=0.5 → 10*0.25=2.5.
+        assert!((reasoning_bias_value(87, 100) - 2.5).abs() < 1e-5, "the ramp midpoint");
+        // The count=99 → the remaining=1, the t=(25-1)/24=1.0 → 10*1.0=10.0.
+        assert!((reasoning_bias_value(99, 100) - 10.0).abs() < 1e-5, "the ramp top");
+        // The budget exhausted (the count >= the budget): the force (the 10.0).
+        assert_eq!(reasoning_bias_value(100, 100), 10.0);
+        assert_eq!(reasoning_bias_value(150, 100), 10.0);
     }
 }

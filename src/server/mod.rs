@@ -24,7 +24,6 @@ use axum::Router;
 use candle_core::{Result, Tensor};
 use colored::*;
 use local_ip_address::{local_ip, local_ipv6};
-use parking_lot::RwLock;
 use regex::Regex;
 use rustchatui::start_ui_server;
 use serde_json::json;
@@ -109,6 +108,15 @@ pub struct ChatCompletionRequest {
     /// Values: "none", "low", "medium", "high", or "xhigh".
     #[serde(default, alias = "reasoning")]
     pub reasoning_effort: Option<String>,
+    /// The reasoning token budget (the max reasoning tokens before the model is
+    /// steered to the end-of-reasoning token). When set, the runner applies a
+    /// sampling bias to the end-of-reasoning token that ramps up as the
+    /// reasoning count approaches this budget (the smooth transition, not the
+    /// hard grammar cutoff). The `None` means no budget (the unbounded
+    /// reasoning, the prior behavior). Aliased as `thinking_budget` for the
+    /// OpenAI-compatible clients.
+    #[serde(default, alias = "thinking_budget")]
+    pub reasoning_budget: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -273,6 +281,18 @@ pub struct ResponseFormat {
     pub format_type: String,
     #[serde(default)]
     pub json_schema: Option<ResponseFormatJsonSchema>,
+    /// The regex pattern (the `response_format.type == "regex"`).
+    #[serde(default)]
+    pub pattern: Option<String>,
+    /// The allowed choices (the `response_format.type == "choice"`).
+    #[serde(default)]
+    pub choices: Option<Vec<String>>,
+    /// The raw grammar body (the `response_format.type == "grammar"`).
+    #[serde(default)]
+    pub grammar: Option<String>,
+    /// The grammar dialect (the `lark` default).
+    #[serde(default)]
+    pub grammar_type: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -642,7 +662,7 @@ pub struct UsageResponse {
 }
 
 pub struct ServerData {
-    pub engine: Arc<RwLock<LLMEngine>>,
+    pub engine: Arc<LLMEngine>,
     pub econfig: EngineConfig,
     pub mcp_manager: Option<Arc<crate::mcp::McpClientManager>>,
 }
@@ -894,9 +914,48 @@ pub struct Args {
     #[arg(long, default_value = None)]
     pub draft_model: Option<String>,
 
+    /// LoRA adapter source (HuggingFace id or local directory), repeatable. Each
+    /// occurrence is a `NAME=SOURCE` pair (for example
+    /// `--lora finance=/adapters/finance` or `--lora legal=hf-ai/legal-qa-lora`).
+    /// The name is the API-facing adapter key (used as `model: ":name` in
+    /// requests); the source is resolved by the common model loader (HF download    /// download, cache, or local directory). When absent, no LoRA is loaded and
+    /// the engine runs the base model with zero overhead.
+    #[arg(long = "lora", num_args = 1.., default_value = None)]
+    pub lora: Vec<String>,
+
+    /// Maximum number of concurrently resident LoRA adapters.
+    #[arg(long, default_value = None)]
+    pub lora_max_tenants: Option<usize>,
+
+    /// Maximum number of distinct LoRA tenants in a single batch.
+    #[arg(long, default_value = None)]
+    pub lora_max_active: Option<usize>,
+
+    /// Maximum resident LoRA adapter bytes (GPU memory bound).
+    #[arg(long, default_value = None)]
+    pub lora_max_bytes: Option<u64>,
+
+    /// LoRA eviction policy: "lru" (default) or "fifo".
+    #[arg(long, default_value = None)]
+    pub lora_eviction_policy: Option<String>,
+
+    /// Pinned LoRA tenants that are never evicted (SLA guarantee). Repeatable.
+    #[arg(long = "lora-pin", num_args = 1.., default_value = None)]
+    pub lora_pin: Vec<String>,
+
+    /// Allow an unknown adapter name to fall back to the base model. When false
+    /// (the default), an unknown adapter name returns a 404.
+    #[arg(long, default_value = "false")]
+    pub lora_allow_base_fallback: bool,
+
     /// Enable grammar-based generation: tool grammar, structured outputs, and client constraints
     #[arg(long, default_value = "false")]
     pub enable_tool_grammar: bool,
+
+    /// Path to a user-defined reasoning-grammar YAML file (the levels map to inner
+    /// Lark expressions). Loaded into the global registry at startup.
+    #[arg(long, default_value = None)]
+    pub reasoning_grammars: Option<String>,
 }
 
 impl Args {
@@ -1488,19 +1547,20 @@ fn ui_api_config_for_addr(sock_addr: SocketAddr) -> (Option<u16>, Option<String>
 ///
 /// When `--pd-server` is active the address is ignored (binds `0.0.0.0:0` instead).
 pub async fn run_server(
-    engine: Arc<RwLock<LLMEngine>>,
+    engine: Arc<LLMEngine>,
     econfig: EngineConfig,
     addr: ServerAddr,
     with_ui_server: bool,
 ) -> Result<()> {
     use axum::extract::DefaultBodyLimit;
-    let (has_vision, model_name, resolved_max_model_len) = {
-        let e = engine.read();
-        e.get_model_info()
-    };
+    let (has_vision, model_name, resolved_max_model_len) = engine.get_model_info();
     let has_vision = Arc::new(has_vision);
     let exposed_model_id = resolve_engine_model_id(&econfig).unwrap_or_else(|| model_name.clone());
     let exposed_max_model_len = resolved_max_model_len;
+    // The LoRA adapter names (the /v1/models listing). The base model +
+    // each adapter (the composite `base:adapter` id) are listed so the client can
+    // discover the selectable names. The empty when no adapter is loaded.
+    let lora_adapter_names: Vec<String> = econfig.lora.adapters.iter().map(|(name, _)| name.clone()).collect();
 
     let is_pd_server = if let Some(cfg) = &econfig.pd_config {
         matches!(cfg.role, PdRole::Server)
@@ -1559,22 +1619,44 @@ pub async fn run_server(
                 } else {
                     vec!["text", "embedding"]
                 };
+                // The base model + each LoRA adapter (the composite `base:adapter` id).
+                // The client selects the adapter via the `model` field (the
+                // `base:adapter` form); the base alone has no adapter. Each adapter
+                // entry carries a `parent` field (the base model id, the vLLM/SGLang
+                // convention) so the adapter-to-base relationship is explicit. Any
+                // subset of the listed adapters may be composed additively via the
+                // `base:a+b` model form (the multi-adapter delta).
+                let mut data = vec![json!({
+                    "id": exposed_model_id,
+                    "object": "model",
+                    "created": std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_millis() as i64,
+                    "owned_by": "xinfer",
+                    "permission": [],
+                    "modalities": m,
+                    "max_model_len": exposed_max_model_len,
+                    "parent": null,
+                })];
+                for adapter_name in &lora_adapter_names {
+                    data.push(json!({
+                        "id": format!("{exposed_model_id}:{adapter_name}"),
+                        "object": "model",
+                        "created": std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_millis() as i64,
+                        "owned_by": "xinfer",
+                        "permission": [],
+                        "modalities": m,
+                        "max_model_len": exposed_max_model_len,
+                        "parent": exposed_model_id,
+                    }));
+                }
                 Json(json!({
                     "object": "list",
-                    "data": [
-                        {
-                            "id": exposed_model_id,
-                            "object": "model",
-                            "created": std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap()
-                                .as_millis() as i64,
-                            "owned_by": "xinfer",
-                            "permission": [],
-                            "modalities": m,
-                            "max_model_len": exposed_max_model_len,
-                        }
-                    ]
+                    "data": data
                 }))
             }),
         )
@@ -1587,6 +1669,9 @@ pub async fn run_server(
         )
         .route("/v1/embeddings", post(server::create_embeddings))
         .route("/v1/usage", get(server::get_usage))
+        .route("/v1/lora", get(server::list_lora_adapters))
+        .route("/v1/lora/load", post(server::load_lora_adapter))
+        .route("/v1/lora/unload", post(server::unload_lora_adapter))
         .route("/tokenize", post(server::tokenize))
         .route("/detokenize", post(server::detokenize))
         .layer(DefaultBodyLimit::max(100 * 1024 * 1024)) // 100MB body size limit
@@ -1971,6 +2056,7 @@ mod tests {
             tool_call_start_ids: Vec::new(),
             tool_call_end_ids: Vec::new(),
             add_bos_token: false,
+            add_eos_token: false,
         };
 
         normalize_reasoning_controls(&mut params, &guidance_tokens);
@@ -1993,6 +2079,7 @@ mod tests {
             tool_call_start_ids: Vec::new(),
             tool_call_end_ids: Vec::new(),
             add_bos_token: false,
+            add_eos_token: false,
         };
 
         normalize_reasoning_controls(&mut params, &guidance_tokens);
@@ -2014,6 +2101,7 @@ mod tests {
             tool_call_start_ids: Vec::new(),
             tool_call_end_ids: Vec::new(),
             add_bos_token: false,
+            add_eos_token: false,
         };
 
         normalize_reasoning_controls(&mut params, &guidance_tokens);

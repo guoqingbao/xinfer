@@ -1,27 +1,36 @@
 //src/core/engine.rs
-use super::runner::{ModelRunner, RunnerType, Seqs};
-use super::scheduler::{Scheduler, KVCACHE_SWAP_THRESHOLD};
+use super::runner::ModelRunner;
+use super::block_manager::BlockManager;
+use super::scheduler::Scheduler;
 use super::sequence::Sequence;
+use super::qos::SeqReport;
 use crate::core::scheduler::PD_PREFILL_STATUS_CHECK_COOLING_PERIOD;
-use crate::core::sequence::{DecodeSequence, SequenceStatus};
+use crate::core::sequence::SequenceStatus;
+use crate::core::lora::{DEFAULT_LORA_MAX_BYTES, DEFAULT_LORA_MAX_TENANTS};
 use crate::core::GenerationOutput;
 use crate::models::layers::distributed::Comm;
 #[cfg(feature = "nccl")]
 use crate::models::layers::distributed::Id;
 use crate::models::layers::VarBuilderX;
 use crate::runner::{
-    receive_local, send_and_expect_ack, send_local, MessageType, RunnerInitRequest,
+    send_and_expect_ack, MessageType, RunnerInitRequest, SpecSeqStatsData,
 };
 use crate::server::logger::ChatCompletionLogger;
 use crate::server::parser::{detect_prefilled_reasoning_end_marker, ToolConfig};
 use crate::server::{EmbeddingStrategy, UsageResponse};
 use crate::tools::Tool;
+use crate::domain::fwd::FwdMessage;
+use crate::domain::http::HttpMessage;
+use crate::domain::sched::SchedMessage;
+use crate::domain::stream::StreamMessage;
+use crate::domain::{start_fwd_actor, start_http_actor, start_kv_actor, start_sched_actor, start_stream_actor};
+use ractor::rpc::CallResult;
 use crate::transfer::PdRole;
 use crate::transfer::Transfer;
 use crate::utils::chat_template::Message;
 use crate::utils::config::{EngineConfig, EosTokenId, ModelType, SamplingParams};
 use crate::utils::guidance::{build_llg_factory, extract_guidance_tokens, GuidanceTokens};
-use crate::utils::guidance_grammar::{get_reasoning_token_strings, is_reasoning_grammar};
+use crate::utils::guidance_grammar::is_reasoning_grammar;
 use crate::utils::heartbeat::heartbeat_worker;
 use crate::utils::image::{get_image_config, ImageData, ImageProcessConfig};
 use crate::utils::kvcache_allocator::KVCacheAllocator;
@@ -36,12 +45,9 @@ use futures::future::join_all;
 use interprocess::local_socket::traits::Listener;
 use interprocess::local_socket::{GenericNamespaced, ToNsName};
 use interprocess::local_socket::{ListenerOptions, Stream as LocalStream};
-use interprocess::TryClone;
 use once_cell::sync::Lazy;
 use parking_lot::RwLock;
-use rayon::iter::IntoParallelIterator;
-use rayon::iter::ParallelIterator;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -50,7 +56,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokenizers::Tokenizer;
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
-use tokio::sync::mpsc::{channel, Receiver, Sender};
+use tokio::sync::mpsc::Receiver;
 pub static GLOBAL_RT: Lazy<Runtime> = Lazy::new(|| {
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -87,37 +93,54 @@ pub struct PreprocessedRequest {
     pub token_ids: Vec<u32>,
 }
 
-#[allow(dead_code)]
+/// Extract the success value from a Ractor RPC call, or a default. Wraps the
+/// `ActorRef::call` + `CallResult` extraction so call sites stay concise.
+async fn rpc_value<M, T>(
+    ref_: &ractor::ActorRef<M>,
+    builder: impl FnOnce(ractor::RpcReplyPort<T>) -> M,
+    default: T,
+) -> T
+where
+    M: ractor::Message,
+    T: Send + 'static,
+{
+    match ref_.call(builder, None).await {
+        Ok(CallResult::Success(v)) => v,
+        _ => default,
+    }
+}
+
 pub struct LLMEngine {
-    pub runners: Arc<RwLock<RunnerType>>,
-    pub scheduler: Scheduler,
+    /// The forward-pass actor (the sole path to the model transport). Every
+    /// other component reaches the model through this `ActorRef<FwdMessage>`,
+    /// never a direct transport reference. This is what makes the desync class
+    /// of bug structurally impossible: the `IpcChannel` actor is the sole socket
+    /// writer, and the `FwdD` actor is the sole driver of it.
+    pub fwd: ractor::ActorRef<FwdMessage>,
+    /// The stream delivery actor (the per-request channels, the token delivery).
+    pub stream: ractor::ActorRef<StreamMessage>,
+    /// The scheduler actor (the engine loop). Owns the `Scheduler` state + drives
+    /// the `FwdD` + `StreamD` actors.
+    pub sched: ractor::ActorRef<SchedMessage>,
+    /// The HTTP ingestion actor (the request queue, the per-request stream channels).
+    pub http: ractor::ActorRef<HttpMessage>,
     pub tokenizer: Tokenizer,
     pub econfig: EngineConfig,
     default_chat_template: String,
     template: ChatTemplate,
     prompt_replay_candidates: Vec<Vec<u32>>,
-    stream_decoders: HashMap<usize, super::DecodeStreamType>,
-    stream_senders: HashMap<usize, Sender<StreamItem>>,
-    request_types: HashMap<usize, RequestType>,
-    decode_start_times: HashMap<usize, usize>,
-    decode_length: HashMap<usize, usize>,
-    seq_prefilled_reasoning_end: HashMap<usize, String>,
-    seq_prompt_replays: HashMap<usize, Vec<u32>>,
-    last_check_throughput_time: usize,
-    active_requests: HashSet<usize>,
-    cancelled_sequences: Vec<usize>,
-    stop_flag: Arc<AtomicBool>,
     has_vision: bool,
     model_name: String,
     pub model_type: ModelType,
     pub tool_config: ToolConfig,
     pub img_cfg: Option<ImageProcessConfig>,
     pub guidance_tokens: GuidanceTokens,
+seq_spec_stats: std::sync::Mutex<HashMap<usize, SpecSeqStatsData>>,
 }
 
 impl LLMEngine {
     #[allow(unused_mut)]
-    pub fn new(econfig: &EngineConfig, dtype: DType) -> Result<Arc<RwLock<Self>>> {
+    pub async fn new(econfig: &EngineConfig, dtype: DType) -> Result<Arc<Self>> {
         let (model_pathes, is_gguf, mut config, config_tokenizer, tokenizer, mut generation_cfg) =
             init_config_tokenizer(econfig)?;
         let llg_factory = match build_llg_factory(tokenizer.clone(), config.vocab_size) {
@@ -213,7 +236,7 @@ impl LLMEngine {
         #[cfg(feature = "nvtx")]
         let use_runner = false;
 
-        let runners = if !use_runner {
+        let fwd = if !use_runner {
             let device = crate::utils::new_device(device_ids[0])?;
             log_info!("Loading model...");
             let reporter: Arc<RwLock<Box<dyn ProgressLike>>> =
@@ -287,7 +310,15 @@ impl LLMEngine {
 
             model_loaded.store(true, Ordering::SeqCst);
             let _ = handle.join();
-            RunnerType::Thread(model_runner)
+            // The in-process model (the non-nccl build). Ractor actors require
+            // `Send` state, but the in-process ModelRunner (the GPU tensors) is
+            // not Send. The Ractor conversion supports the IPC runner path (the
+            // nccl build); the in-process path is not supported.
+            candle_core::bail!(
+                "Ractor engine requires the IPC runner path (the nccl build). \
+                 The in-process (non-nccl) ModelRunner is not Send and cannot be \
+                 a Ractor actor's. Build with the nccl feature."
+            );
         } else {
             log_info!("Loading model with runner(s)...");
 
@@ -466,18 +497,18 @@ impl LLMEngine {
                     master_port: econfig.master_port,
                     local_num_gpus,
                 };
-                let worker_tcp_streams = crate::utils::multi_node::master_accept_worker_streams(
+                let _worker_tcp_streams = crate::utils::multi_node::master_accept_worker_streams(
                     &mn_config,
                 )
                 .map_err(|e| {
                     candle_core::Error::Msg(format!("Multi-node forward coord failed: {}", e))
                 })?;
-                RunnerType::MultiNodeMaster {
-                    local_streams,
-                    remote_streams: worker_tcp_streams,
-                }
+                // The multi-node case: the local streams drive the FwdD actor (the
+                // remote TCP streams are coordinated separately by the multi-node
+                // worker daemon, the NCCL all-reduce synchronizes the compute).
+                start_fwd_actor(local_streams).await
             } else {
-                RunnerType::Process(local_streams)
+                start_fwd_actor(local_streams).await
             }
         };
 
@@ -490,9 +521,32 @@ impl LLMEngine {
             );
             econfig.max_model_len = Some(32768);
         }
-        let runners = Arc::new(RwLock::new(runners));
 
-        let mut scheduler = Scheduler::new(runners.clone(), &econfig, &config);
+        // The KV-cache actor (the block pool, the prefix cache, the mamba slots, the
+        // tier ladder). Owned before the scheduler so the scheduler can drive it
+        // through the KvRef proxy (the no shared block_manager).
+        let prefix_cache_cfg = crate::core::scheduler::build_prefix_cache_config(&econfig);
+        let mamba_snapshot_default_stride_blocks = econfig
+            .effective_prefill_chunk_size()
+            .div_ceil(econfig.block_size)
+            .max(1);
+        let block_manager = BlockManager::new(
+            fwd.clone(),
+            econfig.num_blocks,
+            (econfig.cpu_mem_fold.unwrap_or(0.5f32) * econfig.num_blocks as f32) as usize,
+            econfig.block_size,
+            prefix_cache_cfg,
+            config
+                .architectures
+                .as_ref()
+                .and_then(|arches| arches.first())
+                .map(|arch| crate::utils::is_qwen3_hybrid_arch_name(arch))
+                .unwrap_or(false),
+            mamba_snapshot_default_stride_blocks,
+        );
+        let kv = start_kv_actor(block_manager).await;
+
+        let mut scheduler = Scheduler::new(kv.clone(), &econfig, &config);
 
         // Preserve model-specific tool token detection for non-guided paths.
         let mut tool_config = ToolConfig::for_model_type(&model_type);
@@ -569,39 +623,68 @@ impl LLMEngine {
 
         log_warn!("Model loaded.\n");
 
-        let engine = Arc::new(RwLock::new(Self {
-            runners,
+        // The LoRA startup log (the #4, the operator visibility): the loaded
+        // adapters + the residency budget. The no-op when no adapter is loaded
+        // (the base model only, the zero overhead).
+        if !econfig.lora.adapters.is_empty() {
+            crate::log_info!(
+                "LoRA: {} adapter(s) loaded ({:?}), budget {} tenants / {} bytes, policy {:?}, pinned {:?}",
+                econfig.lora.adapters.len(),
+                econfig.lora.adapters.iter().map(|(n, _)| n).collect::<Vec<_>>(),
+                econfig.lora.max_tenants.unwrap_or(DEFAULT_LORA_MAX_TENANTS),
+                econfig.lora.max_bytes.unwrap_or(DEFAULT_LORA_MAX_BYTES),
+                econfig.lora.eviction_policy,
+                econfig.lora.pinned
+            );
+        }
+
+        // The stream delivery actor (the per-request channels, the token delivery).
+        let stream = start_stream_actor().await;
+        // The scheduler actor (the engine loop): owns the Scheduler state + drives
+        // the FwdD + StreamD actors. The mtp/dflash flags come from the econfig.
+        let mtp_enabled = crate::speculative::uses_builtin_mtp(&econfig);
+        let dflash_enabled = crate::speculative::uses_dflash(&econfig);
+        let sched = start_sched_actor(
             scheduler,
+            fwd.clone(),
+            stream.clone(),
+            mtp_enabled,
+            dflash_enabled,
+        ).await;
+        // The HTTP ingestion actor (the request queue, the per-request stream
+        // channels): forwards sequences to the SchedD actor + registers the stream
+        // channels with the StreamD actor.
+        let http = start_http_actor(sched.clone(), stream.clone()).await;
+        // Resolve the circular dependency: SchedD needs HttpRef for
+        // take_prompt_replay and remove_active_request. HttpD needs SchedRef
+        // for cancel forwarding. Both are created, now wire them.
+        let _ = sched.send_message(SchedMessage::SetHttp(http.clone()));
+
+        let engine = Arc::new(Self {
+            fwd,
+            stream,
+            sched,
+            http,
             tokenizer,
             econfig,
             default_chat_template,
             template,
             prompt_replay_candidates,
-            stream_decoders: HashMap::new(),
-            stream_senders: HashMap::new(),
-            request_types: HashMap::new(),
-            decode_start_times: HashMap::new(),
-            decode_length: HashMap::new(),
-            seq_prefilled_reasoning_end: HashMap::new(),
-            seq_prompt_replays: HashMap::new(),
-            last_check_throughput_time: 0,
-            active_requests: HashSet::new(),
-            cancelled_sequences: Vec::new(),
-            stop_flag: stop_flag.clone(),
             has_vision: config.is_multi_model.unwrap_or(false),
             model_type,
             tool_config,
             img_cfg,
             model_name,
             guidance_tokens,
-        }));
+            seq_spec_stats: std::sync::Mutex::new(HashMap::new()),
+            });
 
         Self::start_engine(engine.clone());
         Ok(engine)
     }
 
-    fn add_request_(
-        &mut self,
+    async fn add_request_(
+        &self,
         params: &SamplingParams,
         prompt: &str,
         request_type: &RequestType,
@@ -613,7 +696,7 @@ impl LLMEngine {
             .encode_fast(prompt, true)
             .expect("encode failed!");
         let token_ids: Vec<u32> = tokens.get_ids().to_vec();
-        self.add_request_pretokenized_(params, prompt, token_ids, request_type, images, image_idx)
+        self.add_request_pretokenized_(params, prompt, token_ids, request_type, images, image_idx).await
     }
 
     /// Same body as `add_request_` but accepts a pre-computed `token_ids`
@@ -621,8 +704,8 @@ impl LLMEngine {
     /// serialization of concurrent server handlers gets cut by ~
     /// chat-template + tokenize wall × concurrency in chat-template-heavy
     /// workloads.
-    fn add_request_pretokenized_(
-        &mut self,
+    async fn add_request_pretokenized_(
+        &self,
         params: &SamplingParams,
         prompt: &str,
         token_ids: Vec<u32>,
@@ -723,7 +806,7 @@ impl LLMEngine {
             image_idx,
         );
 
-        let prompt_required_blocks = self.scheduler.block_manager.required_blocks(&seq);
+        let prompt_required_blocks = rpc_value(&self.sched, |r| SchedMessage::BlockRequired(seq.clone(), r), 0).await;
         let requested_decode_blocks = max_tokens.div_ceil(self.econfig.block_size);
         let minimum_decode_budget_tokens = max_tokens.min(REQUEST_ADMISSION_DECODE_BUDGET_TOKENS);
         let minimum_decode_blocks = minimum_decode_budget_tokens.div_ceil(self.econfig.block_size);
@@ -731,14 +814,12 @@ impl LLMEngine {
             prompt_required_blocks.saturating_add(requested_decode_blocks);
         let mut minimum_required_blocks =
             prompt_required_blocks.saturating_add(minimum_decode_blocks);
-        let mut available_blocks = self.scheduler.block_manager.get_num_free_blocks();
+        let mut available_blocks = rpc_value(&self.sched, |r| SchedMessage::BlockFree(r), 0).await;
 
         while target_required_blocks > available_blocks {
             let prev_target = target_required_blocks;
             let target_required_tokens = target_required_blocks * self.econfig.block_size;
-            let evicted = self
-                .scheduler
-                .evict_prefix_cache_until_free(target_required_blocks);
+            let evicted = rpc_value(&self.sched, |r| SchedMessage::EvictPrefixUntilFree(target_required_blocks, r), 0).await;
             if evicted > 0 {
                 crate::log_warn!(
                     "Evicted {} prefix cache block(s) to reserve {} KV tokens for request admission (prompt + {} requested decode tokens).",
@@ -747,13 +828,13 @@ impl LLMEngine {
                     max_tokens
                 );
             }
-            if evicted == 0 && !self.try_release_cache(target_required_tokens) {
+            if evicted == 0 && !self.try_release_cache(target_required_tokens).await {
                 break;
             }
-            let prompt_required_blocks = self.scheduler.block_manager.required_blocks(&seq);
+            let prompt_required_blocks = rpc_value(&self.sched, |r| SchedMessage::BlockRequired(seq.clone(), r), 0).await;
             target_required_blocks = prompt_required_blocks.saturating_add(requested_decode_blocks);
             minimum_required_blocks = prompt_required_blocks.saturating_add(minimum_decode_blocks);
-            available_blocks = self.scheduler.block_manager.get_num_free_blocks();
+            available_blocks = rpc_value(&self.sched, |r| SchedMessage::BlockFree(r), 0).await;
 
             if evicted > 0 && target_required_blocks >= prev_target {
                 break;
@@ -778,12 +859,12 @@ impl LLMEngine {
                 minimum_decode_budget_tokens
             );
         }
-        let seq_id = self.scheduler.add(seq);
+        let seq_id = rpc_value(&self.sched, |r| SchedMessage::Add(seq, r), 0).await;
         if let Some(end_marker) = detect_prefilled_reasoning_end_marker(prompt) {
-            self.seq_prefilled_reasoning_end.insert(seq_id, end_marker);
+            let _ = self.stream.send_message(StreamMessage::RecordPrefilledReasoningEnd(seq_id, end_marker));
         }
         if let Some(replay_ids) = raw_replay_token_ids {
-            self.seq_prompt_replays.insert(seq_id, replay_ids);
+            let _ = self.http.send_message(HttpMessage::SetPromptReplay(seq_id, replay_ids));
         }
 
         if *request_type == RequestType::Stream {
@@ -795,14 +876,14 @@ impl LLMEngine {
                 stream: decoder,
             };
             let boxed_decoder: Box<dyn super::DecodeStreamTrait + Send + Sync> = Box::new(wrapped);
-            self.stream_decoders.insert(seq_id, boxed_decoder);
+            let _ = self.stream.send_message(StreamMessage::SetDecoder(seq_id, boxed_decoder));
         }
-        self.active_requests.insert(seq_id);
+        let _ = self.http.send_message(HttpMessage::AddActiveRequest(seq_id));
         Ok((seq_id, length))
     }
 
-    pub fn add_request(
-        &mut self,
+    pub async fn add_request(
+        &self,
         params: &SamplingParams,
         prompt: &str,
         request_type: RequestType,
@@ -810,10 +891,14 @@ impl LLMEngine {
         image_idx: i32,
     ) -> Result<(usize, usize, Receiver<StreamItem>)> {
         let (seq_id, prompt_length) =
-            self.add_request_(params, prompt, &request_type, images, image_idx)?;
-        let (tx, rx) = channel(1024);
-        self.stream_senders.insert(seq_id, tx);
-        self.request_types.insert(seq_id, request_type.clone());
+            self.add_request_(params, prompt, &request_type, images, image_idx).await?;
+        // The stream channel is registered through the HttpD actor (the request
+        // ingestion domain), which forwards it to the StreamD actor.
+        let rx = match self.http.call(|r| HttpMessage::RegisterStream(seq_id, r), None).await {
+            Ok(CallResult::Success(rx)) => rx,
+            _ => return Err(candle_core::Error::msg("register_stream failed")),
+        };
+        let _ = self.stream.send_message(StreamMessage::SetRequestType(seq_id, request_type.clone()));
         if self.econfig.server_mode.unwrap_or(true) && request_type != RequestType::Completion {
             log_warn!(
                 "[{:?}] New request [Seq_id {}, {} tokens] received! (session_id: {:?})\n",
@@ -829,8 +914,8 @@ impl LLMEngine {
     /// Pretokenized variant of `add_request`. Caller has already done
     /// tokenize (typically via `preprocess`) outside the engine write
     /// lock, so the only work that needs `&mut self` is the scheduler-add.
-    pub fn add_request_pretokenized(
-        &mut self,
+    pub async fn add_request_pretokenized(
+        &self,
         params: &SamplingParams,
         prompt: &str,
         token_ids: Vec<u32>,
@@ -845,10 +930,12 @@ impl LLMEngine {
             &request_type,
             images,
             image_idx,
-        )?;
-        let (tx, rx) = channel(1024);
-        self.stream_senders.insert(seq_id, tx);
-        self.request_types.insert(seq_id, request_type.clone());
+        ).await?;
+        let rx = match self.http.call(|r| HttpMessage::RegisterStream(seq_id, r), None).await {
+            Ok(CallResult::Success(rx)) => rx,
+            _ => return Err(candle_core::Error::msg("register_stream failed")),
+        };
+        let _ = self.stream.send_message(StreamMessage::SetRequestType(seq_id, request_type.clone()));
         if self.econfig.server_mode.unwrap_or(true) && request_type != RequestType::Completion {
             log_warn!(
                 "[{:?}] New request [Seq_id {}, {} tokens] received! (session_id: {:?})\n",
@@ -863,9 +950,9 @@ impl LLMEngine {
 
     /// Apply chat template + tokenize each `(params, messages)` pair under
     /// shared access (`&self`) so N concurrent server handlers can run this
-    /// in parallel under their own `engine.read()` guards. Returns a list
+    /// in parallel under their own `engine.as_ref()` guards. Returns a list
     /// of `PreprocessedRequest`s that feed `generate_sync`
-    /// or `generate_stream`, which acquire `engine.write()`
+    /// or `generate_stream`, which acquire `engine.as_ref()`
     /// only briefly for the scheduler-add step.
     pub fn preprocess(
         &self,
@@ -896,13 +983,13 @@ impl LLMEngine {
         Ok(out)
     }
 
-    pub fn get_num_cached_tokens(&self) -> usize {
-        self.scheduler.get_num_cached_tokens()
+    pub async fn get_num_cached_tokens(&self) -> usize {
+        rpc_value(&self.sched, |r| SchedMessage::GetNumCachedTokens(r), 0).await
     }
 
     /// See [`Scheduler::get_num_cached_tokens_for_seq`].
-    pub fn get_num_cached_tokens_for_seq(&self, seq_id: usize) -> Option<usize> {
-        self.scheduler.get_num_cached_tokens_for_seq(seq_id)
+    pub async fn get_num_cached_tokens_for_seq(&self, seq_id: usize) -> Option<usize> {
+        rpc_value(&self.sched, |r| SchedMessage::GetNumCachedTokensForSeq(seq_id, r), None).await
     }
 
     fn trim_prompt_replay_prefix(
@@ -970,725 +1057,112 @@ impl LLMEngine {
             .cloned()
     }
 
-    pub fn get_available_kv_tokens(&self) -> usize {
-        self.scheduler.get_available_kv_tokens()
+pub async fn get_available_kv_tokens(&self) -> usize {
+        rpc_value(&self.sched, |r| SchedMessage::GetAvailableKvTokens(r), 0).await
     }
 
-    fn take_prompt_replay_token_ids(&mut self, seq_id: usize) -> Option<Vec<u32>> {
-        self.seq_prompt_replays.remove(&seq_id)
-    }
-
-    pub fn notify_runner_finished(&mut self, id: usize) -> Result<()> {
-        match &mut *self.runners.write() {
-            RunnerType::Thread(model_runner) => Ok(model_runner.finished(id)),
-            RunnerType::Process(ref mut runner_streams) => {
-                for stream in runner_streams {
-                    send_local(
-                        &mut vec![stream.try_clone()?],
-                        &MessageType::FinishDecode(id),
-                        false,
-                    )?;
-                }
-                Ok(())
-            }
-            RunnerType::MultiNodeMaster {
-                ref mut local_streams,
-                ref mut remote_streams,
-            } => {
-                let msg = MessageType::FinishDecode(id);
-                for stream in local_streams.iter_mut() {
-                    send_local(&mut vec![stream.try_clone()?], &msg, false)?;
-                }
-                let serialized = bincode::serialize(&msg).expect("Bincode serialization failed");
-                for tcp_stream in remote_streams.iter_mut() {
-                    crate::utils::multi_node::send_tcp(tcp_stream, &serialized)?;
-                }
-                Ok(())
+pub async fn notify_runner_finished(&self, id: usize) -> Result<()> {
+        // The capture-before-drop: the per-seq spec stats were pulled from the
+        // runner by the SchedD at finish-detection (the `fwd_finished`, BEFORE the
+        // `Finished` message dropped them runner-side) + stashed in the SchedD-owned
+        // map. Read that surviving copy (the no post-drop race) into the engine cache.
+        if let Some(spec_stats) = rpc_value(&self.sched, |r| SchedMessage::GetSpecStats(id, r), None).await {
+            if !spec_stats.mechanism.is_empty() {
+                self.seq_spec_stats.lock().unwrap().insert(id, spec_stats);
             }
         }
+        let _ = self.fwd.send_message(FwdMessage::Finished(id));
+        Ok(())
+    }
+
+    /// The end-of-sequence scheduling report (cached tokens + QoS stats) for the
+    /// server's per-sequence display. Delegates to the scheduler (same process).
+    pub async fn get_seq_report(&self, seq_id: usize) -> Option<SeqReport> {
+        rpc_value(&self.sched, |r| SchedMessage::GetSeqReport(seq_id, r), None).await
+    }
+
+// The llg anti-loop methods (the get_seq_loop_stats + the observe_loop). The
+    // fetch_spec_seq_stats is dropped (the §7.3 capture-before-drop: the per-seq spec
+    // stats now come from the SchedD-owned map via GetSpecStats, the no runner fetch).
+    /// The cached per-seq loop-defense stats (for the server's end-of-sequence report).
+    /// Routed through the SchedD actor (which owns the loop-defense state).
+    pub async fn get_seq_loop_stats(&self, seq_id: usize) -> Option<crate::utils::loop_detect::LoopSeqStats> {
+        rpc_value(&self.sched, |r| SchedMessage::GetSeqLoopStats(seq_id, r), None).await
+    }
+
+    /// The cached per-seq spec stats (for the server's end-of-sequence report).
+    pub fn get_seq_spec_stats(&self, seq_id: usize) -> Option<SpecSeqStatsData> {
+        self.seq_spec_stats.lock().unwrap().get(&seq_id).cloned()
     }
 
     /// Release hybrid GDN/Mamba active slots queued by scheduler-side abort paths.
-    pub fn drain_pending_runner_releases(&mut self) {
-        let pending = self.scheduler.take_pending_runner_releases();
-        for seq_id in pending {
-            // Route scheduler-side aborts through the normal cancellation path
-            // so the request bookkeeping and response channel are cleaned up as
-            // well as the runner slot. Avoid a second notification when the
-            // request was already cancelled by another path.
-            if !self.cancelled_sequences.contains(&seq_id) {
-                self.cancelled_sequences.push(seq_id);
-            }
-        }
-        if !self.cancelled_sequences.is_empty() {
-            self.check_canceled(None);
-        }
-    }
-
-    /// Phase 1: Schedule sequences and prepare data for the forward pass.
-    /// Returns (scheduled_ids, is_prefill, cloned_sequences) or None if no work.
-    pub fn prepare_step(&mut self) -> Result<Option<(Vec<usize>, bool, Vec<Sequence>)>> {
-        let (scheduled_ids, is_prefill) = match self.scheduler.schedule() {
-            Ok((ids, prefill)) => (ids, prefill),
-            Err(e) => {
-                crate::log_error!("[Scheduler] Schedule error: {:?}", e);
-                (vec![], true)
-            }
-        };
-        if scheduled_ids.is_empty() {
-            return Ok(None);
-        }
-
-        if is_prefill {
-            let downgraded = self
-                .scheduler
-                .fallback_missing_mamba_prefix_snapshots(&scheduled_ids)?;
-            if downgraded > 0 {
-                crate::log_warn!(
-                    "Prefill fallback: {} sequence(s) downgraded to full prefill due to missing mamba snapshots.",
-                    downgraded
-                );
-            }
-        }
-
-        // Pre-allocate blocks for speculative verify positions before cloning sequences
-        if !is_prefill {
-            if self.econfig.num_speculative_tokens.unwrap_or(0) > 0
-                && (crate::speculative::uses_builtin_mtp(&self.econfig)
-                    || crate::speculative::uses_dflash(&self.econfig))
-            {
-                let spec_tokens = self.econfig.num_speculative_tokens.unwrap_or(0);
-                self.scheduler
-                    .pre_allocate_mtp_blocks(&scheduled_ids, spec_tokens + 1);
-            }
-        }
-
-        let seqs = self.scheduler.get_sequences(&scheduled_ids);
-        let owned_seqs: Vec<Sequence> = seqs
-            .iter()
-            .map(|s| {
-                if is_prefill {
-                    s.clone_for_prefill_forward()
-                } else {
-                    (*s).clone()
-                }
-            })
-            .collect();
-        Ok(Some((scheduled_ids, is_prefill, owned_seqs)))
-    }
-
-    /// Phase 2: Run the forward pass. Does NOT require the engine lock - only the runner lock.
-    pub fn run_forward(
-        runners: &Arc<RwLock<RunnerType>>,
-        owned_seqs: &[Sequence],
-        is_prefill: bool,
-    ) -> Result<Vec<u32>> {
-        match &mut *runners.write() {
-            RunnerType::Thread(model_runner) => {
-                let seq_refs: Vec<&Sequence> = owned_seqs.iter().collect();
-                model_runner.run(Seqs::SeqRefs(&seq_refs), is_prefill)
-            }
-            RunnerType::Process(ref mut runner_streams) => {
-                Self::run_forward_on_local_streams(runner_streams, owned_seqs, is_prefill)
-            }
-            RunnerType::MultiNodeMaster {
-                ref mut local_streams,
-                ref mut remote_streams,
-            } => {
-                let request = if is_prefill {
-                    MessageType::RunPrefill((owned_seqs.to_vec(), true))
-                } else {
-                    let sequences = owned_seqs
-                        .iter()
-                        .map(|s| DecodeSequence::new(s))
-                        .collect::<Vec<_>>();
-                    MessageType::RunDecode((sequences, false))
-                };
-                let serialized =
-                    bincode::serialize(&request).expect("Bincode serialization failed");
-
-                // Send to remote worker nodes via TCP (fire-and-forget the responses;
-                // NCCL all-reduce synchronizes the actual computation)
-                for tcp_stream in remote_streams.iter_mut() {
-                    if let Err(e) = crate::utils::multi_node::send_tcp(tcp_stream, &serialized) {
-                        candle_core::bail!("Failed to send forward to remote worker: {}", e);
-                    }
-                }
-
-                // Run on local runners (which also participate in the NCCL collective)
-                let result =
-                    Self::run_forward_on_local_streams(local_streams, owned_seqs, is_prefill);
-
-                // Collect acks from remote workers
-                for tcp_stream in remote_streams.iter_mut() {
-                    match crate::utils::multi_node::recv_tcp(tcp_stream) {
-                        Ok(data) => {
-                            let resp: MessageType = bincode::deserialize(&data)
-                                .expect("Failed to deserialize remote worker response");
-                            match resp {
-                                MessageType::RunResponse(ref ids) if ids.is_empty() => {
-                                    candle_core::bail!("Remote worker returned empty response");
-                                }
-                                MessageType::RunResponse(_) => {} // OK
-                                other => {
-                                    candle_core::bail!("Unexpected remote response: {:?}", other);
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            candle_core::bail!("Failed to receive from remote worker: {}", e);
-                        }
-                    }
-                }
-
-                result
-            }
-        }
-    }
-
-    fn run_forward_on_local_streams(
-        runner_streams: &mut Vec<LocalStream>,
-        owned_seqs: &[Sequence],
-        is_prefill: bool,
-    ) -> Result<Vec<u32>> {
-        let request = if is_prefill {
-            MessageType::RunPrefill((owned_seqs.to_vec(), true))
-        } else {
-            let sequences = owned_seqs
-                .iter()
-                .map(|s| DecodeSequence::new(s))
-                .collect::<Vec<_>>();
-            MessageType::RunDecode((sequences, false))
-        };
-
-        let cloned_streams: Vec<LocalStream> = runner_streams
-            .iter_mut()
-            .map(|s| s.try_clone().expect("clone failed"))
-            .collect();
-
-        let all_outputs: Result<Vec<Vec<u32>>> = cloned_streams
-            .into_par_iter()
-            .map(|mut stream| {
-                let msg = request.clone();
-                send_local(&mut vec![stream.try_clone()?], &msg, false)?;
-                let response = receive_local(&mut stream, false)?;
-
-                match response {
-                    MessageType::RunResponse(output_ids) => {
-                        if output_ids.len() == 0 {
-                            candle_core::bail!("Runner step error, no response!")
-                        } else {
-                            Ok(output_ids)
-                        }
-                    }
-                    other => {
-                        candle_core::bail!("Unexpected response type: {:?}", other)
-                    }
-                }
-            })
-            .collect();
-
-        let all_outputs = all_outputs.map_err(candle_core::Error::wrap)?;
-        if let Some(output_ids) = all_outputs.first() {
-            Ok(output_ids.clone())
-        } else {
-            candle_core::bail!("No output ids received from model runners");
-        }
-    }
-
-    fn run_mtp_on_local_streams(
-        runner_streams: &mut Vec<LocalStream>,
-        request: &MessageType,
-    ) -> Result<Vec<Vec<u32>>> {
-        // MTP executes tensor-parallel attention/MoE kernels and therefore every
-        // local runner must enter the same NCCL collectives. Send the request to
-        // all ranks before waiting for any response; waiting on rank 0 first would
-        // deadlock while the other ranks are still idle.
-        let cloned_streams: Vec<LocalStream> = runner_streams
-            .iter_mut()
-            .map(|s| s.try_clone().expect("clone failed"))
-            .collect();
-
-        let all_outputs: Result<Vec<Vec<Vec<u32>>>> = cloned_streams
-            .into_par_iter()
-            .map(|mut stream| {
-                send_local(&mut vec![stream.try_clone()?], request, false)?;
-                match receive_local(&mut stream, false)? {
-                    MessageType::RunResponseMTP(multi_tokens) if !multi_tokens.is_empty() => {
-                        Ok(multi_tokens)
-                    }
-                    MessageType::RunResponseMTP(_) => {
-                        candle_core::bail!("MTP runner returned empty response")
-                    }
-                    other => {
-                        candle_core::bail!("Unexpected MTP response type: {:?}", other)
-                    }
-                }
-            })
-            .collect();
-
-        let all_outputs = all_outputs.map_err(candle_core::Error::wrap)?;
-        all_outputs
-            .into_iter()
-            .next()
-            .ok_or_else(|| candle_core::Error::Msg("No response from local MTP runners".into()))
-    }
-
-    /// Run MTP speculative decode forward pass.
-    /// Returns Vec<Vec<u32>> where each inner vec contains all accepted tokens for that sequence.
-    fn run_forward_mtp(
-        runners: &Arc<RwLock<RunnerType>>,
-        owned_seqs: &[Sequence],
-    ) -> Result<Vec<Vec<u32>>> {
-        match &mut *runners.write() {
-            RunnerType::Thread(model_runner) => {
-                let seq_refs: Vec<&Sequence> = owned_seqs.iter().collect();
-                model_runner.run_mtp_decode(Seqs::SeqRefs(&seq_refs))
-            }
-            RunnerType::Process(ref mut runner_streams) => {
-                use crate::runner::MessageType;
-
-                let sequences = owned_seqs
-                    .iter()
-                    .map(|s| DecodeSequence::new(s))
-                    .collect::<Vec<_>>();
-                let request = MessageType::RunDecodeMTP(sequences);
-                Self::run_mtp_on_local_streams(runner_streams, &request)
-            }
-            RunnerType::MultiNodeMaster {
-                ref mut local_streams,
-                ref mut remote_streams,
-            } => {
-                use crate::runner::MessageType;
-
-                let sequences = owned_seqs
-                    .iter()
-                    .map(|s| DecodeSequence::new(s))
-                    .collect::<Vec<_>>();
-                let request = MessageType::RunDecodeMTP(sequences);
-                let serialized =
-                    bincode::serialize(&request).expect("Bincode serialization failed");
-
-                for tcp_stream in remote_streams.iter_mut() {
-                    if let Err(e) = crate::utils::multi_node::send_tcp(tcp_stream, &serialized) {
-                        candle_core::bail!("Failed to send MTP forward to remote worker: {}", e);
-                    }
-                }
-
-                let result = Self::run_mtp_on_local_streams(local_streams, &request);
-
-                for tcp_stream in remote_streams.iter_mut() {
-                    let _ = crate::utils::multi_node::recv_tcp(tcp_stream);
-                }
-
-                result
-            }
-        }
-    }
-
-    fn run_dflash_on_local_streams(
-        runner_streams: &mut Vec<LocalStream>,
-        request: &MessageType,
-    ) -> Result<Vec<Vec<u32>>> {
-        let cloned_streams: Vec<LocalStream> = runner_streams
-            .iter_mut()
-            .map(|stream| stream.try_clone().expect("clone failed"))
-            .collect();
-        let all_outputs: Result<Vec<Vec<Vec<u32>>>> = cloned_streams
-            .into_par_iter()
-            .map(|mut stream| {
-                send_local(&mut vec![stream.try_clone()?], request, false)?;
-                match receive_local(&mut stream, false)? {
-                    MessageType::RunResponseDFlash(tokens) if !tokens.is_empty() => Ok(tokens),
-                    MessageType::RunResponseDFlash(_) => {
-                        candle_core::bail!("DFlash runner returned empty response")
-                    }
-                    other => candle_core::bail!("Unexpected DFlash response type: {:?}", other),
-                }
-            })
-            .collect();
-        all_outputs
-            .map_err(candle_core::Error::wrap)?
-            .into_iter()
-            .next()
-            .ok_or_else(|| candle_core::Error::Msg("No response from local DFlash runners".into()))
-    }
-
-    fn run_forward_dflash(
-        runners: &Arc<RwLock<RunnerType>>,
-        owned_seqs: &[Sequence],
-    ) -> Result<Vec<Vec<u32>>> {
-        match &mut *runners.write() {
-            RunnerType::Thread(model_runner) => {
-                let seq_refs: Vec<&Sequence> = owned_seqs.iter().collect();
-                model_runner.run_dflash_decode(Seqs::SeqRefs(&seq_refs))
-            }
-            RunnerType::Process(runner_streams) => {
-                let sequences = owned_seqs
-                    .iter()
-                    .map(|sequence| DecodeSequence::new(sequence))
-                    .collect::<Vec<_>>();
-                let request = MessageType::RunDecodeDFlash(sequences);
-                Self::run_dflash_on_local_streams(runner_streams, &request)
-            }
-            RunnerType::MultiNodeMaster {
-                local_streams,
-                remote_streams,
-            } => {
-                let sequences = owned_seqs
-                    .iter()
-                    .map(|sequence| DecodeSequence::new(sequence))
-                    .collect::<Vec<_>>();
-                let request = MessageType::RunDecodeDFlash(sequences);
-                let serialized =
-                    bincode::serialize(&request).expect("Bincode serialization failed");
-                for stream in remote_streams.iter_mut() {
-                    crate::utils::multi_node::send_tcp(stream, &serialized)?;
-                }
-                let result = Self::run_dflash_on_local_streams(local_streams, &request);
-                for stream in remote_streams.iter_mut() {
-                    let _ = crate::utils::multi_node::recv_tcp(stream);
-                }
-                result
-            }
-        }
-    }
-
-    /// Phase 3: Postprocess forward pass results, deliver tokens, and do maintenance.
-    /// Handles both single-token (normal decode/prefill) and multi-token (MTP) outputs.
-    pub fn finish_step(
-        &mut self,
-        scheduled_ids: Vec<usize>,
-        is_prefill: bool,
-        multi_output_ids: Vec<Vec<u32>>,
-    ) -> Result<usize> {
-        if scheduled_ids.len() != multi_output_ids.len() {
-            candle_core::bail!(
-                "Forward output count mismatch: {} scheduled sequence(s), {} output row(s)",
-                scheduled_ids.len(),
-                multi_output_ids.len()
-            );
-        }
-
-        // `scheduled_ids` are indexes into scheduler.running, while
-        // `multi_output_ids` is dense and ordered by position in scheduled_ids.
-        // Keep that association explicit; a running index is not an output index.
-        let (indices, output_by_running_index) = if is_prefill {
-            let (indices, finished_indices) =
-                self.scheduler.filter_prefill_finished(&scheduled_ids);
-            if indices.is_empty() {
-                self.check_canceled(None);
-                return Ok(0);
-            } else {
-                if indices.len() != finished_indices.len() {
-                    candle_core::bail!(
-                        "Prefill result mapping mismatch: {} output position(s), {} running sequence(s)",
-                        indices.len(),
-                        finished_indices.len()
-                    );
-                }
-                let wrapped: Vec<Vec<u32>> = indices
-                    .iter()
-                    .map(|&output_idx| {
-                        multi_output_ids.get(output_idx).cloned().ok_or_else(|| {
-                            candle_core::Error::msg(format!(
-                                "Prefill output index {} out of range for {} output row(s)",
-                                output_idx,
-                                multi_output_ids.len()
-                            ))
-                        })
-                    })
-                    .collect::<Result<_>>()?;
-                self.scheduler.postprocess(&finished_indices, &wrapped);
-                let output_map = finished_indices
-                    .iter()
-                    .copied()
-                    .zip(wrapped)
-                    .collect::<HashMap<_, _>>();
-                (finished_indices, output_map)
-            }
-        } else {
-            self.scheduler
-                .postprocess(&scheduled_ids, &multi_output_ids);
-            let output_map = scheduled_ids
-                .iter()
-                .copied()
-                .zip(multi_output_ids)
-                .collect::<HashMap<_, _>>();
-            (scheduled_ids, output_map)
-        };
-
-        let mut prefill_batch: Vec<(usize, usize, f32, bool)> = Vec::new();
-        for &idx in &indices {
-            let step_tokens = output_by_running_index.get(&idx).ok_or_else(|| {
-                candle_core::Error::msg(format!(
-                    "Missing forward output for running sequence index {}",
-                    idx
-                ))
-            })?;
-            let sq = self.scheduler.get_running(idx);
-            if let Some(s) = sq {
-                let seq_id = s.id;
-                if s.is_finished() {
-                    if let Some(sender) = self.stream_senders.get_mut(&seq_id) {
-                        if let Some(request_type) = self.request_types.get(&seq_id) {
-                            let prompt_start_time = s.created_time();
-
-                            let decode_finish_time = SystemTime::now()
-                                .duration_since(UNIX_EPOCH)
-                                .expect("Time went backwards")
-                                .as_millis()
-                                as usize;
-                            let decode_start_time = if let Some(decode_start_time) =
-                                self.decode_start_times.get(&seq_id)
-                            {
-                                *decode_start_time
-                            } else {
-                                decode_finish_time
-                            };
-
-                            if s.is_tool_call_end {
-                                if *request_type == RequestType::Stream {
-                                    if let Some(decoder) = self.stream_decoders.get_mut(&seq_id) {
-                                        if let Some(tok) = decoder.step(s.last_token)? {
-                                            let _ = sender
-                                                .try_send(StreamItem::Token(tok, s.last_token));
-                                        }
-                                    }
-                                } else {
-                                    let _ = sender.try_send(StreamItem::TokenID(s.last_token));
-                                }
-                            }
-
-                            if *request_type == RequestType::Stream {
-                                let num_appended = s.output_ids.len()
-                                    - self.decode_length.get(&seq_id).copied().unwrap_or(0);
-                                let tokens_to_stream =
-                                    &step_tokens[..num_appended.min(step_tokens.len())];
-                                for &tok in tokens_to_stream {
-                                    if let Some(decoder) = self.stream_decoders.get_mut(&seq_id) {
-                                        if let Some(text) = decoder.step(tok)? {
-                                            let _ = sender.try_send(StreamItem::Token(text, tok));
-                                        }
-                                    }
-                                }
-                                let _ = sender.try_send(StreamItem::Done((
-                                    prompt_start_time,
-                                    decode_start_time,
-                                    decode_finish_time,
-                                    s.output_ids.len(),
-                                    s.stop_sequence.clone(),
-                                )));
-                            } else {
-                                let _ = sender.try_send(StreamItem::Completion((
-                                    prompt_start_time,
-                                    decode_start_time,
-                                    decode_finish_time,
-                                    s.output_ids.clone(),
-                                    s.stop_sequence.clone(),
-                                )));
-                            }
-                        }
-                    }
-
-                    self.stream_senders.remove(&seq_id);
-                    self.stream_decoders.remove(&seq_id);
-                    if let Some(_) = self.active_requests.get(&seq_id) {
-                        self.active_requests.remove(&seq_id);
-                    }
-                    self.decode_start_times.remove(&seq_id);
-                    self.decode_length.remove(&seq_id);
-                    self.seq_prefilled_reasoning_end.remove(&seq_id);
-                    self.seq_prompt_replays.remove(&seq_id);
-                    let _ = self.notify_runner_finished(seq_id);
-                    if self.econfig.server_mode.unwrap_or(true) {
-                        self.scheduler.print_free_blocks();
-                    }
-                } else {
-                    if !self.decode_start_times.contains_key(&seq_id) {
-                        let cur_time = SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .expect("Time went backwards")
-                            .as_millis() as usize;
-                        self.decode_start_times.insert(seq_id, cur_time);
-                        self.decode_length.insert(seq_id, 1);
-
-                        let time_costs = cur_time - s.created_time();
-                        if time_costs / 100 > 0 && s.len() > 0 {
-                            prefill_batch.push((
-                                seq_id,
-                                s.len(),
-                                time_costs as f32 / 1000f32,
-                                s.num_cached_tokens > 0,
-                            ));
-                        }
-                    }
-
-                    if let Some(length) = self.decode_length.get_mut(&seq_id) {
-                        *length = s.output_len();
-                    }
-
-                    let mut token_ids = if step_tokens.len() > 1 {
-                        step_tokens.to_vec()
-                    } else if self.is_pd_mode() && s.pd_first_token.is_some() && s.output_len() == 2
-                    {
-                        vec![s.pd_first_token.unwrap_or(s.last_token), s.last_token]
-                    } else {
-                        vec![s.last_token]
-                    };
-                    if let Some(mut replay_ids) = self.take_prompt_replay_token_ids(seq_id) {
-                        replay_ids.extend(token_ids);
-                        token_ids = replay_ids;
-                    }
-
-                    if let Some(sender) = self.stream_senders.get_mut(&seq_id) {
-                        if let Some(request_type) = self.request_types.get(&seq_id) {
-                            if *request_type == RequestType::Stream {
-                                if let Some(decoder) = self.stream_decoders.get_mut(&seq_id) {
-                                    for token_id in token_ids {
-                                        if let Some(tok) = decoder.step(token_id)? {
-                                            let result =
-                                                sender.try_send(StreamItem::Token(tok, token_id));
-                                            if result.is_err() {
-                                                crate::log_error!(
-                                                    "Error when sending token to client [seq_id {}]",
-                                                    seq_id
-                                                );
-                                                self.cancelled_sequences.push(seq_id);
-                                            }
-                                        }
-                                    }
-                                }
-                            } else {
-                                for token_id in token_ids {
-                                    if let Err(_) = sender.try_send(StreamItem::TokenID(token_id)) {
-                                        crate::log_error!(
-                                            "Error when sending token to client [seq_id {}]",
-                                            seq_id
-                                        );
-                                        self.cancelled_sequences.push(seq_id);
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        if !prefill_batch.is_empty() {
-            let seq_ids: Vec<usize> = prefill_batch.iter().map(|(id, _, _, _)| *id).collect();
-            let total_tokens: usize = prefill_batch.iter().map(|(_, t, _, _)| *t).sum();
-            let max_time: f32 = prefill_batch
-                .iter()
-                .map(|(_, _, t, _)| *t)
-                .fold(0.0f32, f32::max);
-            if max_time > 0.0 {
-                crate::log_info!(
-                    "Prefilling {} seq(s) {:?}: {} total tokens in {:.2}s ({:.2} tokens/s)",
-                    prefill_batch.len(),
-                    seq_ids,
-                    total_tokens,
-                    max_time,
-                    total_tokens as f32 / max_time,
-                );
-            }
-        }
-        self.scheduler.clear_finished();
-
-        if indices.is_empty()
-            && self.scheduler.kv_cache_usage_percent() > KVCACHE_SWAP_THRESHOLD + 0.01f32
-        {
-            if !self.try_release_cache(0) {
-                if let Some(oldest_seq_id) = self.active_requests.clone().iter().min() {
-                    crate::log_error!(
-                        "Unable to schedule task(s), drop the oldest active request (seq_id: {:?})",
-                        oldest_seq_id
-                    );
-                    self.cancelled_sequences.push(*oldest_seq_id);
-                    self.check_canceled(Some(
-                        "Unable to schedule task(s), this request has been dropped!".to_string(),
-                    ));
-                }
-                if self.scheduler.kv_cache_usage_percent() > 0.99f32 {
-                    self.free_resources();
-                }
-            }
-        } else {
-            self.check_canceled(None);
-        }
-        if self.econfig.server_mode.unwrap_or(true) {
-            self.may_print_decoding_throughput(&indices);
-        }
-        Ok(indices.len())
-    }
-
-    pub fn try_release_cache(&mut self, tokens_required: usize) -> bool {
+    pub async fn try_release_cache(&self, tokens_required: usize) -> bool {
         if tokens_required == 0 {
-            return self.scheduler.evict_prefix_cache_blocks(1) > 0;
+            return rpc_value(&self.sched, |r| SchedMessage::EvictPrefixCacheBlocks(1, r), 0).await > 0;
         }
 
         let required_blocks = tokens_required.div_ceil(self.econfig.block_size);
-        self.scheduler
-            .evict_prefix_cache_until_free(required_blocks)
-            > 0
+        rpc_value(&self.sched, |r| SchedMessage::EvictPrefixUntilFree(required_blocks, r), 0).await > 0
     }
 
-    pub fn check_canceled(&mut self, reason: Option<String>) {
-        if !self.cancelled_sequences.is_empty() {
-            for i in 0..self.cancelled_sequences.len() {
-                let seq_id = self.cancelled_sequences[i];
-                self.scheduler.cancel(seq_id);
-                // Ensure model-side per-sequence state (e.g., Qwen3.5 Mamba cache slot) is released.
-                let _ = self.notify_runner_finished(seq_id);
-                if let Some(_) = self.active_requests.get(&seq_id) {
-                    self.active_requests.remove(&seq_id);
-                }
-                self.stream_decoders.remove(&seq_id);
-                self.decode_start_times.remove(&seq_id);
-                self.seq_prefilled_reasoning_end.remove(&seq_id);
-                self.seq_prompt_replays.remove(&seq_id);
-                if let Some(r) = &reason {
-                    if let Some(sender) = self.stream_senders.get_mut(&seq_id) {
-                        if let Some(request_type) = self.request_types.get(&seq_id) {
-                            if *request_type == RequestType::Stream {
-                                let _ = sender.try_send(StreamItem::Error(r.clone()));
+    pub async fn check_canceled(&self, reason: Option<String>) {
+        // Process cancellations + drain the pending runner releases in a loop
+        // (the no mutual recursion, which would create an infinitely-sized future).
+        loop {
+            let cancelled = rpc_value(&self.http, |r| HttpMessage::TakeCancellations(r), Vec::new()).await;
+            if !cancelled.is_empty() {
+                for seq_id in cancelled {
+                    let _ = self.sched.send_message(SchedMessage::Cancel(seq_id));
+                    // Ensure model-side per-sequence state (e.g., Qwen3.5 Mamba cache slot) is released.
+                    let _ = self.notify_runner_finished(seq_id).await;
+                    let _ = self.http.send_message(HttpMessage::RemoveActiveRequest(seq_id));
+                    let _ = self.stream.send_message(StreamMessage::ForgetSequence(seq_id));
+                    let _ = rpc_value(&self.http, |r| HttpMessage::TakePromptReplay(seq_id, r), None).await;
+                    if let Some(r) = &reason {
+                        let request_type = rpc_value(&self.stream, |r| StreamMessage::GetRequestType(seq_id, r), None).await;
+                        if let Some(request_type) = request_type {
+                            if request_type == RequestType::Stream {
+                                let _ = self.stream.send_message(StreamMessage::DeliverDone(seq_id, StreamItem::Error(r.clone())));
                             }
                         }
                     }
                 }
-                self.stream_senders.remove(&seq_id);
+                let _ = self.sched.send_message(SchedMessage::ClearFinished);
             }
-            self.scheduler.clear_finished();
-            self.cancelled_sequences.clear();
+            // Drain the pending runner releases (mark them cancelled, the loop
+            // processes them on the next iteration).
+            let pending = rpc_value(&self.sched, |r| SchedMessage::TakePendingRunnerReleases(r), Vec::new()).await;
+            if pending.is_empty() {
+                break;
+            }
+            for seq_id in &pending {
+                let _ = self.http.send_message(HttpMessage::MarkCancelled(*seq_id));
+            }
         }
-        self.drain_pending_runner_releases();
     }
 
-    pub fn may_print_decoding_throughput(&mut self, active_indices: &Vec<usize>) {
-        if active_indices.is_empty() || self.active_requests.is_empty() {
+    pub async fn may_print_decoding_throughput(&self, active_indices: &Vec<usize>) {
+        if active_indices.is_empty() || rpc_value(&self.http, |r| HttpMessage::IsIdle(r), false).await {
             return;
         }
         let cur_time = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("Time went backwards")
             .as_millis() as usize;
-        if cur_time - self.last_check_throughput_time < 10000 {
+        if !rpc_value(&self.stream, |r| StreamMessage::ThroughputGate(cur_time, r), false).await {
             return;
         }
-        self.last_check_throughput_time = cur_time;
 
         let mut total_decoded_length = 0;
         let mut total_decoded_time_costs = 0;
 
         let mut seq_ids = Vec::new();
         for &idx in active_indices {
-            if let Some(seq) = self.scheduler.get_running(idx) {
-                if let Some(length) = self.decode_length.get(&seq.id) {
+            if let Some(seq) = rpc_value(&self.sched, |r| SchedMessage::GetRunning(idx, r), None).await {
+                if let Some(length) = rpc_value(&self.stream, |r| StreamMessage::GetDecodeLength(seq.id, r), None).await {
                     total_decoded_length += length;
                 }
-                if let Some(start_time) = self.decode_start_times.get(&seq.id) {
+                if let Some(start_time) = rpc_value(&self.stream, |r| StreamMessage::GetDecodeStartTime(seq.id, r), None).await {
                     total_decoded_time_costs += cur_time - start_time;
                 }
                 seq_ids.push(seq.id);
@@ -1707,21 +1181,19 @@ impl LLMEngine {
         }
 
         if total_decoded_length % 100 > 50 {
-            self.scheduler.print_free_blocks();
+            let _ = self.sched.send_message(SchedMessage::PrintFreeBlocks);
         }
     }
 
-    pub fn cancel(&mut self, seq_id: usize) {
-        self.cancelled_sequences.push(seq_id);
+    pub fn cancel(&self, seq_id: usize) {
+        let _ = self.http.send_message(HttpMessage::MarkCancelled(seq_id));
     }
 
-    pub fn cancel_all_with_reason(&mut self, reason: Option<String>) -> bool {
-        for seq_id in &self.active_requests {
-            self.cancelled_sequences.push(*seq_id);
-        }
-        let has_requests_to_cancel = self.cancelled_sequences.len() > 0;
-        self.check_canceled(reason);
-        has_requests_to_cancel
+    pub async fn cancel_all_with_reason(&self, reason: Option<String>) -> bool {
+        let had_active = !rpc_value(&self.http, |r| HttpMessage::IsIdle(r), false).await;
+        let _ = self.http.send_message(HttpMessage::CancelAllActive);
+        self.check_canceled(reason).await;
+        had_active
     }
 
     pub fn apply_chat_template(
@@ -1786,7 +1258,8 @@ impl LLMEngine {
         }
         // Generation alignment and open/close parity enforcement
         if let Some(grammar) = &params.grammar {
-            if self.guidance_tokens.add_bos_token {
+            let lark = crate::utils::guidance_grammar::get_lark_from_top_level_grammar(grammar);
+            if lark.contains("start: bos ") {
                 // BOS-based trimming: trim the last BOS token from the prompt tail.
                 // Only trim if the prompt actually ends with the BOS string to avoid
                 // splitting in the middle of a multi-turn conversation.
@@ -1809,37 +1282,13 @@ impl LLMEngine {
                         }
                     }
                 }
-            } else {
-                // Reasoning tag-based trimming: check for reasoning start/end tokens
-                if let Some((start_str, end_str)) =
-                    get_reasoning_token_strings(&self.guidance_tokens, &self.tokenizer)
-                {
-                    if is_reasoning_grammar(&grammar) {
-                        // Control entire reasoning block via guidance
-                        if prompt.trim().ends_with(&start_str) || prompt.trim().ends_with(&end_str)
-                        {
-                            if let Some((prompt, _trimmed)) = prompt.rsplit_once(&start_str) {
-                                return (prompt.to_string(), image_idx);
-                            }
-                        }
-                    } else if params.guidance_reasoning_end_ids.is_empty() {
-                        // Only trim <think> when NOT using two-phase reasoning.
-                        // With two-phase reasoning, the model needs the <think> prefix
-                        // to generate reasoning freely before grammar constraints kick in.
-                        if prompt.trim().ends_with(&start_str) {
-                            if let Some((prompt, _trimmed)) = prompt.rsplit_once(&start_str) {
-                                return (prompt.to_string(), image_idx);
-                            }
-                        }
-                    }
-                }
             }
         }
-        (prompt, image_idx)
+(prompt, image_idx)
     }
 
-    pub fn is_idle(&self) -> bool {
-        self.active_requests.is_empty()
+    pub async fn is_idle(&self) -> bool {
+        rpc_value(&self.http, |r| HttpMessage::IsIdle(r), false).await
     }
 
     pub fn is_pd_mode(&self) -> bool {
@@ -1855,10 +1304,10 @@ impl LLMEngine {
     }
 
     /// Registers preprocessed completion requests. Callers should run
-    /// `preprocess(...)` under `engine.read()` first, then call this under
-    /// `engine.write()` so the write lock is held only for request admission.
-    pub fn generate_sync(
-        &mut self,
+    /// `preprocess(...)` under `engine.as_ref()` first, then call this under
+    /// `engine.as_ref()` so the write lock is held only for request admission.
+    pub async fn generate_sync(
+        &self,
         preprocessed: Vec<PreprocessedRequest>,
         images: Option<ImageData>,
         logger: &Option<Arc<ChatCompletionLogger>>,
@@ -1875,7 +1324,7 @@ impl LLMEngine {
                 RequestType::Completion,
                 &images,
                 pp.image_idx,
-            )?;
+            ).await?;
             receivers.push((seq_id, prompt_length, rx));
         }
         Ok(receivers)
@@ -2006,28 +1455,28 @@ impl LLMEngine {
         Ok(results)
     }
 
-    pub fn free_resources(&mut self) {
+    pub async fn free_resources(&self) {
         crate::log_error!("***Release all resources for future usage!");
-        self.scheduler.clear_finished();
-        let released_ids = self.scheduler.release_waitings();
+        let _ = self.sched.send_message(SchedMessage::ClearFinished);
+        let released_ids = rpc_value(&self.sched, |r| SchedMessage::ReleaseWaitings(r), Vec::new()).await;
         for seq_id in released_ids {
-            let _ = self.notify_runner_finished(seq_id);
+            let _ = self.notify_runner_finished(seq_id).await;
         }
-        self.seq_prefilled_reasoning_end.clear();
-        self.seq_prompt_replays.clear();
+        let _ = self.stream.send_message(StreamMessage::ResetAll);
+        let _ = self.http.send_message(HttpMessage::ClearPromptReplays);
     }
 
     /// Returns the reasoning end marker when the prompt for this sequence
     /// already ended with an opening think marker.
-    pub fn get_prefilled_reasoning_end_marker(&self, seq_id: usize) -> Option<String> {
-        self.seq_prefilled_reasoning_end.get(&seq_id).cloned()
+    pub async fn get_prefilled_reasoning_end_marker(&self, seq_id: usize) -> Option<String> {
+        rpc_value(&self.stream, |r| StreamMessage::GetPrefilledReasoningEnd(seq_id, r), None).await
     }
 
     /// Registers a preprocessed streaming request. Callers should run
-    /// `preprocess(...)` under `engine.read()` first, then call this under
-    /// `engine.write()` so the write lock is held only for request admission.
-    pub fn generate_stream(
-        &mut self,
+    /// `preprocess(...)` under `engine.as_ref()` first, then call this under
+    /// `engine.as_ref()` so the write lock is held only for request admission.
+    pub async fn generate_stream(
+        &self,
         preprocessed: PreprocessedRequest,
         images: Option<ImageData>,
         logger: &Option<Arc<ChatCompletionLogger>>,
@@ -2042,9 +1491,9 @@ impl LLMEngine {
             RequestType::Stream,
             &images,
             preprocessed.image_idx,
-        ) {
+        ).await {
             Ok((seq_id, prompt_length, rx)) => {
-                let prefilled_reasoning_end = self.get_prefilled_reasoning_end_marker(seq_id);
+                let prefilled_reasoning_end = self.get_prefilled_reasoning_end_marker(seq_id).await;
                 Ok((seq_id, prompt_length, prefilled_reasoning_end, rx))
             }
             Err(e) => {
@@ -2053,22 +1502,23 @@ impl LLMEngine {
         }
     }
 
-    pub fn get_usage_stats(&self, session_id: Option<String>) -> Result<UsageResponse> {
+    pub async fn get_usage_stats(&self, session_id: Option<String>) -> Result<UsageResponse> {
         match session_id {
             Some(sid) => {
-                let available_kvcache_tokens = self.scheduler.get_available_kv_tokens();
+                let available_kvcache_tokens = rpc_value(&self.sched, |r| SchedMessage::GetAvailableKvTokens(r), 0).await;
                 let max_model_len = self
                     .econfig
                     .max_model_len
                     .ok_or_else(|| candle_core::Error::msg("max_model_len not set!"))?;
                 let (seq_id, status) =
-                    self.scheduler.find_seq_by_session_id(&sid).ok_or_else(|| {
-                        candle_core::Error::msg(format!("Seq with session_id {} not found", sid))
+                    rpc_value(&self.sched, |r| SchedMessage::FindSeqBySessionId(sid.clone(), r), None).await.ok_or_else(|| {
+                        candle_core::Error::msg(format!("Seq with session_id {sid} not found"))
                     })?;
-                let token_used = self.scheduler.get_seq_token_usage(seq_id)?;
+                let token_used = rpc_value(&self.sched, |r| SchedMessage::GetSeqTokenUsage(seq_id, r), Err("RPC failed".to_string())).await
+                    .map_err(|e| candle_core::Error::Msg(e))?;
 
-                let total_kv_cache_tokens = self.scheduler.get_total_kv_tokens();
-                let (swap_used, total_swap_memory) = self.scheduler.get_cpu_swap_usage();
+                let total_kv_cache_tokens = rpc_value(&self.sched, |r| SchedMessage::GetTotalKvTokens(r), 0).await;
+                let (swap_used, total_swap_memory) = rpc_value(&self.sched, |r| SchedMessage::GetCpuSwapUsage(r), (0.0, 0.0)).await;
 
                 let session_status = match status {
                     SequenceStatus::FinishSwapped | SequenceStatus::Swapped => {
@@ -2093,8 +1543,8 @@ impl LLMEngine {
         }
     }
 
-    pub fn embed(
-        &mut self,
+    pub async fn embed(
+        &self,
         inputs: &[String],
         strategy: EmbeddingStrategy,
     ) -> Result<(Vec<Vec<f32>>, usize)> {
@@ -2128,8 +1578,8 @@ impl LLMEngine {
                 &None,
                 -1,
             );
-            let required_blocks = self.scheduler.block_manager.required_blocks(&seq);
-            let available_blocks = self.scheduler.block_manager.get_num_free_blocks();
+            let required_blocks = rpc_value(&self.sched, |r| SchedMessage::BlockRequired(seq.clone(), r), 0).await;
+            let available_blocks = rpc_value(&self.sched, |r| SchedMessage::BlockFree(r), 0).await;
             if required_blocks > available_blocks {
                 let available_tokens = available_blocks * self.econfig.block_size;
                 let required_tokens = required_blocks * self.econfig.block_size;
@@ -2139,7 +1589,9 @@ impl LLMEngine {
                     required_tokens
                 );
             }
-            self.scheduler.block_manager.allocate(&mut seq)?;
+            seq = rpc_value(&self.sched, |r| SchedMessage::BlockAllocate(seq, r), None).await.ok_or_else(|| {
+                candle_core::Error::msg("Failed to allocate blocks for embedding sequence")
+            })?;
 
             let mut chunked_mean: Option<Vec<f32>> = None;
             let mut last_vec: Option<Vec<f32>> = None;
@@ -2149,123 +1601,12 @@ impl LLMEngine {
             while seq.num_cached_tokens < seq.len() {
                 let remaining = seq.len() - seq.num_cached_tokens;
                 let chunk_tokens = std::cmp::min(chunk_size, remaining);
-                let embedding_result = match &mut *self.runners.write() {
-                    RunnerType::Thread(model_runner) => model_runner.embed(&[&seq], &strategy),
-                    RunnerType::Process(ref mut runner_streams) => {
-                        let request = MessageType::RunEmbed((vec![seq.clone()], strategy.clone()));
-                        let cloned_streams: Vec<LocalStream> = runner_streams
-                            .iter_mut()
-                            .map(|s| s.try_clone().expect("clone failed"))
-                            .collect();
-
-                        let all_outputs: Result<Vec<Vec<Vec<f32>>>> = cloned_streams
-                            .into_par_iter()
-                            .map(|mut stream| {
-                                let msg = request.clone();
-                                send_local(&mut vec![stream.try_clone()?], &msg, false)?;
-                                let response = receive_local(&mut stream, false)?;
-
-                                match response {
-                                    MessageType::RunResponseEmbed(output_embed) => {
-                                        if output_embed.len() == 0 {
-                                            candle_core::bail!("Runner step error, no response!")
-                                        } else {
-                                            Ok(output_embed)
-                                        }
-                                    }
-                                    other => {
-                                        candle_core::bail!("Unexpected response type: {:?}", other)
-                                    }
-                                }
-                            })
-                            .collect();
-                        let all_outputs = all_outputs.map_err(candle_core::Error::wrap)?;
-                        if let Some(output_embed) = all_outputs.first() {
-                            Ok(output_embed.clone())
-                        } else {
-                            candle_core::bail!(
-                                "No output embedding states received from model runners"
-                            );
-                        }
-                    }
-                    RunnerType::MultiNodeMaster {
-                        local_streams: ref mut runner_streams,
-                        ref mut remote_streams,
-                    } => {
-                        let request = MessageType::RunEmbed((vec![seq.clone()], strategy.clone()));
-                        let serialized =
-                            bincode::serialize(&request).expect("Bincode serialization failed");
-
-                        for tcp_stream in remote_streams.iter_mut() {
-                            crate::utils::multi_node::send_tcp(tcp_stream, &serialized)?;
-                        }
-
-                        let cloned_streams: Vec<LocalStream> = runner_streams
-                            .iter_mut()
-                            .map(|s| s.try_clone().expect("clone failed"))
-                            .collect();
-
-                        let all_outputs: Result<Vec<Vec<Vec<f32>>>> = cloned_streams
-                            .into_par_iter()
-                            .map(|mut stream| {
-                                let msg = request.clone();
-                                send_local(&mut vec![stream.try_clone()?], &msg, false)?;
-                                let response = receive_local(&mut stream, false)?;
-
-                                match response {
-                                    MessageType::RunResponseEmbed(output_embed) => {
-                                        if output_embed.is_empty() {
-                                            candle_core::bail!("Runner step error, no response!")
-                                        } else {
-                                            Ok(output_embed)
-                                        }
-                                    }
-                                    other => {
-                                        candle_core::bail!("Unexpected response type: {:?}", other)
-                                    }
-                                }
-                            })
-                            .collect();
-                        let all_outputs = all_outputs.map_err(candle_core::Error::wrap);
-
-                        for tcp_stream in remote_streams.iter_mut() {
-                            let data = crate::utils::multi_node::recv_tcp(tcp_stream)?;
-                            let response: MessageType = bincode::deserialize(&data)
-                                .expect("Failed to deserialize remote worker response");
-                            match response {
-                                MessageType::RunResponseEmbed(output_embed) => {
-                                    if output_embed.is_empty() {
-                                        candle_core::bail!(
-                                            "Remote worker returned empty embedding response"
-                                        );
-                                    }
-                                }
-                                MessageType::Error(err) => {
-                                    candle_core::bail!("Remote worker embedding failed: {}", err);
-                                }
-                                other => {
-                                    candle_core::bail!(
-                                        "Unexpected remote embedding response: {:?}",
-                                        other
-                                    );
-                                }
-                            }
-                        }
-
-                        if let Some(output_embed) = all_outputs?.first() {
-                            Ok(output_embed.clone())
-                        } else {
-                            candle_core::bail!(
-                                "No output embedding states received from model runners"
-                            );
-                        }
-                    }
-                };
+                let embedding_result = rpc_value(&self.fwd, |r| FwdMessage::Embed(vec![seq.clone()], strategy.clone(), r), Err("embed RPC failed".to_string())).await;
                 let embedding_vecs = match embedding_result {
                     Ok(v) => v,
                     Err(e) => {
-                        self.scheduler.block_manager.deallocate(&seq);
-                        return Err(e);
+                        let _ = self.sched.send_message(SchedMessage::BlockDeallocate(seq.clone()));
+                        return Err(candle_core::Error::Msg(e));
                     }
                 };
                 if let Some(vec) = embedding_vecs.into_iter().next() {
@@ -2307,7 +1648,7 @@ impl LLMEngine {
                 }
             }
 
-            self.scheduler.block_manager.deallocate(&seq);
+            let _ = self.sched.send_message(SchedMessage::BlockDeallocate(seq.clone()));
             prompt_tokens += seq.len();
 
             let final_vec = match strategy {
@@ -2328,94 +1669,34 @@ impl LLMEngine {
         Ok((outputs, prompt_tokens))
     }
 
-    pub fn start_engine(engine: Arc<RwLock<Self>>) {
+pub fn start_engine(engine: Arc<Self>) {
+        // The engine loop runs as a tokio task (the Ractor actors are async). It
+        // drives the SchedD actor's Step RPC (the schedule -> forward -> postprocess
+        // -> delivery -> cleanup).
         GLOBAL_RT.spawn(async move {
-            let engine = engine.clone();
-            let (is_pd_server, runners, mtp_enabled, dflash_enabled) = {
-                let guard = engine.read();
-                let has_mtp = crate::speculative::uses_builtin_mtp(&guard.econfig);
-                let has_dflash = crate::speculative::uses_dflash(&guard.econfig);
-                (
-                    guard.is_pd_mode() && guard.is_pd_server(),
-                    guard.runners.clone(),
-                    has_mtp,
-                    has_dflash,
-                )
+            let (is_pd_server, sched) = {
+                (engine.is_pd_mode() && engine.is_pd_server(), engine.sched.clone())
             };
             loop {
-                let idle = {
-                    let guard = engine.read();
-                    guard.is_idle() && !is_pd_server
-                };
-
+                let idle = engine.is_idle().await && !is_pd_server;
                 if idle {
-                    tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
                     continue;
                 }
-
-                let mut task_processed = 0;
-
-                // Phase 1: Schedule (engine lock held briefly)
-                let prep = {
-                    let mut guard = engine.write();
-                    match guard.prepare_step() {
-                        Ok(p) => p,
-                        Err(e) => {
-                            crate::log_error!("[Engine Loop] Prepare error: {:?}", e);
-                            if !guard.cancel_all_with_reason(Some(e.to_string())) {
-                                std::process::exit(1);
-                            }
-                            None
-                        }
-                    }
-                };
-                // Engine lock released -- server can accept new requests during forward pass
-
-                if let Some((scheduled_ids, is_prefill, owned_seqs)) = prep {
-                    let use_dflash = dflash_enabled && !is_prefill && owned_seqs.len() == 1;
-                    let use_mtp =
-                        !use_dflash && mtp_enabled && !is_prefill && owned_seqs.len() == 1;
-
-                    let forward_result: Result<Vec<Vec<u32>>> = if use_mtp {
-                        Self::run_forward_mtp(&runners, &owned_seqs)
-                    } else if use_dflash {
-                        Self::run_forward_dflash(&runners, &owned_seqs)
-                    } else {
-                        Self::run_forward(&runners, &owned_seqs, is_prefill)
-                            .map(|ids| ids.into_iter().map(|t| vec![t]).collect())
-                    };
-
-                    match forward_result {
-                        Ok(multi_output_ids) => {
-                            let mut guard = engine.write();
-                            match guard.finish_step(scheduled_ids, is_prefill, multi_output_ids) {
-                                Ok(n) => task_processed = n,
-                                Err(e) => {
-                                    crate::log_error!("[Engine Loop] Finish error: {:?}", e);
-                                    guard.cancel_all_with_reason(Some(e.to_string()));
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            crate::log_error!("[Engine Loop] Forward error: {:?}", e);
-                            let mut guard = engine.write();
-                            guard.cancel_all_with_reason(Some(e.to_string()));
-                        }
-                    }
-                } else {
-                    let mut guard = engine.write();
-                    guard.check_canceled(None);
-                }
-
+                // The inference step is driven by the SchedD actor (the schedule -> forward -> postprocess -> stream delivery).
+                let task_processed = rpc_value(&sched, |r| SchedMessage::Step(r), 0).await;
+                // The periodic decode throughput log (the may_print_decoding_throughput has its
+                // own 10s gate, so calling it every iteration is safe).
+                let active_indices = rpc_value(&sched, |r| SchedMessage::GetActiveIndices(r), Vec::new()).await;
+                engine.may_print_decoding_throughput(&active_indices).await;
                 if task_processed == 0 {
-                    tokio::time::sleep(tokio::time::Duration::from_millis(if is_pd_server {
+                    engine.check_canceled(None).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(if is_pd_server {
                         PD_PREFILL_STATUS_CHECK_COOLING_PERIOD as u64
                     } else {
                         1
-                    }))
-                    .await;
+                    })).await;
                 }
-                tokio::task::yield_now().await;
             }
         });
     }
@@ -2454,6 +1735,7 @@ mod tests {
             tool_call_start_ids: Vec::new(),
             tool_call_end_ids: Vec::new(),
             add_bos_token: false,
+            add_eos_token: false,
         };
 
         assert_eq!(
@@ -2472,6 +1754,7 @@ mod tests {
             tool_call_start_ids: Vec::new(),
             tool_call_end_ids: Vec::new(),
             add_bos_token: false,
+            add_eos_token: false,
         };
 
         assert_eq!(
@@ -2490,6 +1773,7 @@ mod tests {
             tool_call_start_ids: Vec::new(),
             tool_call_end_ids: Vec::new(),
             add_bos_token: false,
+            add_eos_token: false,
         };
 
         assert_eq!(
@@ -2508,6 +1792,7 @@ mod tests {
             tool_call_start_ids: Vec::new(),
             tool_call_end_ids: Vec::new(),
             add_bos_token: false,
+            add_eos_token: false,
         };
 
         assert_eq!(
@@ -2526,6 +1811,7 @@ mod tests {
             tool_call_start_ids: Vec::new(),
             tool_call_end_ids: Vec::new(),
             add_bos_token: false,
+            add_eos_token: false,
         };
 
         assert_eq!(
@@ -2533,4 +1819,5 @@ mod tests {
             None
         );
     }
-}
+
+    }

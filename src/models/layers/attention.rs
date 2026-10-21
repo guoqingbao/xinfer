@@ -311,7 +311,9 @@ impl Attention {
                 block_size,
                 sm_version,
                 vec![local_q, local_k, local_v],
-            )?;
+            )?
+            .with_tp(comm.rank(), comm.world_size())
+            .with_lora_module(format!("{}.qkv_proj", vb.module_path()));
             return Ok(Some(QkvProjection::Packed(merged)));
         }
 
@@ -349,7 +351,9 @@ impl Attention {
             packed_bias,
             vec![local_q, local_k, local_v],
             &None,
-        )?;
+        )?
+        .with_tp(comm.rank(), comm.world_size())
+        .with_lora_module(format!("{}.qkv_proj", vb.module_path()));
         Ok(Some(QkvProjection::Packed(merged)))
     }
 
@@ -465,7 +469,7 @@ impl Attention {
                 &config.quantization_config,
                 &config.quant,
                 dtype,
-            )?;
+            )?.with_lora_module(format!("{}.q_proj", vb.module_path()));
             let k_proj = TensorParallelColumnLinear::load_with_shard(
                 hidden_size,
                 num_kv_heads * head_dim,
@@ -479,7 +483,7 @@ impl Attention {
                 &config.quantization_config,
                 &config.quant,
                 dtype,
-            )?;
+            )?.with_lora_module(format!("{}.k_proj", vb.module_path()));
             let high_precision_quant = config
                 .quant
                 .as_deref()
@@ -501,7 +505,7 @@ impl Attention {
                     &None
                 },
                 dtype,
-            )?;
+            )?.with_lora_module(format!("{}.v_proj", vb.module_path()));
             QkvProjection::Separate {
                 q_proj,
                 k_proj,
@@ -521,7 +525,7 @@ impl Attention {
             &config.quantization_config,
             &config.quant,
             dtype,
-        )?;
+        )?.with_lora_module(format!("{}.o_proj", vb.module_path()));
 
         let norm_dtype = if is_qvar_builder
             || config.quant.is_some()

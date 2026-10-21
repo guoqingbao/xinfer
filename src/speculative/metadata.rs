@@ -8,6 +8,10 @@ pub struct SpecSeqInfo {
     pub id: usize,
     pub len: usize,
     pub block_table: Vec<u32>,
+    /// The per-seq dynamic draft length K for this step (the no fixed ceiling).
+    /// 0 = the plain decode (the no verify). Set by the scheduler from the per-seq
+    /// rolling prefix-acceptance curve (the knee).
+    pub k: usize,
 }
 
 impl ModelRunner {

@@ -2,7 +2,9 @@ use crate::core::runner::{Model, ModelRunner, Seqs};
 use crate::models::layers::linear::set_linear_is_prefill;
 use crate::models::qwen3_5_mtp::Qwen3_5MtpHead;
 use crate::speculative::metadata::SpecSeqInfo;
-use crate::speculative::verify::{mtp_stats_summary, mtp_stats_update, verify_draft_greedy};
+use crate::speculative::spec_stats::spec_stats_update;
+use crate::speculative::verify::{mtp_stats_summary, mtp_stats_update, verify_draft_greedy, verify_draft_rejection};
+use crate::utils::logits_processor::LogitsProcessor;
 use candle_core::{Result, Tensor};
 use std::sync::Arc;
 
@@ -173,12 +175,20 @@ impl ModelRunner {
     ///   4. Verify: run main model on [anchor, draft_0, ..., draft_{K-1}] using native flash
     ///   5. On partial rejection: roll back GDN state to the accepted token boundary
     ///   6. Greedy-accept matching prefix; take bonus token at first mismatch
-    pub fn run_mtp_decode(&self, seqs: Seqs) -> Result<Vec<Vec<u32>>> {
+    pub fn run_mtp_decode(&self, seqs: Seqs) -> Result<Vec<crate::runner::SpecStepOut>> {
         let mtp_head = match &self.mtp_head {
             Some(h) => h.clone(),
             None => {
+                // The no MTP head (the plain decode fallback): the no speculative K (the
+                // next_k = 0, the no draft). The tokens are the plain-decode outputs.
                 let output = self.run(seqs, false)?;
-                return Ok(output.into_iter().map(|t| vec![t]).collect());
+                return Ok(output
+                    .into_iter()
+                    .map(|t| crate::runner::SpecStepOut {
+                        tokens: vec![t],
+                        next_k: 0,
+                    })
+                    .collect());
             }
         };
 
@@ -190,6 +200,7 @@ impl ModelRunner {
                         id: seq.id,
                         len: seq.len(),
                         block_table: seq.block_table.clone(),
+                        k: seq.spec_k,
                     })
                     .collect();
                 (s.len(), infos)
@@ -201,6 +212,7 @@ impl ModelRunner {
                         id: ds.id,
                         len: ds.len,
                         block_table: ds.block_tables.clone(),
+                        k: ds.spec_k,
                     })
                     .collect();
                 (d.len(), infos)
@@ -212,7 +224,22 @@ impl ModelRunner {
         }
 
         let seq_info = &seq_infos[0];
-        let num_draft = self.mtp_num_speculative;
+        // The per-seq dynamic K: draft `seq_info.k` tokens (the no fixed
+        // mtp_num_speculative ceiling). The k=0 case (the SD not enabled for this
+        // seq) falls back to the plain decode (the no verify).
+        let num_draft = seq_info.k;
+        if num_draft == 0 {
+            // The SD not enabled for this seq (the k=0): the plain decode fallback,
+            // the no speculative K (the next_k = 0).
+            let output = self.run(seqs, false)?;
+            return Ok(output
+                .into_iter()
+                .map(|t| crate::runner::SpecStepOut {
+                    tokens: vec![t],
+                    next_k: 0,
+                })
+                .collect());
+        }
 
         // Step 1: Main model decode for logits + hidden state.
         let (anchor_token, seq_hidden) = self.mtp_decode_step1(seqs, seq_info)?;
@@ -238,7 +265,7 @@ impl ModelRunner {
 
         let base_position = seq_info.len.saturating_sub(1);
         let anchor_token_tensor = Tensor::from_vec(vec![anchor_token], (1,), self.device())?;
-        let (draft_tokens, _last_hidden) = mtp_head.draft_tokens_gpu(
+        let (draft_tokens, _last_hidden, draft_logits) = mtp_head.draft_tokens_gpu(
             &seq_hidden,
             &anchor_token_tensor,
             num_draft,
@@ -248,7 +275,12 @@ impl ModelRunner {
         )?;
 
         if draft_tokens.is_empty() {
-            return Ok(vec![vec![anchor_token]]);
+            // The no draft produced (the empty-draft bail): the anchor only, the no
+            // speculative K (the next_k = 0, the no verify).
+            return Ok(vec![crate::runner::SpecStepOut {
+                tokens: vec![anchor_token],
+                next_k: 0,
+            }]);
         }
 
         // Step 3: Verify draft tokens via prefill-style forward on [anchor, draft_0..K-1].
@@ -361,7 +393,63 @@ impl ModelRunner {
         };
         let all_logits = all_logits_result?;
 
-        let verify_result = verify_draft_greedy(&all_logits, &draft_tokens)?;
+// The P3 fix: mask the verify logits with the PDA projection (the draft-position
+        // guidance). A grammar-illegal draft token is rejected by the verify (the
+        // masked distribution doesn't favor it).
+        let masked_all_logits = self.mask_verify_logits(&all_logits, &draft_tokens, seq_info.id)?;
+        // The verify: the greedy argmax accept (the default) OR the lossless
+        // rejection sampling (the XINFER_SPEC_REJECTION_SAMPLING, the target's
+        // sampled distribution honored, the no biased output at temperature > 0).
+        // The rejection path uses the MASKED target logits (the PDA constraint is
+        // honored in the p_target, the no grammar-illegal draft accepted).
+        let verify_result = if crate::utils::env::spec_rejection_sampling() {
+            // The lossless rejection sampling. The `p_target` is the target's
+            // post-sampling distribution per verify position (the sampler's
+            // transform over the MASKED logits, the exact distribution the normal
+            // decode would sample from); the `p_draft` is the drafter's per-position
+            // softmax.
+            let sampling = self
+                .cached_sampling()
+                .map(|c| c.sampling)
+                .unwrap_or(crate::utils::logits_processor::Sampling::ArgMax);
+            let processor = LogitsProcessor::from_sampling(0, sampling);
+            let vflat: Vec<f32> = masked_all_logits
+                .to_dtype(candle_core::DType::F32)?
+                .flatten_all()?
+                .to_vec1()?;
+            let vocab = vflat.len() / verify_len.max(1);
+            let target_probs_flat: Vec<f32> = (0..verify_len)
+                .flat_map(|row| {
+                    let r = &vflat[row * vocab..(row + 1) * vocab];
+                    processor.sampling_probs_row(r).unwrap_or_else(|| r.to_vec())
+                })
+                .collect();
+            let target_probs_tensor =
+                Tensor::from_vec(target_probs_flat, (verify_len, vocab), self.device())?;
+            // The draft probs (the softmax of the drafter's per-position logits).
+            let draft_stacked = Tensor::stack(&draft_logits, 0)?;
+            let dflat: Vec<f32> = draft_stacked
+                .to_dtype(candle_core::DType::F32)?
+                .flatten_all()?
+                .to_vec1()?;
+            let drows = dflat.len() / vocab.max(1);
+            let mut draft_probs_flat = vec![0.0f32; dflat.len()];
+            for r in 0..drows {
+                let row = &dflat[r * vocab..(r + 1) * vocab];
+                let max = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let exps: Vec<f32> = row.iter().map(|&x| (x - max).exp()).collect();
+                let sum: f32 = exps.iter().sum();
+                let inv = if sum > 0.0 { 1.0 / sum } else { 0.0 };
+                for (j, &e) in exps.iter().enumerate() {
+                    draft_probs_flat[r * vocab + j] = e * inv;
+                }
+            }
+            let draft_probs_tensor =
+                Tensor::from_vec(draft_probs_flat, (drows, vocab), self.device())?;
+            verify_draft_rejection(&target_probs_tensor, &draft_probs_tensor, &draft_tokens, 0)?
+        } else {
+            verify_draft_greedy(&masked_all_logits, &draft_tokens)?
+        };
 
         if verify_result.num_accepted < verify_result.num_proposed {
             let commit_len = 1 + verify_result.num_accepted;
@@ -384,11 +472,25 @@ impl ModelRunner {
         result_tokens.extend_from_slice(&verify_result.accepted_tokens);
         result_tokens.push(verify_result.continuation_token);
 
-        if mtp_stats_update(verify_result.num_proposed, verify_result.num_accepted) {
+        // The windowed MTP summary is logged once (the rank-0, the authoritative NCCL
+        // all-reduce makes all ranks agree on the verify outcome, so the per-rank logs are
+        // identical). The no 4x repetition on a 4-GPU TP run.
+        if self.is_first_rank() && mtp_stats_update(verify_result.num_proposed, verify_result.num_accepted) {
             crate::log_info!("{}", mtp_stats_summary());
         }
+        spec_stats_update("MTP", seq_info.id, &verify_result);
 
-        Ok(vec![result_tokens])
+        // The per-seq next-step K (the runner-computed, the no the scheduler guessing
+        // from an empty cross-process global). The rolling curve is populated in THIS
+        // process (the runner), so the knee is computed here + reported back in the
+        // SpecStepOut (the no the main-process SPEC_SEQ_STATS, which is empty).
+        let ceiling = self.mtp_num_speculative;
+        let break_even = self.spec_break_even();
+        let next_k = crate::speculative::spec_stats::spec_seq_next_k(seq_info.id, ceiling, break_even);
+        Ok(vec![crate::runner::SpecStepOut {
+            tokens: result_tokens,
+            next_k,
+        }])
     }
 
     fn run_mtp_decode_batch(
@@ -396,7 +498,7 @@ impl ModelRunner {
         seqs: Seqs,
         seq_infos: &[SpecSeqInfo],
         mtp_head: Arc<Qwen3_5MtpHead>,
-    ) -> Result<Vec<Vec<u32>>> {
+    ) -> Result<Vec<crate::runner::SpecStepOut>> {
         let embed_weight = match self.model() {
             Model::Qwen3_5(m) => m.embed_weight().clone(),
             Model::Qwen3_5MoE(m) => m.embed_weight().clone(),
@@ -429,10 +531,13 @@ impl ModelRunner {
             };
             let anchor_tensor = Tensor::from_vec(vec![anchor], (1,), self.device())?;
             let base_position = seq_info.len.saturating_sub(1);
-            let (draft, _) = mtp_head.draft_tokens_gpu(
+            // The per-seq K: draft `seq_info.k` tokens (the no fixed ceiling). The
+            // verify below uses the batch-max K (the uniform q_len for the one
+            // attention pass), but each seq drafts its own dynamic length.
+            let (draft, _last_hidden, _draft_logits) = mtp_head.draft_tokens_gpu(
                 &seq_hidden,
                 &anchor_tensor,
-                self.mtp_num_speculative,
+                seq_info.k,
                 &embed_weight,
                 &lm_head_fn,
                 base_position,
@@ -442,10 +547,22 @@ impl ModelRunner {
         }
 
         if draft_tokens.iter().any(|draft| draft.is_empty()) {
-            return Ok(anchors.into_iter().map(|anchor| vec![anchor]).collect());
+            // The no draft produced for some seq (the empty-draft bail): the anchor only,
+            // the no speculative K (the next_k = 0, the no verify).
+            return Ok(anchors
+                .into_iter()
+                .map(|anchor| crate::runner::SpecStepOut {
+                    tokens: vec![anchor],
+                    next_k: 0,
+                })
+                .collect());
         }
 
-        let verify_len = self.mtp_num_speculative + 1;
+        // The batch verify length: the MAX per-seq K across the batch (the uniform
+        // q_len for the one attention pass). A seq with a smaller K drafts fewer
+        // tokens; its verify positions beyond its draft are the anchor-only (the no
+        // over-verify past the seq's own K).
+        let verify_len = seq_infos.iter().map(|s| s.k).max().unwrap_or(0) + 1;
         let mut verify_tokens = Vec::with_capacity(seq_infos.len() * verify_len);
         let mut slot_mappings = Vec::with_capacity(seq_infos.len());
         for (seq_info, (anchor, draft)) in seq_infos.iter().zip(anchors.iter().zip(&draft_tokens)) {
@@ -509,7 +626,9 @@ impl ModelRunner {
         for (index, (seq_info, draft)) in seq_infos.iter().zip(&draft_tokens).enumerate() {
             let offset = index * verify_len;
             let logits = all_logits.narrow(0, offset, verify_len)?;
-            let verify_result = verify_draft_greedy(&logits, draft)?;
+            // The P3 fix: mask the per-seq verify logits with the PDA projection (the draft-position guidance).
+            let masked_logits = self.mask_verify_logits(&logits, draft, seq_info.id)?;
+            let verify_result = verify_draft_greedy(&masked_logits, draft)?;
             if verify_result.num_accepted < verify_result.num_proposed {
                 let keep_tokens = 1 + verify_result.num_accepted;
                 if !self.rollback_mamba_at(seq_info.id, keep_tokens, offset)? {
@@ -524,8 +643,89 @@ impl ModelRunner {
             result.extend_from_slice(&verify_result.accepted_tokens);
             result.push(verify_result.continuation_token);
             mtp_stats_update(verify_result.num_proposed, verify_result.num_accepted);
-            outputs.push(result);
+            spec_stats_update("MTP", seq_info.id, &verify_result);
+            // The per-seq next-step K (the runner-computed, the no the scheduler
+            // guessing from an empty cross-process global).
+            let ceiling = self.mtp_num_speculative;
+            let break_even = self.spec_break_even();
+            let next_k = crate::speculative::spec_stats::spec_seq_next_k(seq_info.id, ceiling, break_even);
+            outputs.push(crate::runner::SpecStepOut {
+                tokens: result,
+                next_k,
+            });
         }
         Ok(outputs)
+    }
+
+    /// The drafter-chaining seam (the MTP → the DFlash): run the MTP draft for a
+    /// single sequence + return the draft's + the MTP's final hidden state
+    /// (the anchor the DFlash drafter consumes). The `final_hidden` is the
+    /// MTP head's post-draft hidden state (the `draft_tokens_gpu` return), which
+    /// the DFlash `draft_tokens` accepts as its `target_hidden`. This makes the
+    /// linear-then-parallel drafter chain possible (the MTP's stable-acceptance
+    /// draft anchors the DFlash's batch-varying draft).
+    pub fn mtp_draft_hidden(
+        &self,
+        seqs: Seqs,
+        mtp_head: &Arc<Qwen3_5MtpHead>,
+    ) -> Result<(Vec<u32>, Tensor)> {
+        let seq_infos: Vec<SpecSeqInfo> = match &seqs {
+            Seqs::SeqRefs(seqs_ref) => seqs_ref
+                .iter()
+                .map(|seq| SpecSeqInfo {
+                    id: seq.id,
+                    len: seq.len(),
+                    block_table: seq.block_table.clone(),
+                    k: seq.spec_k,
+                })
+                .collect(),
+            Seqs::DecodeVec(decode_seqs) => decode_seqs
+                .iter()
+                .map(|ds| SpecSeqInfo {
+                    id: ds.id,
+                    len: ds.len,
+                    block_table: ds.block_tables.clone(),
+                    k: ds.spec_k,
+                })
+                .collect(),
+        };
+        let seq_info = &seq_infos[0];
+        // The per-seq K (the no fixed mtp_num_speculative ceiling).
+        let num_draft = seq_info.k;
+
+        // The MTP Step 1 (the anchor token + the hidden state).
+        let (anchor_token, seq_hidden) = self.mtp_decode_step1(seqs, seq_info)?;
+
+        let embed_weight = match self.model() {
+            Model::Qwen3_5(m) => m.embed_weight().clone(),
+            Model::Qwen3_5MoE(m) => m.embed_weight().clone(),
+            Model::Qwen3VL(m) => m
+                .embed_weight()
+                .expect("Qwen3VL MTP requires Qwen3.5 text backbone")
+                .clone(),
+            _ => unreachable!(),
+        };
+        let lm_head_fn = |hidden: &Tensor| -> Result<Tensor> {
+            match self.model() {
+                Model::Qwen3_5(m) => m.forward_lm_head(hidden),
+                Model::Qwen3_5MoE(m) => m.forward_lm_head(hidden),
+                Model::Qwen3VL(m) => m.forward_lm_head(hidden),
+                _ => unreachable!(),
+            }
+        };
+
+        let base_position = seq_info.len.saturating_sub(1);
+        let anchor_token_tensor = Tensor::from_vec(vec![anchor_token], (1,), self.device())?;
+        // The MTP draft (the K tokens) + the final hidden state (the chaining anchor).
+        let (draft_tokens, final_hidden, _draft_logits) = mtp_head.draft_tokens_gpu(
+            &seq_hidden,
+            &anchor_token_tensor,
+            num_draft,
+            &embed_weight,
+            lm_head_fn,
+            base_position,
+        )?;
+
+        Ok((draft_tokens, final_hidden))
     }
 }
