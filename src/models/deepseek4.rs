@@ -1,4 +1,5 @@
 use crate::models::layers::distributed::{AllReduce, Comm, VocabParallelLinear};
+use crate::core::lora::apply_embedding_lora;
 use crate::models::layers::ds_v4::{
     hc_expand, hc_head, hc_post, hc_pre_norm, CompressorDecodeState, CompressorWeights,
     FusedMoeMxfp4, HcBlockWeights, HcHeadWeights, HcHiddenStates, IndexerDecodeState,
@@ -2001,7 +2002,7 @@ impl DeepSeekV4ForCausalLM {
             &config.quantization_config,
             &None,
             dtype,
-        )?;
+        )?.with_lora_module("lm_head".to_string());
 
         // HC head weights (for the final collapse)
         let hc_head = if v4_cfg.hc_mult > 1 {
@@ -2070,6 +2071,8 @@ impl DeepSeekV4ForCausalLM {
 
     pub fn embed_forward(&self, xs: &Tensor) -> Result<Tensor> {
         let xs = self.embed_tokens.forward(xs)?;
+        // The embedding LoRA (the #1.11): the active tenant's embedding delta.
+        let xs = apply_embedding_lora(&xs)?;
         // W2 only requants routed MoE experts; dense/attn stay FP8 and need BF16/F16 acts.
         // Casting embeds to F32 (ISQ/GGUF path) breaks fp8_matmul_cutlass on SM90.
         let is_w2 = self

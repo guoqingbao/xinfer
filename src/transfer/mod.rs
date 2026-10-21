@@ -161,6 +161,8 @@ pub struct Transfer {
     comm_handle: Option<JoinHandle<()>>,
     rank: usize,
     communicator: Communicator,
+    /// The stop signal for the background comm thread (the graceful shutdown on drop).
+    stop_flag: Arc<AtomicBool>,
 }
 
 impl Transfer {
@@ -182,6 +184,8 @@ impl Transfer {
         let thread_available_tokens = available_tokens.clone();
 
         let communicator = Communicator::new(config.clone(), config.role.clone(), rank);
+        // Clone the stop_flag for the struct field (the original is moved into the thread).
+        let stop_flag_struct = stop_flag.clone();
         // Start the background communication thread
         let thread_comm = communicator.clone();
         let comm_handle = Some(std::thread::spawn(move || {
@@ -204,6 +208,7 @@ impl Transfer {
             rank,
             communicator,
             available_tokens,
+            stop_flag: stop_flag_struct,
         })
     }
 
@@ -706,7 +711,11 @@ impl Transfer {
 
 impl Drop for Transfer {
     fn drop(&mut self) {
-        // TODO: Add logic to gracefully shut down the comm_handle thread
+        // Gracefully shut down the comm_handle thread: signal the stop + join.
+        self.stop_flag.store(true, std::sync::atomic::Ordering::Release);
+        if let Some(handle) = self.comm_handle.take() {
+            let _ = handle.join();
+        }
     }
 }
 

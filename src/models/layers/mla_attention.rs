@@ -4,6 +4,7 @@ use crate::models::layers::others::{rms_norm, NormX};
 use crate::models::layers::rotary_emb::ApplyRotaryEmbedding;
 use crate::models::layers::VarBuilderX;
 use crate::utils::config::Config;
+use crate::core::lora::{active_tenant, global_registry};
 use attention_rs::InputMetadata;
 use candle_core::{DType, Result, Tensor, D};
 use std::collections::HashMap;
@@ -164,7 +165,7 @@ impl MlaAttention {
                     &config.quantization_config,
                     &config.quant,
                     dtype,
-                )?;
+                )?.with_lora_module(format!("{}.q_a_proj", vb.module_path()));
                 let q_a_ln = rms_norm(
                     q_lora_rank,
                     mla_cfg.rms_norm_eps,
@@ -180,7 +181,7 @@ impl MlaAttention {
                     &config.quantization_config,
                     &config.quant,
                     dtype,
-                )?;
+                )?.with_lora_module(format!("{}.q_b_proj", vb.module_path()));
                 (Some(q_a), Some(q_a_ln), Some(q_b), None)
             } else {
                 let q = ReplicatedLinear::load_b(
@@ -191,7 +192,7 @@ impl MlaAttention {
                     &config.quantization_config,
                     &config.quant,
                     dtype,
-                )?;
+                )?.with_lora_module(format!("{}.q_proj", vb.module_path()));
                 (None, None, None, Some(q))
             };
 
@@ -203,7 +204,7 @@ impl MlaAttention {
             &config.quantization_config,
             &config.quant,
             dtype,
-        )?;
+        )?.with_lora_module(format!("{}.kv_a_proj_with_mqa", vb.module_path()));
 
         let kv_a_layernorm = rms_norm(
             kv_lora_rank,
@@ -224,7 +225,7 @@ impl MlaAttention {
                 &config.quantization_config,
                 &config.quant,
                 dtype,
-            )?)
+            )?.with_lora_module(format!("{}.kv_b_proj", vb.module_path())))
         } else {
             None
         };
@@ -236,7 +237,7 @@ impl MlaAttention {
             &config.quantization_config,
             &config.quant,
             dtype,
-        )?;
+        )?.with_lora_module(format!("{}.o_proj", vb.module_path()));
 
         let (w_uk, w_uv_t) = if has_separate_kv_b {
             // attn_k_b layout varies between GGUF converters:
@@ -436,11 +437,12 @@ impl MlaAttention {
         attn_out: &Tensor,
         seq_len: usize,
         xs_dtype: DType,
+        w_uv_t: &Tensor,
     ) -> Result<Tensor> {
         // attn_out: [seq_len, num_heads, kv_lora_rank]
         // w_uv_t: [num_heads, kv_lora_rank, v_head_dim]
         let attn_t = attn_out.transpose(0, 1)?.contiguous()?;
-        let y = attn_t.matmul(&self.w_uv_t)?;
+        let y = attn_t.matmul(w_uv_t)?;
         let y = y.transpose(0, 1)?.contiguous()?;
         let y = y.reshape((seq_len, self.num_heads * self.v_head_dim))?;
         let y = y.to_dtype(xs_dtype)?;
@@ -459,6 +461,15 @@ impl MlaAttention {
         input_metadata: &InputMetadata,
     ) -> Result<Tensor> {
         let (seq_len, _) = xs.dims2()?;
+
+        // The MLA LoRA correction (the #1.9): when a LoRA tenant is active + the
+        // kv_b_proj has a LoRA adapter, the absorbed w_uk/w_uv_t (the pre-computed
+        // at load from the base kv_b_proj weight) must be corrected for the LoRA
+        // delta. The effective kv_b_proj weight is the base + the delta; the
+        // absorbed w_uk/w_uv_t are re-derived from the effective weight. When no
+        // tenant is active (or the kv_b_proj has no adapter), the pre-computed
+        // absorbed weights are used (the fast path, the prior behavior).
+        let (w_uk, w_uv_t) = self.absorbed_weights_with_lora(xs.device())?;
 
         // Q projection — keep q_resid for DSA indexer
         let (q, q_resid) = if let (Some(q_a), Some(q_a_ln), Some(q_b)) =
@@ -527,7 +538,7 @@ impl MlaAttention {
                 // w_uk: [num_heads, qk_nope_head_dim, kv_lora_rank]
                 let q_nope_t = q_nope.transpose(0, 1)?.contiguous()?;
                 let q_nope_absorbed = q_nope_t
-                    .matmul(&self.w_uk)?
+                    .matmul(&w_uk)?
                     .transpose(0, 1)?
                     .contiguous()?
                     .to_dtype(self.dtype)?;
@@ -568,7 +579,7 @@ impl MlaAttention {
                                         self.sm_scale,
                                     )?;
 
-                                    return self.project_mla_output(&attn_out, seq_len, xs.dtype());
+                                    return self.project_mla_output(&attn_out, seq_len, xs.dtype(), &w_uv_t);
                                 }
                             }
                         }
@@ -622,7 +633,7 @@ impl MlaAttention {
                 // Project via w_uv_t: [num_heads, kv_lora_rank, v_head_dim]
                 let attn_out_t = attn_out.transpose(0, 1)?.contiguous()?;
                 let y = attn_out_t
-                    .matmul(&self.w_uv_t)?
+                    .matmul(&w_uv_t)?
                     .transpose(0, 1)?
                     .contiguous()?;
                 // y: [seq_len, num_heads, v_head_dim]
@@ -648,7 +659,7 @@ impl MlaAttention {
             // w_uk: [num_heads, qk_nope_head_dim, kv_lora_rank]
             // q_absorbed: [seq_len, num_heads, kv_lora_rank]
             let q_nope_t = q_nope.transpose(0, 1)?.contiguous()?;
-            let q_absorbed = q_nope_t.matmul(&self.w_uk)?.transpose(0, 1)?.contiguous()?;
+            let q_absorbed = q_nope_t.matmul(&w_uk)?.transpose(0, 1)?.contiguous()?;
 
             // The fused kernels need block_tables and context_lens as i32 on GPU,
             // and ckv_cache/kpe_cache in 3D [num_blocks, block_size, dim] layout.
@@ -682,7 +693,7 @@ impl MlaAttention {
                                 &topk_idxs,
                                 self.sm_scale,
                             )?;
-                            return self.project_mla_output(&attn_out, seq_len, xs.dtype());
+                            return self.project_mla_output(&attn_out, seq_len, xs.dtype(), &w_uv_t);
                         }
                     }
 
@@ -696,7 +707,7 @@ impl MlaAttention {
                         cu_seqlens_q,
                         self.sm_scale,
                     )?;
-                    return self.project_mla_output(&attn_out, seq_len, xs.dtype());
+                    return self.project_mla_output(&attn_out, seq_len, xs.dtype(), &w_uv_t);
                 }
 
                 // DSA is prefill-only: dense MLA decode is faster at all practical context lengths.
@@ -714,9 +725,93 @@ impl MlaAttention {
                     self.sm_scale,
                     max_ctx,
                 )?;
-                return self.project_mla_output(&attn_out, seq_len, xs.dtype());
+                return self.project_mla_output(&attn_out, seq_len, xs.dtype(), &w_uv_t);
             }
         }
         candle_core::bail!("MLA attention requires CUDA platform!")
+    }
+
+    /// The MLA LoRA correction (the #1.9): the absorbed `w_uk`/`w_uv_t` are
+    /// pre-computed at load from the base `kv_b_proj` weight. When a LoRA tenant
+    /// is active + the `kv_b_proj` has a LoRA adapter, the effective `kv_b_proj`
+    /// weight is the base + the delta, so the absorbed weights must be re-derived
+    /// from the effective weight. This method returns the corrected absorbed
+    /// weights when a tenant is active (the correction), else the pre-computed
+    /// `self.w_uk`/`self.w_uv_t` (the fast path, the prior behavior).
+    ///
+    /// The correction is only applied when the `kv_b_proj` is present (the
+    /// `has_separate_kv_b` is false, the absorbed path) + a tenant is active +
+    /// the `kv_b_proj` has a LoRA adapter. Otherwise the pre-computed absorbed
+    /// weights are used (the no correction needed).
+    fn absorbed_weights_with_lora(
+        &self,
+        device: &candle_core::Device,
+    ) -> Result<(Tensor, Tensor)> {
+        // The fast path: no tenant active, or the kv_b_proj is absent (the
+        // separate-kv-b path, the w_uk/w_uv_t are from the checkpoint directly), or
+        // the kv_b_proj has no LoRA adapter. The pre-computed absorbed weights
+        // are correct.
+        let tenant_active = active_tenant().is_some();
+        if self.kv_b_proj.is_none() {
+            return Ok((self.w_uk.clone(), self.w_uv_t.clone()));
+        }
+        if !tenant_active {
+            return Ok((self.w_uk.clone(), self.w_uv_t.clone()));
+        }
+        // The check if the kv_b_proj has a LoRA adapter for the active tenant.
+        // The kv_b_proj is marked with the with_lora_module("kv_b_proj"), so the
+        // adapter is looked up under that module name.
+        let has_adapter = global_registry()
+            .map(|reg| {
+                let reg = reg.lock().unwrap_or_else(|e| e.into_inner());
+                reg.active_adapter_for("kv_b_proj").is_some()
+            })
+            .unwrap_or(false);
+        if !has_adapter {
+            return Ok((self.w_uk.clone(), self.w_uv_t.clone()));
+        }
+        // The correction: recompute the absorbed weights from the effective
+        // kv_b_proj weight (the base + the delta). The effective weight is the
+        // `kv_b_proj.weight() + the delta` (the LoRA delta on the kv_b_proj).
+        // The absorbed w_uk/w_uv_t are derived from the kv_b_proj weight via the
+        // reshape + the narrow + the transpose (the same-time derivation, the
+        // mla_attention.rs:346-353).
+        let effective_kv_b = self.effective_kv_b_weight(device)?;
+        let w = effective_kv_b.reshape((
+            self.num_heads,
+            self.qk_nope_head_dim + self.v_head_dim,
+            self.kv_lora_rank,
+        ))?;
+        let w_uk = w
+            .narrow(1, 0, self.qk_nope_head_dim)?
+            .contiguous()?
+            .to_dtype(self.dtype)?;
+        let w_uv = w.narrow(1, self.qk_nope_head_dim, self.v_head_dim)?.contiguous()?;
+        let w_uv_t = w_uv.transpose(1, 2)?.contiguous()?.to_dtype(self.dtype)?;
+        Ok((w_uk, w_uv_t))
+    }
+
+    /// The effective kv_b_proj weight (the base + the Lo tenant's LoRA delta).
+    /// The ` weight is the `kv_b_proj.weight()` (the `[out, in]`); the delta
+    /// is the `scaling * (I @ A) @ B` (the identity input, the weight on the
+    /// weight itself, the `B @ A * scaling` reshaped to the weight layout).
+    fn effective_kv_b_weight(&self, device: &candle_core::Device) -> Result<Tensor> {
+        let Some(kv_b) = &self.kv_b_proj else {
+            candle_core::bail!("effective_kv_b_weight called with no kv_b_proj");
+        };
+        let base = kv_b.weight()?;
+        // The LoRA delta on the weight: the `scaling * (B @ A)` reshaped to the
+        // `[out, in]` weight layout. The A is the `[in, rank]`, the B is the
+        // `[rank, out]`, so the B @ A is the `[out, in]` (the weight layout).
+        let tenant = active_tenant();
+        let Some(registry) = global_registry() else {
+            return Ok(base);
+        };
+        let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(adapter) = tenant.as_deref().and_then(|t| reg.active_adapter_for_tenant(t, "kv_b_proj")) else {
+            return Ok(base);
+        };
+        let delta = adapter.weight_delta(device)?;
+        Ok(base.broadcast_add(&delta)?)
     }
 }

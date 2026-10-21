@@ -92,3 +92,16 @@ pub fn soft_mask_disabled() -> bool {
             .unwrap_or(false)
     })
 }
+/// `XINFER_DEBUG_ACTOR=1` enables verbose logging at every actor message boundary
+/// in the SchedD engine loop (schedule, forward, gate, postprocess, delivery, cleanup).
+/// Default off (zero overhead).
+pub const ACTOR_DEBUG_ENV: &str = "XINFER_DEBUG_ACTOR";
+static ACTOR_DEBUG: OnceLock<bool> = OnceLock::new();
+
+pub fn actor_debug() -> bool {
+    *ACTOR_DEBUG.get_or_init(|| {
+        env::var(ACTOR_DEBUG_ENV)
+            .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false)
+    })
+}

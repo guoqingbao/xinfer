@@ -14,6 +14,7 @@ use super::{
     Usage, UsageQuery, UsageResponse,
 };
 use crate::core::engine::{LLMEngine, StreamItem};
+use crate::core::lora::global_registry;
 use crate::server::parser::{BufferedFinalizeResult, StreamResult, StreamToolParser};
 use crate::tools::helpers::{
     build_invalid_tool_call_feedback, build_tool_schema_map, filter_tool_calls, log_tool_calls,
@@ -26,6 +27,7 @@ use crate::utils::guidance_grammar::{
     GrammarRequestDispatcher,
 };
 use axum::extract::{Json, Query, State};
+use axum::http::StatusCode;
 use axum::response::{sse::KeepAlive, Sse};
 use base64::Engine;
 use std::collections::HashSet;
@@ -400,6 +402,71 @@ pub async fn chat_completion(
     params.session_id = request.session_id.clone();
     params.thinking = request.thinking.clone();
     params.stop_sequences = request.stop.clone();
+    // LoRA adapter selection (the request `model` field). The
+    // `model` is the `base:adapter` composite (the `/v1/models` listing form).
+    // The left of the `:` is the base model id (validated against the exposed
+    // model); the right is the adapter name (the `lora_tenant`). The there is
+    // no `:` (the bare base id), there is no adapter (the base model). When the
+    // adapter is unknown + the `allow_base_fallback` is set, the base model is
+    // used (no 404); otherwise the unknown adapter is a 404.
+    //
+    // Stacking: the right of the `:` may be a `+`-separated list of adapters
+    // (e.g. `base:style+domain`). All listed adapters are composed additively:
+    // `base + sum_j scaling_j * (x @ A_j) @ B_j`. A single adapter (no `+`) is
+    // the prior behavior.
+    let exposed_id = super::resolve_engine_model_id(&data.econfig)
+        .unwrap_or_else(|| "default".to_string());
+    let (base_id, adapter_names) = match request.model.as_ref().and_then(|m| m.split_once(':')) {
+        Some((base, adapters)) => {
+            let names: Vec<String> = adapters
+                .split('+')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            (base.to_string(), Some(names))
+        }
+        None => (
+            request.model.clone().unwrap_or(exposed_id.clone()),
+            None,
+        ),
+    };
+    if let Some(names) = &adapter_names {
+        // Validate the base matches the exposed model (no cross-model routing).
+        if !base_id.is_empty() && base_id != exposed_id {
+            return ChatResponder::ValidationError(
+                format!("unknown base model '{base_id}' (the exposed model is '{exposed_id}')"),
+            );
+        }
+        // Validate each adapter is known (no unknown adapter).
+        let all_known = names
+            .iter()
+            .all(|n| data.econfig.lora.adapters.iter().any(|(name, _)| name == n));
+        if all_known {
+            // The single-adapter fast path keeps the prior `lora_tenant` field;
+            // the multi-adapter path uses the `lora_tenants` stack.
+            if names.len() == 1 {
+                params.lora_tenant = Some(names[0].clone());
+            } else {
+                params.lora_tenants = names.clone();
+            }
+            let session = request.session_id.as_deref().unwrap_or("-");
+            crate::log_info!(
+                "[LoRA] model={model_id} adapters={names:?} session={session} tenant set"
+            );
+        } else if data.econfig.lora.allow_base_fallback {
+            crate::log_warn!(
+                "[LoRA] model={model_id} unknown adapter(s) {names:?}, falling back to base model (allow_base_fallback)"
+            );
+            // No tenant (the base model, not the unknown adapter).
+        } else {
+            return ChatResponder::ValidationError(
+                format!(
+                    "unknown LoRA adapter(s) {names:?} (the loaded adapters: {:?})",
+                    data.econfig.lora.adapters.iter().map(|(n, _)| n).collect::<Vec<_>>()
+                ),
+            );
+        }
+    }
     // `reasoning_effort` is the control sent by the built-in UI and by
     // OpenAI-compatible clients.  Preserve an explicit `none`: dropping it
     // would make the engine fall back to its reasoning-enabled default.
@@ -420,7 +487,7 @@ pub async fn chat_completion(
         tokenizer,
         chat_template,
     ) = {
-        let e = data.engine.read();
+        let e = data.engine.as_ref();
         (
             e.img_cfg.clone(),
             e.model_type.clone(),
@@ -563,7 +630,7 @@ pub async fn chat_completion(
             crate::log_warn!("Stream request has session_id {sid}");
         }
         let preprocessed = {
-            let e = data.engine.read();
+            let e = data.engine.as_ref();
             match e.preprocess(
                 std::slice::from_ref(&params),
                 std::slice::from_ref(&messages),
@@ -581,8 +648,8 @@ pub async fn chat_completion(
             }
         };
         let (seq_id, prompt_length, prefilled_reasoning_end, stream) = {
-            let mut e = data.engine.write();
-            match e.generate_stream(preprocessed, image_data, &logger) {
+            let e = data.engine.as_ref();
+            match e.generate_stream(preprocessed, image_data, &logger).await {
                 Ok((seq_id, prompt_length, prefilled_reasoning_end, stream)) => {
                     (seq_id, prompt_length, prefilled_reasoning_end, stream)
                 }
@@ -640,7 +707,7 @@ pub async fn chat_completion(
             let stream_ctx =
                 StreamingContext::new(seq_id, model_id.to_string(), created, response_tx.clone());
             if !stream_ctx.send_role_start() {
-                let mut e = engine_clone.write();
+                let e = engine_clone.as_ref();
                 e.cancel(seq_id);
                 let _ = response_tx.try_send(ChatResponse::Done);
                 return;
@@ -668,7 +735,7 @@ pub async fn chat_completion(
                                 "[Seq {}] Stream client disconnected during prefill/stream",
                                 current_seq_id
                             );
-                            let mut e = engine_clone.write();
+                            let e = engine_clone.as_ref();
                             e.cancel(current_seq_id);
                             break;
                         }
@@ -737,7 +804,7 @@ pub async fn chat_completion(
                                             "[Seq {}] Stream send error (disconnected)",
                                             current_seq_id
                                         );
-                                        let mut e = engine_clone.write();
+                                        let e = engine_clone.as_ref();
                                         e.cancel(current_seq_id);
                                         break;
                                     }
@@ -778,7 +845,7 @@ pub async fn chat_completion(
                                             current_seq_id,
                                             tool_buffer_timeout
                                         );
-                                        let mut e = engine_clone.write();
+                                        let e = engine_clone.as_ref();
                                         e.cancel(current_seq_id);
                                         buffering_cancel_requested = true;
                                     }
@@ -828,7 +895,7 @@ pub async fn chat_completion(
                                         l.log_stream_token(&safe_text);
                                     }
                                     if !reasoning_router.send(&safe_text, false, &stream_ctx) {
-                                        let mut e = engine_clone.write();
+                                        let e = engine_clone.as_ref();
                                         e.cancel(current_seq_id);
                                         break;
                                     }
@@ -859,7 +926,7 @@ pub async fn chat_completion(
                                     "[Seq {}] Stream send error (disconnected)",
                                     current_seq_id
                                 );
-                                let mut e = engine_clone.write();
+                                let e = engine_clone.as_ref();
                                 e.cancel(current_seq_id);
                                 break;
                             }
@@ -959,7 +1026,7 @@ pub async fn chat_completion(
                                     l.log_stream_token(&safe_suppressed);
                                 }
                                 if !stream_ctx.send_token(&safe_suppressed) {
-                                    let mut e = engine_clone.write();
+                                    let e = engine_clone.as_ref();
                                     e.cancel(current_seq_id);
                                     break;
                                 }
@@ -1065,7 +1132,7 @@ pub async fn chat_completion(
                                         "[Seq {}] Stream send error (disconnected)",
                                         current_seq_id
                                     );
-                                    let mut e = engine_clone.write();
+                                    let e = engine_clone.as_ref();
                                     e.cancel(current_seq_id);
                                     break;
                                 }
@@ -1101,9 +1168,10 @@ pub async fn chat_completion(
                                 error: None,
                             }],
                             usage: include_usage.then_some({
-                                let engine = engine_clone.read();
+                                let engine = engine_clone.as_ref();
                                 let cached = engine
                                     .get_num_cached_tokens_for_seq(current_seq_id)
+                                    .await
                                     .unwrap_or(0);
                                 let reasoning_tokens =
                                     crate::utils::chat_template::extract_reasoning_content(
@@ -1154,18 +1222,41 @@ pub async fn chat_completion(
 
                         crate::log_warn!("--- Performance Metrics ---");
                         if prompt_time_taken > 0.0 {
+                            let cached = engine_clone
+                                .get_num_cached_tokens_for_seq(current_seq_id)
+                                .await
+                                .unwrap_or(0);
+                            let actual_prefill = prompt_length.saturating_sub(cached);
+                            if cached > 0 {
+                                crate::log_info!(
+                                    "[Seq {}] ⏳️ Prompt: {} tokens ({} cached + {} actual) in {:.2}s ({:.2} t/s actual, {:.2} t/s synthetic)",
+                                    current_seq_id,
+                                    prompt_length,
+                                    cached,
+                                    actual_prefill,
+                                    prompt_time_taken,
+                                    actual_prefill as f32 / prompt_time_taken.max(0.001),
+                                    prompt_length as f32 / prompt_time_taken.max(0.001)
+                                );
+                            } else {
+                                crate::log_info!(
+                                    "[Seq {}] ⏳️ Prompt: {} tokens in {:.2}s ({:.2} t/s)",
+                                    current_seq_id,
+                                    prompt_length,
+                                    prompt_time_taken,
+                                    prompt_length as f32 / prompt_time_taken.max(0.001)
+                                );
+                            }
+                        } else {
+                            let cached = engine_clone
+                                .get_num_cached_tokens_for_seq(current_seq_id)
+                                .await
+                                .unwrap_or(prompt_length);
                             crate::log_info!(
-                                "[Seq {}] ⏱️ Prompt: {} tokens in {:.2}s ({:.2} t/s)",
+                                "[Seq {}] ⏳️ Prompt: {} tokens (fully cached, {} from prefix cache)",
                                 current_seq_id,
                                 prompt_length,
-                                prompt_time_taken,
-                                prompt_length as f32 / prompt_time_taken.max(0.001)
-                            );
-                        } else {
-                            crate::log_info!(
-                                "[Seq {}] ⏱️ Prompt: {} tokens (cached)",
-                                current_seq_id,
-                                prompt_length
+                                cached
                             );
                         }
                         crate::log_info!(
@@ -1229,7 +1320,7 @@ pub async fn chat_completion(
         let mut total_decoded_time_taken = 0f32;
         let mut choices = Vec::new();
         let tokenizer = {
-            let e = data.engine.read();
+            let e = data.engine.as_ref();
             Arc::new(e.tokenizer.clone())
         };
 
@@ -1238,7 +1329,7 @@ pub async fn chat_completion(
             messages.len()
         );
         let preprocessed = {
-            let e = data.engine.read();
+            let e = data.engine.as_ref();
             match e.preprocess(
                 std::slice::from_ref(&current_params),
                 std::slice::from_ref(&messages),
@@ -1253,8 +1344,8 @@ pub async fn chat_completion(
             }
         };
         let receivers = {
-            let mut e = data.engine.write();
-            match e.generate_sync(preprocessed, image_data, &logger) {
+            let e = data.engine.as_ref();
+            match e.generate_sync(preprocessed, image_data, &logger).await {
                 Ok(receivers) => receivers,
                 Err(e) => {
                     crate::log_error!("Completion generation failed: {:?}", e);
@@ -1425,11 +1516,11 @@ pub async fn chat_completion(
         );
 
         let (cached_tokens_total, reasoning_tokens_total): (usize, usize) = {
-            let engine = data.engine.read();
-            let cached: usize = sync_seq_ids
-                .iter()
-                .filter_map(|sid| engine.get_num_cached_tokens_for_seq(*sid))
-                .sum();
+            let engine = data.engine.as_ref();
+            let mut cached: usize = 0;
+            for sid in &sync_seq_ids {
+                cached += engine.get_num_cached_tokens_for_seq(*sid).await.unwrap_or(0);
+            }
             // Reasoning text is extracted directly from each choice's
             // `decode_output` rather than from `message.reasoning_content`,
             // because the latter is only populated on the env-gated tools
@@ -1502,8 +1593,8 @@ pub async fn create_embeddings(
 
     let model_name = model.unwrap_or_else(|| "default".to_string());
 
-    let mut engine = data.engine.write();
-    let (vectors, prompt_tokens) = match engine.embed(&inputs, embedding_type.clone()) {
+    let engine = data.engine.as_ref();
+    let (vectors, prompt_tokens) = match engine.embed(&inputs, embedding_type.clone()).await {
         Ok(res) => res,
         Err(e) => return ChatResponder::ModelError(format!("Embedding generation failed: {e:?}")),
     };
@@ -1554,8 +1645,8 @@ pub async fn get_usage(
     State(state): State<Arc<ServerData>>,
     Query(request): Query<UsageQuery>,
 ) -> ChatResponder {
-    let engine = state.engine.read();
-    let stats = match engine.get_usage_stats(request.session_id.clone()) {
+    let engine = state.engine.as_ref();
+    let stats = match engine.get_usage_stats(request.session_id.clone()).await {
         Ok(s) => s,
         Err(e) => {
             return ChatResponder::InternalError(format!("Failed to obtain usage status {:?}", e));
@@ -1571,6 +1662,116 @@ pub async fn get_usage(
         total_swap_memory: stats.total_swap_memory,
         session_status: stats.session_status,
     })
+}
+
+/// The request body for the `/v1/lora/load` endpoint (the hot adapter
+/// load). The `name` is the tenant key, the `source` is the HF id or local dir
+/// (the model loader resolves it).
+#[derive(serde::Deserialize)]
+pub struct LoraLoadRequest {
+    pub name: String,
+    pub source: String,
+}
+
+/// The request body for the `/v1/lora/unload` endpoint (the hot
+/// adapter unload). The `name` is the tenant key.
+#[derive(serde::Deserialize)]
+pub struct LoraUnloadRequest {
+    pub name: String,
+}
+
+/// The `/v1/lora` endpoint (the adapter list RPC): list the
+/// loaded LoRA adapters (the tenant names + the resident byte count). The
+/// operator sees what is loaded + the memory usage.
+pub async fn list_lora_adapters(
+    State(state): State<Arc<ServerData>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let registry = global_registry();
+    let data = match registry {
+        Some(reg) => {
+            let reg = reg.lock().unwrap_or_else(|e| e.into_inner());
+            serde_json::json!({
+                "object": "list",
+                "data": reg.tenant_names().iter().map(|t| serde_json::json!({
+                    "name": t,
+                    "resident_bytes": reg.tenant_bytes(t),
+                })).collect::<Vec<_>>(),
+                "total_tenants": reg.tenant_count(),
+                "resident_bytes": reg.resident_bytes(),
+                "max_tenants": reg.max_tenants(),
+                "max_bytes": reg.max_bytes(),
+            })
+        }
+        None => serde_json::json!({
+            "object": "list",
+            "data": [],
+            "total_tenants": 0,
+            "note": "no LoRA registry (the --lora not configured)"
+        }),
+    };
+    let _ = state; // the state is unused (the registry is process-wide)
+    Ok(Json(data))
+}
+
+/// The `/v1/lora/load` endpoint (the hot adapter load): load a new
+/// adapter at runtime (no restart). The `name` is the tenant key, the
+/// `source` is the HF id or local dir. The adapter is loaded into the global
+/// registry (the on-demand load).
+pub async fn load_lora_adapter(
+    State(_state): State<Arc<ServerData>>,
+    Json(request): Json<LoraLoadRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let Some(registry) = global_registry() else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "no LoRA registry (the --lora not configured)"})),
+        ));
+    };
+    let mut reg = registry.lock().unwrap_or_else(|e| e.into_inner());
+    // Register the source (the on-demand load input) + load the adapter.
+    // The device/dtype are the registry's stored values (set at startup via
+    // with_device, the model's compute device + dtype).
+    reg.add_source(&request.name, &request.source);
+    match reg.ensure_loaded(&request.name) {
+        Ok(()) => {
+            Ok(Json(serde_json::json!({
+                "status": "loaded",
+                "name": request.name,
+                "source": request.source,
+            })))
+        }
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("failed to load LoRA adapter: {e}") })),
+        )),
+    }
+}
+
+/// The `/v1/lora/unload` endpoint (the hot adapter unload): unload an
+/// adapter at runtime (no restart). The `name` is the tenant key. The
+/// adapter's weights are freed (the GPU memory released).
+pub async fn unload_lora_adapter(
+    State(_state): State<Arc<ServerData>>,
+    Json(request): Json<LoraUnloadRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let Some(registry) = global_registry() else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "no LoRA registry (the --lora not configured)"})),
+        ));
+    };
+    let mut reg = registry.lock().unwrap_or_else(|e| e.into_inner());
+    if reg.unregister(&request.name) {
+        Ok(Json(serde_json::json!({
+            "status": "unloaded",
+            "name": request.name,
+        })))
+    } else {
+        Err((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": format!("LoRA adapter '{}' not found", request.name)})),
+        ))
+    }
 }
 
 #[utoipa::path(
@@ -1593,7 +1794,7 @@ pub async fn tokenize(
             // For messages, we need to apply chat template
             // First convert to internal Message format
             let img_cfg = {
-                let e = data.engine.read();
+                let e = data.engine.as_ref();
                 e.img_cfg.clone()
             };
             let (converted_messages, _) =
@@ -1608,7 +1809,7 @@ pub async fn tokenize(
                 };
 
             // Apply chat template using engine's template
-            let engine = data.engine.read();
+            let engine = data.engine.as_ref();
             let mut template = engine.get_chat_template();
             template.set_messages(&converted_messages);
             let prompt = match template.apply_chat_template(&Vec::new(), false) {
@@ -1628,7 +1829,7 @@ pub async fn tokenize(
 
     // Get tokenizer and tokenize
     let tokenizer = {
-        let e = data.engine.read();
+        let e = data.engine.as_ref();
         e.tokenizer.clone()
     };
 
@@ -1670,7 +1871,7 @@ pub async fn detokenize(
     let skip_special_tokens = request.skip_special_tokens.unwrap_or(true);
 
     let tokenizer = {
-        let e = data.engine.read();
+        let e = data.engine.as_ref();
         e.tokenizer.clone()
     };
 

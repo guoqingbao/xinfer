@@ -1,5 +1,6 @@
 pub mod block_manager;
 pub mod engine;
+pub mod lora;
 pub mod prefix_cache;
 pub mod runner;
 pub mod scheduler;
@@ -125,7 +126,7 @@ where
     }
 }
 
-type DecodeStreamType = Box<dyn DecodeStreamTrait + Send + Sync>;
+pub type DecodeStreamType = Box<dyn DecodeStreamTrait + Send + Sync>;
 
 #[macro_export]
 macro_rules! build_model {
