@@ -192,10 +192,18 @@ fn main() -> Result<()> {
     let x_src = (0..(3 * 256))
         .map(|i| (i as f32 - 384.0) / 192.0)
         .collect::<Vec<_>>();
+    let x_large_src = (0..(64 * 256))
+        .map(|i| {
+            let centered = ((i * 37 + 11) % 2048) as f32 - 1024.0;
+            centered / 257.0
+        })
+        .collect::<Vec<_>>();
     let q_cpu = Tensor::from_vec(q_src, (4, 256), &Device::Cpu)?;
     let x_cpu = Tensor::from_vec(x_src, (3, 256), &Device::Cpu)?;
+    let x_large_cpu = Tensor::from_vec(x_large_src, (64, 256), &Device::Cpu)?;
     let q_cuda = q_cpu.to_device(&device)?;
     let x_cuda = x_cpu.to_device(&device)?;
+    let x_large_cuda = x_large_cpu.to_device(&device)?;
     for (tag, dtype) in [
         ("q4k", quantized::GgmlDType::Q4K),
         ("q6k", quantized::GgmlDType::Q6K),
@@ -209,10 +217,22 @@ fn main() -> Result<()> {
         let cpu_raw = q_cpu_tensor.data()?.into_owned();
         let cuda_raw = q_cuda_tensor.data()?.into_owned();
         let native_raw = q_native_tensor.data()?.into_owned();
-        let y_cpu = quantized::QMatMul::from_qtensor(q_cpu_tensor)?.forward(&x_cpu)?;
-        let y_cuda = quantized::QMatMul::from_qtensor(q_cuda_tensor)?.forward(&x_cuda)?;
-        let y_native = quantized::QMatMul::from_qtensor(q_native_tensor)?.forward(&x_cuda)?;
+        let packed_tensor = quantized::QTensor::cat_rows(&[&q_cuda_tensor, &q_native_tensor])?;
+        let packed_raw = packed_tensor.data()?.into_owned();
+        let y_packed = quantized::QMatMul::from_qtensor(packed_tensor)?.forward(&x_cuda)?;
+        let qmat_cpu = quantized::QMatMul::from_qtensor(q_cpu_tensor)?;
+        let qmat_cuda = quantized::QMatMul::from_qtensor(q_cuda_tensor)?;
+        let qmat_native = quantized::QMatMul::from_qtensor(q_native_tensor)?;
+        let y_cpu = qmat_cpu.forward(&x_cpu)?;
+        let y_cuda = qmat_cuda.forward(&x_cuda)?;
+        let y_native = qmat_native.forward(&x_cuda)?;
+        // M=64 is the CUDA tensor-core crossover.  Record both the automatic
+        // dispatch and the explicit path so the Python reference can verify
+        // that the policy introduces no additional numerical change.
+        let y_large = qmat_cuda.forward(&x_large_cuda)?;
+        let y_large_explicit = qmat_cuda.forward_via_f16(&x_large_cuda)?;
         record(&mut file, &format!("{tag}_x"), &x_cpu)?;
+        record(&mut file, &format!("{tag}_x_large"), &x_large_cpu)?;
         record(&mut file, &format!("{tag}_weight_source"), &q_cpu)?;
         record(&mut file, &format!("{tag}_weight_cpu_dequant"), &q_cpu_deq)?;
         record(
@@ -228,9 +248,17 @@ fn main() -> Result<()> {
         record(&mut file, &format!("{tag}_matmul_cpu"), &y_cpu)?;
         record(&mut file, &format!("{tag}_matmul_cuda"), &y_cuda)?;
         record(&mut file, &format!("{tag}_matmul_native"), &y_native)?;
+        record(&mut file, &format!("{tag}_matmul_packed"), &y_packed)?;
+        record(&mut file, &format!("{tag}_matmul_large"), &y_large)?;
+        record(
+            &mut file,
+            &format!("{tag}_matmul_large_explicit_f16"),
+            &y_large_explicit,
+        )?;
         record_bytes(&mut file, &format!("{tag}_cpu_raw"), &cpu_raw)?;
         record_bytes(&mut file, &format!("{tag}_cuda_raw"), &cuda_raw)?;
         record_bytes(&mut file, &format!("{tag}_native_raw"), &native_raw)?;
+        record_bytes(&mut file, &format!("{tag}_packed_raw"), &packed_raw)?;
     }
 
     file.flush()?;
