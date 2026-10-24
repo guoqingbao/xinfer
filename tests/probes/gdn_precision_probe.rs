@@ -175,11 +175,13 @@ fn record_gqa(file: &mut std::fs::File, device: &Device) -> Result<()> {
     let total = lengths.iter().sum::<usize>();
     let nk = 2;
     let nv = 4;
-    let k_dim = 64;
+    // Exercise the production Qwen3.5/Qwen3.8 geometry, including the
+    // warp-segmented 128x128 decode specialization.
+    let k_dim = 128;
     // FlashInfer's SM90 delta-rule kernel requires k_dim == v_dim. The
     // separate flat recurrence/decode cases above still cover sub-64 value
     // widths that exposed the shared-memory barrier bug.
-    let v_dim = 64;
+    let v_dim = 128;
     // Match the model path: q/k are L2-normalized before the delta rule.
     let q = gdn::l2_norm_last_dim(&random(device, (total, nk, k_dim))?, 1e-6)?;
     let k = gdn::l2_norm_last_dim(&random(device, (total, nk, k_dim))?, 1e-6)?;

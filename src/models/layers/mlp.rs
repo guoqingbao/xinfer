@@ -39,6 +39,42 @@ pub struct MLP {
 }
 
 impl MLP {
+    /// Join GGUF gate/up rows on-device without changing their quantized
+    /// bytes. One packed projection shares activation quantization and launch
+    /// overhead while producing the same two logical outputs.
+    fn merge_gguf_gate_up(
+        gate_proj: TensorParallelColumnLinear,
+        up_proj: TensorParallelColumnLinear,
+        dtype: DType,
+    ) -> GateUpProjection {
+        let merged = match (gate_proj.as_qtensor(), up_proj.as_qtensor()) {
+            (Some(gate), Some(up))
+                if gate.dtype() == up.dtype()
+                    && gate.shape().dims().len() == 2
+                    && gate.shape().dims() == up.shape().dims() =>
+            {
+                let n = gate.shape().dims()[0];
+                candle_core::quantized::QTensor::cat_rows(&[gate.as_ref(), up.as_ref()])
+                    .and_then(|weight| {
+                        let qlinear = crate::models::layers::linear::QLinear::from_qparts_x(
+                            weight, None, dtype,
+                        )?;
+                        MergedParallelColumnLinear::from_packed_local_qlinear(
+                            crate::models::layers::linear::LinearX::QLinear(qlinear),
+                            None,
+                            vec![n, n],
+                        )
+                    })
+                    .ok()
+            }
+            _ => None,
+        };
+        match merged {
+            Some(merged) => GateUpProjection::Packed(merged),
+            None => GateUpProjection::Separate { gate_proj, up_proj },
+        }
+    }
+
     /// Merge two independently-loaded NVFP4 gate/up projections into a single
     /// fused GEMM (sglang-style). Byte-concatenates the FP4 blocks and E4M3
     /// block scales and carries the per-half weight global scales in
@@ -540,7 +576,11 @@ impl MLP {
                 quant,
                 dtype,
             )?;
-            Self::merge_nvfp4_gate_up(gate_proj, up_proj, gate_up_merged)
+            if is_qvar_builder && !gate_up_merged {
+                Self::merge_gguf_gate_up(gate_proj, up_proj, dtype)
+            } else {
+                Self::merge_nvfp4_gate_up(gate_proj, up_proj, gate_up_merged)
+            }
         };
 
         let down_proj = TensorParallelRowLinear::load_with_hints(

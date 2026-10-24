@@ -286,12 +286,15 @@ async fn main() -> Result<()> {
         }
         for prompt in prompts.iter() {
             let msg = Message::new("user".to_string(), prompt.clone(), 0);
-            let param = SamplingParams::new_with_max_tokens(args.max_tokens);
+            let mut param = SamplingParams::new_with_max_tokens(args.max_tokens);
+            param.ignore_eos = args.ignore_eos;
             message_list.push(vec![msg]);
             params.push(param);
         }
     } else {
-        params.push(SamplingParams::new_with_max_tokens(args.max_tokens));
+        let mut param = SamplingParams::new_with_max_tokens(args.max_tokens);
+        param.ignore_eos = args.ignore_eos;
+        params.push(param);
     }
 
     let (resolved_max_model_len, resolved_max_num_seqs) = {
