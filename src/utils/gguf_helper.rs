@@ -349,6 +349,7 @@ pub fn get_gguf_info<R: std::io::Seek + std::io::Read>(
     let (mut tokenizer, kind) = match props.model.as_str() {
         "llama" | "replit" => unigram_tokenizer(&props)?,
         "gpt2" => bpe_tokenizer(&props)?,
+        "gemma4" => gemma4_bpe_tokenizer(&props)?,
         other => {
             anyhow::bail!("Tokenizer model `{other}` not supported.");
         }
@@ -484,6 +485,56 @@ fn bpe_tokenizer(p: &PropsGGUF) -> Result<(Tokenizer, TokenizerKind)> {
             let tk = p.tokens[i.unwrap() as usize].clone();
             tokenizer.add_special_tokens(&[AddedToken::from(tk.to_string(), true)]);
         }
+    }
+
+    Ok((tokenizer, TokenizerKind::Bpe))
+}
+
+/// Gemma4: SentencePiece-style BPE ("▁" for spaces, byte fallback, no space prefix),
+/// matching HF `tokenizer.json`. Its whitespace Split pre-tokenizer runs after the
+/// normalizer has already replaced every space, so it is a no-op and omitted.
+fn gemma4_bpe_tokenizer(p: &PropsGGUF) -> Result<(Tokenizer, TokenizerKind)> {
+    let merges = p
+        .merges
+        .as_ref()
+        .ok_or(anyhow::Error::msg("gemma4 tokenizer must include merges"))?
+        .iter()
+        .map(|merge| {
+            let (a, b) = merge
+                .split_once(' ')
+                .ok_or_else(|| anyhow::anyhow!("malformed gemma4 merge `{merge}`"))?;
+            Ok((a.to_string(), b.to_string()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut vocab = ahash::AHashMap::new();
+    for (i, token) in p.tokens.iter().enumerate() {
+        #[allow(clippy::cast_possible_truncation)]
+        vocab.insert(token.clone(), i as u32);
+    }
+
+    let mut bpe = BpeBuilder::new()
+        .vocab_and_merges(vocab, merges)
+        .byte_fallback(true)
+        .fuse_unk(true);
+    if let Some(unk) = p.unk {
+        bpe = bpe.unk_token(p.tokens[unk as usize].to_string());
+    }
+    let bpe = bpe.build().map_err(anyhow::Error::msg)?;
+
+    let mut tokenizer = TokenizerX::new(
+        ModelWrapper::BPE(bpe),
+        Some(Decoder::Sequence(vec![
+            Decoder::Replace("▁", " "),
+            Decoder::ByteFallback,
+            Decoder::Fuse,
+        ])),
+        Some(Normalizer::Replace(" ", "▁")),
+    )?;
+
+    for i in [p.bos, p.eos, p.unk].into_iter().flatten() {
+        let tk = p.tokens[i as usize].clone();
+        tokenizer.add_special_tokens(&[AddedToken::from(tk, true)]);
     }
 
     Ok((tokenizer, TokenizerKind::Bpe))

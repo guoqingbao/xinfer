@@ -753,6 +753,32 @@ impl Attention {
         input_metadata: &InputMetadata,
         q_scale: Option<&Tensor>,
     ) -> Result<Tensor> {
+        self.forward_with_kv(
+            xs,
+            rotary_emb,
+            attention_mask,
+            positions,
+            cache,
+            input_metadata,
+            q_scale,
+            None,
+        )
+        .map(|(y, _)| y)
+    }
+
+    /// Like `forward_ext`, but returns the K/V written to the cache and can attend over
+    /// `shared_kv` (another layer's K/V) instead of its own, as Gemma4 KV-shared layers do.
+    pub fn forward_with_kv(
+        &self,
+        xs: &Tensor,
+        rotary_emb: &Option<Arc<dyn ApplyRotaryEmbedding>>,
+        attention_mask: Option<&Vec<Tensor>>,
+        positions: &Tensor,
+        cache: Option<(&Tensor, &Tensor)>,
+        input_metadata: &InputMetadata,
+        q_scale: Option<&Tensor>,
+        shared_kv: Option<(&Tensor, &Tensor)>,
+    ) -> Result<(Tensor, (Tensor, Tensor))> {
         let (seq_len, _) = xs.dims2()?;
 
         let (q_raw, k, v) = match &self.qkv_proj {
@@ -848,6 +874,13 @@ impl Attention {
             v
         };
 
+        // shortcut: the own K/V of a shared layer is still projected (its weights ship in the
+        // checkpoint) and then discarded; skip the projection if that ever shows up in profiles.
+        let (k, v) = match shared_kv {
+            Some((k, v)) => (k.clone(), v.clone()),
+            None => (k, v),
+        };
+
         if let Some(rotary_emb) = &rotary_emb {
             if let (Some(original_max_position_embeddings), Some(llama_4_scaling_beta)) = (
                 rotary_emb.get_original_max_position_embeddings(),
@@ -903,7 +936,7 @@ impl Attention {
         } else {
             y.to_dtype(xs.dtype())?
         };
-        self.o_proj.forward(&y)
+        Ok((self.o_proj.forward(&y)?, (k, v)))
     }
 
     /// Optimized single-token attention without KV cache or paged attention.

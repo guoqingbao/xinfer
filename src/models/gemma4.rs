@@ -5,6 +5,8 @@ use crate::models::layers::mlp::MLP;
 use crate::models::layers::moe::{
     FusedMoe, FusedMoeGGUF, FusedMoeISQ, FusedMoeMxfp4, FusedMoeNvfp4, FusedMoeWNA16,
 };
+#[cfg(feature = "cuda")]
+use crate::models::layers::moe_offload::{experts::host_bytes, host_banks::HostBank};
 use crate::models::layers::others::{embedding, rms_norm, NormX};
 use crate::models::layers::rotary_emb::{ApplyRotaryEmbedding, RotaryEmbedding};
 use crate::models::layers::VarBuilderX;
@@ -368,28 +370,28 @@ impl Gemma4DecoderLayer {
         let input_layernorm = rms_norm(
             config.hidden_size,
             config.rms_norm_eps,
-            vb.pp("input_layernorm"),
+            vb.pp(&gguf_name(is_qvar_builder, "input_layernorm")),
             DType::F32,
             false,
         )?;
         let post_attention_layernorm = rms_norm(
             config.hidden_size,
             config.rms_norm_eps,
-            vb.pp("post_attention_layernorm"),
+            vb.pp(&gguf_name(is_qvar_builder, "post_attention_layernorm")),
             DType::F32,
             false,
         )?;
         let pre_feedforward_layernorm = rms_norm(
             config.hidden_size,
             config.rms_norm_eps,
-            vb.pp("pre_feedforward_layernorm"),
+            vb.pp(&gguf_name(is_qvar_builder, "pre_feedforward_layernorm")),
             DType::F32,
             false,
         )?;
         let post_feedforward_layernorm = rms_norm(
             config.hidden_size,
             config.rms_norm_eps,
-            vb.pp("post_feedforward_layernorm"),
+            vb.pp(&gguf_name(is_qvar_builder, "post_feedforward_layernorm")),
             DType::F32,
             false,
         )?;
@@ -431,14 +433,14 @@ impl Gemma4DecoderLayer {
                 let norm = rms_norm(
                     config.hidden_size,
                     config.rms_norm_eps,
-                    vb.pp("post_per_layer_input_norm"),
+                    vb.pp(&gguf_name(is_qvar_builder, "post_per_layer_input_norm")),
                     DType::F32,
                     false,
                 )?;
                 let gate = ReplicatedLinear::load_no_bias(
                     config.hidden_size,
                     pli_dim,
-                    vb.pp("per_layer_input_gate"),
+                    vb.pp(&gguf_name(is_qvar_builder, "per_layer_input_gate")),
                     &config.quantization_config,
                     &config.quant,
                     dtype,
@@ -446,7 +448,7 @@ impl Gemma4DecoderLayer {
                 let proj = ReplicatedLinear::load_no_bias(
                     pli_dim,
                     config.hidden_size,
-                    vb.pp("per_layer_projection"),
+                    vb.pp(&gguf_name(is_qvar_builder, "per_layer_projection")),
                     &config.quantization_config,
                     &config.quant,
                     dtype,
@@ -498,7 +500,8 @@ impl Gemma4DecoderLayer {
         positions: &Tensor,
         cache: Option<(&Tensor, &Tensor)>,
         input_metadata: &InputMetadata,
-    ) -> Result<Tensor> {
+        shared_kv: Option<(&Tensor, &Tensor)>,
+    ) -> Result<(Tensor, (Tensor, Tensor))> {
         let xs = xs.clone();
 
         let residual = xs.clone();
@@ -516,9 +519,16 @@ impl Gemma4DecoderLayer {
             self.rotary_emb.clone()
         };
 
-        let attn_output =
-            self.self_attn
-                .forward(&normed, &Some(rope), mask, positions, cache, input_metadata)?;
+        let (attn_output, kv) = self.self_attn.forward_with_kv(
+            &normed,
+            &Some(rope),
+            mask,
+            positions,
+            cache,
+            input_metadata,
+            None,
+            shared_kv,
+        )?;
 
         let mut xs = self.post_attention_layernorm.forward(&attn_output)?;
         xs = (xs + &residual)?;
@@ -584,12 +594,15 @@ impl Gemma4DecoderLayer {
             let gated = gate
                 .forward(&xs)?
                 .apply(&candle_nn::Activation::GeluPytorchTanh)?;
-            let gated = (gated * pli)?;
+            let gated = (&gated * pli.to_dtype(gated.dtype())?)?;
             let projected = proj.forward(&gated)?;
             xs = (&residual_ple + norm.forward(&projected)?)?;
         }
 
-        xs.broadcast_mul(&self.layer_scalar.to_dtype(xs.dtype())?)
+        Ok((
+            xs.broadcast_mul(&self.layer_scalar.to_dtype(xs.dtype())?)?,
+            kv,
+        ))
     }
 }
 
@@ -611,6 +624,78 @@ pub struct Gemma4ForCausalLM {
     layer_types: Vec<String>,
     hidden_size_per_layer_input: Option<usize>,
     num_hidden_layers: usize,
+    // Layers from this index reuse the K/V of the last earlier layer of the same type.
+    first_kv_shared_layer: usize,
+    #[cfg(feature = "cuda")]
+    _ple_host: Option<PleHostTable>,
+}
+
+/// llama.cpp GGUF tensor name for a Gemma4 HF name; unchanged for safetensors.
+fn gguf_name(is_qvar: bool, hf: &str) -> String {
+    if !is_qvar {
+        return hf.to_string();
+    }
+    if let Some(rest) = hf.strip_prefix("model.layers.") {
+        return format!("blk.{rest}");
+    }
+    match hf {
+        "model.embed_tokens" => "token_embd",
+        "model.norm" => "output_norm",
+        "model.embed_tokens_per_layer" => "per_layer_token_embd",
+        "model.per_layer_model_projection" => "per_layer_model_proj",
+        "model.per_layer_projection_norm" => "per_layer_proj_norm",
+        "input_layernorm" => "attn_norm",
+        "post_attention_layernorm" => "post_attention_norm",
+        "pre_feedforward_layernorm" => "ffn_norm",
+        "post_feedforward_layernorm" => "post_ffw_norm",
+        "post_per_layer_input_norm" => "post_norm",
+        "per_layer_input_gate" => "inp_gate",
+        "per_layer_projection" => "proj",
+        other => other,
+    }
+    .to_string()
+}
+
+/// Pinned host memory behind a device-mapped `embed_tokens_per_layer`. The tensor is never
+/// dropped: its slice is not a device allocation, so it must not reach `cuMemFree`.
+#[cfg(feature = "cuda")]
+struct PleHostTable {
+    _bank: HostBank,
+    _tensor: std::mem::ManuallyDrop<Tensor>,
+}
+
+/// Moves the per-layer embedding table (~5 GB for E2B/E4B) into pinned host memory mapped
+/// into the GPU address space. Lookups gather a few rows over PCIe, inside CUDA graphs too.
+#[cfg(feature = "cuda")]
+fn map_host_table(w: &Tensor, dev: &candle_core::CudaDevice) -> Result<(Tensor, PleHostTable)> {
+    use candle_core::{CudaStorage, Storage};
+    let bank = HostBank::new(dev, &host_bytes(w)?, 1)?;
+    let n = w.elem_count();
+    let storage = unsafe {
+        match w.dtype() {
+            DType::BF16 => CudaStorage::wrap_cuda_slice(
+                dev.upgrade_device_ptr::<half::bf16>(bank.dev_ptr, n),
+                dev.clone(),
+            ),
+            DType::F16 => CudaStorage::wrap_cuda_slice(
+                dev.upgrade_device_ptr::<half::f16>(bank.dev_ptr, n),
+                dev.clone(),
+            ),
+            DType::F32 => CudaStorage::wrap_cuda_slice(
+                dev.upgrade_device_ptr::<f32>(bank.dev_ptr, n),
+                dev.clone(),
+            ),
+            dt => candle_core::bail!("per-layer embedding: unsupported dtype {dt:?}"),
+        }
+    };
+    let t = Tensor::from_storage(Storage::Cuda(storage), w.shape().clone())?;
+    Ok((
+        t.clone(),
+        PleHostTable {
+            _bank: bank,
+            _tensor: std::mem::ManuallyDrop::new(t),
+        },
+    ))
 }
 
 impl Gemma4ForCausalLM {
@@ -625,6 +710,18 @@ impl Gemma4ForCausalLM {
     ) -> Result<Self> {
         let reporter = progress_reporter.clone();
         let is_qvar_builder = vb.is_qvar_builder();
+
+        // GGUF configs leave `sliding_window` unset and carry it in the extra config instead.
+        let mut config = config.clone();
+        if config.sliding_window.is_none() {
+            config.sliding_window = config
+                .extra_config_json
+                .as_ref()
+                .and_then(|e| serde_json::from_str::<serde_json::Value>(e).ok())
+                .and_then(|v| v.get("sliding_window")?.as_u64())
+                .map(|v| v as usize);
+        }
+        let config = &config;
 
         let layer_types: Vec<String> = if let Some(extra) = &config.extra_config_json {
             let v: serde_json::Value =
@@ -761,21 +858,56 @@ impl Gemma4ForCausalLM {
         let (embed_tokens, vocab_size) = embedding(
             config.vocab_size,
             config.hidden_size,
-            vb.pp(&format!("{}.embed_tokens", lm_prefix)),
+            vb.pp(&gguf_name(
+                is_qvar_builder,
+                &format!("{}.embed_tokens", lm_prefix),
+            )),
             dtype,
         )?;
 
+        #[cfg(feature = "cuda")]
+        let mut ple_host = None;
         let (embed_tokens_per_layer, per_layer_model_projection, per_layer_projection_norm) =
             if let Some(pli_dim) = hidden_size_per_layer_input {
                 let total_dim = pli_dim * config.num_hidden_layers;
-                let (emb, _) = embedding(
-                    config.vocab_size,
-                    total_dim,
-                    vb.pp(&format!("{}.embed_tokens_per_layer", lm_prefix)),
-                    dtype,
-                )?;
+                let emb_vb = vb.pp(&gguf_name(
+                    is_qvar_builder,
+                    &format!("{}.embed_tokens_per_layer", lm_prefix),
+                ));
+                #[cfg(feature = "cuda")]
+                let host_w = match (device, &emb_vb.0) {
+                    (Device::Cuda(_), Either::Left(_)) => {
+                        match (emb_vb.cpu_var_builder(), config.vocab_size) {
+                            (Some(cpu_vb), Some(vs)) => {
+                                Some(cpu_vb.get((vs, total_dim), "weight")?)
+                            }
+                            _ => None,
+                        }
+                    }
+                    // GGUF: dequantize on the host, never as F32 in VRAM.
+                    (Device::Cuda(_), Either::Right(q)) => Some(
+                        q.with_device(&Device::Cpu)
+                            .get_no_shape("weight")?
+                            .dequantize(&Device::Cpu)?,
+                    ),
+                    _ => None,
+                };
+                #[cfg(feature = "cuda")]
+                let emb = match (host_w, device) {
+                    (Some(w), Device::Cuda(dev)) => {
+                        let (w, host) = map_host_table(&w.to_dtype(dtype)?, dev)?;
+                        ple_host = Some(host);
+                        candle_nn::Embedding::new(w, total_dim)
+                    }
+                    _ => embedding(config.vocab_size, total_dim, emb_vb, dtype)?.0,
+                };
+                #[cfg(not(feature = "cuda"))]
+                let emb = embedding(config.vocab_size, total_dim, emb_vb, dtype)?.0;
 
-                let proj_vb = vb.pp(&format!("{}.per_layer_model_projection", lm_prefix));
+                let proj_vb = vb.pp(&gguf_name(
+                    is_qvar_builder,
+                    &format!("{}.per_layer_model_projection", lm_prefix),
+                ));
                 let proj_linear = match &proj_vb.0 {
                     Either::Left(pvb) => {
                         use candle_nn::var_builder::Shard;
@@ -813,7 +945,10 @@ impl Gemma4ForCausalLM {
                 let norm = rms_norm(
                     pli_dim,
                     config.rms_norm_eps,
-                    vb.pp(&format!("{}.per_layer_projection_norm", lm_prefix)),
+                    vb.pp(&gguf_name(
+                        is_qvar_builder,
+                        &format!("{}.per_layer_projection_norm", lm_prefix),
+                    )),
                     DType::F32,
                     false,
                 )?;
@@ -924,7 +1059,7 @@ impl Gemma4ForCausalLM {
                 };
 
             let layer = Gemma4DecoderLayer::new(
-                vb.pp(&layer_prefix),
+                vb.pp(&gguf_name(is_qvar_builder, &layer_prefix)),
                 comm.clone(),
                 rotary_emb.clone(),
                 rotary_emb_local.clone(),
@@ -944,7 +1079,7 @@ impl Gemma4ForCausalLM {
         let norm = rms_norm(
             config.hidden_size,
             config.rms_norm_eps,
-            vb.pp(&format!("{}.norm", lm_prefix)),
+            vb.pp(&gguf_name(is_qvar_builder, &format!("{}.norm", lm_prefix))),
             DType::F32,
             false,
         )?;
@@ -954,7 +1089,10 @@ impl Gemma4ForCausalLM {
             config.hidden_size,
             vocab_size,
             if tie_word_embeddings {
-                vb.pp(&format!("{}.embed_tokens", lm_prefix))
+                vb.pp(&gguf_name(
+                    is_qvar_builder,
+                    &format!("{}.embed_tokens", lm_prefix),
+                ))
             } else if is_qvar_builder {
                 vb.pp("model.output")
             } else {
@@ -983,6 +1121,9 @@ impl Gemma4ForCausalLM {
             layer_types,
             hidden_size_per_layer_input,
             num_hidden_layers: config.num_hidden_layers,
+            first_kv_shared_layer,
+            #[cfg(feature = "cuda")]
+            _ple_host: ple_host,
         })
     }
 
@@ -1015,7 +1156,8 @@ impl Gemma4ForCausalLM {
         let embedded = emb_per_layer.forward(input_ids)?;
         let embedded = (embedded * (pli_dim as f64).sqrt())?;
 
-        let projected = inputs_embeds.apply(proj)?;
+        // GGUF/ISQ keep the embeddings in F32 while this projection stays in the model dtype.
+        let projected = inputs_embeds.to_dtype(proj.weight().dtype())?.apply(proj)?;
         let projected = (projected * (self.config.hidden_size as f64).powf(-0.5))?;
 
         let seq_len = input_ids.dim(0)?;
@@ -1074,11 +1216,19 @@ impl Gemma4ForCausalLM {
         );
 
         if let Some(kv_caches) = kv_caches {
+            // Last non-shared K/V per attention type: [sliding, full].
+            let mut last_kv: [Option<(Tensor, Tensor)>; 2] = [None, None];
             for ((k_cache, v_cache), (i, layer)) in
                 zip(kv_caches.iter(), self.layers.iter().enumerate())
             {
                 let pli = per_layer_inputs.as_ref().map(|v| &v[i]);
-                xs = layer.forward(
+                let slot = if layer.is_sliding { 0 } else { 1 };
+                let shared_kv = if i >= self.first_kv_shared_layer {
+                    last_kv[slot].as_ref().map(|(k, v)| (k, v))
+                } else {
+                    None
+                };
+                let (out, kv) = layer.forward(
                     &xs,
                     pli,
                     sliding_mask.as_ref(),
@@ -1086,7 +1236,12 @@ impl Gemma4ForCausalLM {
                     positions,
                     Some((k_cache, v_cache)),
                     input_metadata,
+                    shared_kv,
                 )?;
+                xs = out;
+                if i < self.first_kv_shared_layer {
+                    last_kv[slot] = Some(kv);
+                }
             }
         }
 

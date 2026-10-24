@@ -148,6 +148,13 @@ pub fn new_device(ordinal: usize) -> Result<Device> {
     }
 }
 
+/// GGUF integer array elements may be stored as u32 or i32.
+fn gguf_value_u32(v: &candle_core::quantized::gguf_file::Value) -> Option<u32> {
+    v.to_u32()
+        .ok()
+        .or_else(|| v.to_i32().ok().and_then(|x| u32::try_from(x).ok()))
+}
+
 pub fn config_from_gguf<R: std::io::Seek + std::io::Read>(
     ct: &candle_core::quantized::gguf_file::Content,
     reader: &mut R,
@@ -186,8 +193,15 @@ pub fn config_from_gguf<R: std::io::Seek + std::io::Read>(
         .and_then(|v| v.to_u32())
         .map(|v| v as usize)
         .or_else(|_| {
+            // Per-layer widths (Gemma4 E2B/E4B): the first layer's; double-wide layers come from extra config.
+            let per_layer = md_get(format!("{arch}.feed_forward_length").as_str())
+                .and_then(|v| v.to_vec())
+                .ok()
+                .and_then(|arr| arr.first().and_then(gguf_value_u32));
             if arch == "qwen35moe" {
                 Ok(0) //Qwen3.5 MoE has no MLP layer
+            } else if let Some(first) = per_layer {
+                Ok(first as usize)
             } else {
                 candle_core::bail!("cannot find {arch}.feed_forward_length in metadata")
             }
@@ -617,6 +631,18 @@ pub fn config_from_gguf<R: std::io::Seek + std::io::Read>(
                 "final_logit_softcapping": final_logit_softcapping,
                 "enable_moe_block": enable_moe,
                 "num_global_key_value_heads": num_global_kv_heads,
+                // E2B/E4B only; absent keys keep the dense/MoE Gemma4 path unchanged.
+                "hidden_size_per_layer_input":
+                    md_opt_usize(format!("{arch}.embedding_length_per_layer_input").as_str()),
+                "num_kv_shared_layers":
+                    md_opt_usize(format!("{arch}.attention.shared_kv_layers").as_str()),
+                "use_double_wide_mlp": md_get(format!("{arch}.feed_forward_length").as_str())
+                    .and_then(|v| v.to_vec())
+                    .map(|arr| {
+                        let w: Vec<u32> = arr.iter().filter_map(gguf_value_u32).collect();
+                        w.iter().any(|&x| Some(&x) != w.first())
+                    })
+                    .unwrap_or(false),
             })
             .to_string(),
         )

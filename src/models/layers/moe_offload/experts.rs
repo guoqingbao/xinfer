@@ -37,7 +37,7 @@ fn arr<T, const N: usize>(v: Vec<T>) -> [T; N] {
 }
 
 /// Little-endian bytes of a tensor, as the GPU stores them (fp8/e8m0 are u8-backed).
-fn host_bytes(t: &Tensor) -> Result<Vec<u8>> {
+pub(crate) fn host_bytes(t: &Tensor) -> Result<Vec<u8>> {
     fn le<T: Copy, const B: usize>(v: &[T], f: fn(T) -> [u8; B]) -> Vec<u8> {
         v.iter().flat_map(|&x| f(x)).collect()
     }
