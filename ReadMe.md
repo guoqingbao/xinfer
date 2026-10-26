@@ -114,9 +114,9 @@ Add `--kvcache-dtype` to compress KV cache and extend context length:
 | Ministral-3-3B (**Multimodal**) | ISQ (BF16→Q4K) | 3B | **193.67** tokens/s |
 | Qwen3-VL-8B-Instruct (**Multimodal**) | Q8_0 | 8B | **112.51** tokens/s |
 | Llama-3.1-8B | ISQ (BF16→Q4K) | 8B | **133.10** tokens/s |
-| DeepSeek-R1-0528-Qwen3-8B | Q4_K_M | 8B | **139.25** tokens/s |
-| GLM-4-9B-0414 | Q4_K_M | 9B | **77.48** tokens/s |
-| QwQ-32B | Q4_K_M | 32B | **46.02** tokens/s |
+| DeepSeek-R1-0528-Qwen3-8B | Q4_K_M | 8B | **161.60** tokens/s |
+| GLM-4-9B-0414 | Q4_K_M | 9B | **92.10** tokens/s |
+| QwQ-32B | Q4_K_M | 32B | **55.65** tokens/s |
 | **Qwen3-30B-A3B** | NVFP4 | **30B (MoE)** | **197.29** tokens/s (**RTX 5090**) |
 | **Qwen3-30B-A3B** | NVFP4 | **30B (MoE)** | **72.86** tokens/s (**V100, Software FP4**) |
 | **Qwen3-Next-80B** | AWQ | **80B (MoE)** | **90** tokens/s (**Hopper**) |
@@ -124,7 +124,7 @@ Add `--kvcache-dtype` to compress KV cache and extend context length:
 | **Qwen3.5/3.6/3.8 27B** | FP8 | **27B (Dense)** | **45** tokens/s (**Hopper**) |
 | **Qwen3.6-35B-A3B** (**Multimodal**) | FP8 | **35B (MoE)** | **120** tokens/s (**Hopper**) |
 | **GLM4.7 Flash** | NVFP4 | **30B (MoE)** | **79** tokens/s (**Hopper, Software FP4**) |
-| **Gemma4-31B** | ISQ (BF16→Q4K) | **31B (Dense)** | **47** tokens/s (**Hopper**) |
+| **Gemma4-31B** | ISQ (BF16→Q4K) | **31B (Dense)** | **55** tokens/s (**Hopper**) |
 | **Gemma4-26B-A4B** | NVFP4 | **26B (MoE)** | **137.23** tokens/s (**RTX 5090**) |
 | **MiniMax-M2.5** | NVFP4 | **229B (MoE)** | **64.50** tokens/s (**Hopper, Software FP4, TP=2**) |
 

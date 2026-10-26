@@ -219,6 +219,13 @@ pub struct QLinear {
 }
 
 impl QLinear {
+    pub fn qtensor(&self) -> Option<&Arc<QTensor>> {
+        match &self.inner {
+            Some(QMatMul::QTensor(tensor)) => Some(tensor),
+            _ => None,
+        }
+    }
+
     fn ggml_dtype_from_str(quant: &str) -> GgmlDType {
         match quant.to_lowercase().as_str() {
             "q40" | "q4_0" => GgmlDType::Q4_0,
@@ -501,8 +508,13 @@ impl Module for QLinear {
             } else {
                 x.to_owned()
             };
+            let logical_rows = xs.elem_count() / xs.dim(candle_core::D::Minus1)?;
             let xs = match inner {
-                QMatMul::QTensor(weight) if is_iq_gguf_dtype(weight.dtype()) => {
+                // Candle owns the large-M GGUF tensor-core dispatch.  Retain
+                // the custom IQ packed kernel only for decode/small batches.
+                QMatMul::QTensor(weight)
+                    if is_iq_gguf_dtype(weight.dtype()) && logical_rows < 64 =>
+                {
                     #[cfg(feature = "cuda")]
                     {
                         gguf_iq_matmul(&xs, weight)?
@@ -563,6 +575,13 @@ impl Module for LinearX {
 }
 
 impl LinearX {
+    pub fn as_qtensor(&self) -> Option<&Arc<QTensor>> {
+        match self {
+            Self::QLinear(linear) => linear.qtensor(),
+            _ => None,
+        }
+    }
+
     /// Run a dense linear whose checkpoint dtype may differ from the model
     /// activation dtype.  GGUF GDN tensors that need layout restoration can
     /// be kept in F16 (IQ tensors cannot be requantized), while the rest of

@@ -42,6 +42,56 @@ pub struct Attention {
 }
 
 impl Attention {
+    /// Pack native GGUF Q/K/V weights without requantizing their payloads.
+    /// This reduces three small decode matvec dispatches to one.
+    fn try_pack_gguf_qkv(
+        q_proj: &TensorParallelColumnLinear,
+        k_proj: &TensorParallelColumnLinear,
+        v_proj: &TensorParallelColumnLinear,
+        dtype: DType,
+    ) -> Option<QkvProjection> {
+        let (q, k, v) = (
+            q_proj.as_qtensor()?,
+            k_proj.as_qtensor()?,
+            v_proj.as_qtensor()?,
+        );
+        if q.dtype() != k.dtype()
+            || q.dtype() != v.dtype()
+            || q.shape().dims().len() != 2
+            || k.shape().dims().len() != 2
+            || v.shape().dims().len() != 2
+            || q.shape().dims()[1] != k.shape().dims()[1]
+            || q.shape().dims()[1] != v.shape().dims()[1]
+        {
+            return None;
+        }
+
+        let bias = match (
+            q_proj.qlinear_bias(),
+            k_proj.qlinear_bias(),
+            v_proj.qlinear_bias(),
+        ) {
+            (None, None, None) => None,
+            (Some(qb), Some(kb), Some(vb)) => Some(Tensor::cat(&[qb, kb, vb], 0).ok()?),
+            _ => return None,
+        };
+        let splits = vec![
+            q.shape().dims()[0],
+            k.shape().dims()[0],
+            v.shape().dims()[0],
+        ];
+        let weight = candle_core::quantized::QTensor::cat_rows(&[q, k, v]).ok()?;
+        let qlinear =
+            crate::models::layers::linear::QLinear::from_qparts_x(weight, None, dtype).ok()?;
+        let packed = MergedParallelColumnLinear::from_packed_local_qlinear(
+            crate::models::layers::linear::LinearX::QLinear(qlinear),
+            bias,
+            splits,
+        )
+        .ok()?;
+        Some(QkvProjection::Packed(packed))
+    }
+
     fn normalize_sharded_2d(
         t: Tensor,
         shard: candle_nn::var_builder::Shard,
@@ -502,10 +552,20 @@ impl Attention {
                 },
                 dtype,
             )?;
-            QkvProjection::Separate {
-                q_proj,
-                k_proj,
-                v_proj,
+            if is_qvar_builder {
+                Self::try_pack_gguf_qkv(&q_proj, &k_proj, &v_proj, dtype).unwrap_or(
+                    QkvProjection::Separate {
+                        q_proj,
+                        k_proj,
+                        v_proj,
+                    },
+                )
+            } else {
+                QkvProjection::Separate {
+                    q_proj,
+                    k_proj,
+                    v_proj,
+                }
             }
         };
 

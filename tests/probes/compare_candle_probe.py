@@ -197,6 +197,22 @@ def main():
         )
         failures += not ok
 
+        packed = rec[f"{tag}_matmul_packed"].to(dev)
+        packed_expected = torch.cat(
+            [rec[f"{tag}_matmul_cuda"].to(dev), rec[f"{tag}_matmul_native"].to(dev)],
+            dim=-1,
+        )
+        raw_expected = torch.cat(
+            [rec[f"{tag}_cuda_raw"].flatten(), rec[f"{tag}_native_raw"].flatten()]
+        )
+        raw_got = rec[f"{tag}_packed_raw"].flatten()
+        packed_ok = torch.equal(packed, packed_expected) and torch.equal(raw_got, raw_expected)
+        print(
+            f"{'PASS_EXACT' if packed_ok else 'FAIL':14} {tag+'_packed_gate_up':34} "
+            f"output_exact={torch.equal(packed, packed_expected)} raw_exact={torch.equal(raw_got, raw_expected)}"
+        )
+        failures += not packed_ok
+
         got = rec[f"{tag}_matmul_native"].to(dev)
         exact = rec[f"{tag}_x"].to(dev) @ expected_dequant.to(dev).t()
         cuda_input_golden = q8_1_dequant(rec[f"{tag}_x"].to(dev))
@@ -216,6 +232,30 @@ def main():
             f"cpu_ref_max={cpu_max:.8g} native_ref_max={native_max:.8g} "
             f"cpu_ref_mean={cpu_mean:.8g} native_ref_mean={native_mean:.8g} "
             f"q8_native_max={q8_max:.8g} q8_native_mean={q8_mean:.8g}"
+        )
+        failures += not ok
+
+        # Large-M CUDA dispatch: its exact contract is an F16-input/F16-weight
+        # tensor-core GEMM with F32 API output.  Also compare its error against
+        # the previous Q8_1-activation formulation to ensure the optimization
+        # did not trade away precision.
+        x_large = rec[f"{tag}_x_large"].to(dev)
+        got_large = rec[f"{tag}_matmul_large"].to(dev)
+        got_explicit = rec[f"{tag}_matmul_large_explicit_f16"].to(dev)
+        f16_gold = (x_large.half() @ expected_dequant.half().t()).float()
+        exact_large = x_large @ expected_dequant.t()
+        q8_large = q8_1_dequant(x_large) @ expected_dequant.t()
+        dispatch_diff = (got_large - got_explicit).abs().max().item()
+        f16_diff = (got_large - f16_gold).abs().max().item()
+        f16_err = (got_large - exact_large).abs()
+        q8_err = (q8_large - exact_large).abs()
+        precision_ok = (f16_err.mean() <= q8_err.mean()) and (f16_err.max() <= q8_err.max())
+        ok = dispatch_diff == 0.0 and f16_diff <= 2e-4 and precision_ok
+        print(
+            f"{'PASS_PRECISION' if ok else 'FAIL':14} {tag+'_large_f16_dispatch':34} "
+            f"dispatch_max={dispatch_diff:.8g} f16_ref_max={f16_diff:.8g} "
+            f"f16_exact_max={f16_err.max().item():.8g} q8_exact_max={q8_err.max().item():.8g} "
+            f"f16_exact_mean={f16_err.mean().item():.8g} q8_exact_mean={q8_err.mean().item():.8g}"
         )
         failures += not ok
     raise SystemExit(1 if failures else 0)

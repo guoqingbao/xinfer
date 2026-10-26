@@ -40,6 +40,12 @@ enum GdnProjection {
         in_proj_b: TensorParallelColumnLinear,
         in_proj_a: TensorParallelColumnLinear,
     },
+    // GGUF Qwen3.5: checkpoint rows packed on-device as [q|k|v|z] and [b|a].
+    // This preserves quantized bytes while sharing input quantization/launches.
+    PackedQkvzBa {
+        in_proj_qkvz: MergedParallelColumnLinear,
+        in_proj_ba: MergedParallelColumnLinear,
+    },
 }
 
 pub struct GatedDeltaNet {
@@ -75,6 +81,59 @@ pub struct GatedDeltaNet {
 }
 
 impl GatedDeltaNet {
+    fn pack_gguf_qwen35_projection(
+        in_proj_qkv: TensorParallelColumnLinear,
+        in_proj_z: TensorParallelColumnLinear,
+        in_proj_b: TensorParallelColumnLinear,
+        in_proj_a: TensorParallelColumnLinear,
+        key_dim: usize,
+        value_dim: usize,
+        num_v_heads: usize,
+        dtype: DType,
+    ) -> std::result::Result<
+        GdnProjection,
+        (
+            TensorParallelColumnLinear,
+            TensorParallelColumnLinear,
+            TensorParallelColumnLinear,
+            TensorParallelColumnLinear,
+        ),
+    > {
+        let packed = (|| -> Result<GdnProjection> {
+            let qkv = in_proj_qkv
+                .as_qtensor()
+                .ok_or_else(|| candle_core::Error::Msg("qkv is not a native GGUF tensor".into()))?;
+            let z = in_proj_z
+                .as_qtensor()
+                .ok_or_else(|| candle_core::Error::Msg("z is not a native GGUF tensor".into()))?;
+            let b = in_proj_b
+                .as_qtensor()
+                .ok_or_else(|| candle_core::Error::Msg("b is not a native GGUF tensor".into()))?;
+            let a = in_proj_a
+                .as_qtensor()
+                .ok_or_else(|| candle_core::Error::Msg("a is not a native GGUF tensor".into()))?;
+            let qkvz_weight =
+                candle_core::quantized::QTensor::cat_rows(&[qkv.as_ref(), z.as_ref()])?;
+            let ba_weight = candle_core::quantized::QTensor::cat_rows(&[b.as_ref(), a.as_ref()])?;
+            let qkvz =
+                crate::models::layers::linear::QLinear::from_qparts_x(qkvz_weight, None, dtype)?;
+            let ba = crate::models::layers::linear::QLinear::from_qparts_x(ba_weight, None, dtype)?;
+            Ok(GdnProjection::PackedQkvzBa {
+                in_proj_qkvz: MergedParallelColumnLinear::from_packed_local_qlinear(
+                    crate::models::layers::linear::LinearX::QLinear(qkvz),
+                    None,
+                    vec![key_dim, key_dim, value_dim, value_dim],
+                )?,
+                in_proj_ba: MergedParallelColumnLinear::from_packed_local_qlinear(
+                    crate::models::layers::linear::LinearX::QLinear(ba),
+                    None,
+                    vec![num_v_heads, num_v_heads],
+                )?,
+            })
+        })();
+        packed.map_err(|_| (in_proj_qkv, in_proj_z, in_proj_b, in_proj_a))
+    }
+
     /// Check if a weight at the given VarBuilder path actually carries quantized data.
     /// Returns false when the weight is stored in its original dtype (BF16/F16/F32)
     /// even though the model-level quantization config is set.
@@ -385,6 +444,28 @@ impl GatedDeltaNet {
                     };
 
                 if let Ok(in_proj_qkv) = split_qkv_legacy {
+                    if vb.is_qvar_builder() {
+                        match Self::pack_gguf_qwen35_projection(
+                            in_proj_qkv,
+                            in_proj_z,
+                            in_proj_b,
+                            in_proj_a,
+                            key_dim_global,
+                            value_dim_global,
+                            num_v_heads_global,
+                            DType::F32,
+                        ) {
+                            Ok(packed) => return Ok(packed),
+                            Err((in_proj_qkv, in_proj_z, in_proj_b, in_proj_a)) => {
+                                return Ok(GdnProjection::SplitQkvZaLegacy {
+                                    in_proj_qkv,
+                                    in_proj_z,
+                                    in_proj_b,
+                                    in_proj_a,
+                                });
+                            }
+                        }
+                    }
                     return Ok(GdnProjection::SplitQkvZaLegacy {
                         in_proj_qkv,
                         in_proj_z,
@@ -508,6 +589,28 @@ impl GatedDeltaNet {
                 let b = in_proj_b.forward(xs)?;
                 let a = in_proj_a.forward(xs)?;
                 Ok((q, k, v, z, b, a))
+            }
+            GdnProjection::PackedQkvzBa {
+                in_proj_qkvz,
+                in_proj_ba,
+            } => {
+                let qkvz = in_proj_qkvz.forward(xs)?;
+                let ba = in_proj_ba.forward(xs)?;
+                if qkvz.len() != 4 || ba.len() != 2 {
+                    candle_core::bail!(
+                        "invalid packed GGUF GDN projection splits: qkvz={}, ba={}",
+                        qkvz.len(),
+                        ba.len()
+                    )
+                }
+                Ok((
+                    qkvz[0].clone(),
+                    qkvz[1].clone(),
+                    qkvz[2].clone(),
+                    qkvz[3].clone(),
+                    ba[0].clone(),
+                    ba[1].clone(),
+                ))
             }
         }
     }

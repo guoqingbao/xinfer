@@ -168,8 +168,15 @@ impl LogitsProcessor {
                 let indices = asort[b].clone();
                 let mut prs = sorted[b].clone();
 
-                let sum_p = prs.iter().sum::<f32>();
-                let index = if top_p <= 0.0 || top_p >= sum_p {
+                // Top-p follows top-k, so calculate its cutoff against the
+                // renormalized top-k candidate distribution.
+                let top_k_mass = prs.iter().sum::<f32>();
+                if top_k_mass > 0.0 {
+                    for probability in &mut prs {
+                        *probability /= top_k_mass;
+                    }
+                }
+                let index = if top_p <= 0.0 || top_p >= 1.0 {
                     self.sample_multinomial(&prs)
                         .map_err(candle_core::Error::wrap)?
                 } else {
@@ -194,9 +201,74 @@ impl LogitsProcessor {
         vec_ret
     }
 
+    #[cfg(feature = "metal")]
+    fn sample_metal_topk(
+        &self,
+        logits: &Tensor,
+        top_k: usize,
+        temperature: f32,
+        top_p: Option<f32>,
+    ) -> Result<Vec<u32>> {
+        let logits = logits.to_dtype(DType::F32)?.contiguous()?;
+        let vocab_size = *logits
+            .dims()
+            .last()
+            .ok_or_else(|| Error::Msg("sampling received empty logits".into()))?;
+        let top_k = top_k.min(vocab_size);
+        if top_k == 0 {
+            return Err(Error::Msg("sampling top-k must be positive".into()));
+        }
+
+        // Sort on Metal and transfer only the selected candidates to the CPU
+        // sampler. The previous Metal path copied and sorted the full vocab.
+        let scaled = (&logits / temperature as f64)?;
+        let top_indices = scaled
+            .arg_sort_last_dim(false)?
+            .narrow(D::Minus1, 0, top_k)?
+            .contiguous()?;
+        let top_logits = scaled.gather(&top_indices, D::Minus1)?;
+        // Normalize after top-k filtering, matching the sampler chain used by
+        // llama.cpp. This softmax is only over the selected candidates.
+        let probabilities = candle_nn::ops::softmax_last_dim(&top_logits)?.contiguous()?;
+        let indices = top_indices.to_vec2::<u32>()?;
+        let probabilities = probabilities.to_vec2::<f32>()?;
+
+        let mut tokens = Vec::with_capacity(indices.len());
+        for (indices, mut probabilities) in indices.into_iter().zip(probabilities) {
+            if let Some(top_p) = top_p {
+                if top_p > 0.0 && top_p < 1.0 {
+                    let mut cumulative = 0.0;
+                    for probability in &mut probabilities {
+                        if cumulative >= top_p {
+                            *probability = 0.0;
+                        } else {
+                            cumulative += *probability;
+                        }
+                    }
+                }
+            }
+            let candidate = self.sample_multinomial(&probabilities)? as usize;
+            tokens.push(indices[candidate]);
+        }
+        Ok(tokens)
+    }
+
     /// Sample tokens using a pre-computed sampling strategy.
     /// This is more efficient than `sample()` when the strategy is already computed and cached.
     pub fn sample_with_strategy(&self, logits: &Tensor, sampling: &Sampling) -> Result<Vec<u32>> {
+        #[cfg(feature = "metal")]
+        if logits.device().is_metal() {
+            match sampling {
+                Sampling::TopK { k, temperature } => {
+                    return self.sample_metal_topk(logits, *k, *temperature, None);
+                }
+                Sampling::TopKThenTopP { k, p, temperature } => {
+                    return self.sample_metal_topk(logits, *k, *temperature, Some(*p));
+                }
+                _ => {}
+            }
+        }
+
         #[cfg(feature = "cuda")]
         {
             // Extract k, p, and temperature based on the sampling strategy.

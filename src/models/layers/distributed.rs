@@ -71,6 +71,17 @@ impl TensorParallelColumnLinear {
     pub fn as_nvfp4(&self) -> Option<&crate::models::layers::linear::LnNvfp4> {
         self.linear.as_nvfp4()
     }
+
+    pub fn as_qtensor(&self) -> Option<&std::sync::Arc<candle_core::quantized::QTensor>> {
+        self.linear.as_qtensor()
+    }
+
+    pub fn qlinear_bias(&self) -> Option<&Tensor> {
+        match &self.linear {
+            crate::models::layers::linear::LinearX::QLinear(linear) => linear.bias(),
+            _ => None,
+        }
+    }
 }
 
 pub fn tensor_parallel_chunk(

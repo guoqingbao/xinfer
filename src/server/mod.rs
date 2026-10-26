@@ -761,6 +761,10 @@ pub struct Args {
     #[arg(long, default_value_t = 16384)]
     pub max_tokens: usize,
 
+    /// Continue generation after the model emits an EOS token.
+    #[arg(long, default_value_t = false)]
+    pub ignore_eos: bool,
+
     /// for batch performance test
     #[arg(long, default_value = None)]
     pub batch: Option<usize>,

@@ -617,7 +617,7 @@ impl Scheduler {
                 let seq = &mut self.running[idx];
 
                 if hit_stop_sequence
-                    || self.eos_token_id.contains(&token)
+                    || (!seq.sampling_params.ignore_eos && self.eos_token_id.contains(&token))
                     || seq.output_len() >= seq.sampling_params.max_tokens.unwrap_or(16384)
                     || seq.len()
                         > self
@@ -697,7 +697,8 @@ impl Scheduler {
             }
             let mut finished = false;
             for &tok in extra_tokens {
-                if self.eos_token_id.contains(&tok) {
+                if !self.running[idx].sampling_params.ignore_eos && self.eos_token_id.contains(&tok)
+                {
                     self.running[idx].append_token(tok);
                     self.running[idx].status = SequenceStatus::Finished;
                     self.block_manager
