@@ -2,14 +2,16 @@
 // Shared Qwen3.5/Qwen3Next GatedDeltaNet linear-attention layer.
 
 use crate::models::layers::distributed::{
-    load_restored_gguf_column_linear, load_restored_gguf_merged_qkv_linear,
-    load_restored_gguf_row_linear, shard, tensor_parallel_chunk, Comm, MergedParallelColumnLinear,
-    TensorParallelColumnLinear, TensorParallelRowLinear,
+    load_iq_gguf_sharded_row_linear, load_restored_gguf_column_linear,
+    load_restored_gguf_merged_qkv_linear, load_restored_gguf_row_linear, shard,
+    tensor_parallel_chunk, AllGather, Comm, MergedParallelColumnLinear, TensorParallelColumnLinear,
+    TensorParallelRowLinear,
 };
 use crate::models::layers::{collect_key_map, VarBuilderX};
 use crate::utils::config::Config;
 use crate::utils::gguf_helper::{
-    restore_qwen35_a_log_from_gguf, restore_qwen35_qkv_weight, undo_tiled_v_heads_first_dim,
+    restore_qwen35_a_log_from_gguf, restore_qwen35_qkv_row_indices, restore_qwen35_qkv_weight,
+    tile_v_heads_last_dim, undo_tiled_v_heads_first_dim, undo_tiled_v_heads_first_dim_indices,
     undo_tiled_v_heads_last_dim,
 };
 use crate::utils::resolve_qwen3_hybrid_config;
@@ -48,9 +50,58 @@ enum GdnProjection {
     },
 }
 
+struct IqTiledOutProjection {
+    gather: Option<AllGather>,
+    replicated_weight: bool,
+    rank: usize,
+    world_size: usize,
+    num_k_heads: usize,
+    num_v_heads: usize,
+    head_v_dim: usize,
+}
+
+impl IqTiledOutProjection {
+    fn prepare_local_input(&self, x: &Tensor, token_count: usize) -> Result<Tensor> {
+        let (_, local_value_dim) = x.dims2()?;
+        let logical_input = if self.world_size > 1 {
+            let gather = self.gather.as_ref().ok_or_else(|| {
+                candle_core::Error::Msg(
+                    "IQ GDN output projection requires NCCL all-gather for tensor parallelism"
+                        .into(),
+                )
+            })?;
+            let flat = x
+                .contiguous()?
+                .reshape((1, token_count * local_value_dim))?;
+            gather
+                .apply(&flat)?
+                .reshape((self.world_size, token_count, local_value_dim))?
+                .transpose(0, 1)?
+                .contiguous()?
+                .reshape((token_count, self.world_size * local_value_dim))?
+        } else {
+            x.clone()
+        };
+        let tiled = tile_v_heads_last_dim(
+            &logical_input,
+            self.num_k_heads,
+            self.num_v_heads,
+            self.head_v_dim,
+        )?;
+        if self.world_size > 1 && !self.replicated_weight {
+            tiled
+                .narrow(1, self.rank * local_value_dim, local_value_dim)?
+                .contiguous()
+        } else {
+            Ok(tiled)
+        }
+    }
+}
+
 pub struct GatedDeltaNet {
     projection: GdnProjection,
     out_proj: TensorParallelRowLinear,
+    iq_tiled_out_proj: Option<IqTiledOutProjection>,
     conv_weight: Tensor,
     conv_bias: Option<Tensor>,
     a_log: Tensor,
@@ -218,6 +269,17 @@ impl GatedDeltaNet {
             ("in_proj_a", "ssm_alpha"),
         ];
         let projection_key_map = collect_key_map(vb.is_qvar_builder(), projection_pairs);
+        let restored_v_head_rows = undo_tiled_v_heads_first_dim_indices(
+            num_k_heads_global,
+            num_v_heads_global,
+            head_v_dim,
+        )?;
+        let restored_qkv_rows = restore_qwen35_qkv_row_indices(
+            key_dim_global,
+            num_k_heads_global,
+            num_v_heads_global,
+            head_v_dim,
+        )?;
 
         // Qwen3Next format: fused qkvz + fused ba
         let projection_size_qkvz = key_dim_global * 2 + value_dim_global * 2;
@@ -276,6 +338,7 @@ impl GatedDeltaNet {
                 projection_key_map["in_proj_z"],
                 comm.clone(),
                 DType::F32,
+                &restored_v_head_rows,
                 |w| {
                     undo_tiled_v_heads_first_dim(
                         &w,
@@ -308,6 +371,7 @@ impl GatedDeltaNet {
                 projection_key_map["in_proj_b"],
                 comm.clone(),
                 DType::F32,
+                &restored_v_head_rows,
                 |w| undo_tiled_v_heads_first_dim(&w, num_k_heads_global, num_v_heads_global, 1),
             )
         } else {
@@ -332,6 +396,7 @@ impl GatedDeltaNet {
                 projection_key_map["in_proj_a"],
                 comm.clone(),
                 DType::F32,
+                &restored_v_head_rows,
                 |w| undo_tiled_v_heads_first_dim(&w, num_k_heads_global, num_v_heads_global, 1),
             )
         } else {
@@ -417,6 +482,7 @@ impl GatedDeltaNet {
                             projection_key_map["in_proj_qkv"],
                             comm.clone(),
                             DType::F32,
+                            &restored_qkv_rows,
                             |w| {
                                 restore_qwen35_qkv_weight(
                                     &w,
@@ -776,23 +842,51 @@ impl GatedDeltaNet {
         };
 
         // Output projection
-        let out_proj = if vb.is_qvar_builder() && num_k_heads_global != num_v_heads_global {
-            load_restored_gguf_row_linear(
+        let (out_proj, iq_tiled_out_proj) = if vb.is_qvar_builder()
+            && num_k_heads_global != num_v_heads_global
+        {
+            let iq_sharded = load_iq_gguf_sharded_row_linear(
                 &vb,
                 value_dim_global,
                 hidden_size,
                 gdn_key_map["out_proj"],
                 comm.clone(),
                 DType::F32,
-                |w| {
-                    undo_tiled_v_heads_last_dim(
-                        &w,
-                        num_k_heads_global,
-                        num_v_heads_global,
+            )?;
+            if let Some((out_proj, replicated_weight)) = iq_sharded {
+                (
+                    out_proj,
+                    Some(IqTiledOutProjection {
+                        gather: (world_size > 1).then(|| AllGather::new(comm.clone())),
+                        replicated_weight,
+                        rank,
+                        world_size,
+                        num_k_heads: num_k_heads_global,
+                        num_v_heads: num_v_heads_global,
                         head_v_dim,
-                    )
-                },
-            )?
+                    }),
+                )
+            } else {
+                (
+                    load_restored_gguf_row_linear(
+                        &vb,
+                        value_dim_global,
+                        hidden_size,
+                        gdn_key_map["out_proj"],
+                        comm.clone(),
+                        DType::F32,
+                        |w| {
+                            undo_tiled_v_heads_last_dim(
+                                &w,
+                                num_k_heads_global,
+                                num_v_heads_global,
+                                head_v_dim,
+                            )
+                        },
+                    )?,
+                    None,
+                )
+            }
         } else {
             let vb_out = vb.pp(gdn_key_map["out_proj"]);
             let (qc_out, q_out) = if is_quantized {
@@ -800,15 +894,18 @@ impl GatedDeltaNet {
             } else {
                 (None, None)
             };
-            TensorParallelRowLinear::load_with_hints(
-                value_dim_global,
-                hidden_size,
-                vb_out,
-                comm.clone(),
-                &qc_out,
-                &q_out,
-                dtype,
-            )?
+            (
+                TensorParallelRowLinear::load_with_hints(
+                    value_dim_global,
+                    hidden_size,
+                    vb_out,
+                    comm.clone(),
+                    &qc_out,
+                    &q_out,
+                    dtype,
+                )?,
+                None,
+            )
         };
 
         // GDN output norm (gated RMSNorm): both Qwen3.5 and Qwen3Next use per-head params.
@@ -857,6 +954,7 @@ impl GatedDeltaNet {
         Ok(Self {
             projection,
             out_proj,
+            iq_tiled_out_proj,
             conv_weight,
             conv_bias,
             a_log,
@@ -1114,9 +1212,19 @@ impl GatedDeltaNet {
             )?
         };
 
-        let out = self
-            .out_proj
-            .forward(&gated_output.to_dtype(self.model_dtype)?)?;
+        let mut out_proj_input = gated_output.to_dtype(self.model_dtype)?;
+        if let Some(iq_tiled_out_proj) = &self.iq_tiled_out_proj {
+            out_proj_input = iq_tiled_out_proj.prepare_local_input(&out_proj_input, token_count)?;
+        }
+        let out = if self
+            .iq_tiled_out_proj
+            .as_ref()
+            .is_some_and(|projection| projection.replicated_weight)
+        {
+            self.out_proj.forward_local(&out_proj_input)?
+        } else {
+            self.out_proj.forward(&out_proj_input)?
+        };
         if out.dtype() != original_dtype {
             out.to_dtype(original_dtype)
         } else {

@@ -731,6 +731,54 @@ pub fn undo_tiled_v_heads_first_dim(
         .reshape(dims)
 }
 
+/// Source row indices in the order produced by `undo_tiled_v_heads_first_dim`.
+/// GGUF quant blocks run along the last dimension, so callers can use this
+/// order to restore a tensor by moving whole raw rows without dequantizing it.
+pub fn undo_tiled_v_heads_first_dim_indices(
+    num_k_heads: usize,
+    num_v_heads: usize,
+    head_dim: usize,
+) -> candle_core::Result<Vec<usize>> {
+    if num_k_heads == 0 || num_v_heads == 0 || head_dim == 0 || num_v_heads % num_k_heads != 0 {
+        candle_core::bail!(
+            "invalid GDN head dimensions (num_k_heads={}, num_v_heads={}, head_dim={})",
+            num_k_heads,
+            num_v_heads,
+            head_dim
+        );
+    }
+    let num_v_per_k = num_v_heads / num_k_heads;
+    let mut rows = Vec::with_capacity(num_v_heads * head_dim);
+    for k_head in 0..num_k_heads {
+        for v_head in 0..num_v_per_k {
+            let source_head = v_head * num_k_heads + k_head;
+            for dim in 0..head_dim {
+                rows.push(source_head * head_dim + dim);
+            }
+        }
+    }
+    Ok(rows)
+}
+
+/// Row order for the restored Qwen3.5 packed `[q|k|v]` projection.
+pub fn restore_qwen35_qkv_row_indices(
+    key_dim: usize,
+    num_k_heads: usize,
+    num_v_heads: usize,
+    head_v_dim: usize,
+) -> candle_core::Result<Vec<usize>> {
+    let value_dim = num_v_heads * head_v_dim;
+    let mut rows = Vec::with_capacity(key_dim * 2 + value_dim);
+    rows.extend(0..key_dim);
+    rows.extend(key_dim..key_dim * 2);
+    rows.extend(
+        undo_tiled_v_heads_first_dim_indices(num_k_heads, num_v_heads, head_v_dim)?
+            .into_iter()
+            .map(|row| key_dim * 2 + row),
+    );
+    Ok(rows)
+}
+
 pub fn undo_tiled_v_heads_last_dim(
     x: &candle_core::Tensor,
     num_k_heads: usize,
@@ -755,6 +803,45 @@ pub fn undo_tiled_v_heads_last_dim(
     let split_dim = dims.len() - 1;
     let mut reshaped = dims[..split_dim].to_vec();
     reshaped.extend_from_slice(&[num_v_per_k, num_k_heads, head_dim]);
+    x.reshape(reshaped)?
+        .transpose(split_dim, split_dim + 1)?
+        .contiguous()?
+        .reshape(dims)
+}
+
+/// Convert logical `[key_head, value_head_within_key, dim]` order back to
+/// GGUF's tiled `[value_head_within_key, key_head, dim]` order.
+pub fn tile_v_heads_last_dim(
+    x: &candle_core::Tensor,
+    num_k_heads: usize,
+    num_v_heads: usize,
+    head_dim: usize,
+) -> candle_core::Result<candle_core::Tensor> {
+    if num_k_heads == num_v_heads {
+        return Ok(x.clone());
+    }
+    if num_k_heads == 0 || num_v_heads == 0 || num_v_heads % num_k_heads != 0 || head_dim == 0 {
+        candle_core::bail!(
+            "invalid GDN head dimensions (num_k_heads={}, num_v_heads={}, head_dim={})",
+            num_k_heads,
+            num_v_heads,
+            head_dim
+        );
+    }
+    let dims = x.dims().to_vec();
+    let last = *dims.last().ok_or_else(|| {
+        candle_core::Error::Msg("tile_v_heads_last_dim expects non-empty tensor".into())
+    })?;
+    if last != num_v_heads * head_dim {
+        candle_core::bail!(
+            "tile_v_heads_last_dim expects trailing dim {}, got {:?}",
+            num_v_heads * head_dim,
+            x.shape()
+        );
+    }
+    let split_dim = dims.len() - 1;
+    let mut reshaped = dims[..split_dim].to_vec();
+    reshaped.extend_from_slice(&[num_k_heads, num_v_heads / num_k_heads, head_dim]);
     x.reshape(reshaped)?
         .transpose(split_dim, split_dim + 1)?
         .contiguous()?
