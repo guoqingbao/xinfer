@@ -18,7 +18,6 @@ use candle_core::{DType, Device, Module, Result, Tensor};
 use candle_nn::Linear;
 use either::Either;
 use parking_lot::RwLock;
-use std::iter::zip;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -196,6 +195,7 @@ impl Gemma4DecoderLayer {
         dtype: DType,
         intermediate_size: usize,
         hidden_size_per_layer_input: Option<usize>,
+        kv_shared: bool,
     ) -> Result<Self> {
         let is_qvar_builder = vb.is_qvar_builder();
 
@@ -273,6 +273,7 @@ impl Gemma4DecoderLayer {
             dtype,
             k_eq_v,
             false,
+            kv_shared,
         )?;
 
         let mlp = MLP::new(
@@ -624,8 +625,8 @@ pub struct Gemma4ForCausalLM {
     layer_types: Vec<String>,
     hidden_size_per_layer_input: Option<usize>,
     num_hidden_layers: usize,
-    // Layers from this index reuse the K/V of the last earlier layer of the same type.
-    first_kv_shared_layer: usize,
+    // KV cache of every layer; KV-shared layers point at their producer layer's cache.
+    kv_cache_index: Vec<usize>,
     #[cfg(feature = "cuda")]
     _ple_host: Option<PleHostTable>,
 }
@@ -848,6 +849,14 @@ impl Gemma4ForCausalLM {
         let first_kv_shared_layer = config
             .num_hidden_layers
             .saturating_sub(num_kv_shared_layers);
+        // Same layout the KV-cache allocator uses: cache index per layer.
+        let kv_cache_index = match crate::utils::gemma4_kv_cache_layout(config) {
+            Some(layout) => layout,
+            None if num_kv_shared_layers > 0 => candle_core::bail!(
+                "Gemma4: cannot resolve the producer layers of {num_kv_shared_layers} KV-shared layers"
+            ),
+            None => (0..config.num_hidden_layers).collect(),
+        };
 
         let lm_prefix = if is_qvar_builder {
             "model"
@@ -1071,6 +1080,7 @@ impl Gemma4ForCausalLM {
                 dtype,
                 layer_intermediate,
                 hidden_size_per_layer_input,
+                kv_cache_index[i] != i,
             )?;
             layers.push(layer);
             reporter.write().set_progress(i + 1);
@@ -1121,7 +1131,7 @@ impl Gemma4ForCausalLM {
             layer_types,
             hidden_size_per_layer_input,
             num_hidden_layers: config.num_hidden_layers,
-            first_kv_shared_layer,
+            kv_cache_index,
             #[cfg(feature = "cuda")]
             _ple_host: ple_host,
         })
@@ -1216,15 +1226,14 @@ impl Gemma4ForCausalLM {
         );
 
         if let Some(kv_caches) = kv_caches {
-            // Last non-shared K/V per attention type: [sliding, full].
-            let mut last_kv: [Option<(Tensor, Tensor)>; 2] = [None, None];
-            for ((k_cache, v_cache), (i, layer)) in
-                zip(kv_caches.iter(), self.layers.iter().enumerate())
-            {
+            // K/V each cache owner produced this step, for the KV-shared layers that follow.
+            let mut produced: Vec<Option<(Tensor, Tensor)>> = vec![None; kv_caches.len()];
+            for (i, layer) in self.layers.iter().enumerate() {
+                let c = self.kv_cache_index[i];
+                let (k_cache, v_cache) = &kv_caches[c];
                 let pli = per_layer_inputs.as_ref().map(|v| &v[i]);
-                let slot = if layer.is_sliding { 0 } else { 1 };
-                let shared_kv = if i >= self.first_kv_shared_layer {
-                    last_kv[slot].as_ref().map(|(k, v)| (k, v))
+                let shared_kv = if c != i {
+                    produced[c].as_ref().map(|(k, v)| (k, v))
                 } else {
                     None
                 };
@@ -1239,8 +1248,8 @@ impl Gemma4ForCausalLM {
                     shared_kv,
                 )?;
                 xs = out;
-                if i < self.first_kv_shared_layer {
-                    last_kv[slot] = Some(kv);
+                if c == i {
+                    produced[c] = Some(kv);
                 }
             }
         }

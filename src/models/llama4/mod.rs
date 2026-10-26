@@ -235,6 +235,7 @@ impl LLama4DecoderLayer {
             dtype,
             false,
             text_cfg.use_qk_norm && use_rope,
+            false,
         )?;
 
         let moe_layers = text_cfg.moe_layers();

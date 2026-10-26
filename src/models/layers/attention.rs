@@ -20,6 +20,10 @@ enum QkvProjection {
         v_proj: TensorParallelColumnLinear,
     },
     Packed(MergedParallelColumnLinear),
+    /// KV-shared layer (Gemma4 E2B/E4B): K/V come from an earlier layer.
+    QOnly {
+        q_proj: TensorParallelColumnLinear,
+    },
 }
 
 pub struct Attention {
@@ -420,9 +424,11 @@ impl Attention {
             dtype,
             false,
             false,
+            false,
         )
     }
 
+    /// `kv_shared`: load only `q_proj`; `forward_with_kv` must then get `shared_kv`.
     pub fn new_with_options(
         vb: VarBuilderX,
         comm: Rc<Comm>,
@@ -432,6 +438,7 @@ impl Attention {
         dtype: DType,
         k_eq_v: bool,
         qk_l2_norm: bool,
+        kv_shared: bool,
     ) -> Result<Self> {
         let hidden_size = config.hidden_size;
         let num_heads = config.num_attention_heads;
@@ -487,7 +494,24 @@ impl Attention {
         let attention_heads = num_heads / world_size;
         let (kv_heads, kv_shard) = kv_head_shard(num_kv_heads, comm.rank(), world_size)?;
 
-        let qkv_proj = if let Some(packed) = Self::try_load_packed_qkv(
+        let qkv_proj = if kv_shared {
+            QkvProjection::QOnly {
+                q_proj: TensorParallelColumnLinear::load_with_hints(
+                    hidden_size,
+                    q_out_dim,
+                    attention_bias,
+                    if is_qvar_builder {
+                        vb.pp(key_map["q_proj"])
+                    } else {
+                        vb.pp("q_proj")
+                    },
+                    comm.clone(),
+                    &config.quantization_config,
+                    &config.quant,
+                    dtype,
+                )?,
+            }
+        } else if let Some(packed) = Self::try_load_packed_qkv(
             &vb,
             hidden_size,
             q_out_dim,
@@ -801,6 +825,19 @@ impl Attention {
                 }
                 (qkv[0].clone(), qkv[1].clone(), qkv[2].clone())
             }
+            QkvProjection::QOnly { q_proj } => {
+                if shared_kv.is_none() {
+                    candle_core::bail!("KV-shared attention layer called without shared K/V");
+                }
+                // Zeros only feed the K norm/RoPE path below; `shared_kv` replaces them.
+                let q = q_proj.forward(xs)?;
+                let z = Tensor::zeros(
+                    (seq_len, self.num_kv_heads * self.head_dim),
+                    q.dtype(),
+                    q.device(),
+                )?;
+                (q, z.clone(), z)
+            }
         };
 
         let local_q_dim = self.num_heads * self.head_dim;
@@ -964,6 +1001,11 @@ impl Attention {
             QkvProjection::Packed(qkv_proj) => {
                 let qkv = qkv_proj.forward(xs)?;
                 (qkv[0].clone(), qkv[1].clone(), qkv[2].clone())
+            }
+            QkvProjection::QOnly { .. } => {
+                candle_core::bail!(
+                    "forward_single_token_no_cache: KV-shared layers need shared K/V"
+                )
             }
         };
 

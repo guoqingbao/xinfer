@@ -1409,6 +1409,45 @@ pub fn qwen3_hybrid_layer_types(config: &Config) -> Option<Vec<String>> {
 /// - HF multimodal (`Gemma4ForConditionalGeneration`): keys nested under `text_config`
 /// - HF text-only (`Gemma4ForCausalLM`): keys at top level of `extra_config_json`
 /// - GGUF: synthetic JSON with `swa_head_dim`/`global_head_dim` at top level
+/// Gemma4 KV-cache layout: the cache index of every layer. The last `num_kv_shared_layers`
+/// layers (E2B/E4B) reuse the cache of the last earlier layer of the same attention type,
+/// so only `num_hidden_layers - num_kv_shared_layers` caches exist. `None` without sharing.
+pub fn gemma4_kv_cache_layout(config: &Config) -> Option<Vec<usize>> {
+    let arch = config.architectures.as_ref()?.first()?;
+    if !arch.contains("Gemma4") {
+        return None;
+    }
+    let root: serde_json::Value = serde_json::from_str(config.extra_config_json.as_ref()?).ok()?;
+    let cfg = root.get("text_config").unwrap_or(&root);
+    let get = |key: &str| cfg.get(key).or_else(|| root.get(key));
+    let n = config.num_hidden_layers;
+    let shared = get("num_kv_shared_layers")?.as_u64()? as usize;
+    if shared == 0 || shared >= n {
+        return None;
+    }
+    let layer_types: Vec<String> = serde_json::from_value(get("layer_types")?.clone()).ok()?;
+    if layer_types.len() != n {
+        return None;
+    }
+    let first_shared = n - shared;
+    (0..n)
+        .map(|i| {
+            if i < first_shared {
+                Some(i)
+            } else {
+                (0..first_shared)
+                    .rev()
+                    .find(|&j| layer_types[j] == layer_types[i])
+            }
+        })
+        .collect()
+}
+
+/// Number of KV caches a `gemma4_kv_cache_layout` needs (layers that own their cache).
+pub fn gemma4_num_kv_caches(layout: &[usize]) -> usize {
+    layout.iter().enumerate().filter(|&(i, &c)| i == c).count()
+}
+
 pub fn gemma4_per_layer_cache_config(config: &Config) -> Option<Vec<(usize, usize)>> {
     let arch = config.architectures.as_ref()?.first()?;
     if !arch.contains("Gemma4") {
@@ -1443,7 +1482,7 @@ pub fn gemma4_per_layer_cache_config(config: &Config) -> Option<Vec<(usize, usiz
         .and_then(|v| v.as_u64())
         .unwrap_or(swa_kv_heads as u64) as usize;
 
-    let per_layer = layer_types
+    let mut per_layer = layer_types
         .iter()
         .map(|lt| {
             if lt == "full_attention" {
@@ -1453,6 +1492,10 @@ pub fn gemma4_per_layer_cache_config(config: &Config) -> Option<Vec<(usize, usiz
             }
         })
         .collect::<Vec<_>>();
+    // KV-shared layers own no cache; the cache-owning layers come first.
+    if let Some(layout) = gemma4_kv_cache_layout(config) {
+        per_layer.truncate(gemma4_num_kv_caches(&layout));
+    }
 
     if per_layer
         .iter()
@@ -2719,8 +2762,8 @@ pub fn log_throughput(outputs: &[GenerationOutput]) {
 #[cfg(test)]
 mod tests {
     use super::{
-        config_from_gguf, gemma4_per_layer_cache_config, get_arch_rope, parse_fallback_moe_cfg,
-        ModelType,
+        config_from_gguf, gemma4_kv_cache_layout, gemma4_num_kv_caches,
+        gemma4_per_layer_cache_config, get_arch_rope, parse_fallback_moe_cfg, ModelType,
     };
     use crate::utils::config::Config;
     use candle_core::quantized::gguf_file::{Content, Value, VersionedMagic};
@@ -2912,6 +2955,29 @@ mod tests {
         let per_layer = gemma4_per_layer_cache_config(&config).unwrap();
         assert_eq!(per_layer[0], (8, 256));
         assert_eq!(per_layer[5], (8, 512));
+    }
+
+    #[test]
+    fn gemma4_kv_shared_layers_reuse_producer_caches() {
+        let config = gemma4_test_config(serde_json::json!({
+            "layer_types": [
+                "sliding_attention",
+                "sliding_attention",
+                "full_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "full_attention"
+            ],
+            "swa_head_dim": 256,
+            "global_head_dim": 512,
+            "num_kv_shared_layers": 3
+        }));
+
+        let layout = gemma4_kv_cache_layout(&config).unwrap();
+        assert_eq!(layout, vec![0, 1, 2, 1, 1, 2]);
+        assert_eq!(gemma4_num_kv_caches(&layout), 3);
+        let per_layer = gemma4_per_layer_cache_config(&config).unwrap();
+        assert_eq!(per_layer, vec![(8, 256), (8, 256), (8, 512)]);
     }
 }
 
