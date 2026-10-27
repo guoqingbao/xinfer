@@ -790,8 +790,9 @@ impl Attention {
         .map(|(y, _)| y)
     }
 
-    /// Like `forward_ext`, but returns the K/V written to the cache and can attend over
-    /// `shared_kv` (another layer's K/V) instead of its own, as Gemma4 KV-shared layers do.
+    /// Like `forward_ext`, but returns the K/V written to the cache. With `shared_kv`
+    /// (producer layer, its K/V), attends over the producer's K/V and cache instead of
+    /// its own, as Gemma4 KV-shared layers do.
     pub fn forward_with_kv(
         &self,
         xs: &Tensor,
@@ -801,7 +802,7 @@ impl Attention {
         cache: Option<(&Tensor, &Tensor)>,
         input_metadata: &InputMetadata,
         q_scale: Option<&Tensor>,
-        shared_kv: Option<(&Tensor, &Tensor)>,
+        shared_kv: Option<(&Attention, &Tensor, &Tensor)>,
     ) -> Result<(Tensor, (Tensor, Tensor))> {
         let (seq_len, _) = xs.dims2()?;
 
@@ -911,11 +912,11 @@ impl Attention {
             v
         };
 
-        // shortcut: the own K/V of a shared layer is still projected (its weights ship in the
-        // checkpoint) and then discarded; skip the projection if that ever shows up in profiles.
-        let (k, v) = match shared_kv {
-            Some((k, v)) => (k.clone(), v.clone()),
-            None => (k, v),
+        // A KV-shared layer runs on its producer's PagedAttention: same logical layer index
+        // (TurboQuant buffers, FP8 KV scales) and split-K workspace as the cache it reads.
+        let (attn, k, v) = match shared_kv {
+            Some((producer, k, v)) => (&producer.attn, k.clone(), v.clone()),
+            None => (&self.attn, k, v),
         };
 
         if let Some(rotary_emb) = &rotary_emb {
@@ -943,8 +944,7 @@ impl Attention {
                 .to_dtype(q.dtype())?;
         }
 
-        let y = self
-            .attn
+        let y = attn
             .forward(
                 &q,
                 &k,

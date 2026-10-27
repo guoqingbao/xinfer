@@ -663,8 +663,11 @@ impl KVCacheAllocator {
         let flash_splitk_bytes: u64 = if cfg!(feature = "flash") || cfg!(feature = "flashattn") {
             let q_heads_per_shard = self.num_attention_heads / self.num_shards.max(1);
             let splits = 8usize; // flash::NUM_SPLITS
-            let per_layer = 64 * q_heads_per_shard * splits * (self.head_dim + 2) * 4;
-            (per_layer * self.num_kv_layers) as u64
+                                 // One workspace per cache owner (Gemma4 KV-shared layers run on their producer's
+                                 // PagedAttention), sized by that layer's own head_dim.
+            (0..self.num_kv_layers)
+                .map(|i| 64 * q_heads_per_shard * splits * (self.layer_kv_config(i).1 + 2) * 4)
+                .sum::<usize>() as u64
         } else {
             0
         };

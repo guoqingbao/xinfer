@@ -501,7 +501,7 @@ impl Gemma4DecoderLayer {
         positions: &Tensor,
         cache: Option<(&Tensor, &Tensor)>,
         input_metadata: &InputMetadata,
-        shared_kv: Option<(&Tensor, &Tensor)>,
+        shared_kv: Option<(&Attention, &Tensor, &Tensor)>,
     ) -> Result<(Tensor, (Tensor, Tensor))> {
         let xs = xs.clone();
 
@@ -1233,7 +1233,9 @@ impl Gemma4ForCausalLM {
                 let (k_cache, v_cache) = &kv_caches[c];
                 let pli = per_layer_inputs.as_ref().map(|v| &v[i]);
                 let shared_kv = if c != i {
-                    produced[c].as_ref().map(|(k, v)| (k, v))
+                    produced[c]
+                        .as_ref()
+                        .map(|(k, v)| (&self.layers[c].self_attn, k, v))
                 } else {
                     None
                 };
