@@ -20,6 +20,10 @@ enum QkvProjection {
         v_proj: TensorParallelColumnLinear,
     },
     Packed(MergedParallelColumnLinear),
+    /// KV-shared layer (Gemma4 E2B/E4B): K/V come from an earlier layer.
+    QOnly {
+        q_proj: TensorParallelColumnLinear,
+    },
 }
 
 pub struct Attention {
@@ -420,9 +424,11 @@ impl Attention {
             dtype,
             false,
             false,
+            false,
         )
     }
 
+    /// `kv_shared`: load only `q_proj`; `forward_with_kv` must then get `shared_kv`.
     pub fn new_with_options(
         vb: VarBuilderX,
         comm: Rc<Comm>,
@@ -432,6 +438,7 @@ impl Attention {
         dtype: DType,
         k_eq_v: bool,
         qk_l2_norm: bool,
+        kv_shared: bool,
     ) -> Result<Self> {
         let hidden_size = config.hidden_size;
         let num_heads = config.num_attention_heads;
@@ -487,7 +494,24 @@ impl Attention {
         let attention_heads = num_heads / world_size;
         let (kv_heads, kv_shard) = kv_head_shard(num_kv_heads, comm.rank(), world_size)?;
 
-        let qkv_proj = if let Some(packed) = Self::try_load_packed_qkv(
+        let qkv_proj = if kv_shared {
+            QkvProjection::QOnly {
+                q_proj: TensorParallelColumnLinear::load_with_hints(
+                    hidden_size,
+                    q_out_dim,
+                    attention_bias,
+                    if is_qvar_builder {
+                        vb.pp(key_map["q_proj"])
+                    } else {
+                        vb.pp("q_proj")
+                    },
+                    comm.clone(),
+                    &config.quantization_config,
+                    &config.quant,
+                    dtype,
+                )?,
+            }
+        } else if let Some(packed) = Self::try_load_packed_qkv(
             &vb,
             hidden_size,
             q_out_dim,
@@ -753,6 +777,33 @@ impl Attention {
         input_metadata: &InputMetadata,
         q_scale: Option<&Tensor>,
     ) -> Result<Tensor> {
+        self.forward_with_kv(
+            xs,
+            rotary_emb,
+            attention_mask,
+            positions,
+            cache,
+            input_metadata,
+            q_scale,
+            None,
+        )
+        .map(|(y, _)| y)
+    }
+
+    /// Like `forward_ext`, but returns the K/V written to the cache. With `shared_kv`
+    /// (producer layer, its K/V), attends over the producer's K/V and cache instead of
+    /// its own, as Gemma4 KV-shared layers do.
+    pub fn forward_with_kv(
+        &self,
+        xs: &Tensor,
+        rotary_emb: &Option<Arc<dyn ApplyRotaryEmbedding>>,
+        attention_mask: Option<&Vec<Tensor>>,
+        positions: &Tensor,
+        cache: Option<(&Tensor, &Tensor)>,
+        input_metadata: &InputMetadata,
+        q_scale: Option<&Tensor>,
+        shared_kv: Option<(&Attention, &Tensor, &Tensor)>,
+    ) -> Result<(Tensor, (Tensor, Tensor))> {
         let (seq_len, _) = xs.dims2()?;
 
         let (q_raw, k, v) = match &self.qkv_proj {
@@ -774,6 +825,19 @@ impl Attention {
                     );
                 }
                 (qkv[0].clone(), qkv[1].clone(), qkv[2].clone())
+            }
+            QkvProjection::QOnly { q_proj } => {
+                if shared_kv.is_none() {
+                    candle_core::bail!("KV-shared attention layer called without shared K/V");
+                }
+                // Zeros only feed the K norm/RoPE path below; `shared_kv` replaces them.
+                let q = q_proj.forward(xs)?;
+                let z = Tensor::zeros(
+                    (seq_len, self.num_kv_heads * self.head_dim),
+                    q.dtype(),
+                    q.device(),
+                )?;
+                (q, z.clone(), z)
             }
         };
 
@@ -848,6 +912,13 @@ impl Attention {
             v
         };
 
+        // A KV-shared layer runs on its producer's PagedAttention: same logical layer index
+        // (TurboQuant buffers, FP8 KV scales) and split-K workspace as the cache it reads.
+        let (attn, k, v) = match shared_kv {
+            Some((producer, k, v)) => (&producer.attn, k.clone(), v.clone()),
+            None => (&self.attn, k, v),
+        };
+
         if let Some(rotary_emb) = &rotary_emb {
             if let (Some(original_max_position_embeddings), Some(llama_4_scaling_beta)) = (
                 rotary_emb.get_original_max_position_embeddings(),
@@ -873,8 +944,7 @@ impl Attention {
                 .to_dtype(q.dtype())?;
         }
 
-        let y = self
-            .attn
+        let y = attn
             .forward(
                 &q,
                 &k,
@@ -903,7 +973,7 @@ impl Attention {
         } else {
             y.to_dtype(xs.dtype())?
         };
-        self.o_proj.forward(&y)
+        Ok((self.o_proj.forward(&y)?, (k, v)))
     }
 
     /// Optimized single-token attention without KV cache or paged attention.
@@ -931,6 +1001,11 @@ impl Attention {
             QkvProjection::Packed(qkv_proj) => {
                 let qkv = qkv_proj.forward(xs)?;
                 (qkv[0].clone(), qkv[1].clone(), qkv[2].clone())
+            }
+            QkvProjection::QOnly { .. } => {
+                candle_core::bail!(
+                    "forward_single_token_no_cache: KV-shared layers need shared K/V"
+                )
             }
         };
 

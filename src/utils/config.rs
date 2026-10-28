@@ -785,6 +785,10 @@ pub struct TokenizerConfig {
     #[serde(default, deserialize_with = "deserialize_token_field")]
     pub eos_token: Option<String>,
     #[serde(default, deserialize_with = "deserialize_token_field")]
+    pub eot_token: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_token_field")]
+    pub str_token: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_token_field")]
     pub pad_token: Option<String>,
 }
 

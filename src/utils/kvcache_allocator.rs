@@ -16,7 +16,10 @@
 //! let (gpu_cache, cpu_cache) = allocator.init_kv_cache(&allocation, dtype, &device)?;
 //! ```
 
-use super::{gemma4_per_layer_cache_config, qwen3_hybrid_layer_types, resolve_qwen3_hybrid_config};
+use super::{
+    gemma4_kv_cache_layout, gemma4_num_kv_caches, gemma4_per_layer_cache_config,
+    qwen3_hybrid_layer_types, resolve_qwen3_hybrid_config,
+};
 use crate::utils::config::{Config, EngineConfig};
 use candle_core::{DType, Device, Result, Tensor};
 use std::fmt;
@@ -352,6 +355,9 @@ impl KVCacheAllocator {
                 .iter()
                 .filter(|t| t.as_str() == "full_attention")
                 .count()
+        } else if let Some(layout) = gemma4_kv_cache_layout(config) {
+            // Gemma4 E2B/E4B: KV-shared layers reuse an earlier layer's cache.
+            gemma4_num_kv_caches(&layout)
         } else {
             config.num_hidden_layers
         };
@@ -657,8 +663,11 @@ impl KVCacheAllocator {
         let flash_splitk_bytes: u64 = if cfg!(feature = "flash") || cfg!(feature = "flashattn") {
             let q_heads_per_shard = self.num_attention_heads / self.num_shards.max(1);
             let splits = 8usize; // flash::NUM_SPLITS
-            let per_layer = 64 * q_heads_per_shard * splits * (self.head_dim + 2) * 4;
-            (per_layer * self.num_kv_layers) as u64
+                                 // One workspace per cache owner (Gemma4 KV-shared layers run on their producer's
+                                 // PagedAttention), sized by that layer's own head_dim.
+            (0..self.num_kv_layers)
+                .map(|i| 64 * q_heads_per_shard * splits * (self.layer_kv_config(i).1 + 2) * 4)
+                .sum::<usize>() as u64
         } else {
             0
         };
