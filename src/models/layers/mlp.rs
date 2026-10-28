@@ -611,6 +611,17 @@ impl MLP {
     }
 
     pub fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        // Packed GGUF gate/up: consume both halves in a single fused
+        // SiLU-and-mul pass. Splitting first would copy the whole fused
+        // output twice before the activation even starts.
+        if let GateUpProjection::Packed(proj) = &self.gate_up_proj {
+            if matches!(self.activation, Activation::Silu) && self.swiglu_limit == 0.0 {
+                let packed = proj.forward_packed(xs)?;
+                let half = packed.dim(candle_core::D::Minus1)? / 2;
+                let activated = attention_rs::silu_and_mul::silu_and_mul(&packed, half)?;
+                return self.down_proj.forward(&activated);
+            }
+        }
         let (gate, up) = match &self.gate_up_proj {
             GateUpProjection::Separate { gate_proj, up_proj } => {
                 (gate_proj.forward(xs)?, up_proj.forward(xs)?)
