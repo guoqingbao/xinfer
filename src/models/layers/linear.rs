@@ -425,13 +425,17 @@ impl QLinear {
     }
 
     pub fn from_qparts_x(w: QTensor, b: Option<Tensor>, dtype: DType) -> Result<Self> {
+        Self::from_qparts_arc_x(Arc::new(w), b, dtype)
+    }
+
+    pub fn from_qparts_arc_x(w: Arc<QTensor>, b: Option<Tensor>, dtype: DType) -> Result<Self> {
         let bx = match b {
             Some(b_) => Some(b_.to_dtype(DType::F32)?),
             _ => None,
         };
 
         Ok(Self {
-            inner: Some(QMatMul::QTensor(Arc::new(w))),
+            inner: Some(QMatMul::QTensor(w)),
             bias: bx,
             wna16: None,
             dtype,

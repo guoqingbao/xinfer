@@ -2,6 +2,7 @@ use candle::quantized::{GgmlDType, QTensor};
 use candle::{Device, Result, Shape};
 use candle_core as candle;
 use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 use std::sync::Arc;
 use std::sync::Mutex;
 
@@ -138,6 +139,75 @@ impl VarBuilder {
             );
         }
         Ok(tensor)
+    }
+
+    /// Load rows in the requested order by copying complete GGUF quantization
+    /// blocks. GGUF blocks are laid out along the last dimension, so moving
+    /// whole rows preserves every bit of IQ and K-quant weights.
+    pub fn get_rows_permuted<S: Into<Shape>>(
+        &self,
+        s: S,
+        name: &str,
+        source_rows: &[usize],
+    ) -> Result<QTensor> {
+        let path = self.path(name);
+        let shape = s.into();
+        let (rows, cols) = shape.dims2()?;
+        if source_rows.is_empty() {
+            candle::bail!("cannot load an empty row selection for {path}");
+        }
+
+        let shard_idx = self.resolve_shard(&path)?;
+        let mut shards = self.shards.lock().unwrap();
+        let shard = &mut shards[shard_idx];
+        let (dtype, tensor_offset) = {
+            let tensor_info =
+                shard.content.tensor_infos.get(&path).ok_or_else(|| {
+                    candle::Error::Msg(format!("cannot find tensor info for {path}"))
+                })?;
+            if tensor_info.shape.dims() != shape.dims() {
+                candle::bail!(
+                    "shape mismatch for {path}, got {:?}, expected {shape:?}",
+                    tensor_info.shape
+                );
+            }
+            (
+                tensor_info.ggml_dtype,
+                shard.content.tensor_data_offset + tensor_info.offset,
+            )
+        };
+        for &row in source_rows {
+            if row >= rows {
+                candle::bail!("row index {row} is out of bounds for {path} with {rows} rows");
+            }
+        }
+
+        let block_size = dtype.block_size();
+        if cols % block_size != 0 {
+            candle::bail!(
+                "cannot move raw GGUF rows for {path}: row width {cols} is not divisible by block size {block_size}"
+            );
+        }
+        let row_bytes = cols / block_size * dtype.type_size();
+        let tensor_bytes = rows * row_bytes;
+        let mut raw = vec![0u8; tensor_bytes];
+        shard.file.seek(SeekFrom::Start(tensor_offset))?;
+        shard.file.read_exact(&mut raw)?;
+
+        let mut permuted = vec![0u8; source_rows.len() * row_bytes];
+        for (dst_row, &src_row) in source_rows.iter().enumerate() {
+            let src = src_row * row_bytes;
+            let dst = dst_row * row_bytes;
+            permuted[dst..dst + row_bytes].copy_from_slice(&raw[src..src + row_bytes]);
+        }
+        drop(shards);
+
+        candle_core::quantized::ggml_file::qtensor_from_ggml(
+            dtype,
+            &permuted,
+            vec![source_rows.len(), cols],
+            &self.device,
+        )
     }
 
     pub fn get_sharded<S: Into<Shape>>(

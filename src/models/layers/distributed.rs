@@ -4,7 +4,7 @@ use crate::models::layers::linear::{
 };
 use crate::models::layers::{isq_high_precision_quant, VarBuilderX};
 use crate::utils::config::QuantConfig;
-use crate::utils::gguf_helper::restore_qwen35_qkv_weight;
+use crate::utils::gguf_helper::{restore_qwen35_qkv_row_indices, restore_qwen35_qkv_weight};
 #[cfg(feature = "nccl")]
 pub use candle_core::cuda_backend::cudarc::nccl::safe::{Comm, Id};
 use candle_core::quantized::{GgmlDType, QTensor};
@@ -112,12 +112,10 @@ fn is_dense_gguf_dtype(dtype: GgmlDType) -> bool {
     matches!(dtype, GgmlDType::F32 | GgmlDType::F16 | GgmlDType::BF16)
 }
 
-// Restoring Qwen3.5/3.8 GDN heads permutes rows before tensor-parallel
-// sharding.  IQ formats are supported natively for direct GGUF matmuls, but
-// Candle intentionally does not implement IQ re-quantization.  Keep these
-// restored tensors in dequantized form instead of silently converting them to
-// another quantization format.
-fn is_iq_gguf_dtype(dtype: GgmlDType) -> bool {
+// IQ formats are supported natively for direct GGUF matmuls, but Candle does
+// not implement IQ re-quantization. Keep tensors dense only when a raw
+// block-preserving restore or shard is not available.
+pub(crate) fn is_iq_gguf_dtype(dtype: GgmlDType) -> bool {
     matches!(
         dtype,
         GgmlDType::IQ2_XXS
@@ -143,14 +141,39 @@ pub fn load_restored_gguf_column_linear(
     name: &str,
     comm: Rc<Comm>,
     dtype: DType,
+    restored_row_order: &[usize],
     restore_weight: impl FnOnce(Tensor) -> Result<Tensor>,
 ) -> Result<TensorParallelColumnLinear> {
     let qvb = match &vb.pp(name).0 {
         Either::Right(vb) => vb.clone(),
         _ => candle_core::bail!("expected GGUF varbuilder for {}", name),
     };
+    let wdtype = qvb
+        .tensor_dtype("weight")
+        .ok_or_else(|| candle_core::Error::Msg(format!("missing GGUF weight for {name}")))?;
+    if is_iq_gguf_dtype(wdtype) {
+        if restored_row_order.len() != out_dim {
+            candle_core::bail!(
+                "restored row order for {name} has {} rows, expected {out_dim}",
+                restored_row_order.len()
+            );
+        }
+        let world_size = comm.world_size();
+        if out_dim % world_size != 0 {
+            candle_core::bail!(
+                "tensor-parallel output rows for {name} ({out_dim}) are not divisible by world_size {world_size}"
+            );
+        }
+        let local_rows = out_dim / world_size;
+        let local_order =
+            &restored_row_order[comm.rank() * local_rows..(comm.rank() + 1) * local_rows];
+        let local_weight = qvb.get_rows_permuted((out_dim, in_dim), "weight", local_order)?;
+        qvb.clear_cache();
+        let qlinear = QLinear::from_qparts_x(local_weight, None, dtype)?;
+        return Ok(TensorParallelColumnLinear::new(Linear::QLinear(qlinear)));
+    }
+
     let ws = qvb.get((out_dim, in_dim), "weight")?;
-    let wdtype = ws.dtype();
     let weight = if is_dense_gguf_dtype(wdtype) {
         restore_weight(ws.dequantize(qvb.device())?)?
     } else {
@@ -317,8 +340,45 @@ pub fn load_restored_gguf_merged_qkv_linear(
         _ => candle_core::bail!("expected GGUF varbuilder for {}", name),
     };
     let out_dim = key_dim_global * 2 + value_dim_global;
+    let mut wdtype = qvb
+        .tensor_dtype("weight")
+        .ok_or_else(|| candle_core::Error::Msg(format!("missing GGUF weight for {name}")))?;
+    if is_iq_gguf_dtype(wdtype) {
+        let world_size = comm.world_size();
+        if key_dim_global % world_size != 0 || value_dim_global % world_size != 0 {
+            candle_core::bail!(
+                "Qwen3.5 qkv output rows are not divisible by tensor-parallel world_size {world_size}"
+            );
+        }
+        let row_order = restore_qwen35_qkv_row_indices(
+            key_dim_global,
+            num_k_heads_global,
+            num_v_heads_global,
+            head_v_dim,
+        )?;
+        let chunk_sizes = [key_dim_global, key_dim_global, value_dim_global];
+        let mut local_order =
+            Vec::with_capacity(key_dim_global * 2 / world_size + value_dim_global / world_size);
+        let mut output_splits = Vec::with_capacity(chunk_sizes.len());
+        let mut offset = 0usize;
+        for &chunk_size in &chunk_sizes {
+            let local_size = chunk_size / world_size;
+            let start = offset + comm.rank() * local_size;
+            local_order.extend_from_slice(&row_order[start..start + local_size]);
+            output_splits.push(local_size);
+            offset += chunk_size;
+        }
+        let local_weight = qvb.get_rows_permuted((out_dim, hidden_size), "weight", &local_order)?;
+        qvb.clear_cache();
+        let qlinear = QLinear::from_qparts_x(local_weight, None, dtype)?;
+        return MergedParallelColumnLinear::from_packed_local_qlinear(
+            Linear::QLinear(qlinear),
+            None,
+            output_splits,
+        );
+    }
+
     let ws = qvb.get((out_dim, hidden_size), "weight")?;
-    let mut wdtype = ws.dtype();
     let dense_weight = is_dense_gguf_dtype(wdtype);
     let keep_dense_weight = keep_restored_gguf_dense(wdtype);
     let weight = restore_qwen35_qkv_weight(
@@ -628,6 +688,52 @@ pub fn load_restored_gguf_row_linear(
         comm,
         dtype,
     ))
+}
+
+/// Load an IQ GGUF output projection by sharding its original tiled columns.
+/// The caller supplies activations in the same tiled order before this linear.
+/// Uses a quantized column shard when it is block-aligned. If the shard cuts
+/// an IQ block, keeps the full quantized matrix on each rank instead.
+pub fn load_iq_gguf_sharded_row_linear(
+    vb: &VarBuilderX,
+    in_dim: usize,
+    out_dim: usize,
+    name: &str,
+    comm: Rc<Comm>,
+    dtype: DType,
+) -> Result<Option<(TensorParallelRowLinear, bool)>> {
+    let qvb = match &vb.pp(name).0 {
+        Either::Right(vb) => vb.clone(),
+        _ => candle_core::bail!("expected GGUF varbuilder for {name}"),
+    };
+    let Some(wdtype) = qvb.tensor_dtype("weight") else {
+        candle_core::bail!("missing GGUF weight for {name}");
+    };
+    if !is_iq_gguf_dtype(wdtype) {
+        return Ok(None);
+    }
+    let Some(weight) = qvb.get_sharded(
+        (out_dim, in_dim),
+        "weight",
+        1,
+        comm.rank(),
+        comm.world_size(),
+    )?
+    else {
+        let weight = qvb.get((out_dim, in_dim), "weight")?;
+        qvb.clear_cache();
+        let qlinear = QLinear::from_qparts_arc_x(weight, None, dtype)?;
+        return Ok(Some((
+            TensorParallelRowLinear::new(Linear::QLinear(qlinear), comm.clone(), dtype),
+            true,
+        )));
+    };
+    qvb.clear_cache();
+    let qlinear = QLinear::from_qparts_arc_x(weight, None, dtype)?;
+    Ok(Some((
+        TensorParallelRowLinear::new(Linear::QLinear(qlinear), comm.clone(), dtype),
+        false,
+    )))
 }
 
 pub fn shard(dim: usize, rank: usize, world_size: usize) -> candle_nn::var_builder::Shard {
