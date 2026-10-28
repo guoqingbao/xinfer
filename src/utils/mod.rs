@@ -1851,6 +1851,8 @@ pub fn init_config_tokenizer(
                         chat_template: None,
                         bos_token: None,
                         eos_token: None,
+                        eot_token: None,
+                        str_token: None,
                         pad_token: None,
                     }
                 }
@@ -1862,31 +1864,6 @@ pub fn init_config_tokenizer(
             Tokenizer::from_file(&tokenizer_file).map_err(candle_core::Error::wrap)?;
         let _ = tokenizer.with_truncation(None);
         let _ = tokenizer.with_padding(None);
-
-        // For multimodal models, merge tokenizer's eos_token string to token IDs
-        // This ensures EOSTOKENIDS includes tokens from both tokenizer and config
-        if config.is_multi_model == Some(true) {
-            let tokenizer_eos_ids: Vec<u32> = config_tokenizer
-                .eos_token
-                .as_ref()
-                .and_then(|eos_str| tokenizer.get_vocab(true).get(eos_str).copied())
-                .map(|id| vec![id])
-                .unwrap_or_default();
-
-            if !tokenizer_eos_ids.is_empty() {
-                let tokenizer_eos = if tokenizer_eos_ids.len() == 1 {
-                    EosTokenId::Single(tokenizer_eos_ids[0])
-                } else {
-                    EosTokenId::Multiple(tokenizer_eos_ids)
-                };
-
-                if let Some(existing_eos) = config.eos_token_id.take() {
-                    config.eos_token_id = Some(existing_eos.merge_dedup(tokenizer_eos));
-                } else {
-                    config.eos_token_id = Some(tokenizer_eos);
-                }
-            }
-        }
 
         let generation_config_path = model_pathes.get_generation_config_filename();
         let generation_cfg = if generation_config_path.display().to_string() != ""
@@ -1935,6 +1912,52 @@ pub fn init_config_tokenizer(
                 crate::log_warn!("Try loading chat template from chat_template.json");
                 config_tokenizer.chat_template =
                     Some(std::fs::read_to_string(&f).map_err(candle_core::Error::wrap)?);
+            }
+        }
+
+        // For multimodal models, merge tokenizer's eos_token string to token IDs.
+        // Gemma4 chat models also stop at eot_token and str_token; these are the
+        // assistant turn and tool-response stop tokens in its chat format.
+        let is_gemma4 = matches!(
+            arch_name.as_str(),
+            "Gemma4ForConditionalGeneration" | "Gemma4ForCausalLM"
+        );
+        let is_gemma4_chat = is_gemma4 && config_tokenizer.chat_template.is_some();
+        if config.is_multi_model == Some(true) || is_gemma4_chat {
+            let mut tokenizer_eos_ids: Vec<u32> = config_tokenizer
+                .eos_token
+                .as_ref()
+                .and_then(|eos_str| tokenizer.get_vocab(true).get(eos_str).copied())
+                .map(|id| vec![id])
+                .unwrap_or_default();
+
+            if is_gemma4_chat {
+                for token in [
+                    config_tokenizer.eot_token.as_ref(),
+                    config_tokenizer.str_token.as_ref(),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    if let Some(id) = tokenizer.get_vocab(true).get(token) {
+                        tokenizer_eos_ids.push(*id);
+                    }
+                }
+            }
+
+            if !tokenizer_eos_ids.is_empty() {
+                tokenizer_eos_ids.dedup();
+                let tokenizer_eos = if tokenizer_eos_ids.len() == 1 {
+                    EosTokenId::Single(tokenizer_eos_ids[0])
+                } else {
+                    EosTokenId::Multiple(tokenizer_eos_ids)
+                };
+
+                if let Some(existing_eos) = config.eos_token_id.take() {
+                    config.eos_token_id = Some(existing_eos.merge_dedup(tokenizer_eos));
+                } else {
+                    config.eos_token_id = Some(tokenizer_eos);
+                }
             }
         }
 
@@ -2029,6 +2052,8 @@ pub fn init_config_tokenizer(
             chat_template,
             bos_token: bos,
             eos_token: eos,
+            eot_token: None,
+            str_token: None,
             pad_token,
         };
         let archs = config.architectures.as_ref().unwrap();
