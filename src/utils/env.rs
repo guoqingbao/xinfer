@@ -6,6 +6,10 @@ pub const MAMBA_SNAPSHOT_BLOCK_STRIDE_ENV: &str = "XINFER_MAMBA_SNAPSHOT_STRIDE_
 pub const STREAM_AS_REASONING_CONTENT_ENV: &str = "XINFER_STREAM_AS_REASONING_CONTENT";
 
 pub const SM90_LOWER_PRECISION_GDN_PREFILL_ENV: &str = "SM90_LOWER_PRECISION_GDN_PREFILL";
+/// Select the GDN prefill algorithm: `auto`/`fast` uses the FlashInfer SM90
+/// chunked kernel when the build and device support it, `exact` forces the
+/// reference sequential recurrence.
+pub const GDN_PREFILL_ENV: &str = "XINFER_GDN_PREFILL";
 
 pub const MOE_OFFLOAD_ENV: &str = "XINFER_MOE_OFFLOAD";
 
@@ -62,6 +66,20 @@ static SM90_LOWER_PRECISION_GDN_PREFILL: OnceLock<bool> = OnceLock::new();
 
 pub fn sm90_lower_precision_gdn_prefill() -> bool {
     *SM90_LOWER_PRECISION_GDN_PREFILL.get_or_init(|| {
+        // New, explicit control wins. `auto`/`fast` enable the chunked
+        // FlashInfer kernel (the launcher itself falls back when the device
+        // or build lacks SM90 support). `exact` keeps the reference
+        // recurrence. The legacy variable still overrides the default, so
+        // existing deployments that set it keep their behavior.
+        if let Ok(v) = env::var(GDN_PREFILL_ENV) {
+            let v = v.trim().to_ascii_lowercase();
+            return matches!(v.as_str(), "1" | "true" | "yes" | "fast" | "chunked");
+        }
+        // The chunked FlashInfer kernel is SM90-only and uses lower-precision
+        // accumulation than the reference recurrence, so it stays opt-in.
+        // It matches the reference to BF16 rounding on typical inputs (p50
+        // diff 0, p99 ~0.3% of range) but the differential probe shows
+        // non-exact states for some input distributions.
         env::var(SM90_LOWER_PRECISION_GDN_PREFILL_ENV)
             .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "TRUE" | "YES"))
             .unwrap_or(false)

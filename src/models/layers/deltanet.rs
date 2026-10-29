@@ -530,6 +530,202 @@ impl GatedDeltaNet {
         ))
     }
 
+    /// Project inputs for decode while preserving the packed in_proj_qkv
+    /// output.  Only the legacy split projection (separate qkv/z/a/b weights,
+    /// which is what dense Qwen3.8 checkpoints use) can stay packed; other
+    /// variants return `None` and take the generic path.
+    fn project_inputs_decode_packed(
+        &self,
+        xs: &Tensor,
+    ) -> Result<Option<(Tensor, Tensor, Tensor, Tensor)>> {
+        let GdnProjection::SplitQkvZaLegacy {
+            in_proj_qkv,
+            in_proj_z,
+            in_proj_b,
+            in_proj_a,
+        } = &self.projection
+        else {
+            return Ok(None);
+        };
+        let xs = &if xs.dtype() != self.model_dtype {
+            xs.to_dtype(self.model_dtype)?
+        } else {
+            xs.clone()
+        };
+        let qkv = in_proj_qkv.forward(xs)?;
+        let expected = self.key_dim * 2 + self.value_dim;
+        let (_, qkv_dim) = qkv.dims2()?;
+        if qkv_dim != expected {
+            return Ok(None);
+        }
+        let z = in_proj_z.forward(xs)?;
+        let b = in_proj_b.forward(xs)?;
+        let a = in_proj_a.forward(xs)?;
+        Ok(Some((qkv, z, b, a)))
+    }
+
+    fn gdn_gating_decode(&self, a: &Tensor, b: &Tensor) -> Result<(Tensor, Tensor)> {
+        let (a_expanded, b_expanded) = (a.unsqueeze(0)?, b.unsqueeze(0)?);
+        let (g, beta) =
+            gdn::fused_gdn_gating(&self.a_log, &a_expanded, &b_expanded, &self.dt_bias)?;
+        Ok((g.squeeze(0)?, beta.squeeze(0)?))
+    }
+
+    fn finish_gdn_output(
+        &self,
+        output: Tensor,
+        z: &Tensor,
+        original_dtype: DType,
+    ) -> Result<Tensor> {
+        let token_count = output.dim(0)?;
+        let output = output.reshape((token_count, self.value_dim))?;
+        let gated_output = if self.gate_sigmoid {
+            gdn::gated_rmsnorm_sigmoid_mul(
+                &output,
+                z,
+                &self.gdn_norm_weight,
+                self.gdn_norm_bias.as_ref(),
+                self.rms_norm_eps,
+                self.head_v_dim,
+            )?
+        } else {
+            gdn::gated_rmsnorm_silu_mul(
+                &output,
+                z,
+                &self.gdn_norm_weight,
+                self.gdn_norm_bias.as_ref(),
+                self.rms_norm_eps,
+                self.head_v_dim,
+            )?
+        };
+        let out = self
+            .out_proj
+            .forward(&gated_output.to_dtype(self.model_dtype)?)?;
+        if out.dtype() != original_dtype {
+            out.to_dtype(original_dtype)
+        } else {
+            Ok(out)
+        }
+    }
+
+    fn forward_decode_packed(
+        &self,
+        qkv: Tensor,
+        z: Tensor,
+        b: Tensor,
+        a: Tensor,
+        mamba_cache: &mut MambaCache,
+        seq_slots: &Tensor,
+        original_dtype: DType,
+    ) -> Result<Tensor> {
+        // Match the generic path: GDN math runs in `gdn_dtype` (F32 for GGUF
+        // models), so convert the projections before the conv/state kernels.
+        let (qkv, z, b, a) = if qkv.dtype() != self.gdn_dtype {
+            (
+                qkv.to_dtype(self.gdn_dtype)?,
+                z.to_dtype(self.gdn_dtype)?,
+                b.to_dtype(self.gdn_dtype)?,
+                a.to_dtype(self.gdn_dtype)?,
+            )
+        } else {
+            (qkv, z, b, a)
+        };
+        let token_count = qkv.dim(0)?;
+        let d_conv = self.key_dim * 2 + self.value_dim;
+        let conv_out = gdn::causal_conv1d_update_slots(
+            &qkv,
+            &self.conv_weight,
+            self.conv_bias.as_ref(),
+            mamba_cache.conv_state_mut(self.gdn_layer_idx),
+            seq_slots,
+            true,
+        )?;
+
+        let q = gdn::l2_norm_range(
+            &conv_out,
+            0,
+            self.num_k_heads,
+            d_conv,
+            self.head_k_dim,
+            1e-6,
+        )?;
+        let k = gdn::l2_norm_range(
+            &conv_out,
+            self.key_dim,
+            self.num_k_heads,
+            d_conv,
+            self.head_k_dim,
+            1e-6,
+        )?;
+
+        let (q, k) = match (q, k) {
+            (Some(q), Some(k)) => (q, k),
+            _ => {
+                let q = conv_out
+                    .narrow(1, 0, self.key_dim)?
+                    .contiguous()?
+                    .reshape((token_count, self.num_k_heads, self.head_k_dim))?;
+                let k = conv_out
+                    .narrow(1, self.key_dim, self.key_dim)?
+                    .contiguous()?
+                    .reshape((token_count, self.num_k_heads, self.head_k_dim))?;
+                let v = conv_out
+                    .narrow(1, self.key_dim * 2, self.value_dim)?
+                    .contiguous()?
+                    .reshape((token_count, self.num_v_heads, self.head_v_dim))?;
+                let q = gdn::l2_norm_last_dim(&q, 1e-6)?;
+                let k = gdn::l2_norm_last_dim(&k, 1e-6)?;
+                let (g, beta) = self.gdn_gating_decode(&a, &b)?;
+                let global_state = mamba_cache.recurrent_state_mut(self.gdn_layer_idx);
+                let output = gdn::gated_delta_rule_decode_slots_gqa(
+                    &q,
+                    &k,
+                    &v,
+                    &g,
+                    &beta,
+                    global_state,
+                    seq_slots,
+                    self.scale as f32,
+                )?;
+                return self.finish_gdn_output(output, &z, original_dtype);
+            }
+        };
+
+        let (g, beta) = self.gdn_gating_decode(&a, &b)?;
+        let global_state = mamba_cache.recurrent_state_mut(self.gdn_layer_idx);
+        let output = match gdn::gated_delta_rule_decode_slots_gqa_strided_v(
+            &q,
+            &k,
+            &conv_out,
+            self.key_dim * 2,
+            d_conv,
+            &g,
+            &beta,
+            global_state,
+            seq_slots,
+            self.scale as f32,
+        )? {
+            Some(out) => out,
+            None => {
+                let v = conv_out
+                    .narrow(1, self.key_dim * 2, self.value_dim)?
+                    .contiguous()?
+                    .reshape((token_count, self.num_v_heads, self.head_v_dim))?;
+                gdn::gated_delta_rule_decode_slots_gqa(
+                    &q,
+                    &k,
+                    &v,
+                    &g,
+                    &beta,
+                    global_state,
+                    seq_slots,
+                    self.scale as f32,
+                )?
+            }
+        };
+        self.finish_gdn_output(output, &z, original_dtype)
+    }
+
     fn project_inputs(
         &self,
         xs: &Tensor,
@@ -903,6 +1099,22 @@ impl GatedDeltaNet {
 
         let (token_count, _hidden) = xs.dims2()?;
         let is_prefill = input_metadata.is_prefill;
+        // Decode fast path: consume the packed in_proj_qkv output directly and
+        // keep q/k/v as strided slices of the conv output, avoiding ~8
+        // narrow+contiguous copies per layer.
+        if !is_prefill && !input_metadata.is_mtp_verify {
+            if let Some((qkv, z, b, a)) = self.project_inputs_decode_packed(xs)? {
+                return self.forward_decode_packed(
+                    qkv,
+                    z,
+                    b,
+                    a,
+                    mamba_cache,
+                    seq_slots,
+                    original_dtype,
+                );
+            }
+        }
         let (q, k, v, z, b, a) = self.project_inputs(xs)?;
 
         let (q, k, v, z, b, a) = if q.dtype() != self.gdn_dtype {
@@ -1014,7 +1226,17 @@ impl GatedDeltaNet {
             };
 
             if self.num_k_heads != self.num_v_heads {
+                // FlashInfer's chunked GDN prefill is SM90-only by project
+                // limitation. Check the device up front so other archs do not
+                // pay for the exp(g) allocation before falling back.
+                let sm90_device = match xs.device() {
+                    candle_core::Device::Cuda(dev) => {
+                        attention_rs::cuda_utils::sm_version(dev) == Some(90)
+                    }
+                    _ => false,
+                };
                 let flashinfer_result = if !input_metadata.is_mtp_verify
+                    && sm90_device
                     && crate::utils::env::sm90_lower_precision_gdn_prefill()
                 {
                     #[cfg(all(feature = "cuda", feature = "flashinfer"))]

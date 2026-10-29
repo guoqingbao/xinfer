@@ -12,11 +12,21 @@ pub struct NormX {
     v4_weight: Option<Tensor>,
     v4_eps: f32,
     dtype: DType,
+    /// Effective F32 RMSNorm weight for the fused CUDA kernel.  Set only for
+    /// RMSNorm modules whose weight is F32, which is how quantized models keep
+    /// norm statistics in F32 while activations stay BF16/F16.
+    fused_weight: Option<Tensor>,
+    eps: f32,
 }
 impl NormX {
     pub fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         if let Some(weight) = &self.v4_weight {
             return self.forward_v4(xs, weight);
+        }
+        if let Some(weight) = &self.fused_weight {
+            if let Some(out) = self.try_fused_forward(xs, weight)? {
+                return Ok(out);
+            }
         }
         let in_dtype = xs.dtype();
         if xs.dtype() != self.dtype {
@@ -33,6 +43,85 @@ impl NormX {
             };
             Ok(out)
         }
+    }
+
+    /// Fused residual-add + RMSNorm.
+    ///
+    /// Returns `(normalized, residual_sum)`; `residual_sum` is the dtype-rounded
+    /// `x + residual` that the reference add produces before the norm.  Falls
+    /// back to a separate add + norm on unsupported devices/layouts.
+    pub fn forward_add(&self, x: &Tensor, residual: &Tensor) -> Result<(Tensor, Tensor)> {
+        if let Some(weight) = &self.fused_weight {
+            if let Some(out) = self.try_fused_add(x, residual, weight)? {
+                return Ok(out);
+            }
+        }
+        let sum = (x + residual)?;
+        let normed = self.forward(&sum)?;
+        Ok((normed, sum))
+    }
+
+    /// One-launch RMSNorm for CUDA tensors when the norm weight is F32.
+    fn try_fused_forward(&self, xs: &Tensor, weight: &Tensor) -> Result<Option<Tensor>> {
+        if !matches!(xs.device(), candle_core::Device::Cuda(_)) {
+            return Ok(None);
+        }
+        let dims = xs.dims().to_vec();
+        let Some(&dim) = dims.last() else {
+            return Ok(None);
+        };
+        if dim == 0 || weight.dim(0)? != dim || xs.elem_count() % dim != 0 {
+            return Ok(None);
+        }
+        let rows = xs.elem_count() / dim;
+        let x = if xs.is_contiguous() {
+            xs.clone()
+        } else {
+            xs.contiguous()?
+        };
+        let x = x.reshape((rows, dim))?;
+        let out = attention_rs::norm::rms_norm(&x, weight, self.eps)?;
+        Ok(Some(out.reshape(dims)?))
+    }
+
+    fn try_fused_add(
+        &self,
+        x: &Tensor,
+        residual: &Tensor,
+        weight: &Tensor,
+    ) -> Result<Option<(Tensor, Tensor)>> {
+        if !matches!(x.device(), candle_core::Device::Cuda(_)) {
+            return Ok(None);
+        }
+        let dims = x.dims().to_vec();
+        let Some(&dim) = dims.last() else {
+            return Ok(None);
+        };
+        if residual.dims() != x.dims()
+            || dim == 0
+            || weight.dim(0)? != dim
+            || x.elem_count() % dim != 0
+        {
+            return Ok(None);
+        }
+        let rows = x.elem_count() / dim;
+        let x = if x.is_contiguous() {
+            x.clone()
+        } else {
+            x.contiguous()?
+        };
+        let r = if residual.is_contiguous() {
+            residual.clone()
+        } else {
+            residual.contiguous()?
+        };
+        let (normed, sum) = attention_rs::norm::add_rms_norm(
+            &x.reshape((rows, dim))?,
+            &r.reshape((rows, dim))?,
+            weight,
+            self.eps,
+        )?;
+        Ok(Some((normed.reshape(dims.clone())?, sum.reshape(dims)?)))
     }
 
     /// F32 weight tensor for DeepSeek-V4 ATen-order RMSNorm (used by fused HC pre+norm).
@@ -146,6 +235,8 @@ pub fn rms_norm_v4_sharded(
         v4_weight: Some(weight_f32),
         v4_eps: eps as f32,
         dtype,
+        fused_weight: None,
+        eps: eps as f32,
     })
 }
 
@@ -170,11 +261,18 @@ pub fn rms_norm_sharded(
     };
 
     let weight = if is_gemma { (weight + 1.0)? } else { weight };
+    let fused_weight = if weight.dtype() == DType::F32 {
+        Some(weight.clone())
+    } else {
+        None
+    };
     Ok(NormX {
         norm: Either::Left(RmsNorm::new(weight, eps)),
         v4_weight: None,
         v4_eps: eps as f32,
         dtype,
+        fused_weight,
+        eps: eps as f32,
     })
 }
 
@@ -203,6 +301,8 @@ pub fn layer_norm(
             v4_weight: None,
             v4_eps: eps as f32,
             dtype,
+            fused_weight: None,
+            eps: eps as f32,
         })
     } else {
         Ok(NormX {
@@ -210,6 +310,8 @@ pub fn layer_norm(
             v4_weight: None,
             v4_eps: eps as f32,
             dtype,
+            fused_weight: None,
+            eps: eps as f32,
         })
     }
 }

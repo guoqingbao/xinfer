@@ -235,9 +235,10 @@ impl GLM4MoeLiteDecoderLayer {
             cache,
             input_metadata,
         )?;
-        let xs = (attn_output + residual)?;
-        let residual = &xs;
-        let xs = self.post_attention_layernorm.forward(&xs)?;
+        // Fused residual add + RMSNorm (same rounding as add-then-normalize).
+        let (xs, residual_sum) =
+            self.post_attention_layernorm.forward_add(&attn_output, residual)?;
+        let residual = &residual_sum;
 
         let shared_output = if let Some(shared_expert) = &self.shared_expert {
             Some(shared_expert.forward(&xs)?)

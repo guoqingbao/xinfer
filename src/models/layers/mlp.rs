@@ -611,23 +611,26 @@ impl MLP {
     }
 
     pub fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        // Packed GGUF gate/up: consume both halves in a single fused
-        // SiLU-and-mul pass. Splitting first would copy the whole fused
-        // output twice before the activation even starts.
-        if let GateUpProjection::Packed(proj) = &self.gate_up_proj {
-            // The fused SiLU-and-mul CUDA kernel supports BF16/F16 only.
-            // GGUF models run their activations in F32 (`gdn_dtype`), so keep
-            // the reference split path for those.
-            if matches!(self.activation, Activation::Silu)
-                && self.swiglu_limit == 0.0
-                && matches!(xs.dtype(), DType::BF16 | DType::F16)
-            {
-                let packed = proj.forward_packed(xs)?;
-                let half = packed.dim(candle_core::D::Minus1)? / 2;
-                let activated = attention_rs::silu_and_mul::silu_and_mul(&packed, half)?;
-                return self.down_proj.forward(&activated);
+        // Fused SiLU-and-mul on the packed gate/up projection.  The packed
+        // path previously narrowed the output into two contiguous tensors and
+        // ran `silu(gate) * up` (two more launches); the fused kernel reads the
+        // packed output in place.  BF16/F16/F32 are supported by the CUDA and
+        // Metal kernels; clamped (DeepSeek-V4) and non-SiLU activations keep
+        // the reference path.
+        if self.swiglu_limit <= 0.0
+            && matches!(self.activation, Activation::Silu)
+            && matches!(xs.dtype(), DType::BF16 | DType::F16 | DType::F32)
+        {
+            if let GateUpProjection::Packed(gate_up_proj) = &self.gate_up_proj {
+                if let Some((packed, splits)) = gate_up_proj.forward_packed(xs)? {
+                    if splits.len() == 2 && splits[0] == splits[1] {
+                        let activated = attention_rs::silu_and_mul::silu_and_mul(&packed, splits[0])?;
+                        return self.down_proj.forward(&activated);
+                    }
+                }
             }
         }
+
         let (gate, up) = match &self.gate_up_proj {
             GateUpProjection::Separate { gate_proj, up_proj } => {
                 (gate_proj.forward(xs)?, up_proj.forward(xs)?)
