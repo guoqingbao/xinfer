@@ -164,6 +164,9 @@ Prefill (8k tokens), before changes:
 
 ## Remaining roadmap
 
+The full, continuously updated opportunity backlog with file/function-level
+details is in [`docs/performance_opportunities.md`](performance_opportunities.md).
+
 Priorities are ordered by measured/estimated impact at batch 32 unless noted.
 The batch-32 step is ~24.5 ms; ~16 ms is the unavoidable weight-read floor.
 
