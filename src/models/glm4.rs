@@ -162,8 +162,9 @@ impl GLM4DecoderLayer {
         )?;
         let attn_output = self.post_self_attn_layernorm.forward(&attn_output)?;
         // Fused residual add + RMSNorm (same rounding as add-then-normalize).
-        let (xs, residual_sum) =
-            self.post_attention_layernorm.forward_add(&attn_output, residual)?;
+        let (xs, residual_sum) = self
+            .post_attention_layernorm
+            .forward_add(&attn_output, residual)?;
         let residual = &residual_sum;
         let mlp_output = self.mlp.forward(&xs)?;
         let mlp_output = self.post_mlp_layernorm.forward(&mlp_output)?;

@@ -624,7 +624,8 @@ impl MLP {
             if let GateUpProjection::Packed(gate_up_proj) = &self.gate_up_proj {
                 if let Some((packed, splits)) = gate_up_proj.forward_packed(xs)? {
                     if splits.len() == 2 && splits[0] == splits[1] {
-                        let activated = attention_rs::silu_and_mul::silu_and_mul(&packed, splits[0])?;
+                        let activated =
+                            attention_rs::silu_and_mul::silu_and_mul(&packed, splits[0])?;
                         return self.down_proj.forward(&activated);
                     }
                 }

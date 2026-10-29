@@ -206,8 +206,9 @@ impl GLM4DecoderLayer {
             input_metadata,
         )?;
         // Fused residual add + RMSNorm (same rounding as add-then-normalize).
-        let (xs, residual_sum) =
-            self.post_attention_layernorm.forward_add(&attn_output, residual)?;
+        let (xs, residual_sum) = self
+            .post_attention_layernorm
+            .forward_add(&attn_output, residual)?;
         let residual = &residual_sum;
 
         //shared experts for GLM4 MoE models

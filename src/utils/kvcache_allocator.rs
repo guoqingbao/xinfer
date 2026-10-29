@@ -1329,6 +1329,7 @@ impl KVCacheAllocator {
 
     /// Calculate allocation plan given the minimum available memory across ranks
     /// This is the main entry point - call AFTER collecting all rank memory reports
+    #[allow(unused)]
     pub fn plan_allocation(
         &self,
         min_available_memory: u64,

@@ -211,8 +211,9 @@ impl MiniMaxDecoderLayer {
             input_metadata,
         )?;
         // Fused residual add + RMSNorm (same rounding as add-then-normalize).
-        let (xs, residual_sum) =
-            self.post_attention_layernorm.forward_add(&attn_output, residual)?;
+        let (xs, residual_sum) = self
+            .post_attention_layernorm
+            .forward_add(&attn_output, residual)?;
         let residual = &residual_sum;
         let mlp_output = self.moe.forward(&xs, input_metadata.moe_is_prefill())?;
         residual + mlp_output
