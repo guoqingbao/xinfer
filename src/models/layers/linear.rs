@@ -510,14 +510,10 @@ impl Module for QLinear {
             };
             let logical_rows = xs.elem_count() / xs.dim(candle_core::D::Minus1)?;
             let xs = match inner {
-                // Candle owns the large-M GGUF tensor-core dispatch.  Retain
-                // the custom IQ packed kernel only for decode/small batches.
+                // Use the packed GGUF kernel for decode-sized CUDA batches.
+                // Metal continues through Candle's quantized matmul.
                 QMatMul::QTensor(weight)
-                    if is_native_gguf_dtype(weight.dtype())
-                        && logical_rows <= 32
-                        && std::env::var("XINFER_GGUF_NATIVE")
-                            .map(|v| v != "0")
-                            .unwrap_or(true) =>
+                    if is_native_gguf_dtype(weight.dtype()) && logical_rows <= 32 =>
                 {
                     #[cfg(feature = "cuda")]
                     {
