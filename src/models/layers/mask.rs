@@ -1,6 +1,16 @@
 use candle_core::{DType, Device, Tensor};
 
-#[cfg(any(feature = "flash", feature = "flashattn", feature = "flashinfer"))]
+// Every backend with an in-kernel (flash-style) attention path is listed here.
+// Those kernels apply causality and any sliding window themselves, so the
+// dense quadratic mask is never read on these builds. On Metal this covers
+// the causal prefill SDPA path, the paged prefill kernel and the decode
+// kernels; `metal` enables `attention-rs/metal-flash` (see Cargo.toml).
+#[cfg(any(
+    feature = "flash",
+    feature = "flashattn",
+    feature = "flashinfer",
+    feature = "metal"
+))]
 pub fn get_attention_causal_mask(
     _: &Device,
     _: DType,
@@ -13,7 +23,12 @@ pub fn get_attention_causal_mask(
 }
 
 #[allow(unreachable_code)]
-#[cfg(not(any(feature = "flash", feature = "flashattn", feature = "flashinfer")))]
+#[cfg(not(any(
+    feature = "flash",
+    feature = "flashattn",
+    feature = "flashinfer",
+    feature = "metal"
+)))]
 fn get_causal_mask_internal(
     device: &Device,
     dtype: DType,
@@ -26,7 +41,12 @@ fn get_causal_mask_internal(
     mask.unsqueeze(0)?.unsqueeze(0)
 }
 
-#[cfg(not(any(feature = "flash", feature = "flashattn", feature = "flashinfer")))]
+#[cfg(not(any(
+    feature = "flash",
+    feature = "flashattn",
+    feature = "flashinfer",
+    feature = "metal"
+)))]
 pub fn get_attention_causal_mask(
     device: &Device,
     dtype: DType,

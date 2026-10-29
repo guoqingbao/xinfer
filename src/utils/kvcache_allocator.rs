@@ -1368,7 +1368,32 @@ impl KVCacheAllocator {
         // The KV pool is a physical token budget shared by all requests. The
         // request preallocation limit is not a request-count-times-context
         // reservation: a request consumes blocks only for its actual tokens.
-        let num_gpu_blocks = min_available_memory as usize / per_block;
+        let mut num_gpu_blocks = min_available_memory as usize / per_block;
+
+        // When the user pins the context length, spending the whole budget on
+        // KV leaves the GPU short of memory for activations; on unified-memory
+        // Macs that measurably slows both prefill and decode. Keep enough
+        // blocks for the configured requests plus prefix-cache headroom.
+        #[cfg(feature = "metal")]
+        if self.user_max_model_len.is_some() {
+            let blocks_per_seq = max_model_len.div_ceil(self.block_size.max(1));
+            let active = max_num_seqs.saturating_mul(blocks_per_seq).max(1);
+            let multiplier = std::env::var("XINFER_KV_BLOCK_MULTIPLIER")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(2);
+            let capped = active.saturating_mul(multiplier.max(1));
+            if capped < num_gpu_blocks {
+                crate::log_info!(
+                    "Capping KV-cache to {} blocks ({} tokens) for max_model_len {}; \
+                     the rest of the budget is left for activations",
+                    capped,
+                    capped * self.block_size,
+                    max_model_len
+                );
+                num_gpu_blocks = capped;
+            }
+        }
 
         if num_gpu_blocks == 0 {
             return Err(KVCacheError::InsufficientGpuMemory {
