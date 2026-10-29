@@ -615,7 +615,13 @@ impl MLP {
         // SiLU-and-mul pass. Splitting first would copy the whole fused
         // output twice before the activation even starts.
         if let GateUpProjection::Packed(proj) = &self.gate_up_proj {
-            if matches!(self.activation, Activation::Silu) && self.swiglu_limit == 0.0 {
+            // The fused SiLU-and-mul CUDA kernel supports BF16/F16 only.
+            // GGUF models run their activations in F32 (`gdn_dtype`), so keep
+            // the reference split path for those.
+            if matches!(self.activation, Activation::Silu)
+                && self.swiglu_limit == 0.0
+                && matches!(xs.dtype(), DType::BF16 | DType::F16)
+            {
                 let packed = proj.forward_packed(xs)?;
                 let half = packed.dim(candle_core::D::Minus1)? / 2;
                 let activated = attention_rs::silu_and_mul::silu_and_mul(&packed, half)?;
