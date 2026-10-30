@@ -5,8 +5,8 @@ use crate::utils::config::QuantConfig;
 use crate::utils::should_skip_fp8_for_module;
 use crate::utils::should_skip_quant_for_module;
 #[cfg(feature = "cuda")]
-use attention_rs::gguf_linear::gguf_iq_matmul;
-use attention_rs::gguf_linear::is_iq_gguf_dtype;
+use attention_rs::gguf_linear::gguf_matmul;
+use attention_rs::gguf_linear::is_native_gguf_dtype;
 use candle_core::quantized::GgmlDType;
 use candle_core::{
     quantized::{QMatMul, QTensor},
@@ -510,14 +510,14 @@ impl Module for QLinear {
             };
             let logical_rows = xs.elem_count() / xs.dim(candle_core::D::Minus1)?;
             let xs = match inner {
-                // Candle owns the large-M GGUF tensor-core dispatch.  Retain
-                // the custom IQ packed kernel only for decode/small batches.
+                // Use the packed GGUF kernel for decode-sized CUDA batches.
+                // Metal continues through Candle's quantized matmul.
                 QMatMul::QTensor(weight)
-                    if is_iq_gguf_dtype(weight.dtype()) && logical_rows < 64 =>
+                    if is_native_gguf_dtype(weight.dtype()) && logical_rows <= 32 =>
                 {
                     #[cfg(feature = "cuda")]
                     {
-                        gguf_iq_matmul(&xs, weight)?
+                        gguf_matmul(&xs, weight)?
                     }
                     #[cfg(not(feature = "cuda"))]
                     {
