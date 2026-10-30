@@ -200,9 +200,11 @@ impl Qwen3_5MtpDecoderLayer {
         let attn_output = self
             .attn
             .forward_single_token_no_cache(&xs, &rope, positions)?;
-        let xs = (attn_output + residual)?;
-        let residual = &xs;
-        let xs = self.post_attention_layernorm.forward(&xs)?;
+        // Fused residual add + RMSNorm (same rounding as add-then-normalize).
+        let (xs, residual_sum) = self
+            .post_attention_layernorm
+            .forward_add(&attn_output, residual)?;
+        let residual = &residual_sum;
         let mlp_output = self.mlp.forward(&xs)?;
         residual + mlp_output
     }

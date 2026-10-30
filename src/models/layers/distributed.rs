@@ -255,21 +255,29 @@ impl MergedParallelColumnLinear {
         })
     }
 
-    /// Returns the fused projection output without splitting it. Callers that
-    /// consume both halves elementwise (e.g. a fused SiLU-and-mul) can skip the
-    /// per-half contiguous copies.
-    pub fn forward_packed(&self, x: &Tensor) -> Result<Tensor> {
+    /// Return the packed projection output without splitting it.
+    ///
+    /// Callers that fuse the post-projection activation (dense MLP
+    /// SiLU-and-mul) consume the packed `[.., sum(output_splits)]` tensor
+    /// directly, avoiding one copy per split plus separate activation
+    /// launches.
+    pub fn forward_packed(&self, x: &Tensor) -> Result<Option<(Tensor, Vec<usize>)>> {
+        let Some(output_splits) = &self.output_splits else {
+            return Ok(None);
+        };
         if self.linears.len() != 1 {
-            candle_core::bail!(
-                "forward_packed expects a single fused linear, got {}",
-                self.linears.len()
-            );
+            return Ok(None);
         }
         let mut ys = self.linears[0].forward(x)?;
         if let Some(Some(bias)) = self.biases.first() {
             ys = ys.broadcast_add(bias)?;
         }
-        Ok(ys)
+        let split_dim = ys.dims().len().saturating_sub(1);
+        let total_dim = ys.dim(split_dim)?;
+        if total_dim != output_splits.iter().sum::<usize>() {
+            return Ok(None);
+        }
+        Ok(Some((ys, output_splits.clone())))
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Vec<Tensor>> {

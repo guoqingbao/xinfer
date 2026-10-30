@@ -167,11 +167,13 @@ impl Qwen3_5DecoderLayer {
             }
         };
 
-        let xs = (attn_output + residual)?;
-        let residual = &xs;
-        let xs = self.post_attention_layernorm.forward(&xs)?;
+        // Fused residual add + RMSNorm: same rounding as `(attn + residual)`
+        // followed by the norm, but one kernel instead of four.
+        let (xs, residual) = self
+            .post_attention_layernorm
+            .forward_add(&attn_output, residual)?;
         let mlp_output = self.mlp.forward(&xs)?;
-        residual + mlp_output
+        &residual + mlp_output
     }
 
     pub fn is_full_attention(&self) -> bool {
