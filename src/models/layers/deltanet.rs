@@ -48,6 +48,13 @@ enum GdnProjection {
     },
 }
 
+struct ProjectedGdnInputs {
+    qkv: Tensor,
+    z: Tensor,
+    b: Tensor,
+    a: Tensor,
+}
+
 pub struct GatedDeltaNet {
     projection: GdnProjection,
     out_proj: TensorParallelRowLinear,
@@ -499,7 +506,7 @@ impl GatedDeltaNet {
         &self,
         mixed_qkvz: &Tensor,
         mixed_ba: &Tensor,
-    ) -> Result<(Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)> {
+    ) -> Result<ProjectedGdnInputs> {
         let seq_len = mixed_qkvz.dim(0)?;
         let qkvz_group_dim =
             self.head_k_dim + self.head_k_dim + self.kv_group_size * self.head_v_dim * 2;
@@ -520,51 +527,19 @@ impl GatedDeltaNet {
         let b = mixed_ba.narrow(2, 0, self.kv_group_size)?;
         let a = mixed_ba.narrow(2, self.kv_group_size, self.kv_group_size)?;
 
-        Ok((
-            query.reshape((seq_len, self.key_dim))?,
-            key.reshape((seq_len, self.key_dim))?,
-            value.reshape((seq_len, self.value_dim))?,
-            z.reshape((seq_len, self.value_dim))?,
-            b.reshape((seq_len, self.num_v_heads))?,
-            a.reshape((seq_len, self.num_v_heads))?,
-        ))
+        let query = query.reshape((seq_len, self.key_dim))?;
+        let key = key.reshape((seq_len, self.key_dim))?;
+        let value = value.reshape((seq_len, self.value_dim))?;
+        let qkv = Tensor::cat(&[&query, &key, &value], 1)?;
+        Ok(ProjectedGdnInputs {
+            qkv,
+            z: z.reshape((seq_len, self.value_dim))?,
+            b: b.reshape((seq_len, self.num_v_heads))?,
+            a: a.reshape((seq_len, self.num_v_heads))?,
+        })
     }
 
-    /// Project inputs for decode while preserving the packed in_proj_qkv
-    /// output.  Only the legacy split projection (separate qkv/z/a/b weights,
-    /// which is what dense Qwen3.8 checkpoints use) can stay packed; other
-    /// variants return `None` and take the generic path.
-    fn project_inputs_decode_packed(
-        &self,
-        xs: &Tensor,
-    ) -> Result<Option<(Tensor, Tensor, Tensor, Tensor)>> {
-        let GdnProjection::SplitQkvZaLegacy {
-            in_proj_qkv,
-            in_proj_z,
-            in_proj_b,
-            in_proj_a,
-        } = &self.projection
-        else {
-            return Ok(None);
-        };
-        let xs = &if xs.dtype() != self.model_dtype {
-            xs.to_dtype(self.model_dtype)?
-        } else {
-            xs.clone()
-        };
-        let qkv = in_proj_qkv.forward(xs)?;
-        let expected = self.key_dim * 2 + self.value_dim;
-        let (_, qkv_dim) = qkv.dims2()?;
-        if qkv_dim != expected {
-            return Ok(None);
-        }
-        let z = in_proj_z.forward(xs)?;
-        let b = in_proj_b.forward(xs)?;
-        let a = in_proj_a.forward(xs)?;
-        Ok(Some((qkv, z, b, a)))
-    }
-
-    fn gdn_gating_decode(&self, a: &Tensor, b: &Tensor) -> Result<(Tensor, Tensor)> {
+    fn gdn_gating(&self, a: &Tensor, b: &Tensor) -> Result<(Tensor, Tensor)> {
         let (a_expanded, b_expanded) = (a.unsqueeze(0)?, b.unsqueeze(0)?);
         let (g, beta) =
             gdn::fused_gdn_gating(&self.a_log, &a_expanded, &b_expanded, &self.dt_bias)?;
@@ -618,18 +593,6 @@ impl GatedDeltaNet {
         seq_slots: &Tensor,
         original_dtype: DType,
     ) -> Result<Tensor> {
-        // Match the generic path: GDN math runs in `gdn_dtype` (F32 for GGUF
-        // models), so convert the projections before the conv/state kernels.
-        let (qkv, z, b, a) = if qkv.dtype() != self.gdn_dtype {
-            (
-                qkv.to_dtype(self.gdn_dtype)?,
-                z.to_dtype(self.gdn_dtype)?,
-                b.to_dtype(self.gdn_dtype)?,
-                a.to_dtype(self.gdn_dtype)?,
-            )
-        } else {
-            (qkv, z, b, a)
-        };
         let token_count = qkv.dim(0)?;
         let d_conv = self.key_dim * 2 + self.value_dim;
         let conv_out = gdn::causal_conv1d_update_slots(
@@ -675,7 +638,7 @@ impl GatedDeltaNet {
                     .reshape((token_count, self.num_v_heads, self.head_v_dim))?;
                 let q = gdn::l2_norm_last_dim(&q, 1e-6)?;
                 let k = gdn::l2_norm_last_dim(&k, 1e-6)?;
-                let (g, beta) = self.gdn_gating_decode(&a, &b)?;
+                let (g, beta) = self.gdn_gating(&a, &b)?;
                 let global_state = mamba_cache.recurrent_state_mut(self.gdn_layer_idx);
                 let output = gdn::gated_delta_rule_decode_slots_gqa(
                     &q,
@@ -691,7 +654,7 @@ impl GatedDeltaNet {
             }
         };
 
-        let (g, beta) = self.gdn_gating_decode(&a, &b)?;
+        let (g, beta) = self.gdn_gating(&a, &b)?;
         let global_state = mamba_cache.recurrent_state_mut(self.gdn_layer_idx);
         let output = match gdn::gated_delta_rule_decode_slots_gqa_strided_v(
             &q,
@@ -726,10 +689,7 @@ impl GatedDeltaNet {
         self.finish_gdn_output(output, &z, original_dtype)
     }
 
-    fn project_inputs(
-        &self,
-        xs: &Tensor,
-    ) -> Result<(Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)> {
+    fn project_inputs(&self, xs: &Tensor) -> Result<ProjectedGdnInputs> {
         // Cast to model_dtype for projection input: unquantized (BF16 Linear), FP8, and
         // NVFP4 all accept BF16/F16. GGUF (QLinear) handles input dtype internally.
         let xs = &if xs.dtype() != self.model_dtype {
@@ -753,17 +713,15 @@ impl GatedDeltaNet {
                 in_proj_a,
             } => {
                 let proj_qkv = in_proj_qkv.forward(xs)?;
-                let q = proj_qkv.narrow(1, 0, self.key_dim)?.contiguous()?;
-                let k = proj_qkv
-                    .narrow(1, self.key_dim, self.key_dim)?
-                    .contiguous()?;
-                let v = proj_qkv
-                    .narrow(1, self.key_dim * 2, self.value_dim)?
-                    .contiguous()?;
                 let z = in_proj_z.forward(xs)?;
                 let b = in_proj_b.forward(xs)?;
                 let a = in_proj_a.forward(xs)?;
-                Ok((q, k, v, z, b, a))
+                Ok(ProjectedGdnInputs {
+                    qkv: proj_qkv,
+                    z,
+                    b,
+                    a,
+                })
             }
             GdnProjection::SplitQkvZaMerged {
                 in_proj_qkv,
@@ -778,13 +736,16 @@ impl GatedDeltaNet {
                         qkv.len()
                     );
                 }
-                let q = qkv[0].clone();
-                let k = qkv[1].clone();
-                let v = qkv[2].clone();
+                let packed_qkv = Tensor::cat(&[&qkv[0], &qkv[1], &qkv[2]], 1)?;
                 let z = in_proj_z.forward(xs)?;
                 let b = in_proj_b.forward(xs)?;
                 let a = in_proj_a.forward(xs)?;
-                Ok((q, k, v, z, b, a))
+                Ok(ProjectedGdnInputs {
+                    qkv: packed_qkv,
+                    z,
+                    b,
+                    a,
+                })
             }
             GdnProjection::PackedQkvzBa {
                 in_proj_qkvz,
@@ -799,14 +760,13 @@ impl GatedDeltaNet {
                         ba.len()
                     )
                 }
-                Ok((
-                    qkvz[0].clone(),
-                    qkvz[1].clone(),
-                    qkvz[2].clone(),
-                    qkvz[3].clone(),
-                    ba[0].clone(),
-                    ba[1].clone(),
-                ))
+                let packed_qkv = Tensor::cat(&[&qkvz[0], &qkvz[1], &qkvz[2]], 1)?;
+                Ok(ProjectedGdnInputs {
+                    qkv: packed_qkv,
+                    z: qkvz[3].clone(),
+                    b: ba[0].clone(),
+                    a: ba[1].clone(),
+                })
             }
         }
     }
@@ -1099,37 +1059,31 @@ impl GatedDeltaNet {
 
         let (token_count, _hidden) = xs.dims2()?;
         let is_prefill = input_metadata.is_prefill;
-        // Decode fast path: consume the packed in_proj_qkv output directly and
-        // keep q/k/v as strided slices of the conv output, avoiding ~8
-        // narrow+contiguous copies per layer.
-        if !is_prefill && !input_metadata.is_mtp_verify {
-            if let Some((qkv, z, b, a)) = self.project_inputs_decode_packed(xs)? {
-                return self.forward_decode_packed(
-                    qkv,
-                    z,
-                    b,
-                    a,
-                    mamba_cache,
-                    seq_slots,
-                    original_dtype,
-                );
-            }
-        }
-        let (q, k, v, z, b, a) = self.project_inputs(xs)?;
-
-        let (q, k, v, z, b, a) = if q.dtype() != self.gdn_dtype {
+        // Every projection layout returns QKV packed in the same order, so
+        // both prefill and decode can share the packed convolution input.
+        let ProjectedGdnInputs { qkv, z, b, a } = self.project_inputs(xs)?;
+        let (qkv, z, b, a) = if qkv.dtype() != self.gdn_dtype {
             (
-                q.to_dtype(self.gdn_dtype)?,
-                k.to_dtype(self.gdn_dtype)?,
-                v.to_dtype(self.gdn_dtype)?,
+                qkv.to_dtype(self.gdn_dtype)?,
                 z.to_dtype(self.gdn_dtype)?,
                 b.to_dtype(self.gdn_dtype)?,
                 a.to_dtype(self.gdn_dtype)?,
             )
         } else {
-            (q, k, v, z, b, a)
+            (qkv, z, b, a)
         };
-        let mixed_qkv = Tensor::cat(&[&q, &k, &v], 1)?;
+        if !is_prefill && !input_metadata.is_mtp_verify {
+            return self.forward_decode_packed(
+                qkv,
+                z,
+                b,
+                a,
+                mamba_cache,
+                seq_slots,
+                original_dtype,
+            );
+        }
+        let mixed_qkv = qkv;
 
         let (kv_conv, prefill_conv_state) = if is_prefill {
             let mut conv_state = mamba_cache.get_batch_conv_state(self.gdn_layer_idx, seq_slots)?;
@@ -1190,11 +1144,7 @@ impl GatedDeltaNet {
         let k_conv = kv_conv.narrow(1, self.key_dim, self.key_dim)?;
         let v_conv = kv_conv.narrow(1, self.key_dim * 2, self.value_dim)?;
 
-        // Fused GDN gating
-        let (a_expanded, b_expanded) = (a.unsqueeze(0)?, b.unsqueeze(0)?); // [1, seq_len, num_heads]
-        let (g, beta) =
-            gdn::fused_gdn_gating(&self.a_log, &a_expanded, &b_expanded, &self.dt_bias)?;
-        let (g, beta) = (g.squeeze(0)?, beta.squeeze(0)?);
+        let (g, beta) = self.gdn_gating(&a, &b)?;
 
         let q = q_conv.reshape((token_count, self.num_k_heads, self.head_k_dim))?;
         let k = k_conv.reshape((token_count, self.num_k_heads, self.head_k_dim))?;
@@ -1311,39 +1261,7 @@ impl GatedDeltaNet {
             )?
         };
 
-        // output: [seq_len, num_v_heads, head_v_dim] -> [seq_len, value_dim]
-        let output = output.reshape((token_count, self.value_dim))?;
-
-        // Gated RMSNorm: norm(output) * act(z) via fused kernel.
-        // Qwen3.5 uses silu; Qwen4 uses sigmoid (`output_gate_type`).
-        let gated_output = if self.gate_sigmoid {
-            gdn::gated_rmsnorm_sigmoid_mul(
-                &output,
-                &z,
-                &self.gdn_norm_weight,
-                self.gdn_norm_bias.as_ref(),
-                self.rms_norm_eps,
-                self.head_v_dim,
-            )?
-        } else {
-            gdn::gated_rmsnorm_silu_mul(
-                &output,
-                &z,
-                &self.gdn_norm_weight,
-                self.gdn_norm_bias.as_ref(),
-                self.rms_norm_eps,
-                self.head_v_dim,
-            )?
-        };
-
-        let out = self
-            .out_proj
-            .forward(&gated_output.to_dtype(self.model_dtype)?)?;
-        if out.dtype() != original_dtype {
-            out.to_dtype(original_dtype)
-        } else {
-            Ok(out)
-        }
+        self.finish_gdn_output(output, &z, original_dtype)
     }
 
     /// Roll back this layer's GDN state to the position after `keep_tokens` tokens
