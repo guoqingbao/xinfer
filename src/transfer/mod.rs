@@ -67,6 +67,84 @@ pub struct PdConfig {
     pub url: Option<String>,
 }
 
+// A raw for raw byte payloads (the KV cache + the TurboQuant buffers) that
+/// serializes as a single MsgPack binary value instead of a MsgPack array of
+/// integers. `rmp_serde` encodes a bare `Vec<u8>` as an array (one element per
+/// byte), which adds ~50% overhead on random data + can push a payload past the
+/// receive limit limit (the comm.rs 1GB check) even when the original bincode
+/// form fit. Encoding the bytes as MsgPack binary (the `bin8`/`bin16`/`bin32`
+/// types) is length-prefixed + compact, matching the bincode behavior this
+/// module had before the rmp_serde migration. Both PD ends run the same build,
+/// so the wire-format change is safe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawBytes(pub Vec<u8>);
+
+impl RawBytes {
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+    pub fn as_slice(&self) -> &[u8] {
+        &self.0
+    }
+    pub fn into_inner(self) -> Vec<u8> {
+        self.0
+    }
+}
+
+impl From<Vec<u8>> for RawBytes {
+    fn from(v: Vec<u8>) -> Self {
+        Self(v)
+    }
+}
+
+impl AsRef<[u8]> for RawBytes {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl Serialize for RawBytes {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        // The serialize as a byte string (the MsgPack bin/str), not an array.
+        serializer.serialize_bytes(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for RawBytes {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        // The accept either a byte string (the serialize_bytes output) or a sequence
+        // (the legacy array form, for backward compatibility with in-flight
+        // messages from an older peer).
+        struct RawBytesVisitor;
+        impl<'de> serde::de::Visitor<'de> for RawBytesVisitor {
+            type Value = RawBytes;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a byte string or a byte sequence")
+            }
+            fn visit_bytes<E: serde::de::Error>(self, v: &[u8]) -> std::result::Result<RawBytes, E> {
+                Ok(RawBytes(v.to_vec()))
+            }
+            fn visit_byte_buf<E: serde::de::Error>(self, v: Vec<u8>) -> std::result::Result<RawBytes, E> {
+                Ok(RawBytes(v))
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> std::result::Result<RawBytes, A::Error> {
+                let mut out = Vec::new();
+                while let Some(b) = seq.next_element::<u8>()? {
+                    out.push(b);
+                }
+                Ok(RawBytes(out))
+            }
+        }
+        deserializer.deserialize_bytes(RawBytesVisitor)
+    }
+}
+
 /// Serializable handle for a CUDA IPC memory region.
 /// This is a wrapper around the `cudaIpcMemHandle_t` struct.
 #[cfg(target_arch = "aarch64")]
@@ -85,13 +163,15 @@ pub struct TqLayerIpcHandles {
     pub v_quant: CudaIpcMemHandle,
 }
 
-/// TurboQuant buffer data for a single layer (TCP path).
+/// TurboQuant buffer data for a single layer (TCP path). The raw byte fields
+/// use RawBytes (the compact MsgPack binary encoding, the no the ~50%-inflated
+/// array-of-ints encoding).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TqLayerTcpData {
-    pub k_absmax: Option<Vec<u8>>,
-    pub k_quant: Option<Vec<u8>>,
-    pub v_absmax: Vec<u8>,
-    pub v_quant: Vec<u8>,
+    pub k_absmax: Option<RawBytes>,
+    pub k_quant: Option<RawBytes>,
+    pub v_absmax: RawBytes,
+    pub v_quant: RawBytes,
 }
 
 /// A handle abstracting *how* to get the KV cache data.
@@ -112,8 +192,9 @@ pub enum KVTransferHandle {
     RemoteTcp {
         /// Raw bytes of the KV cache data, copied block-by-block from the server's CPU.
         /// `Vec` is over `num_layers`. `(k_bytes, v_bytes)`.
-        /// The inner `Vec<u8>` contains all blocks for that layer, concatenated.
-        layer_data: Vec<(Vec<u8>, Vec<u8>)>,
+        /// The inner `RawBytes` contains all blocks for that layer, concatenated,
+        /// encoded as compact MsgPack binary (the no the ~50%-inflated array form).
+        layer_data: Vec<(RawBytes, RawBytes)>,
         /// The number of blocks (tokens) in the sequence.
         num_blocks: usize,
         /// TurboQuant buffer data (one per layer). Present when TQ is active.
@@ -161,6 +242,8 @@ pub struct Transfer {
     comm_handle: Option<JoinHandle<()>>,
     rank: usize,
     communicator: Communicator,
+    /// The stop signal for the background comm thread (the graceful shutdown on drop).
+    stop_flag: Arc<AtomicBool>,
 }
 
 impl Transfer {
@@ -182,6 +265,8 @@ impl Transfer {
         let thread_available_tokens = available_tokens.clone();
 
         let communicator = Communicator::new(config.clone(), config.role.clone(), rank);
+        // Clone the stop_flag for the struct field (the original is moved into the thread).
+        let stop_flag_struct = stop_flag.clone();
         // Start the background communication thread
         let thread_comm = communicator.clone();
         let comm_handle = Some(std::thread::spawn(move || {
@@ -204,6 +289,7 @@ impl Transfer {
             rank,
             communicator,
             available_tokens,
+            stop_flag: stop_flag_struct,
         })
     }
 
@@ -369,12 +455,12 @@ impl Transfer {
                             let (local_k_cache, local_v_cache) = &local_gpu_cache[i];
 
                             let remote_k_tensor = super::transfer::bytes_to_cpu_tensor(
-                                k_bytes,
+                                k_bytes.as_slice(),
                                 *num_blocks,
                                 local_k_cache,
                             )?;
                             let remote_v_tensor = super::transfer::bytes_to_cpu_tensor(
-                                v_bytes,
+                                v_bytes.as_slice(),
                                 *num_blocks,
                                 local_v_cache,
                             )?;
@@ -396,12 +482,12 @@ impl Transfer {
                         for (layer_idx, tq_d) in tq_data.iter().enumerate() {
                             attention_rs::with_turboquant_layer(layer_idx, |tq, _| -> Result<()> {
                                 let va_cpu = super::transfer::bytes_to_tq_cpu_tensor(
-                                    &tq_d.v_absmax,
+                                    tq_d.v_absmax.as_slice(),
                                     *num_blocks,
                                     &tq.v_absmax,
                                 )?;
                                 let vq_cpu = super::transfer::bytes_to_tq_cpu_tensor(
-                                    &tq_d.v_quant,
+                                    tq_d.v_quant.as_slice(),
                                     *num_blocks,
                                     &tq.v_quant,
                                 )?;
@@ -412,7 +498,7 @@ impl Transfer {
                                     (&tq_d.k_absmax, &tq.k_absmax)
                                 {
                                     let ka_cpu = super::transfer::bytes_to_tq_cpu_tensor(
-                                        ka_bytes,
+                                        ka_bytes.as_slice(),
                                         *num_blocks,
                                         local_ka,
                                     )?;
@@ -422,7 +508,7 @@ impl Transfer {
                                     (&tq_d.k_quant, &tq.k_quant)
                                 {
                                     let kq_cpu = super::transfer::bytes_to_tq_cpu_tensor(
-                                        kq_bytes,
+                                        kq_bytes.as_slice(),
                                         *num_blocks,
                                         local_kq,
                                     )?;
@@ -589,8 +675,8 @@ impl Transfer {
                             )?;
 
                             layer_data.push((
-                                super::transfer::cpu_tensor_to_bytes::<T>(&k_cpu_tensor)?,
-                                super::transfer::cpu_tensor_to_bytes::<T>(&v_cpu_tensor)?,
+                                RawBytes::from(super::transfer::cpu_tensor_to_bytes::<T>(&k_cpu_tensor)?),
+                                RawBytes::from(super::transfer::cpu_tensor_to_bytes::<T>(&v_cpu_tensor)?),
                             ));
                         }
                     }
@@ -636,14 +722,18 @@ impl Transfer {
                                     Ok(TqLayerTcpData {
                                         k_absmax: ka_cpu
                                             .map(|t| super::transfer::cpu_tensor_to_bytes_any(&t))
-                                            .transpose()?,
+                                            .transpose()?
+                                            .map(RawBytes::from),
                                         k_quant: kq_cpu
                                             .map(|t| super::transfer::cpu_tensor_to_bytes_any(&t))
-                                            .transpose()?,
-                                        v_absmax: super::transfer::cpu_tensor_to_bytes_any(
-                                            &va_cpu,
-                                        )?,
-                                        v_quant: super::transfer::cpu_tensor_to_bytes_any(&vq_cpu)?,
+                                            .transpose()?
+                                            .map(RawBytes::from),
+                                        v_absmax: RawBytes::from(
+                                            super::transfer::cpu_tensor_to_bytes_any(&va_cpu)?,
+                                        ),
+                                        v_quant: RawBytes::from(
+                                            super::transfer::cpu_tensor_to_bytes_any(&vq_cpu)?,
+                                        ),
                                     })
                                 },
                             )
@@ -706,14 +796,22 @@ impl Transfer {
 
 impl Drop for Transfer {
     fn drop(&mut self) {
-        // TODO: Add logic to gracefully shut down the comm_handle thread
+        // Gracefully shut down the comm_handle thread: signal the stop, interrupt
+        // any blocking socket operation (the close wakes a parked listener), +
+        // join. Without the close, a listener blocked in read_exact (an idle peer,
+        // no message arriving) or in accept/connect would block the join forever.
+        self.stop_flag.store(true, std::sync::atomic::Ordering::Release);
+        self.communicator.close();
+        if let Some(handle) = self.comm_handle.take() {
+            let _ = handle.join();
+        }
     }
 }
 
 /// (Client) Converts raw TQ bytes back into a CPU tensor for HtoD copy.
 /// Uses the GPU tensor's shape with dim(0) replaced by `num_blocks`.
 pub fn bytes_to_tq_cpu_tensor(
-    bytes: &Vec<u8>,
+    bytes: &[u8],
     num_blocks: usize,
     gpu_tensor_template: &Tensor,
 ) -> Result<Tensor> {
@@ -725,7 +823,7 @@ pub fn bytes_to_tq_cpu_tensor(
 
 /// (Client) Converts raw bytes back into a CPU tensor for HtoD copy.
 pub fn bytes_to_cpu_tensor(
-    bytes: &Vec<u8>,
+    bytes: &[u8],
     num_blocks: usize,
     gpu_tensor_template: &Tensor, // Used for shape/dtype
 ) -> Result<Tensor> {

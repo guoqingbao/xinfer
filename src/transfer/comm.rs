@@ -23,6 +23,36 @@ enum CommStream {
     Remote(TcpStream),
 }
 
+/// A handle that can interrupt a blocked socket operation (a `read` waiting for a
+/// message, an `accept`/`connect` waiting for a peer). Held by the `Communicator`
+/// so `close` can wake a parked listener thread without contending on the
+/// reader/writer stream locks (which the listener holds across a blocking read).
+/// For the TCP case, a cloned `TcpStream` is shut down (the `shutdown(Both)`
+/// unblocks the `read`/`accept`). For the Unix case, dropping the cloned
+/// `LocalStream` closes the fd (theblocking the `read`/`accept`).
+enum ShutdownHandle {
+    Local(LocalStream),
+    Remote(TcpStream),
+}
+
+impl ShutdownHandle {
+    /// Interrupt the blocking operation on the socket socket.
+    fn shutdown(self) {
+        match self {
+            ShutdownHandle::Remote(s) => {
+                // The shutdown(Both) unblocks a parked read/accept/connect.
+                let _ = s.shutdown(std::net::Shutdown::Both);
+            }
+            ShutdownHandle::Local(s) => {
+                // The dropping the LocalStream closes the fd, unblocking a parked
+                // read/accept. The explicit drop (the no the implicit end-of-scope)
+                // makes the intent clear.
+                drop(s);
+            }
+        }
+    }
+}
+
 impl Read for CommStream {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         match self {
@@ -58,6 +88,10 @@ pub struct Communicator {
     reader: Arc<Mutex<Option<CommStream>>>,
     /// Write-half of the connection
     writer: Arc<Mutex<Option<CommStream>>>,
+    /// A handle that can interrupt a blocking socket operation (the read/accept/connect).
+    /// Set when the connection is established; used by close to wake a parked
+    /// listener thread without contending on the reader/writer locks.
+    shutdown: Arc<Mutex<Option<ShutdownHandle>>>,
     config: PdConfig,
     role: PdRole,
     rank: usize,
@@ -69,6 +103,7 @@ impl Communicator {
         Self {
             reader: Arc::new(Mutex::new(None)),
             writer: Arc::new(Mutex::new(None)),
+            shutdown: Arc::new(Mutex::new(None)),
             config,
             role,
             rank,
@@ -106,6 +141,27 @@ impl Communicator {
                 self.rank
             );
         }
+    }
+
+    /// Close the underlying streams (the reader + the writer), unblocking any
+    /// in-flight blocking operation (a `read_exact` waiting for a message, an
+    /// `accept`/`connect` waiting for a peer). Called by the `Transfer::drop`
+    /// before joining the listener thread, so a parked listener (an idle peer,
+    /// no message arriving) does not block the join indefinitely. The streams
+    /// are set to `None` (the listener loop's next `receive`/`establish``
+    /// sees the closed state + the `stop_flag` check breaks the loop).
+    pub fn close(&self) {
+        // The interrupt any blocking read/accept/connect on the listener thread
+        // via the shutdown handle (a clone of the read socket). This does not
+        // contend on the reader lock (which the listener holds across a blocking
+        // read), so it cannot deadlock.
+        if let Some(handle) = self.shutdown.lock().take() {
+            handle.shutdown();
+        }
+        // The mark the streams as closed (the listener loop's next receive sees
+        // the None + the stop_flag check breaks the loop).
+        *self.reader.lock() = None;
+        *self.writer.lock() = None;
     }
 
     /// The main listener loop, intended to be run in a separate thread.
@@ -150,6 +206,14 @@ impl Communicator {
             // --- Inner loop: Message Receiving ---
             // Now that connection is established, self.stream is Some.
             loop {
+                // The stop signal is checked between messages so a parked
+                // listener (a live, idle peer) observes the shutdown instead of
+                // blocking in receive forever. The Transfer::drop sets the flag
+                // + joins this thread; without this check the join hangs when
+                // the peer is still connected.
+                if stop_flag.load(Ordering::SeqCst) {
+                    break;
+                }
                 match self.receive() {
                     Ok(msg) => self.handle_received_message(
                         msg,
@@ -212,6 +276,14 @@ impl Communicator {
         };
 
         // Store the newly established streams
+        // The shutdown handle: a clone of the read socket, used by close to
+        // interrupt a blocking read/accept on the listener thread (the no
+        // contending on the reader lock the listener holds during the read).
+        let shutdown_handle = match &read_stream {
+            CommStream::Remote(s) => ShutdownHandle::Remote(s.try_clone()?),
+            CommStream::Local(s) => ShutdownHandle::Local(s.try_clone()?),
+        };
+        *self.shutdown.lock() = Some(shutdown_handle);
         *self.reader.lock() = Some(read_stream);
         *self.writer.lock() = Some(write_stream);
         Ok(())
@@ -380,9 +452,9 @@ impl Communicator {
 }
 
 /// Generic, standardized function to send a message.
-/// Uses a 4-byte LE length prefix followed by bincode data.
+/// Uses a 4-byte LE length prefix followed by MsgPack data.
 fn send_message_generic(stream: &mut (impl Read + Write), msg: &TransferMessage) -> Result<bool> {
-    let serialized: Vec<u8> = bincode::serialize(msg).map_err(candle_core::Error::wrap)?;
+    let serialized: Vec<u8> = rmp_serde::to_vec(msg).map_err(candle_core::Error::wrap)?;
     let len = serialized.len() as u32;
     stream.write_all(&len.to_le_bytes())?;
     stream.write_all(&serialized)?;
@@ -391,7 +463,7 @@ fn send_message_generic(stream: &mut (impl Read + Write), msg: &TransferMessage)
 }
 
 /// Generic, standardized function to receive a message.
-/// Reads a 4-byte LE length prefix then bincode data.
+/// Reads a 4-byte LE length prefix then MsgPack data.
 fn receive_message_generic(stream: &mut (impl Read + Write)) -> Result<TransferMessage> {
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf)?;
@@ -405,6 +477,6 @@ fn receive_message_generic(stream: &mut (impl Read + Write)) -> Result<TransferM
     let mut msg_buf = vec![0u8; len];
     stream.read_exact(&mut msg_buf)?;
 
-    let msg = bincode::deserialize(&msg_buf).map_err(candle_core::Error::wrap)?;
+    let msg = rmp_serde::from_slice(&msg_buf).map_err(candle_core::Error::wrap)?;
     Ok(msg)
 }
