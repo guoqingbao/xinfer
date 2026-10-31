@@ -54,7 +54,9 @@ pub const PD_PREFILL_STATUS_CHECK_COOLING_PERIOD: usize = 50; // check prefill s
 pub const PD_PREFILL_TRANSFER_NUM_TOKEN_THRESHOLD: usize = 128; // do not transfer prefill length < 128
 /// When prefix cache hit is high, prefer local prefill if new tokens < this threshold
 pub const PD_LOCAL_PREFILL_NEW_TOKEN_THRESHOLD: usize = 1024;
-const PREFIX_CACHE_RATIO_NORMAL: f32 = 0.65;
+// Retain cached blocks until GPU KV space is actually needed. A 65% cap
+// evicted useful prefixes while over a third of the GPU pool was still free.
+const PREFIX_CACHE_RATIO_NORMAL: f32 = 1.0;
 const PREFIX_CACHE_RATIO_PD_SERVER: f32 = 0.8;
 const PREFIX_CACHE_RATIO_PD_CLIENT: f32 = 0.5;
 const PREFIX_CACHE_PRESSURE_EVICT_PERCENT: f32 = 0.1; // evict 10% of prefix cache when under pressure
@@ -1078,8 +1080,6 @@ impl Scheduler {
                     let mut seq = if is_running {
                         self.running.remove(idx)
                     } else {
-                        // Even though the cached sequence swapped out,
-                        // no need remove it from cached list since it can be recoved
                         self.cached.remove(idx)
                     };
                     if seq.status == SequenceStatus::Running {
@@ -1308,6 +1308,20 @@ impl Scheduler {
     pub fn evict_prefix_cache_until_free(&mut self, min_free_blocks: usize) -> usize {
         self.block_manager
             .evict_prefix_cache_until_free(min_free_blocks)
+    }
+
+    pub fn evict_prefix_cache_until_free_for_seq(
+        &mut self,
+        min_free_blocks: usize,
+        seq: &Sequence,
+    ) -> usize {
+        let protected = self.block_manager.prefix_protect_blocks_for_seq(seq);
+        let protected_hashes = self.block_manager.prefix_protect_trie_hashes_for_seq(seq);
+        self.block_manager.evict_prefix_cache_until_free_skip(
+            min_free_blocks,
+            &protected,
+            &protected_hashes,
+        )
     }
 
     pub fn evict_prefix_cache_blocks(&mut self, blocks: usize) -> usize {

@@ -742,7 +742,7 @@ impl LLMEngine {
             let target_required_tokens = target_required_blocks * self.econfig.block_size;
             let evicted = self
                 .scheduler
-                .evict_prefix_cache_until_free(target_required_blocks);
+                .evict_prefix_cache_until_free_for_seq(target_required_blocks, &seq);
             if evicted > 0 {
                 crate::log_warn!(
                     "Evicted {} prefix cache block(s) to reserve {} KV tokens for request admission (prompt + {} requested decode tokens).",
