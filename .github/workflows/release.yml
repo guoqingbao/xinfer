@@ -174,84 +174,91 @@ jobs:
             dist/wheels/*.whl
 
   # ---------------------------------------------------------------------------
-  # CUDA 13 x64 builds: SM90+ on self-hosted runner (CUDA 13.0 already installed)
-  # Builds run sequentially (max-parallel: 1) switching CUDA_COMPUTE_CAP.
+  # CUDA 13 x64 builds: SM90/100/120 run sequentially on one GitHub-hosted
+  # runner with CUDA 13.0 to limit runner use and stay within resource limits.
   # ---------------------------------------------------------------------------
   cuda:
-    name: cuda-${{ matrix.sm_name }}
-    runs-on: self-hosted
+    name: cuda-sm90-sm100-sm120
+    runs-on: ubuntu-latest
     needs: validate
-    strategy:
-      fail-fast: false
-      max-parallel: 1
-      matrix:
-        include:
-          - sm: "90"
-            sm_name: sm90
-            features: "cuda,nccl,flashinfer,cutlass"
-            python_features: "cuda,nccl,flashinfer,cutlass,python"
-          - sm: "100"
-            sm_name: sm100
-            features: "cuda,nccl,flashinfer,cutlass"
-            python_features: "cuda,nccl,flashinfer,cutlass,python"
-          - sm: "120"
-            sm_name: sm120
-            features: "cuda,nccl,flashinfer,cutlass"
-            python_features: "cuda,nccl,flashinfer,cutlass,python"
     env:
-      CUDA_COMPUTE_CAP: ${{ matrix.sm }}
-      RAYON_NUM_THREADS: "128"
+      CARGO_BUILD_JOBS: "2"
+      CUDAFORGE_THREADS: "2"
+      RAYON_NUM_THREADS: "2"
+    container:
+      image: docker.io/nvidia/cuda:13.0.0-cudnn-devel-ubuntu24.04
     steps:
       - uses: actions/checkout@v4
 
-      - name: Clean previous build artifacts
-        run: cargo clean 2>/dev/null || true
-
-      - name: Ensure perl available for vendored OpenSSL build
+      - name: Install system dependencies
         run: |
-          if ! command -v perl >/dev/null 2>&1; then
-            if command -v apt-get >/dev/null 2>&1; then
-              sudo apt-get update && sudo apt-get install -y perl make
-            else
-              echo "ERROR: perl is required to build vendored OpenSSL." >&2
-              exit 1
-            fi
+          apt-get update
+          apt-get install -y --no-install-recommends --allow-change-held-packages \
+            libnccl-dev libnccl2 \
+            curl git ca-certificates \
+            clang libclang-dev \
+            python3-pip patchelf dpkg-dev \
+            perl make
+          rm -rf /var/lib/apt/lists/*
+
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Install maturin and cargo-deb
+        run: |
+          . "$HOME/.cargo/env"
+          pip3 install --no-cache-dir --break-system-packages maturin patchelf cffi
+          cargo install cargo-deb
+
+      # FlashMLA's CUTLASS submodule is a gitlink, so newer Git rejects it as
+      # a cone-mode sparse-checkout path on cudaforge's second fetch. Pass
+      # Git's documented --skip-checks option for sparse-checkout setup.
+      - name: Allow sparse-checkout paths that include submodules
+        run: |
+          mkdir -p "$HOME/bin"
+          cat > "$HOME/bin/git" <<'EOF'
+          #!/usr/bin/env bash
+          if [[ "${1:-}" == "sparse-checkout" && "${2:-}" == "set" ]]; then
+            shift 2
+            exec /usr/bin/git sparse-checkout set --skip-checks "$@"
           fi
-          command -v make >/dev/null 2>&1 || { echo "ERROR: make is required to build vendored OpenSSL." >&2; exit 1; }
+          exec /usr/bin/git "$@"
+          EOF
+          chmod +x "$HOME/bin/git"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
 
-      - name: Build xinfer binary
-        run: cargo build --release --bin xinfer --features "${{ matrix.features }}"
-
-      - name: Build Python wheel
-        run: ./build.sh --release --features "${{ matrix.python_features }}"
-
-      - name: Bundle runtime libraries with binary
-        run: bash .github/scripts/bundle-binary-libs.sh target/release/xinfer target/release/lib
-
-      - name: Package deb
-        run: cargo deb --no-build --output "dist/xinfer-linux-x64-${{ matrix.sm_name }}.deb"
-
-      - name: Package tar.gz
+      - name: Build and package SM90, SM100, and SM120
         run: |
-          mkdir -p dist/xinfer
-          cp target/release/xinfer dist/xinfer/xinfer
-          cp -a target/release/lib dist/xinfer/lib
-          tar -C dist/xinfer -czf "dist/xinfer-${{ needs.validate.outputs.version }}-linux-x64-${{ matrix.sm_name }}.tar.gz" xinfer lib
-          rm -rf dist/xinfer
+          . "$HOME/.cargo/env"
+          for sm in 90 100 120; do
+            sm_name="sm${sm}"
+            export CUDA_COMPUTE_CAP="$sm"
 
-      - name: Collect and tag wheel with SM variant
-        run: |
-          mkdir -p dist/wheels
-          for whl in target/wheels/*.whl; do
-            base="$(basename "$whl")"
-            tagged="$(echo "$base" | sed "s/-cp/-${{ matrix.sm }}-cp/")"
-            cp "$whl" "dist/wheels/$tagged"
+            cargo clean
+            cargo build --release --bin xinfer --features "cuda,nccl,flashinfer,cutlass"
+            ./build.sh --release --features "cuda,nccl,flashinfer,cutlass,python"
+            bash .github/scripts/bundle-binary-libs.sh target/release/xinfer target/release/lib
+            cargo deb --no-build --output "dist/xinfer-linux-x64-${sm_name}.deb"
+
+            mkdir -p dist/xinfer dist/wheels
+            cp target/release/xinfer dist/xinfer/xinfer
+            cp -a target/release/lib dist/xinfer/lib
+            tar -C dist/xinfer -czf "dist/xinfer-${{ needs.validate.outputs.version }}-linux-x64-${sm_name}.tar.gz" xinfer lib
+            rm -rf dist/xinfer
+
+            for whl in target/wheels/*.whl; do
+              base="$(basename "$whl")"
+              tagged="$(echo "$base" | sed "s/-cp/-${sm}-cp/")"
+              cp "$whl" "dist/wheels/$tagged"
+            done
           done
           ls -la dist/wheels/
 
       - uses: actions/upload-artifact@v4
         with:
-          name: xinfer-cuda-${{ matrix.sm_name }}
+          name: xinfer-cuda-sm90-sm100-sm120
           path: |
             dist/*.tar.gz
             dist/*.deb
