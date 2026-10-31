@@ -1,6 +1,6 @@
 // src/core/block_manager.rs
 use super::kv_swap::CpuOffloadEntry;
-use super::prefix_cache::{PrefixCache, PrefixCacheConfig, PrefixCacheUpdate};
+use super::prefix_cache::{max_reusable_blocks, PrefixCache, PrefixCacheConfig, PrefixCacheUpdate};
 use super::runner::RunnerType;
 use super::sequence::{Sequence, SequenceStatus};
 use crate::def_broadcast_message_to_runners;
@@ -57,7 +57,9 @@ pub struct BlockManager {
     /// CPU copies of evicted prefix-cache blocks keyed by trie hash.
     cpu_offload_entries: HashMap<u64, CpuOffloadEntry>,
     /// Trie hashes in LRU order (front = oldest) for CPU offload tier eviction.
-    cpu_offload_lru: VecDeque<u64>,
+    cpu_offload_lru: VecDeque<(u64, u64)>,
+    cpu_offload_lru_ids: HashMap<u64, u64>,
+    cpu_offload_epoch: u64,
 }
 
 impl BlockManager {
@@ -125,11 +127,9 @@ impl BlockManager {
             valid_mamba_prefix_hashes: HashSet::new(),
             cpu_offload_entries: HashMap::new(),
             cpu_offload_lru: VecDeque::new(),
+            cpu_offload_lru_ids: HashMap::new(),
+            cpu_offload_epoch: 0,
         }
-    }
-
-    fn block_ref_count(&self, block_id: usize) -> usize {
-        self.blocks.get(block_id).map_or(0, |b| b.ref_count)
     }
 
     fn allocate_block(&mut self, block_id: usize) -> &mut Block {
@@ -248,15 +248,11 @@ impl BlockManager {
         seed_block: Option<usize>,
         mut matched_blocks: usize,
     ) -> usize {
-        let full_blocks = tokens.len() / self.block_size;
+        let full_blocks = max_reusable_blocks(tokens.len(), self.block_size);
+        let hashes = prefix_cache.hashes_for_tokens_with_seed(tokens, seed, seed_block);
         let mut gpu_reattach = 0usize;
         while matched_blocks < full_blocks {
-            let Some(trie_hash) = prefix_cache.hash_for_blocks_with_seed(
-                tokens,
-                matched_blocks + 1,
-                seed,
-                seed_block,
-            ) else {
+            let Some(&trie_hash) = hashes.get(matched_blocks) else {
                 break;
             };
             if prefix_cache.block_id_for_hash(trie_hash).is_some() {
@@ -330,14 +326,11 @@ impl BlockManager {
         seed_block: Option<usize>,
         full_blocks: usize,
     ) -> HashSet<u64> {
-        let mut hashes = HashSet::new();
-        for i in 1..=full_blocks {
-            if let Some(hash) = prefix_cache.hash_for_blocks_with_seed(tokens, i, seed, seed_block)
-            {
-                hashes.insert(hash);
-            }
-        }
-        hashes
+        prefix_cache
+            .hashes_for_tokens_with_seed(tokens, seed, seed_block)
+            .into_iter()
+            .take(full_blocks)
+            .collect()
     }
 
     fn insert_promoted_prefix_path(
@@ -497,13 +490,7 @@ impl BlockManager {
     }
 
     fn adjusted_matched_blocks(&self, tokens_len: usize, matched_blocks: usize) -> usize {
-        let full_blocks = tokens_len / self.block_size;
-        if matched_blocks == full_blocks && tokens_len % self.block_size == 0 && matched_blocks > 0
-        {
-            matched_blocks - 1
-        } else {
-            matched_blocks
-        }
+        matched_blocks.min(max_reusable_blocks(tokens_len, self.block_size))
     }
 
     fn resolve_mamba_matched_blocks(
@@ -681,6 +668,12 @@ impl BlockManager {
         let promoted_blocks = matched_blocks.saturating_sub(mamba_matched_blocks);
         let cached_tokens = matched_blocks * self.block_size;
         seq.num_cached_tokens = cached_tokens;
+        if seq
+            .mamba_prefix_warmup_tokens
+            .is_some_and(|target| cached_tokens >= target)
+        {
+            seq.clear_mamba_prefix_warmup();
+        }
         if matched_blocks > 0 {
             crate::log_info!(
                 "Prefix cache hit seq {} ({} cached tokens, {} blocks; raw {}, mamba {}, gpu_extend {})",
@@ -720,23 +713,40 @@ impl BlockManager {
         seed_block: Option<usize>,
         mut matched_blocks: usize,
     ) -> usize {
-        let full_blocks = tokens.len() / self.block_size;
+        // A fully cached, block-aligned prompt has no token left to drive
+        // prefill and sampling. Leave its last block for normal execution.
+        let mut full_blocks = max_reusable_blocks(tokens.len(), self.block_size);
+        let hashes = prefix_cache.hashes_for_tokens_with_seed(tokens, seed, seed_block);
+        let original_matched_blocks = matched_blocks;
+        if self.mamba_prefix_enabled {
+            // KV blocks between snapshots can be reused only if a compatible
+            // Mamba state exists at the final reuse boundary.
+            let mut snapshot_candidates = Vec::new();
+            for i in matched_blocks..full_blocks {
+                let hash = hashes[i];
+                let available = prefix_cache.block_id_for_hash(hash).is_some()
+                    || self.cpu_offload_entry_matches(hash, tokens, i + 1);
+                if !available {
+                    break;
+                }
+                if self.valid_mamba_prefix_hashes.contains(&hash) {
+                    snapshot_candidates.push(i);
+                }
+            }
+            full_blocks = snapshot_candidates
+                .into_iter()
+                .rev()
+                .find(|&i| self.mamba_prefix_hash_usable(seq.id, hashes[i]))
+                .map_or(matched_blocks, |i| i + 1);
+        }
         let mut gpu_reattached = 0usize;
         let mut total_promoted = 0usize;
         while matched_blocks < full_blocks {
-            let Some(trie_hash) = prefix_cache.hash_for_blocks_with_seed(
-                tokens,
-                matched_blocks + 1,
-                seed,
-                seed_block,
-            ) else {
+            let Some(&trie_hash) = hashes.get(matched_blocks) else {
                 break;
             };
             // Blocks still in the GPU trie (not offloaded) — re-attach without using CPU.
             if let Some(block_id) = prefix_cache.block_id_for_hash(trie_hash) {
-                if !self.mamba_prefix_hash_usable(seq.id, trie_hash) {
-                    break;
-                }
                 if let Some(entry) = self.take_cpu_offload_entry(trie_hash) {
                     self.free_cpu_block_ids.push_back(entry.cpu_block_id);
                 }
@@ -744,31 +754,22 @@ impl BlockManager {
                 seq.block_table.push(block_id as u32);
                 matched_blocks += 1;
                 gpu_reattached += 1;
-                if self.mamba_prefix_enabled {
-                    seq.mamba_prefix_hash = Some(trie_hash);
-                }
                 continue;
             }
-            if !self.cpu_offload_entry_matches(trie_hash, tokens, matched_blocks + 1)
-                || !self.mamba_prefix_hash_usable(seq.id, trie_hash)
-            {
+            if !self.cpu_offload_entry_matches(trie_hash, tokens, matched_blocks + 1) {
                 break;
             }
             // Batch-promote consecutive CPU-offloaded blocks.
             let mut promotions = Vec::new();
             let mut probe = matched_blocks;
             while probe < full_blocks {
-                let Some(hash) =
-                    prefix_cache.hash_for_blocks_with_seed(tokens, probe + 1, seed, seed_block)
-                else {
+                let Some(&hash) = hashes.get(probe) else {
                     break;
                 };
                 if prefix_cache.block_id_for_hash(hash).is_some() {
                     break;
                 }
-                if !self.cpu_offload_entry_matches(hash, tokens, probe + 1)
-                    || !self.mamba_prefix_hash_usable(seq.id, hash)
-                {
+                if !self.cpu_offload_entry_matches(hash, tokens, probe + 1) {
                     break;
                 }
                 let Some(gpu_block_id) = self.free_block_ids.pop_front() else {
@@ -791,11 +792,6 @@ impl BlockManager {
                         .extend(gpu_blocks.iter().take(promoted).copied());
                     matched_blocks += promoted;
                     total_promoted += promoted;
-                    if self.mamba_prefix_enabled {
-                        if let Some(&(trie_hash, _)) = promotions.iter().take(promoted).last() {
-                            seq.mamba_prefix_hash = Some(trie_hash);
-                        }
-                    }
                     self.insert_promoted_prefix_path(
                         prefix_cache,
                         seq,
@@ -817,6 +813,19 @@ impl BlockManager {
                     }
                     break;
                 }
+            }
+        }
+        if self.mamba_prefix_enabled {
+            if matched_blocks < full_blocks {
+                while seq.block_table.len() > original_matched_blocks {
+                    if let Some(block_id) = seq.block_table.pop() {
+                        self.decrement_block_ref(block_id as usize);
+                    }
+                }
+                return original_matched_blocks;
+            }
+            if matched_blocks > original_matched_blocks {
+                seq.mamba_prefix_hash = hashes.get(matched_blocks - 1).copied();
             }
         }
         if gpu_reattached > 0 || total_promoted > 0 {
@@ -1007,6 +1016,18 @@ impl BlockManager {
             .insert(trie_hash);
     }
 
+    fn detach_mamba_prefix_from_gpu(&mut self, trie_hash: u64, old_block_id: usize) {
+        if self.mamba_prefix_block_by_hash.get(&trie_hash) == Some(&old_block_id) {
+            self.mamba_prefix_block_by_hash.remove(&trie_hash);
+            if let Some(hashes) = self.mamba_prefix_hashes_by_block.get_mut(&old_block_id) {
+                hashes.remove(&trie_hash);
+                if hashes.is_empty() {
+                    self.mamba_prefix_hashes_by_block.remove(&old_block_id);
+                }
+            }
+        }
+    }
+
     /// Evict prefix blocks from GPU: bulk offload where possible, invalidate mamba only on true drops.
     fn apply_prefix_evictions(
         &mut self,
@@ -1024,6 +1045,12 @@ impl BlockManager {
         let offloaded_gpu_ids =
             self.offload_prefix_blocks_batch(&offload_candidates, protected_trie_hashes);
         let offloaded_set: HashSet<usize> = offloaded_gpu_ids.into_iter().collect();
+
+        for &(block_id, trie_hash, _) in evicted {
+            if offloaded_set.contains(&block_id) {
+                self.detach_mamba_prefix_from_gpu(trie_hash, block_id);
+            }
+        }
 
         for &(block_id, _, _) in evicted {
             self.decrement_block_ref(block_id);
@@ -1094,11 +1121,24 @@ impl BlockManager {
             .as_ref()
             .map(|img| Self::image_seed_and_block(img, tokens, self.block_size))
             .unwrap_or((None, None));
+        // An explicit cache cap smaller than this one sequence must still be
+        // honored; in that case the tail of the sequence cannot be protected.
+        let protected_blocks: HashSet<usize> = if blocks.len() <= prefix_cache.max_cached_blocks() {
+            blocks.iter().copied().collect()
+        } else {
+            HashSet::new()
+        };
         let PrefixCacheUpdate {
             inserted,
             evicted: _,
             evicted_detailed,
-        } = prefix_cache.insert_prefix_with_seed(tokens, &blocks, seed, seed_block);
+        } = prefix_cache.insert_prefix_with_seed_skip(
+            tokens,
+            &blocks,
+            seed,
+            seed_block,
+            &protected_blocks,
+        );
         for block_id in inserted {
             self.increment_block_ref(block_id);
         }
@@ -1145,15 +1185,21 @@ impl BlockManager {
     }
 
     pub fn clear_prefix_cache(&mut self) {
-        let Some(prefix_cache) = self.prefix_cache.as_mut() else {
-            return;
-        };
-        let evicted = prefix_cache.clear();
-        let evicted_blocks = evicted.clone();
-        for block_id in evicted {
-            self.decrement_block_ref(block_id);
+        if let Some(prefix_cache) = self.prefix_cache.as_mut() {
+            let evicted = prefix_cache.clear();
+            for &block_id in &evicted {
+                self.decrement_block_ref(block_id);
+            }
+            self.handle_mamba_prefix_evicted_blocks(&evicted);
         }
-        self.handle_mamba_prefix_evicted_blocks(&evicted_blocks);
+        for (hash, entry) in std::mem::take(&mut self.cpu_offload_entries) {
+            if self.valid_mamba_prefix_hashes.contains(&hash) {
+                self.invalidate_mamba_prefix_hash(hash);
+            }
+            self.free_cpu_block_ids.push_back(entry.cpu_block_id);
+        }
+        self.cpu_offload_lru.clear();
+        self.cpu_offload_lru_ids.clear();
     }
 
     /// GPU trie block ids on the longest prefix match for `seq` (admission eviction shield).
@@ -1193,37 +1239,43 @@ impl BlockManager {
             .as_ref()
             .map(|img| Self::image_seed_and_block(img, &seq.token_ids, self.block_size))
             .unwrap_or((None, None));
-        let mut hashes = HashSet::new();
-        for i in 1..=full_blocks {
-            if let Some(hash) =
-                prefix_cache.hash_for_blocks_with_seed(&seq.token_ids, i, seed, seed_block)
-            {
-                hashes.insert(hash);
-            }
-        }
-        hashes
+        prefix_cache
+            .hashes_for_tokens_with_seed(&seq.token_ids, seed, seed_block)
+            .into_iter()
+            .take(full_blocks)
+            .collect()
     }
 
-    fn remove_cpu_offload_lru_hash(&mut self, trie_hash: u64) {
-        if let Some(pos) = self.cpu_offload_lru.iter().position(|&h| h == trie_hash) {
-            self.cpu_offload_lru.remove(pos);
+    fn compact_cpu_offload_lru(&mut self) {
+        if self.cpu_offload_lru.len() <= self.cpu_offload_entries.len().max(64) * 4 {
+            return;
         }
+        self.cpu_offload_lru
+            .retain(|(hash, id)| self.cpu_offload_lru_ids.get(hash) == Some(id));
     }
 
     fn insert_cpu_offload_entry(&mut self, entry: CpuOffloadEntry) {
         let trie_hash = entry.trie_hash;
+        self.cpu_offload_epoch = self.cpu_offload_epoch.wrapping_add(1);
+        let id = self.cpu_offload_epoch;
         self.cpu_offload_entries.insert(trie_hash, entry);
-        self.cpu_offload_lru.push_back(trie_hash);
+        self.cpu_offload_lru_ids.insert(trie_hash, id);
+        self.cpu_offload_lru.push_back((trie_hash, id));
+        self.compact_cpu_offload_lru();
     }
 
     fn take_cpu_offload_entry(&mut self, trie_hash: u64) -> Option<CpuOffloadEntry> {
-        self.remove_cpu_offload_lru_hash(trie_hash);
-        self.cpu_offload_entries.remove(&trie_hash)
+        self.cpu_offload_lru_ids.remove(&trie_hash);
+        let entry = self.cpu_offload_entries.remove(&trie_hash);
+        self.compact_cpu_offload_lru();
+        entry
     }
 
     fn drop_cpu_offload_entry(&mut self, trie_hash: u64) -> Option<CpuOffloadEntry> {
         let entry = self.take_cpu_offload_entry(trie_hash)?;
-        self.invalidate_mamba_prefix_hash(trie_hash);
+        if self.valid_mamba_prefix_hashes.contains(&trie_hash) {
+            self.invalidate_mamba_prefix_hash(trie_hash);
+        }
         Some(entry)
     }
 
@@ -1232,14 +1284,14 @@ impl BlockManager {
         let mut evicted = 0usize;
         let mut protected_pass = 0usize;
         while evicted < count {
-            let Some(trie_hash) = self.cpu_offload_lru.pop_front() else {
+            let Some((trie_hash, id)) = self.cpu_offload_lru.pop_front() else {
                 break;
             };
-            if !self.cpu_offload_entries.contains_key(&trie_hash) {
+            if self.cpu_offload_lru_ids.get(&trie_hash) != Some(&id) {
                 continue;
             }
             if skip_trie_hashes.contains(&trie_hash) {
-                self.cpu_offload_lru.push_back(trie_hash);
+                self.cpu_offload_lru.push_back((trie_hash, id));
                 protected_pass += 1;
                 if protected_pass >= self.cpu_offload_lru.len() {
                     break;
@@ -1347,10 +1399,11 @@ impl BlockManager {
         if mapping.is_empty() {
             return Vec::new();
         }
-        if self.try_swap_kvcache(mapping, false).is_err() {
+        if let Err(e) = self.copy_kv_cache(mapping, false) {
             for (_, _, _, cpu_bid) in staged {
                 self.free_cpu_block_ids.push_back(cpu_bid);
             }
+            crate::log_warn!("Prefix cache CPU offload failed: {}", e);
             return Vec::new();
         }
         let mut offloaded_gpu_ids = Vec::with_capacity(staged.len());
@@ -1383,7 +1436,7 @@ impl BlockManager {
             return Ok(0);
         }
         let promoted = staged.len();
-        if let Err(e) = self.try_swap_kvcache(mapping, true) {
+        if let Err(e) = self.copy_kv_cache(mapping, true) {
             for entry in staged {
                 self.insert_cpu_offload_entry(entry);
             }
@@ -1629,7 +1682,10 @@ impl BlockManager {
         {
             if self.prefix_cache_enabled() {
                 let (prefix_blocks, suffix_blocks) = self.split_prefix_suffix(seq);
-                if suffix_blocks == 0 || self.free_cpu_block_ids.len() < suffix_blocks {
+                if suffix_blocks == 0
+                    || self.free_cpu_block_ids.len() + self.cpu_offload_entries.len()
+                        < suffix_blocks
+                {
                     return false;
                 }
                 return seq
@@ -1760,6 +1816,9 @@ impl BlockManager {
         let (prefix_blocks, suffix_blocks) = self.split_prefix_suffix(seq);
         if suffix_blocks == 0 {
             candle_core::bail!("Seq {} has no sequence-owned suffix blocks to swap", seq.id);
+        }
+        if self.free_cpu_block_ids.len() < suffix_blocks {
+            self.ensure_cpu_offload_capacity(suffix_blocks, &HashSet::new());
         }
         if self.free_cpu_block_ids.len() < suffix_blocks {
             candle_core::bail!("Not enough CPU swap blocks for seq {} suffix", seq.id);

@@ -1,6 +1,16 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 
+/// Leave at least one token for prefill when the prompt ends on a block boundary.
+pub(crate) fn max_reusable_blocks(tokens_len: usize, block_size: usize) -> usize {
+    let full_blocks = tokens_len / block_size;
+    if tokens_len % block_size == 0 {
+        full_blocks.saturating_sub(1)
+    } else {
+        full_blocks
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct PrefixCacheConfig {
     pub enabled: bool,
@@ -65,6 +75,10 @@ impl PrefixCache {
 
     pub fn cached_blocks(&self) -> usize {
         self.entries.len()
+    }
+
+    pub fn max_cached_blocks(&self) -> usize {
+        self.config.max_cached_blocks
     }
 
     pub fn match_prefix(&mut self, tokens: &[u32]) -> PrefixMatch {
@@ -175,6 +189,31 @@ impl PrefixCache {
             last_hash = Some(hash);
         }
         last_hash
+    }
+
+    /// Hash each full block once, preserving the same seed boundary as lookup.
+    pub fn hashes_for_tokens_with_seed(
+        &self,
+        tokens: &[u32],
+        seed: Option<u64>,
+        seed_block: Option<usize>,
+    ) -> Vec<u64> {
+        let mut hashes = Vec::with_capacity(tokens.len() / self.block_size);
+        let mut parent_hash = 0u64;
+        for (i, block_tokens) in tokens
+            .chunks(self.block_size)
+            .take(tokens.len() / self.block_size)
+            .enumerate()
+        {
+            if let Some(s) = seed {
+                if seed_block == Some(i) {
+                    parent_hash = Self::mix_seed(parent_hash, s);
+                }
+            }
+            parent_hash = Self::hash_block(parent_hash, block_tokens);
+            hashes.push(parent_hash);
+        }
+        hashes
     }
 
     pub fn insert_prefix(&mut self, tokens: &[u32], blocks: &[usize]) -> PrefixCacheUpdate {
@@ -439,5 +478,88 @@ impl PrefixCache {
         parent_hash.hash(&mut hasher);
         seed.hash(&mut hasher);
         hasher.finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{max_reusable_blocks, PrefixCache, PrefixCacheConfig};
+    use std::collections::HashSet;
+
+    #[test]
+    fn retains_blocks_beyond_old_fraction_when_capacity_is_available() {
+        let mut cache = PrefixCache::new(
+            2,
+            PrefixCacheConfig {
+                enabled: true,
+                max_cached_blocks: 5,
+            },
+        );
+        let update = cache.insert_prefix(&[1, 2, 3, 4, 5, 6, 7, 8], &[10, 11, 12, 13]);
+        assert_eq!(cache.cached_blocks(), 4);
+        assert!(update.evicted.is_empty());
+    }
+
+    #[test]
+    fn protects_incoming_prefix_when_capacity_is_reached() {
+        let mut cache = PrefixCache::new(
+            2,
+            PrefixCacheConfig {
+                enabled: true,
+                max_cached_blocks: 3,
+            },
+        );
+        cache.insert_prefix(&[1, 2, 3, 4], &[10, 11]);
+        cache.insert_prefix(&[1, 2, 5, 6], &[10, 12]);
+        let update = cache.insert_prefix_with_seed_skip(
+            &[1, 2, 7, 8],
+            &[10, 13],
+            None,
+            None,
+            &HashSet::from([10, 13]),
+        );
+        assert_eq!(update.evicted, vec![11]);
+        assert_eq!(cache.match_prefix(&[1, 2, 7, 8]).matched_blocks, 2);
+    }
+
+    #[test]
+    fn explicit_capacity_can_evict_an_oversized_prefix_tail() {
+        let mut cache = PrefixCache::new(
+            2,
+            PrefixCacheConfig {
+                enabled: true,
+                max_cached_blocks: 2,
+            },
+        );
+        let update = cache.insert_prefix(&[1, 2, 3, 4, 5, 6], &[10, 11, 12]);
+        assert_eq!(update.evicted, vec![12]);
+        assert_eq!(cache.cached_blocks(), 2);
+    }
+
+    #[test]
+    fn incremental_hashes_match_seeded_lookup() {
+        let cache = PrefixCache::new(
+            2,
+            PrefixCacheConfig {
+                enabled: true,
+                max_cached_blocks: 5,
+            },
+        );
+        let tokens = [1, 2, 3, 4, 5, 6, 7];
+        let hashes = cache.hashes_for_tokens_with_seed(&tokens, Some(42), Some(1));
+        assert_eq!(hashes.len(), 3);
+        for (index, hash) in hashes.into_iter().enumerate() {
+            assert_eq!(
+                Some(hash),
+                cache.hash_for_blocks_with_seed(&tokens, index + 1, Some(42), Some(1))
+            );
+        }
+    }
+
+    #[test]
+    fn block_aligned_prompt_keeps_one_block_for_prefill() {
+        assert_eq!(max_reusable_blocks(54_016, 64), 843);
+        assert_eq!(max_reusable_blocks(54_017, 64), 844);
+        assert_eq!(max_reusable_blocks(64, 64), 0);
     }
 }
