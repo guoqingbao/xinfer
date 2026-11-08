@@ -3040,7 +3040,7 @@ impl FusedMoeNvfp4 {
                 .or_else(|_| {
                     vb.get_with_hints_dtype((), "weight_global_scale", no_shard, DType::F32)
                 })
-                .and_then(|t| t.flatten_all()?.to_vec1::<f32>().map(|v| v[0]))
+                .and_then(|t| t.flatten_all()?.max(0)?.to_scalar::<f32>())
                 .unwrap_or(1.0);
             if raw != 0.0 {
                 1.0 / raw
@@ -3051,7 +3051,7 @@ impl FusedMoeNvfp4 {
             // modelopt format: weight_scale_2 is the direct multiplier
             vb.get_with_hints_dtype((1,), "weight_scale_2", no_shard, DType::F32)
                 .or_else(|_| vb.get_with_hints_dtype((), "weight_scale_2", no_shard, DType::F32))
-                .and_then(|t| t.flatten_all()?.to_vec1::<f32>().map(|v| v[0]))
+                .and_then(|t| t.flatten_all()?.max(0)?.to_scalar::<f32>())
                 .unwrap_or(1.0)
         } else {
             1.0
@@ -3063,7 +3063,7 @@ impl FusedMoeNvfp4 {
         if vb.contains_tensor("input_scale") {
             vb.get_with_hints_dtype((1,), "input_scale", no_shard, DType::F32)
                 .or_else(|_| vb.get_with_hints_dtype((), "input_scale", no_shard, DType::F32))
-                .and_then(|t| t.flatten_all()?.to_vec1::<f32>().map(|v| v[0]))
+                .and_then(|t| t.flatten_all()?.max(0)?.to_scalar::<f32>())
                 .unwrap_or(1.0)
         } else if vb.contains_tensor("input_global_scale") {
             let raw = vb
@@ -3071,7 +3071,7 @@ impl FusedMoeNvfp4 {
                 .or_else(|_| {
                     vb.get_with_hints_dtype((), "input_global_scale", no_shard, DType::F32)
                 })
-                .and_then(|t| t.flatten_all()?.to_vec1::<f32>().map(|v| v[0]))
+                .and_then(|t| t.flatten_all()?.max(0)?.to_scalar::<f32>())
                 .unwrap_or(1.0);
             if raw != 0.0 {
                 1.0 / raw
@@ -3269,7 +3269,7 @@ impl FusedMoeNvfp4 {
                                 DType::F32,
                             )
                         })
-                        .and_then(|t| t.flatten_all()?.to_vec1::<f32>().map(|v| v[0]))
+                        .and_then(|t| t.flatten_all()?.max(0)?.to_scalar::<f32>())
                         .unwrap_or(1.0)
                     } else if vb.contains_tensor("gate_up_proj_weight_global_scale") {
                         let raw = vb
@@ -3287,7 +3287,7 @@ impl FusedMoeNvfp4 {
                                     DType::F32,
                                 )
                             })
-                            .and_then(|t| t.flatten_all()?.to_vec1::<f32>().map(|v| v[0]))
+                            .and_then(|t| t.flatten_all()?.max(0)?.to_scalar::<f32>())
                             .unwrap_or(1.0);
                         if raw != 0.0 {
                             1.0 / raw
@@ -3313,7 +3313,7 @@ impl FusedMoeNvfp4 {
                                 DType::F32,
                             )
                         })
-                        .and_then(|t| t.flatten_all()?.to_vec1::<f32>().map(|v| v[0]))
+                        .and_then(|t| t.flatten_all()?.max(0)?.to_scalar::<f32>())
                         .unwrap_or(1.0)
                     } else if vb.contains_tensor("gate_up_proj_input_global_scale") {
                         let raw = vb
@@ -3331,7 +3331,7 @@ impl FusedMoeNvfp4 {
                                     DType::F32,
                                 )
                             })
-                            .and_then(|t| t.flatten_all()?.to_vec1::<f32>().map(|v| v[0]))
+                            .and_then(|t| t.flatten_all()?.max(0)?.to_scalar::<f32>())
                             .unwrap_or(1.0);
                         if raw != 0.0 {
                             1.0 / raw
@@ -3390,7 +3390,7 @@ impl FusedMoeNvfp4 {
                                 DType::F32,
                             )
                         })
-                        .and_then(|t| t.flatten_all()?.to_vec1::<f32>().map(|v| v[0]))
+                        .and_then(|t| t.flatten_all()?.max(0)?.to_scalar::<f32>())
                         .unwrap_or(1.0)
                     } else if vb.contains_tensor("down_proj_weight_global_scale") {
                         let raw = vb
@@ -3408,7 +3408,7 @@ impl FusedMoeNvfp4 {
                                     DType::F32,
                                 )
                             })
-                            .and_then(|t| t.flatten_all()?.to_vec1::<f32>().map(|v| v[0]))
+                            .and_then(|t| t.flatten_all()?.max(0)?.to_scalar::<f32>())
                             .unwrap_or(1.0);
                         if raw != 0.0 {
                             1.0 / raw
@@ -3429,7 +3429,7 @@ impl FusedMoeNvfp4 {
                                     DType::F32,
                                 )
                             })
-                            .and_then(|t| t.flatten_all()?.to_vec1::<f32>().map(|v| v[0]))
+                            .and_then(|t| t.flatten_all()?.max(0)?.to_scalar::<f32>())
                             .unwrap_or(1.0)
                     } else if vb.contains_tensor("down_proj_input_global_scale") {
                         let raw = vb
@@ -3447,7 +3447,7 @@ impl FusedMoeNvfp4 {
                                     DType::F32,
                                 )
                             })
-                            .and_then(|t| t.flatten_all()?.to_vec1::<f32>().map(|v| v[0]))
+                            .and_then(|t| t.flatten_all()?.max(0)?.to_scalar::<f32>())
                             .unwrap_or(1.0);
                         if raw != 0.0 {
                             1.0 / raw
