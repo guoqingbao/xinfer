@@ -143,7 +143,7 @@ fn resolve_param_properties<'a>(
         if tool.function.name == function_name {
             return tool
                 .function
-                .parameters
+                .parameters_schema()
                 .get("properties")
                 .and_then(|v| v.as_object());
         }

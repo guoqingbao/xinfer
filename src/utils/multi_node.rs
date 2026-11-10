@@ -42,10 +42,9 @@ fn master_distribute_nccl_id(
         )
     })?;
 
-    #[cfg(target_arch = "aarch64")]
-    let raw_id: &[u8; 128] = id.internal();
-    #[cfg(not(target_arch = "aarch64"))]
-    let raw_id: &[i8; 128] = id.internal();
+    // `c_char` is `i8` on x86_64 but `u8` on aarch64/powerpc64/s390x/..., so the
+    // element type has to follow the target instead of being hardcoded.
+    let raw_id: &[core::ffi::c_char; 128] = id.internal();
     let raw_bytes: &[u8] = unsafe { std::slice::from_raw_parts(raw_id.as_ptr() as *const u8, 128) };
 
     let bind_addr = format!("{}:{}", master_addr, master_port);
@@ -134,15 +133,12 @@ fn worker_receive_nccl_id(master_addr: &str, master_port: u16) -> std::io::Resul
     stream.write_all(&[1u8])?;
     stream.flush()?;
 
-    let mut arr = [0i8; 128];
+    let mut arr = [0 as core::ffi::c_char; 128];
     unsafe {
         std::ptr::copy_nonoverlapping(raw_bytes.as_ptr(), arr.as_mut_ptr() as *mut u8, 128);
     }
 
-    #[cfg(not(target_arch = "aarch64"))]
     let id = Id::uninit(arr);
-    #[cfg(target_arch = "aarch64")]
-    let id = Id::uninit(arr.map(|b| b as u8));
 
     crate::log_info!("[Multi-Node] Received NCCL ID from master");
     Ok(id)
