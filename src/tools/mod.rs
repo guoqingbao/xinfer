@@ -15,6 +15,13 @@ use uuid::Uuid;
 pub use openai_protocol::common::{Function, FunctionCallResponse as FunctionCall, Tool, ToolCall};
 
 /// Builder for creating Tool definitions
+///
+/// Note on the schema field: `openai-protocol` 1.18 changed
+/// `Function::parameters` from `Value` to `Option<Value>` so that a request
+/// which omits the field stays distinguishable from one that sends an empty
+/// schema. `Function::parameters_schema` hides that difference and hands back
+/// the schema the function is read with, which is what every caller in this
+/// crate wants.
 pub struct ToolBuilder {
     name: String,
     description: String,
@@ -80,7 +87,7 @@ impl ToolBuilder {
             function: Function {
                 name: self.name,
                 description: Some(self.description),
-                parameters: self.parameters,
+                parameters: Some(self.parameters),
                 strict: self.strict,
                 extra: Default::default(),
             },

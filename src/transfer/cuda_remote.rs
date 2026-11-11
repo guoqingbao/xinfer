@@ -69,12 +69,12 @@ pub(super) fn open_ipc_handle<T: WithDType + candle_core::cuda_backend::CudaDTyp
     if handle.0.len() != 64 {
         candle_core::bail!("Invalid CUipcMemHandle handle!");
     }
-    #[cfg(target_arch = "aarch64")]
-    let raw_array: [u8; 64] = handle.0.clone().try_into().expect("length checked");
-    #[cfg(not(target_arch = "aarch64"))]
-    let raw_array: [i8; 64] = handle.0.clone().try_into().expect("length checked");
+    // `CUipcMemHandle::reserved` is typed as `[c_char; 64]`, and `c_char` is
+    // `i8` on x86_64 but `u8` on aarch64/powerpc64/s390x/..., so the element
+    // type has to follow the target instead of being hardcoded.
+    let raw_array: [c_char; 64] = handle.0.clone().try_into().expect("length checked");
     let handle_raw = CUipcMemHandle {
-        reserved: raw_array.map(|b| b as c_char),
+        reserved: raw_array,
     };
     unsafe {
         lib()

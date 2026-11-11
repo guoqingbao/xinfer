@@ -1574,6 +1574,19 @@ pub async fn get_usage(
 }
 
 #[utoipa::path(
+    get,
+    tag = "xinfer",
+    path = "/v1/acceleration",
+    responses((status = 200, description = "Acceleration path report"))
+)]
+pub async fn get_acceleration(State(state): State<Arc<ServerData>>) -> axum::Json<
+    crate::utils::sm70_diagnostics::AccelerationReport,
+> {
+    let engine = state.engine.read();
+    axum::Json(engine.acceleration_report.clone())
+}
+
+#[utoipa::path(
     post,
     tag = "xinfer",
     path = "/tokenize",

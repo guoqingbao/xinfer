@@ -1599,6 +1599,7 @@ pub async fn run_server(
         )
         .route("/v1/embeddings", post(server::create_embeddings))
         .route("/v1/usage", get(server::get_usage))
+        .route("/v1/acceleration", get(server::get_acceleration))
         .route("/tokenize", post(server::tokenize))
         .route("/detokenize", post(server::detokenize))
         .layer(DefaultBodyLimit::max(100 * 1024 * 1024)) // 100MB body size limit
@@ -1708,6 +1709,7 @@ pub async fn run_server(
     println!("{}", format!("   - POST /v1/embeddings").yellow());
     println!("{}", format!("   - GET  /v1/models").yellow());
     println!("{}", format!("   - GET  /v1/usage").yellow());
+    println!("{}", format!("   - GET  /v1/acceleration").yellow());
     println!("{}", format!("   - POST /tokenize").yellow());
     println!("{}", format!("   - POST /detokenize").yellow());
     println!("");

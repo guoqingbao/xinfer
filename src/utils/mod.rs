@@ -19,6 +19,7 @@ pub use kv_backend::{CpuKvCache, GpuKvCache, KvCacheBackend};
 pub mod logits_processor;
 pub mod multi_node;
 pub mod progress;
+pub mod sm70_diagnostics;
 pub mod special_tokens;
 use crate::core::GenerationOutput;
 use crate::models::gemma3::config::Gemma3Config;

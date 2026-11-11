@@ -603,7 +603,8 @@ text: /(?s:.+?)/
             serde_json::json!({ "type": "object" })
         } else {
             let variants: Vec<Value> = self.tools.iter().map(|tool| {
-                let arguments_schema = sanitize_schema_for_llguidance(&tool.function.parameters);
+                let arguments_schema =
+                    sanitize_schema_for_llguidance(tool.function.parameters_schema());
                 serde_json::json!({
                     "type": "object",
                     "properties": { "name": { "type": "string", "enum": [tool.function.name.clone()] }, "arguments": arguments_schema },
@@ -666,7 +667,7 @@ text: /(?s:.+?)/
             let func_end = lark_quote("</function>\n");
             if let Some(props) = tool
                 .function
-                .parameters
+                .parameters_schema()
                 .get("properties")
                 .and_then(|p| p.as_object())
             {
@@ -694,7 +695,7 @@ text: /(?s:.+?)/
                     }
                     let required_params: Vec<String> = tool
                         .function
-                        .parameters
+                        .parameters_schema()
                         .get("required")
                         .and_then(|r| r.as_array())
                         .map(|arr| {
@@ -759,7 +760,7 @@ text: /(?s:.+?)/
             let func_end = lark_quote("</invoke>\n");
             if let Some(props) = tool
                 .function
-                .parameters
+                .parameters_schema()
                 .get("properties")
                 .and_then(|p| p.as_object())
             {
@@ -787,7 +788,7 @@ text: /(?s:.+?)/
                     }
                     let required_params: Vec<String> = tool
                         .function
-                        .parameters
+                        .parameters_schema()
                         .get("required")
                         .and_then(|r| r.as_array())
                         .map(|arr| {
@@ -855,14 +856,14 @@ text: /(?s:.+?)/
                 .collect();
             if let Some(props) = tool
                 .function
-                .parameters
+                .parameters_schema()
                 .get("properties")
                 .and_then(|p| p.as_object())
             {
                 let mut param_rules_vec: Vec<String> = Vec::new();
                 let required_count = tool
                     .function
-                    .parameters
+                    .parameters_schema()
                     .get("required")
                     .and_then(|r| r.as_array())
                     .map(|arr| arr.len())
@@ -899,7 +900,7 @@ text: /(?s:.+?)/
             .iter()
             .filter_map(|tool| {
                 tool.function
-                    .parameters
+                    .parameters_schema()
                     .get("properties")
                     .and_then(|p| p.as_object())
             })

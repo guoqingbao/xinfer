@@ -225,9 +225,17 @@ pub struct KVCacheAllocator {
     /// Whether FlashInfer GPU workspace is actually initialized at runtime.
     /// When false, do not reserve FlashInfer memory in the KV-cache budget.
     use_flashinfer_workspace: bool,
+    /// Whether the CUTLASS kernels are actually used by the loaded model.
+    /// When false, do not reserve the CUTLASS workspace.
+    use_cutlass_workspace: bool,
 }
 
 /// Mirrors `skip_flashinfer_init` in `core/runner.rs`.
+///
+/// The two must agree: the allocator reserves the FlashInfer workspace
+/// (640 MiB) based on this predicate, while the runner decides whether to
+/// initialize FlashInfer based on the same conditions. A disagreement wastes
+/// 640 MiB of VRAM on a workspace that is never allocated.
 fn uses_flashinfer_workspace(econfig: &EngineConfig, config: &Config) -> bool {
     #[cfg(not(feature = "flashinfer"))]
     {
@@ -259,7 +267,66 @@ fn uses_flashinfer_workspace(econfig: &EngineConfig, config: &Config) -> bool {
         if matches!(arch, "DeepseekV4ForCausalLM" | "deepseek_v4" | "deepseek4") {
             return false;
         }
+        // The FlashInfer prefill/decode kernels only support specific GQA
+        // group sizes (see attention-rs flashinfer.rs). The runner applies
+        // the same check before initializing the backend, so the allocator
+        // has to apply it too or it reserves a workspace nobody allocates.
+        if !flashinfer_gqa_group_supported(econfig, config) {
+            return false;
+        }
         true
+    }
+}
+
+/// Whether the FlashInfer kernels support this model's GQA group size.
+///
+/// `core/runner.rs` applies the same predicate before initializing the
+/// FlashInfer backend.
+pub fn flashinfer_gqa_group_supported(econfig: &EngineConfig, config: &Config) -> bool {
+    let world = econfig.num_shards.unwrap_or(1).max(1);
+    let qo_heads = config.num_attention_heads / world;
+    let kv_heads = if config.num_key_value_heads >= world {
+        config.num_key_value_heads / world
+    } else {
+        1 // replicated KV mode
+    };
+    let group = qo_heads / kv_heads.max(1);
+    matches!(group, 1 | 2 | 3 | 4 | 5 | 6 | 8 | 16 | 32 | 64)
+}
+
+/// Whether the CUTLASS kernels are used by the loaded model.
+///
+/// The CUTLASS path only applies to FP8 / FP4 quantized linear layers
+/// (`LnFp8`, `LnNvfp4`) and only from SM90 upwards. Reserving its 512 MiB
+/// workspace for an F16 model, or for a quantized model on an older GPU,
+/// throws away VRAM that the KV cache could use.
+fn uses_cutlass_workspace(config: &Config) -> bool {
+    if !cfg!(feature = "cutlass") {
+        return false;
+    }
+    let Some(quant) = config
+        .quantization_config
+        .as_ref()
+        .map(|q| q.quant_method.as_str())
+    else {
+        return false;
+    };
+    if !matches!(quant, "fp8" | "nvfp4" | "mxfp4") {
+        return false;
+    }
+    // The CUTLASS kernels in this project require SM90+; below that the
+    // software paths are used instead.
+    #[cfg(feature = "cuda")]
+    {
+        candle_core::Device::cuda_if_available(0)
+            .ok()
+            .and_then(|d| attention_rs::cuda_utils::sm_version(&d))
+            .map(|sm| sm >= 90)
+            .unwrap_or(false)
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        false
     }
 }
 
@@ -601,6 +668,7 @@ impl KVCacheAllocator {
             is_moe,
             prefill_chunk_size: econfig.effective_prefill_chunk_size(),
             use_flashinfer_workspace: uses_flashinfer_workspace(econfig, config),
+            use_cutlass_workspace: uses_cutlass_workspace(config),
         }
     }
 
@@ -627,8 +695,12 @@ impl KVCacheAllocator {
             0
         };
 
-        // CUTLASS workspace: 512 MiB dedicated buffer
-        let cutlass_bytes: u64 = if cfg!(feature = "cutlass") {
+        // CUTLASS workspace: 512 MiB dedicated buffer.
+        // Only reserved when the loaded model actually dispatches to the
+        // CUTLASS kernels. Reserving it for an F16 model, or for a quantized
+        // model on a GPU without the required tensor-core support, would
+        // hand 512 MiB of VRAM to a workspace that is never allocated.
+        let cutlass_bytes: u64 = if self.use_cutlass_workspace {
             512 * 1024 * 1024
         } else {
             0
@@ -638,7 +710,7 @@ impl KVCacheAllocator {
         // Peak = prefill_chunk_size × topk × max(hidden, 2×intermediate) × dtype_size
         // Covers: gathered, rep_out (largest buffers); act_packed and act_scales are smaller.
         let moe_pool_bytes: u64 =
-            if cfg!(feature = "cutlass") && self.is_moe && self.moe_num_experts_per_tok > 0 {
+            if self.use_cutlass_workspace && self.is_moe && self.moe_num_experts_per_tok > 0 {
                 let topk = self.moe_num_experts_per_tok;
                 let size_m = self.prefill_chunk_size * topk;
                 let hidden = self.hidden_size / self.num_shards.max(1);
@@ -1886,6 +1958,83 @@ impl KVCacheAllocator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_config(num_attention_heads: usize, num_key_value_heads: usize) -> Config {
+        serde_json::from_value(serde_json::json!({
+            "architectures": ["Qwen3ForCausalLM"],
+            "num_attention_heads": num_attention_heads,
+            "num_key_value_heads": num_key_value_heads,
+            "max_position_embeddings": 32768,
+            "hidden_size": 4096,
+            "num_hidden_layers": 32,
+            "intermediate_size": 11008,
+            "rms_norm_eps": 1e-6,
+            "vocab_size": 32000,
+            "hidden_act": "silu",
+        }))
+        .expect("test config")
+    }
+
+    fn test_econfig(num_shards: usize) -> EngineConfig {
+        serde_json::from_value(serde_json::json!({
+            "num_blocks": 128,
+            "kvcache_memory_bytes": 0,
+            "block_size": 64,
+            "max_num_seqs": 1,
+            "max_num_batched_tokens": 1024,
+            "num_shards": num_shards,
+            "enable_tool_grammar": false,
+        }))
+        .expect("test engine config")
+    }
+
+    #[test]
+    fn flashinfer_gqa_group_support_matches_the_kernel_limits() {
+        let config = test_config(24, 2);
+        // 24 Q heads / 2 KV heads = group 12, which the FlashInfer kernels do
+        // not support (this is the Qwen3.8-Flash-Next geometry).
+        assert!(!flashinfer_gqa_group_supported(&test_econfig(1), &config));
+        // With TP4 the local shape is 6 Q heads / 1 KV head = group 6, which
+        // is supported.
+        assert!(flashinfer_gqa_group_supported(&test_econfig(4), &config));
+    }
+
+    #[test]
+    fn flashinfer_gqa_group_uses_replicated_kv_when_shards_exceed_kv_heads() {
+        // 8 Q heads / 2 KV heads over 8 shards: the KV heads are replicated
+        // (one per rank), so the local group size is 8 / 8 = 1.
+        let config = test_config(8, 2);
+        assert!(flashinfer_gqa_group_supported(&test_econfig(8), &config));
+
+        // 14 Q heads / 2 KV heads over 1 shard gives group 7, which is not in
+        // the supported set {1,2,3,4,5,6,8,16,32,64}.
+        let config = test_config(14, 2);
+        assert!(!flashinfer_gqa_group_supported(&test_econfig(1), &config));
+        // Splitting further reduces the local group size into the supported
+        // set: 14 / 7 = 2 Q heads per rank with one replicated KV head.
+        assert!(flashinfer_gqa_group_supported(&test_econfig(7), &config));
+    }
+
+    #[test]
+    fn cutlass_workspace_is_not_reserved_for_unquantized_models() {
+        let config = test_config(24, 4);
+        assert!(config.quantization_config.is_none());
+        assert!(!uses_cutlass_workspace(&config));
+    }
+
+    #[test]
+    fn cutlass_workspace_is_not_reserved_without_the_feature() {
+        let mut config = test_config(24, 4);
+        config.quantization_config = serde_json::from_value(serde_json::json!({
+            "quant_method": "nvfp4",
+        }))
+        .expect("test quant config");
+        // Without the `cutlass` feature the workspace is never allocated, so
+        // it must not be reserved either.
+        if !cfg!(feature = "cutlass") {
+            assert!(!uses_cutlass_workspace(&config));
+        }
+    }
 
     #[test]
     fn hybrid_mamba_graph_capture_max_batch_scales_with_max_num_seqs() {

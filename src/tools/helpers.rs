@@ -39,7 +39,7 @@ pub fn build_tool_schema_map(tools: &[Tool]) -> HashMap<String, Value> {
     tools
         .iter()
         .map(|tool| {
-            let mut schema = tool.function.parameters.clone();
+            let mut schema = tool.function.parameters_schema().clone();
             if tool.function.strict == Some(false) {
                 if let Some(obj) = schema.as_object_mut() {
                     obj.insert("x-xinfer-lenient".to_string(), Value::Bool(true));

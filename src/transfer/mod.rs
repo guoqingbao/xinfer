@@ -69,12 +69,13 @@ pub struct PdConfig {
 
 /// Serializable handle for a CUDA IPC memory region.
 /// This is a wrapper around the `cudaIpcMemHandle_t` struct.
-#[cfg(target_arch = "aarch64")]
+///
+/// The payload mirrors `CUipcMemHandle::reserved`, which is typed as
+/// `[c_char; 64]`. `c_char` is `i8` on x86_64 but `u8` on aarch64/powerpc64/
+/// s390x/..., so the element type has to follow the target instead of being
+/// hardcoded to one of the two.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CudaIpcMemHandle(Vec<u8>, Vec<usize>, SerializableDType); // Simplified as bytes. See cuda.rs for real impl.
-#[cfg(not(target_arch = "aarch64"))]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CudaIpcMemHandle(Vec<i8>, Vec<usize>, SerializableDType); // Simplified as bytes. See cuda.rs for real impl.
+pub struct CudaIpcMemHandle(Vec<core::ffi::c_char>, Vec<usize>, SerializableDType); // Simplified as bytes. See cuda.rs for real impl.
 
 /// TurboQuant buffer handles for a single layer (IPC path).
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -74,17 +74,13 @@ impl<'de> Deserialize<'de> for NcclId {
                     bytes.len()
                 )));
             }
-            let mut arr = [0i8; 128];
+            // `c_char` is `i8` on x86_64 but `u8` on aarch64/powerpc64/s390x/...,
+            // so the element type has to follow the target instead of being hardcoded.
+            let mut arr = [0 as core::ffi::c_char; 128];
             unsafe {
                 std::ptr::copy_nonoverlapping(bytes.as_ptr(), arr.as_mut_ptr() as *mut u8, 128);
             }
-            #[cfg(not(target_arch = "aarch64"))]
             return Ok(NcclId(Id::uninit(arr)));
-            #[cfg(target_arch = "aarch64")]
-            {
-                let arr_u8 = arr.map(|b| b as u8);
-                return Ok(NcclId(Id::uninit(arr_u8)));
-            }
         } else {
             struct Visitor;
             impl<'de> serde::de::Visitor<'de> for Visitor {
@@ -101,17 +97,11 @@ impl<'de> Deserialize<'de> for NcclId {
                     if v.len() != 128 {
                         return Err(E::custom(format!("Expected 128 bytes but got {}", v.len())));
                     }
-                    let mut arr = [0i8; 128];
+                    let mut arr = [0 as core::ffi::c_char; 128];
                     unsafe {
                         std::ptr::copy_nonoverlapping(v.as_ptr(), arr.as_mut_ptr() as *mut u8, 128);
                     }
-                    #[cfg(not(target_arch = "aarch64"))]
                     return Ok(NcclId(Id::uninit(arr)));
-                    #[cfg(target_arch = "aarch64")]
-                    {
-                        let arr_u8 = arr.map(|b| b as u8);
-                        return Ok(NcclId(Id::uninit(arr_u8)));
-                    }
                 }
             }
 

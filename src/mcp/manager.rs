@@ -395,7 +395,7 @@ fn map_mcp_tools(
                 function: crate::tools::Function {
                     name: prefixed_name,
                     description: tool.description,
-                    parameters: tool.input_schema,
+                    parameters: Some(tool.input_schema),
                     strict: None,
                     extra: Default::default(),
                 },
