@@ -200,15 +200,9 @@ impl ReportInputs<'_> {
         // check; the engine mirrors the same rules so the report is stable
         // even when the runner lives in another process.
         let flashinfer_built = cfg!(feature = "flashinfer");
-        let world = econfig.num_shards.unwrap_or(1).max(1);
-        let qo_heads = config.num_attention_heads / world;
-        let kv_heads = if config.num_key_value_heads >= world {
-            config.num_key_value_heads / world
-        } else {
-            1
-        };
-        let gqa_group = qo_heads / kv_heads.max(1);
-        let gqa_supported = matches!(gqa_group, 1 | 2 | 3 | 4 | 5 | 6 | 8 | 16 | 32 | 64);
+        let gqa_supported = crate::utils::kvcache_allocator::flashinfer_gqa_group_supported(
+            econfig, config,
+        );
 
         let flashinfer_skip_reason: Option<&'static str> = if flashinfer_built {
             if config.kvcache_dtype.is_turboquant() {

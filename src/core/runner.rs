@@ -694,18 +694,13 @@ impl ModelRunner {
         // 24 Q heads / 2 KV heads (group 12) which is unsupported — fall back
         // to the native flash paged-attention path instead of failing at
         // decode-plan time.
+        //
+        // The KV-cache allocator applies the same predicate to decide whether
+        // to reserve the 640 MiB FlashInfer workspace, so the two must not
+        // drift apart.
         #[cfg(feature = "flashinfer")]
-        let flashinfer_gqa_supported = {
-            let world = comm.world_size();
-            let qo_heads = config.num_attention_heads / world;
-            let kv_heads = if config.num_key_value_heads >= world {
-                config.num_key_value_heads / world
-            } else {
-                1 // replicated KV mode
-            };
-            let group = qo_heads / kv_heads.max(1);
-            matches!(group, 1 | 2 | 3 | 4 | 5 | 6 | 8 | 16 | 32 | 64)
-        };
+        let flashinfer_gqa_supported =
+            crate::utils::kvcache_allocator::flashinfer_gqa_group_supported(econfig, config);
 
         #[cfg(feature = "flashinfer")]
         let skip_flashinfer_init = config.kvcache_dtype.is_turboquant()
