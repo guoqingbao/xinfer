@@ -90,6 +90,35 @@ fn guided_decoding_requests<'a>(
         .collect()
 }
 
+/// Explain why the FlashInfer backend was not initialized.
+///
+/// The runner performs the authoritative check; this turns the individual
+/// conditions into a single human-readable reason for the acceleration
+/// report.
+#[cfg(feature = "flashinfer")]
+fn flashinfer_skip_reason_text(
+    config: &crate::utils::config::Config,
+    model_type: ModelType,
+    gqa_supported: bool,
+) -> &'static str {
+    if config.kvcache_dtype.is_turboquant() {
+        "TurboQuant KV cache is not supported by FlashInfer"
+    } else if config.kvcache_dtype.is_fp8_keys() && !attention_rs::has_flashinfer_fp8_e4m3() {
+        "the build has no FlashInfer FP8 E4M3 support"
+    } else if matches!(
+        model_type,
+        ModelType::Gemma3 | ModelType::Gemma4
+    ) {
+        "Gemma models use heterogeneous head dimensions"
+    } else if !gqa_supported {
+        "the GQA group size is not supported by the FlashInfer kernels"
+    } else if matches!(model_type, ModelType::DeepSeekV4) {
+        "DeepSeek V4 does not consume FlashInfer attention"
+    } else {
+        "not initialized"
+    }
+}
+
 pub enum Model {
     Qwen3(Arc<Qwen3ForCausalLM>),
     Qwen3MoE(Arc<Qwen3MoEForCausalLM>),
@@ -748,6 +777,49 @@ impl ModelRunner {
                     "Use native flash backend ({:?} kvcache, flashattn not suitable)",
                     config.kvcache_dtype
                 );
+            }
+        }
+
+        // Report which acceleration paths this deployment actually uses.
+        // Quantized checkpoints pick a hardware path only on recent
+        // architectures; on older GPUs they silently fall back to a slower
+        // software path. Surface that instead of leaving it to inference
+        // from a throughput number.
+        {
+            use crate::utils::sm70_diagnostics::{
+                build_report, report_and_maybe_fail, ReportInputs,
+            };
+
+            let compute_capability = device
+                .as_cuda_device()
+                .ok()
+                .and_then(|d| attention_rs::cuda_utils::sm_version(d))
+                .map(|sm| sm as usize);
+
+            let mut inputs = ReportInputs::from_engine(config, econfig, compute_capability);
+
+            // The runner owns the authoritative FlashInfer decision; override
+            // the engine's mirrored guess with the real one.
+            #[cfg(feature = "flashinfer")]
+            {
+                inputs.flashinfer_active = !skip_flashinfer_init && flashinfer_kv_params.is_some();
+                inputs.flashinfer_skip_reason = if skip_flashinfer_init {
+                    Some(flashinfer_skip_reason_text(
+                        config,
+                        model_type,
+                        flashinfer_gqa_supported,
+                    ))
+                } else {
+                    None
+                };
+            }
+
+            let report = build_report(inputs);
+
+            if comm.rank() == 0 {
+                if let Err(e) = report_and_maybe_fail(&report) {
+                    candle_core::bail!("{}", e);
+                }
             }
         }
 

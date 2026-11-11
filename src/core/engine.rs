@@ -113,6 +113,9 @@ pub struct LLMEngine {
     pub tool_config: ToolConfig,
     pub img_cfg: Option<ImageProcessConfig>,
     pub guidance_tokens: GuidanceTokens,
+    /// Which acceleration paths this deployment actually uses, and why the
+    /// disabled ones are disabled. See `crate::utils::sm70_diagnostics`.
+    pub acceleration_report: crate::utils::sm70_diagnostics::AccelerationReport,
 }
 
 impl LLMEngine {
@@ -496,6 +499,22 @@ impl LLMEngine {
         }
         let runners = Arc::new(RwLock::new(runners));
 
+        // Compute the acceleration report once, at the engine level, so the
+        // HTTP surface can serve it. The runner prints its own copy during
+        // model loading; both use the same helper so they cannot drift.
+        let acceleration_report = {
+            use crate::utils::sm70_diagnostics::{build_report, ReportInputs};
+            let compute_capability = candle_core::Device::cuda_if_available(0)
+                .ok()
+                .and_then(|d| attention_rs::cuda_utils::sm_version(&d))
+                .map(|sm| sm as usize);
+            build_report(ReportInputs::from_engine(
+                &config,
+                &econfig,
+                compute_capability,
+            ))
+        };
+
         let mut scheduler = Scheduler::new(runners.clone(), &econfig, &config);
 
         // Preserve model-specific tool token detection for non-guided paths.
@@ -598,6 +617,7 @@ impl LLMEngine {
             img_cfg,
             model_name,
             guidance_tokens,
+            acceleration_report,
         }));
 
         Self::start_engine(engine.clone());
